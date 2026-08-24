@@ -1,25 +1,32 @@
 # STATUS — handoff document
 
-Last updated: end of the Phase 0 + Phase 1 run.
+Last updated: end of the **Phase 2** run (research + emulator skeleton).
+Sections 1–13 below are the Phase 0/1 handoff, unchanged except where marked.
+**Section 14 is the Phase 2 handoff — read it if you are picking up Phase 3.**
 
 **Read this first.** It is written for an agent starting with no context beyond
 this repository. Companion docs: `ARCHITECTURE.md` (the plan), `FINDINGS.md` (the
 reverse-engineered protocol, with three corrections listed below),
-`usb-ground-truth.md` (real descriptors captured from the wired controller).
+`usb-ground-truth.md` (real descriptors captured from the wired controller),
+`virtualization-options.md` (**Phase 2**: the option study, the risk register,
+and the exact list of system changes that need user approval).
 
 ---
 
 ## 1. Scope of this run
 
-Delivered: **Phase 0** (environment + hardware survey, USB ground truth, BT
-protocol smoke test) and **Phase 1** (user-mode BT bridge core in Python).
+Delivered so far: **Phase 0** (environment + hardware survey, USB ground truth,
+BT protocol smoke test), **Phase 1** (user-mode BT bridge core in Python) and
+**Phase 2** (virtualization option study + a driver-free USB/IP device-emulator
+skeleton in `emulator/`).
 
-**Phase 2 (virtualization research) was explicitly descoped mid-run** and is
-assigned to a separate agent. Nothing in this repo prejudges Option A
-(usbip-win2) vs Option B (UDECx). One relevant fact fell out of Phase 0 and is
-recorded in `usb-ground-truth.md`: the device needs **~588 KB/s of isochronous
-traffic at 1 ms service intervals** (OUT 392 B/ms + IN 196 B/ms), so isochronous
-support is the make-or-break question for whichever layer is chosen.
+Phase 2's conclusion, in one line: **go with Option A (usbip-win2)**. See §14
+and `docs/virtualization-options.md`. One relevant fact fell out of Phase 0 and
+is recorded in `usb-ground-truth.md`: the device needs **~588 KB/s of
+isochronous traffic at 1 ms service intervals** (OUT 392 B/ms + IN 196 B/ms),
+so isochronous support is the make-or-break question — and Phase 2 established
+that the real device's own descriptors already satisfy every known precondition
+for that to work over Windows' UDE stack.
 
 ## 2. Environment survey
 
@@ -329,6 +336,11 @@ docs/
   FINDINGS.md              BT protocol notes (see §10 for corrections)
   STATUS.md                this file
   usb-ground-truth.md      real descriptors from the wired controller + how to regenerate
+  virtualization-options.md  PHASE 2: option study, risk register, approval list
+emulator/                  PHASE 2: user-mode USB/IP device emulator (see §14)
+  README.md
+  ds5emu/{wire,descriptors,uac,device,backend,server,__main__}.py
+  tests/{test_wire,test_descriptors,test_device,test_server}.py
 samples/                   gitignored (`*.wav`); regenerate the test signal with
                            `-m ds5bridge gen-wav ../samples/test-sweep.wav`, which
                            is deterministic, so nothing is lost by not committing it
@@ -426,3 +438,174 @@ on `sys.path`):
    granularity (lower latency, 93.75 reports/s); `0x39` halves the report rate at
    21.33 ms granularity. DS5Dongle chose `0x39`. Latency vs BT airtime has not
    been measured here.
+
+*(All seven are still open. Phase 2 did not touch the hardware.)*
+
+---
+
+# 14. PHASE 2 HANDOFF — virtualization layer
+
+Written for an agent starting Phase 3 with no context but this repo.
+The full study, with URLs, is `docs/virtualization-options.md`. This section is
+the operational summary.
+
+## 14.1 What this run did and did not do
+
+Did: web research, source reading of vadimgrn/usbip-win2, and wrote
+`emulator/` with 91 passing unit tests.
+
+Did **not**: touch the hardware, install anything, load a driver, run
+`bcdedit`, write a registry key, create a service, or attach a virtual device.
+**No system change was made.** Everything that needs one is in
+`virtualization-options.md` §7, ready to copy-paste, and is still un-run.
+
+The two physical controllers were not used at all this run.
+
+## 14.2 The decision: Option A (usbip-win2)
+
+Write a **user-mode USB/IP server** that emulates the DualSense; attach it
+locally through usbip-win2's Microsoft-signed UDE driver over loopback TCP.
+
+The reasoning that actually decided it — and the single most useful thing
+carried out of this run:
+
+**Isochronous audio over Windows' UDE stack fails for exactly three reasons,
+and the real DualSense already avoids all three.** From usbip-win2 issue #35
+(nefarius + vadimgrn + bozax, closed completed 2024-04-28):
+
+| known killer | our situation |
+|---|---|
+| device presented as full-speed while UDE/USBHUB3 treats the port as high-speed → `USBD_STATUS_INVALID_PARAMETER` on every iso URB | the DualSense **is genuinely High-Speed** (`bcdUSB 0x0200`) |
+| iso `bInterval < 4` — UDE always interprets bInterval as 125 µs microframes | the DualSense declares **`bInterval = 4`** on both iso endpoints |
+| `USBAUDIO.SYS` needs `QueryBusTime`, which UDECx does not implement → endless `ABORT_PIPE`/`SYNC_RESET_PIPE_AND_CLEAR_STALL` loop | usbip-win2 ships `usbip2_filter.sys`, which implements it |
+
+Plus: usbip-win2's `patch_config()` rewrites iso `bInterval` to
+`min(bInterval + 3, 16)` — which would wreck us — but **only for devices
+reporting below `USB_SPEED_HIGH`**. We report high speed, so our descriptors
+pass through verbatim. This is asserted by a unit test
+(`tests/test_device.py::IdentityTests`), because it is the kind of thing a
+future refactor could silently break.
+
+Secondary reasons: signed driver (no test-signing, no WDK, no certificate);
+everything stays in user mode in the same process as the Phase-1 bridge;
+a bug is a process crash, not a bugcheck; and the emulator's descriptor tables
+and control-transfer logic port unchanged to Option B if Option A fails.
+
+Option B (custom UDECx driver) would need a multi-GB WDK, test-signing mode,
+**two** drivers (the UDE client plus a QueryBusTime bus filter), and there is
+**no UDE sample in microsoft/Windows-driver-samples** to start from — verified
+by enumerating that repo's whole file tree. Estimated 4–8 weeks vs 1–2.
+
+## 14.3 What is VERIFIED vs ASSUMED
+
+**Verified by reading primary sources** (usbip-win2's own C++, its issue
+tracker, its release notes, Microsoft Learn, the git tree of
+Windows-driver-samples) — every claim in `virtualization-options.md` carries a
+URL:
+
+- usbip-win2 is a USB/IP **client only**; we must write the server.
+- Its licence is **BSD-2-Clause**, not GPLv3 as the Phase-2 brief guessed.
+- Releases 0.9.7.5 (WHLK certified) and 0.9.7.7 (attestation signed) are signed
+  by Microsoft. **Test signing is not required.** 0.9.7.8 carries the
+  maintainer's own memory-corruption/BSOD warning — do not install it.
+- Isochronous is fully implemented client-side (`URB_FUNCTION_ISOCH_TRANSFER`,
+  iso descriptor repacking, `max_iso_packets = 1024`).
+- The complete iso wire contract (compaction, offset echoing, `start_frame`,
+  `error_count` semantics) — extracted from `wsk_receive.cpp` and
+  `device_ioctl.cpp` and implemented in `emulator/ds5emu/`.
+- USB audio adapters, headsets and webcams are on usbip-win2's known-working
+  device list.
+
+**Verified by execution on this machine:**
+
+- 91 unit tests pass (`emulator/`, ~1.3 s, stdlib only, no driver).
+- The descriptor tables are byte-identical to the hexdumps in
+  `docs/usb-ground-truth.md` — the test re-parses that markdown file, so the two
+  cannot drift.
+
+**ASSUMED / UNVERIFIED — treat as open:**
+
+1. **Nobody has published a USB/IP device emulator with isochronous
+   endpoints.** Every prior-art project found (jiegec/usbip in Rust, the
+   lcgamboa/PythonUSBIP lineage) is HID/control only. All the known-working
+   audio devices are *passthrough of real hardware*. We would be first, and no
+   source says whether a synthetic server can hold 1 ms iso at 588 KB/s. **This
+   is the top risk (R1).**
+2. **Loopback**: no source confirms or denies that usbip-win2's kernel WSK
+   client works against a `127.0.0.1` user-mode server. The code is
+   address-agnostic. (R3.)
+3. **Identity**: a UDE-attached device gets a normal `USB\VID&PID` devnode, the
+   `USB` enumerator, `usbccgp`, a well-formed `ContainerId`, and real class
+   drivers — all confirmed from USBTreeView dumps in issue #35. But it has
+   **no `LocationPaths` / `Location IDs`**, and its parent controller is
+   `ROOT\USBIP_WIN2\UDE`. Whether Sony's PC SDK cares is **not known**. (R2.)
+4. **UAC1 volume MIN/MAX/RES** in `emulator/ds5emu/uac.py` are plausible
+   defaults, **not captured from the physical controller** — hub IOCTLs return
+   descriptors, not class-request responses. (R7.)
+5. `emulator/ds5emu/backend.py::BridgeBackend` is a **stub that raises
+   `NotImplementedError`**. It has never run.
+
+## 14.4 `emulator/` — what exists
+
+```powershell
+cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .   # 91 tests
+..\prototype\.venv\Scripts\python.exe -m ds5emu descr                      # dump descriptors
+..\prototype\.venv\Scripts\python.exe -m ds5emu serve                      # 127.0.0.1:3240
+```
+
+Stdlib only — no new pip packages were installed. `prototype/.venv` is reused
+purely for convenience.
+
+Layering (see `emulator/README.md` for detail): `wire.py` (pure USB/IP bytes) →
+`descriptors.py` (ground truth) → `uac.py` + `device.py` (pure
+`CMD_SUBMIT → RET_SUBMIT`) → `backend.py` (the Phase-1 seam) → `server.py`
+(thin asyncio shell). Everything protocol-shaped is a pure function, so the
+whole thing is testable without a driver, and the C++ escape hatch (if Python
+jitter turns out to matter) touches only the transport shell.
+
+## 14.5 Phase 3: do these in this order
+
+**Step 0 — get approval.** Print `docs/virtualization-options.md` §7 to the
+user. It is a copy-pasteable list: create a restore point, install
+`USBip-0.9.7.7-x64.exe` (verify its Authenticode signature first), and note the
+side effects (2 kernel drivers, a `ROOT\USBIP_WIN2\UDE` devnode, **all USB 3.0
+hubs restart during install**, a scheduled task). Do not proceed without it.
+
+**Step 1 — experiment E2 (5 minutes).** Start `python -m ds5emu serve`, run
+`usbip.exe list -r 127.0.0.1`. Settles whether the kernel WSK client talks to a
+loopback user-mode server at all. Cheap; do it before anything else.
+
+**Step 2 — experiment E1, THE GO/NO-GO.** Attach with the synthetic backend and
+measure isochronous timing for 60 s. Pass criteria are written out in
+`virtualization-options.md` §8: 1000 ± 1 iso packets/s, zero gaps > 2 ms,
+p99 inter-arrival < 2 ms, clean 1 kHz FFT in both directions.
+`SyntheticBackend` already timestamps every iso OUT packet and `ds5emu serve`
+prints median/p99/max gaps on exit, so the instrumentation exists.
+**If E1 fails, stop and re-open Option B before writing any more integration
+code.**
+
+**Step 3 — experiment E3, identity.** With the virtual device attached *and*
+the physical wired one plugged in, diff their devnode properties, run
+`prototype/tools/enum_hid.py` and `dualsense-tester` against both. §8 has the
+exact PowerShell.
+
+**Step 4 — only then** implement `BridgeBackend` and do the real integration.
+Its docstring lists what is needed. The Phase-1 gotchas in §8 above apply
+verbatim, especially #1 (`mic_active=True` in report `0x36`, mandatory for the
+full-duplex a wired DualSense always does) and #3 (never spin on a bare `pass`).
+
+## 14.6 Open questions Phase 2 could not settle
+
+1. **R1 above** — the iso timing question. Only E1 answers it.
+2. Which usbip-win2 receive mode (Zero Copy vs the WSK-event Low Latency path)
+   to attach with, and whether it measurably matters. Issue #173, which added
+   the low-latency path, closed 2026-07-15.
+3. Whether Windows will expose the 4-channel render endpoint usefully, or
+   downmix it — the haptics live on channels 2/3. Compare against the physical
+   wired controller. (R8.)
+4. The real UAC1 volume control ranges (R7). USBPcap on the physical wired unit
+   would capture them.
+5. Whether the emulated HID input path needs to *generate* anything CRC-like.
+   USB HID reports carry no CRC — that is a Bluetooth-transport concern — so
+   probably not, but it is untested. (R6, and §13 question 1.)

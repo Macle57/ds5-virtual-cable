@@ -22,12 +22,19 @@ A software-only equivalent of DS5Dongle: take a Bluetooth-connected DualSense an
 
 ## Virtual USB device layer — candidate paths
 
-### Option A: usbip-win2 (vadimgrn/usbip-win2)
-Ship a user-mode USB/IP *server* that emulates the DualSense device (descriptors copied from DS5Dongle `fake_ds5.h`); attach it locally through usbip-win2's signed `vhci` driver.
+> **PHASE 2 RESOLVED THIS: Option A was chosen.** See
+> `virtualization-options.md` for the evidence, the risk register and the
+> approval list, and `STATUS.md` §14 for the operational handoff. Two
+> corrections to the text below: descriptors come from
+> `usb-ground-truth.md` (the real device), **not** DS5Dongle's `fake_ds5.h`;
+> and usbip-win2's driver is a **UDE (UDECx) client**, not a WDM `vhci`.
+
+### Option A: usbip-win2 (vadimgrn/usbip-win2)  — CHOSEN
+Ship a user-mode USB/IP *server* that emulates the DualSense device (descriptors from `usb-ground-truth.md`); attach it locally through usbip-win2's Microsoft-signed UDE driver.
 - + No kernel development, driver is maintained & signed by someone else
 - + Whole bridge stays in user mode (debuggable, crash-safe)
-- ? Isochronous endpoint emulation quality/latency over loopback — must be validated early (audio is iso!)
-- ? Installation UX (certificate/driver install)
+- ? Isochronous endpoint emulation quality/latency over loopback — must be validated early (audio is iso!). Phase 2 established the *preconditions* are met (high speed + iso bInterval 4 + QueryBusTime supplied by usbip2_filter.sys); the sustained-rate question is Phase 3 experiment E1.
+- + Installation is one Microsoft-signed installer; no test signing, no certificate. Licence is BSD-2-Clause.
 
 ### Option B: custom UDECx (USB Device Emulation) KMDF driver
 Kernel driver creating a virtual USB host controller + emulated device; bridge service talks to it via IOCTLs.
@@ -42,8 +49,8 @@ Kernel driver creating a virtual USB host controller + emulated device; bridge s
 
 - **Phase 0 — environment + hardware survey**: toolchains present? Enumerate both controllers; dump wired controller's real descriptors/report behavior as ground truth; verify BT controller: feature 0x05 read flips to 0x31 input mode, SetState lightbar change works.
 - **Phase 1 — BT bridge core (user mode, no driver)**: CLI proving the full protocol engine on this hardware: decode input @ full rate, SetState passthrough (rumble/triggers/LEDs), play WAV -> speaker + haptics via 0x39/0x36 with correct 45k/48k handling and 10.667ms pacing, record mic -> WAV. This engine is reused verbatim under either Option A or B.
-- **Phase 2 — virtualization spike**: research + prototype Option A vs B; success = a hello-world virtual USB device visible in Device Manager. Any system modification (driver install, test signing, certificates) is proposed first, not executed unilaterally.
-- **Phase 3 — integration**: full descriptor clone, audio pump USB<->BT, latency/jitter tuning, validation: dualsense-tester must classify the virtual device as USB; a Sony PC-SDK title must enable full features.
+- **Phase 2 — virtualization spike** *(DONE, research + code only)*: chose Option A; wrote `emulator/`, a driver-free USB/IP device-emulator skeleton with 91 protocol unit tests. No system modification was made; the required changes are listed for approval in `virtualization-options.md` §7. Making a virtual device actually appear in Device Manager needs that approval and is now the first task of Phase 3.
+- **Phase 3 — install, validate, integrate**: (a) approval + install usbip-win2; (b) experiment E2 (loopback reachability), then **E1, the go/no-go isochronous timing test**; (c) E3, device identity vs the physical wired controller; (d) only then the audio pump USB<->BT via `BridgeBackend`, latency/jitter tuning, and the acceptance tests: dualsense-tester must classify the virtual device as USB, and a Sony PC-SDK title must enable full features.
 
 ## Safety rails
 - Never write feature reports related to pairing (0x09) or firmware to the physical controllers.
