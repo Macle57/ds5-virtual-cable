@@ -38,7 +38,11 @@ ds5emu/
   timing.py       FrameClock (WE are the isochronous clock -- read it), UrbMeter,
                   TimerResolution.
   device.py       The emulated device: CMD_SUBMIT -> RET_SUBMIT. Pure, no threads.
-  backend.py      Backend ABC; SyntheticBackend (hardware-free); BridgeBackend stub.
+  backend.py      Backend ABC; SyntheticBackend (hardware-free).
+  bridge.py       BridgeBackend: a LIVE Bluetooth DualSense behind the virtual
+                  wired one. 3 threads, 4 ring buffers, the rate conversions,
+                  and the U/B/C clock-domain seam -- read its docstring.
+  translate.py    Pure BT<->USB report translation, stdlib only.
   server.py       asyncio TCP shell. Thin on purpose.
   __main__.py     CLI: serve / descr / selftest
 tests/
@@ -46,7 +50,11 @@ tests/
   test_descriptors.py  14 tests: descriptors vs docs/usb-ground-truth.md
   test_device.py       41 tests: control / interrupt / isochronous behaviour
   test_server.py       12 tests: full client-server round trips over loopback TCP
-  test_timing.py       11 tests: frame clock, iso pacing, input-report cadence
+  test_timing.py       22 tests: frame clock, iso pacing, and the 4 ms
+                       interrupt IN gate the endpoint owns
+  test_translate.py    19 tests: BT<->USB report translation
+  test_bridge.py       41 tests: BridgeBackend internals + the clock seam
+                       (skipped without numpy/PyAV/hidapi)
 ```
 
 The layering is deliberate: **everything protocol-shaped is a pure function**,
@@ -70,11 +78,17 @@ the socket layer is testable without a driver.
 report and a generated sine on the mic. It also timestamps every isochronous
 OUT packet, which is the measurement Phase-3 experiment E1 needs.
 
-`BridgeBackend` is a **documented stub that raises NotImplementedError**. It
-lists precisely what Phase 3 has to wire up against `prototype/ds5bridge`
-(rate conversion 48 k↔45 k, Opus framing at 10.667 ms, the haptic channel
-split, the mic jitter buffer, and the `mic_active` gotcha from STATUS.md §8.1).
-It has never been run. Do not treat it as working.
+`BridgeBackend` (`bridge.py`) is **implemented and hardware-verified**. It
+adapts `prototype/ds5bridge` onto a live Bluetooth DualSense: rate conversion
+48 k↔45 k, Opus framing at 10.667 ms, the haptic channel split, the mic jitter
+buffer, and the `mic_active` gotcha from STATUS.md §8.1. Run it with
+`serve --backend bridge`.
+
+Phase 3c attached it to Windows and verified the HID path end to end:
+**249.90 Hz input with 100.00 % field parity** against a simultaneous direct
+Bluetooth read, and adaptive triggers driven by a hidapi write to the virtual
+device. **The audio path through the virtual device is still unverified** --
+see `docs/e2e-results.md` §7.
 
 ## Language choice: Python, with an explicit escape hatch
 
@@ -173,7 +187,10 @@ expected). `--record-out` dumps the received speaker stream as raw 4ch s16le
 
 ## What is NOT done
 
-- `BridgeBackend` — stub only, never executed.
+- **Audio through the virtual device, in either direction.** Phase 3a proved
+  the transport carries 1 ms isochronous with `SyntheticBackend`; Phase 3b
+  proved `BridgeBackend` drives speaker, haptics and mic through its own API;
+  nobody has joined the two yet. Biggest open gap (`docs/e2e-results.md` §5).
 - UAC1 volume MIN/MAX/RES are **assumed** values, not captured from the
   physical controller (risk R7). Windows accepted them and built a working
   mixer, which is weaker evidence than sniffing the real answers.
