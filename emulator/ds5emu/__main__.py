@@ -58,6 +58,31 @@ def cmd_descr(args) -> int:
     return 0
 
 
+class RecordingBackend(SyntheticBackend):
+    """SyntheticBackend that also dumps the speaker stream to a raw file.
+
+    Lives here rather than in backend.py so that E1's measurement plumbing does
+    not collide with the Bluetooth work happening in `BridgeBackend`. The dump
+    is headerless 4-channel s16le at 48 kHz -- exactly the bytes the host put on
+    the wire -- so it can be FFT'd to prove the isochronous OUT path carries the
+    audio intact, not merely at the right rate.
+    """
+
+    def __init__(self, path: str, **kw):
+        super().__init__(**kw)
+        self._fh = open(path, "wb")
+
+    def write_audio_out(self, pcm: bytes) -> None:
+        super().write_audio_out(pcm)
+        self._fh.write(pcm)
+
+    def stop(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:  # pragma: no cover
+            pass
+
+
 def _snapshot(server, backend) -> dict:
     """Everything experiment E1 needs, as plain JSON-able data."""
     dev = server.device
@@ -129,7 +154,10 @@ def cmd_serve(args) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-    backend = SyntheticBackend(tone_hz=args.tone)
+    if args.record_out:
+        backend = RecordingBackend(args.record_out, tone_hz=args.tone)
+    else:
+        backend = SyntheticBackend(tone_hz=args.tone)
     server = UsbIpServer(backend, host=args.host, port=args.port, busid=args.busid,
                          pace_iso=not args.no_pace_iso)
 
@@ -197,6 +225,8 @@ def main(argv=None) -> int:
     s.add_argument("--busid", default=DEFAULT_BUSID)
     s.add_argument("--tone", type=float, default=1000.0,
                    help="synthetic microphone tone in Hz")
+    s.add_argument("--record-out", default=None, metavar="PATH",
+                   help="dump the received speaker stream as raw 4ch s16le 48 kHz")
     s.add_argument("--stats-json", default=None,
                    help="write a measurement snapshot to this file (atomically)")
     s.add_argument("--stats-every", type=float, default=2.0,

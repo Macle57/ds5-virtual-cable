@@ -1,15 +1,26 @@
 # STATUS — handoff document
 
-Last updated: end of the **Phase 2** run (research + emulator skeleton).
-Sections 1–13 below are the Phase 0/1 handoff, unchanged except where marked.
-**Section 14 is the Phase 2 handoff — read it if you are picking up Phase 3.**
+Last updated: end of the **Phase 3a** run (E1/E2/E3 on real hardware).
+Sections 1–13 are the Phase 0/1 handoff; §14 is the Phase 2 handoff.
+**Section 15 is the Phase 3a handoff — read it if you are picking up Phase 3b
+(`BridgeBackend`) or anything else after the go/no-go.**
 
 **Read this first.** It is written for an agent starting with no context beyond
 this repository. Companion docs: `ARCHITECTURE.md` (the plan), `FINDINGS.md` (the
 reverse-engineered protocol, with three corrections listed below),
 `usb-ground-truth.md` (real descriptors captured from the wired controller),
 `virtualization-options.md` (**Phase 2**: the option study, the risk register,
-and the exact list of system changes that need user approval).
+and the exact list of system changes that need user approval),
+`install-record.md` (what was installed on this machine),
+**`e1-results.md`** (Phase 3a: the isochronous go/no-go, with numbers) and
+**`identity-comparison.md`** (Phase 3a: virtual vs physical device).
+
+> **Phase 3a headline: E1 PASSED. Option A works.** The synthetic emulator
+> attaches through usbip-win2, Windows binds `usbccgp` + `usbaudio` + `HidUsb`,
+> and it sustains 384 kB/s out + 192 kB/s in of isochronous audio for 60 s with
+> **zero underruns** and clean 1 kHz tones in both directions. **No reboot was
+> needed.** Three emulator bugs were found and fixed — see §15.3, especially
+> the first one, which changes how you must think about the whole design.
 
 ---
 
@@ -609,3 +620,200 @@ full-duplex a wired DualSense always does) and #3 (never spin on a bare `pass`).
 5. Whether the emulated HID input path needs to *generate* anything CRC-like.
    USB HID reports carry no CRC — that is a Bluetooth-transport concern — so
    probably not, but it is untested. (R6, and §13 question 1.)
+
+---
+
+# 15. PHASE 3a HANDOFF — the go/no-go is settled
+
+Written for an agent starting with no context but this repository.
+Full detail: `docs/e1-results.md` and `docs/identity-comparison.md`.
+This section is the operational summary and the list of traps.
+
+## 15.1 What this run did
+
+Ran experiments E2, E1 and E3 from `virtualization-options.md` §8 against the
+usbip-win2 0.9.7.7 install recorded in `install-record.md`, using
+`SyntheticBackend` (no Bluetooth). Fixed three emulator bugs the hardware
+exposed. Did **not** touch `BridgeBackend`, the Bluetooth controller, or any
+system configuration.
+
+**Results in one table:**
+
+| experiment | question | answer |
+|---|---|---|
+| **E2** | does the kernel WSK client talk to a user-mode loopback server? | **YES**, first try. Risk R3 closed. |
+| **E1** | can UDE + USB/IP hold 1 ms isochronous at full rate? | **YES.** 60 s duplex, 0 underruns, 0.9995 ms mean service interval, FFT-clean both ways. Risks R1 and R4 closed. |
+| **E3** | does it look like a real wired DualSense? | **Byte-identical descriptors**; exactly two differences, both location metadata. Risk R2 narrowed to "no Sony SDK title tested". |
+| — | does Windows expose 4 render channels or downmix? | **4 channels @ 48 kHz.** Risk R8 closed favourably — the haptics on ch2/3 are reachable. |
+
+## 15.2 Two install-record caveats, both resolved
+
+1. **Pending reboot (filter driver returned 3010)** — did **not** bite.
+   `USBAUDIO.SYS` never showed the `QueryBusTime`/`ABORT_PIPE` symptom from
+   usbip-win2 issue #35. `usbip2_filter.sys` works as running-installed. **No
+   reboot has been performed and none is needed.**
+2. **Port 3240 conflict with `usbipd`** — avoided entirely. `usbip.exe` takes a
+   **global** `--tcp-port` option, which must come *before* the subcommand:
+
+   ```powershell
+   & "C:\Program Files\USBip\usbip.exe" --tcp-port 3241 attach -r 127.0.0.1 -b 1-1
+   ```
+
+   The emulator serves on `--port 3241`. **`usbipd` was never stopped** and is
+   still Running / Automatic. Do it this way; there is no need to touch it.
+
+## 15.3 The three bugs — READ THE FIRST ONE BEFORE WRITING BridgeBackend
+
+### (1) There is no bus clock. The emulator IS the audio clock. **(critical)**
+
+On a real bus the host controller paces isochronous traffic from SOF. Over
+USB/IP + UDE there is no SOF, and `usbip2_filter.sys` fakes `QueryBusTime` with
+a constant — that is precisely *why* `USBAUDIO.SYS` works over UDE at all.
+Consequence: **nothing imposes a rate except how fast we answer URBs.**
+
+Measured before any pacing existed: a 48 kHz stream ran at **174 429 frames/s —
+3.63x real time — and Windows reported zero underruns.** It will not tell you
+you are wrong.
+
+Fixed by `emulator/ds5emu/timing.py::FrameClock`: every isochronous URB reserves
+N consecutive 1 ms service intervals on its endpoint and `server.py` sleeps
+until the last is due. `DualSenseDevice.handle_submit_ex()` returns a
+`SubmitResult(reply, deadline)`; the old `handle_submit()` still returns just
+the bytes, which is why the whole existing test suite kept working unchanged.
+
+**What this means for `BridgeBackend`:** the USB side is a hard 48 kHz clock you
+do not control and must not block. The Bluetooth side runs at 45 kHz in
+10.667 ms Opus frames. The rate conversion and the jitter buffer live in the
+backend; `write_audio_out` / `read_audio_in` are called from the URB path and
+must return immediately, always, with silence on underrun.
+
+### (2) Interrupt IN must NAK between service intervals
+
+`SyntheticBackend.read_input_report()` used to return a report on every call, so
+the URB completed instantly and Windows resubmitted at once: **15 526 reports/s**
+through hidapi, 62x the real 250 Hz. Now clock-paced at 250 Hz
+(`bInterval = 6` = 4 ms at high speed). `None` means "nothing queued" and the
+server holds the URB (up to `hid_in_timeout`, now 200 ms) rather than completing
+it empty.
+
+### (3) Isochronous IN returns one service interval, not `wMaxPacketSize`
+
+The host always asks for 196 B; 196 B is **49** stereo frames, so the microphone
+ran at 49 kHz (measured 48 983 frames/s). Now clamped to `ISO_IN_BYTES_PER_MS` =
+192 B = 48 frames. The spare 4 bytes in `wMaxPacketSize` exist only so an
+*asynchronous* endpoint can express clock drift; our frame clock does not drift.
+
+All three are covered by `emulator/tests/test_timing.py`. **102 tests pass.**
+
+## 15.4 How to reproduce E1 in five minutes
+
+```powershell
+# 1. server (terminal 1). --record-out is optional; it dumps the received
+#    speaker stream as raw 4ch s16le 48 kHz for offline FFT.
+cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+..\prototype\.venv\Scripts\python.exe -m ds5emu serve --port 3241 --stats-json C:\Temp\stats.json --stats-every 2
+
+# 2. attach (terminal 2)
+& "C:\Program Files\USBip\usbip.exe" --tcp-port 3241 attach -r 127.0.0.1 -b 1-1 --once
+
+# 3. which endpoints are the virtual ones? Walk the devnode tree -- do NOT
+#    guess from the "2-"/"3-" name prefixes, they move between runs.
+$mi0 = Get-PnpDevice -PresentOnly | Where-Object InstanceId -like "USB\VID_054C&PID_0CE6&MI_00\*"
+$mi0 | ForEach-Object {
+  (Get-PnpDeviceProperty -InstanceId $_.InstanceId | Where-Object KeyName -eq "DEVPKEY_Device_Children").Data |
+    ForEach-Object { (Get-PnpDeviceProperty -InstanceId $_ | Where-Object KeyName -eq "DEVPKEY_Device_FriendlyName").Data } }
+
+# 4. play / record against those endpoints, and read C:\Temp\stats.json while it runs.
+
+# 5. TEARDOWN -- the -X is not optional, see 15.5
+& "C:\Program Files\USBip\usbip.exe" attach -X
+& "C:\Program Files\USBip\usbip.exe" detach -p 1
+```
+
+`stats.json` is rewritten atomically every `--stats-every` seconds, so a run can
+be measured without stopping it. The fields that matter:
+`endpoints.0x01.resyncs` and `.resync_times_s` (**this is the underrun
+counter** — one at stream start is expected, more is a real glitch),
+`packets_per_s`, `bytes_per_s`, `gap_ms_*`.
+
+## 15.5 Operational traps found the hard way
+
+1. **`usbip attach` arms an automatic background re-attach.** Restart the
+   emulator and you silently acquire a *second* attached device on port 02.
+   Always `usbip.exe attach -X` (`--stop-all`) before detaching, and verify with
+   `usbip.exe port` — it prints nothing when clean.
+2. **Never guess which audio endpoint is virtual from its `2-`/`3-` prefix.**
+   Walk `MI_00 -> DEVPKEY_Device_Children -> FriendlyName`. Wrong-endpoint
+   measurements look entirely plausible and are worthless.
+3. **Verify microphone content in WASAPI *exclusive* mode.** Shared mode runs a
+   capture enhancement chain that gates a steady tone to digital silence within
+   ~250 ms. The **physical** controller shows the same behaviour (23 of 60
+   windows at exact zero), so it is Windows, not us — but it will cost you an
+   afternoon if you do not know.
+4. **`Select-Object -First N` truncates a `Tee-Object` pipeline**, silently
+   discarding the rest of the output. Redirect to a file, then read the file.
+   (Cost here: an hour believing the virtual device was invisible to the hub
+   IOCTL dumper when it had been there all along.)
+5. **Give every hardware-facing command an explicit timeout**, and never use a
+   bare blocking `hid.read()` — use `read(size, timeout_ms=...)`. A controller
+   that is absent or dead hangs forever and looks exactly like a driver fault.
+6. **`usbip list` prints every interface as `(00/00/00)`** even when the server
+   sends correct values. Cosmetic client display bug; ignore it.
+
+## 15.6 Hardware state — RE-ENUMERATE, DO NOT TRUST §3
+
+**The user swapped the two controllers during this run.** The mapping in §3 is
+stale. As of the end of Phase 3a:
+
+| | wired (USB) | Bluetooth |
+|---|---|---|
+| firmware (feature `0x20`) | `Jul  4 2025 10:38:40` | `Sep 18 2025 13:15:28` |
+| serial / BD address | `''` (empty, as always on USB) | `d42f4ba1485d` |
+| battery | **0 % / charging** | not read by this agent |
+| measured input rate | 250.30 Hz | — |
+
+`a0fa9c0dd8bb` still appears in `hid.enumerate()` as a stale paired entry whose
+feature reads fail. Ignore it. Always re-run `python -m ds5bridge list` before
+trusting any per-unit identifier, and **read the battery early** — a dying
+controller produces failure modes that look like driver bugs. (The terminal
+crash that interrupted this run may have been triggered by the Bluetooth unit's
+battery dying.)
+
+## 15.7 State left behind
+
+- **Nothing is attached.** `usbip.exe port` prints nothing.
+- **No emulator process is running.**
+- **`usbipd` is Running / Automatic** — it was never stopped.
+- `usbip2_ude` and `usbip2_filter` Running; `ROOT\USB\0000` present, Status OK.
+- The only present `VID_054C&PID_0CE6` devnodes are the physical wired unit and
+  its two children. Several `Unknown`-status ghosts from attach cycles remain in
+  the registry; they are inert and Windows reuses them on the next attach.
+- **No system configuration was changed by this run.** No driver installed, no
+  service reconfigured, no registry write, no reboot.
+
+## 15.8 What Phase 3b should do, in order
+
+1. **Implement `BridgeBackend`** (`emulator/ds5emu/backend.py`) — a sibling
+   agent was working on this concurrently in a worktree; merge before starting.
+   §15.3(1) is the design constraint that matters most.
+2. **Capture the real UAC1 volume ranges** with USBPcap on the physical wired
+   unit and replace the assumed constants in `uac.py` (risk R7 — still open.
+   Windows accepted our guesses and built a working mixer, which is weaker
+   evidence than the real answers).
+3. **Proxy the real feature reports.** `SyntheticBackend` returns correctly
+   *sized* but zero-filled `0x05` / `0x20`, so anything parsing calibration or
+   firmware strings sees garbage.
+4. **Run a Sony PC SDK title.** The last unproven piece of R2. Everything
+   structural it is believed to need — a shared, well-formed `ContainerId`
+   linking HID to audio — is in place; see `identity-comparison.md` §3.
+5. Cheap and worth doing: `dualsense-tester` (WebHID) and an SDL/pygame check
+   against the virtual device.
+
+## 15.9 Phase 2 open questions, updated
+
+Of the six in §14.6: **R1 is closed** (E1 passed). The **receive-mode question
+is moot** — the default mode held the 1 ms cadence with zero underruns, so the
+`wsk_events` low-latency path was never needed. **R8 is closed favourably** —
+Windows exposes all four render channels rather than downmixing. R7 (the real
+UAC1 volume ranges) is still open. R6 and §13 question 1 (input-report CRC) are
+still untested, but E1 gives no reason to think USB HID needs one.
