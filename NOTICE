@@ -1,0 +1,91 @@
+PhantomCable
+Copyright (c) 2026 PhantomCable contributors
+
+This product is licensed under the MIT License; see LICENSE.
+
+It contains portions derived from the following MIT-licensed projects. Their
+copyright and permission notices are reproduced below in full, as MIT requires.
+A file-by-file account of exactly what is derived and what is not is in
+docs/provenance.md, and the wider credits are in ATTRIBUTIONS.md.
+
+================================================================================
+dualsense-tester -- https://github.com/daidr/dualsense-tester
+
+Portions of prototype/ds5bridge/protocol.py and prototype/ds5bridge/crc.py are
+hand-written Python ports of, or transcriptions of protocol constants from:
+  src/utils/dualsense/btAudioStream.ts       (buildReportSix)
+  src/utils/dualsense/microphoneProtocol.ts  (buildBtMicStateReport,
+                                              buildBtMicControlReport)
+  src/utils/dualsense/ds.util.ts             (sendOutputReportFactory)
+  src/utils/dualsense/crc32.util.ts          (CRC-32 seed bytes)
+  src/router/DualSense/_utils/offset.util.ts (createInputReportOffset)
+  src/router/DualSense/views/_OutputPanel/outputStruct.ts and OutputPanel.vue
+                                             (SetState field offsets and
+                                              valid-flag bit names)
+
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2023 Xuezhou Dai (daidr)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+DS5Dongle -- https://github.com/awalol/DS5Dongle
+
+prototype/ds5bridge/protocol.py:build_report_39() is a hand-written Python port
+of the Bluetooth output report 0x39 packet layout in src/audio.cpp
+(audio_bt_task), and prototype/ds5bridge/audio.py's Opus parameters follow the
+encoder configuration in the same file.
+
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2026 awalol
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+usbip-win2 -- https://github.com/vadimgrn/usbip-win2
+
+No usbip-win2 code, header or binary is redistributed with this project; users
+install it themselves from its own releases. Its public headers documented the
+USB/IP wire format that emulator/ds5emu/wire.py implements independently.
+usbip-win2 is licensed under the 2-Clause BSD License as of release 0.9.7.0 and
+later (earlier releases were GPL-3.0); this project targets 0.9.7.7.
+
+================================================================================
+Runtime dependencies are third-party packages installed by the user via pip and
+are not redistributed here. Their licences are listed in docs/provenance.md §6.
