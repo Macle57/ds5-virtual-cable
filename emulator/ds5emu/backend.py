@@ -130,6 +130,8 @@ class SyntheticBackend(Backend):
         with self._lock:
             if self.input_report_hz:
                 now = time.perf_counter()
+                if self._next_report_at == 0.0:      # first ever call
+                    self._next_report_at = now
                 if now < self._next_report_at:
                     return None
                 period = 1.0 / self.input_report_hz
