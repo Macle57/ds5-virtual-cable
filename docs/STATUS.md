@@ -1157,3 +1157,262 @@ defaults to `SyntheticBackend`, deliberately, because experiment E1 wants the
 hardware-free one.
 
 <!-- ====================== END PHASE 3b SECTION ====================== -->
+
+<!-- ===================== BEGIN PHASE 3c SECTION ===================== -->
+
+# 17. PHASE 3c HANDOFF — the merge, the clocks, and the first full system test
+
+Written for an agent starting with no context but this repository.
+Full detail: `docs/e2e-results.md`. This section is the operational summary.
+
+## 17.1 What this run did
+
+Merged Phase 3a (`master`: `usbip-win2` transport validated with
+`SyntheticBackend`) and Phase 3b (worktree branch: `BridgeBackend`, live
+Bluetooth), reconciled their two clocking designs, and attached the combined
+system to Windows for the first time.
+
+**A virtual *wired* DualSense, backed live by a physical *Bluetooth* one, is
+real and works.** Input and output both verified end to end through the real
+Windows driver stack. Audio was not verified — see §17.5.
+
+| | |
+|---|---|
+| merge | 3 conflicts, all resolved keeping both behaviours; §17.2 |
+| clock reconciliation | three domains, not two; §17.3 |
+| **(a) INPUT** | **PASS** — 249.90 Hz, **100.00 %** field parity vs a live direct BT read, 0 sequence discontinuities |
+| **(b) OUTPUT** | **PASS** — adaptive triggers driven from a hidapi write to the virtual device, 4/4 byte-exact |
+| (c)(d)(e) audio + soak | **NOT RUN** — battery blocker, §17.5 |
+| tests | **173**, up from 3a's 102 and 3b's 132 |
+
+## 17.2 The merge — what conflicted and how it was resolved
+
+`worktree-agent-a93cf7482d1451b3b` into `master`. Three real conflicts:
+
+1. **`device.py` `_hid_class` GET_REPORT(Input).** 3b routes it to the new
+   non-consuming `latest_input_report()`; 3a added a `_last_input_report` cache
+   because the paced `SyntheticBackend` answers `None` most of the time. **Kept
+   both** — the base-class `latest_input_report()` delegates to the paced
+   `read_input_report()`, so the cache still covers the `None` windows, while
+   `BridgeBackend`'s override makes it unnecessary.
+2. **`backend.py`.** 3a's input-report pacer vs 3b's module `__getattr__`
+   re-export of `BridgeBackend` from `bridge.py`. Non-overlapping; git merged
+   them and both survive, so the stdlib-only test suite still never imports
+   numpy/PyAV/hidapi.
+3. **`docs/STATUS.md` — both sides wrote a "§15".** 3a's stays as §15; 3b's
+   block is renumbered to **§16**, its internal `§15.x` cross-references
+   rewritten, and it carries a banner pointing here for what Phase 3c
+   superseded.
+
+The merged suite was the exact union — 143 tests — before Phase 3c added its
+own.
+
+## 17.3 The clock reconciliation — THERE ARE THREE CLOCKS, NOT TWO
+
+3a's `FrameClock` paces URB completion at 1 ms. 3b's `BridgeBackend` paces the
+Bluetooth side with a 21.3 ms tick. They compose, and the reason is worth
+knowing before touching either:
+
+| domain | what | drifts against U? |
+|---|---|---|
+| **U** — USB | `timing.FrameClock`, 1 ms service intervals, `perf_counter` | — |
+| **B** — Bluetooth send | `pacing.Pacer`, one tick per `0x39`, `perf_counter` | **no** |
+| **C** — the controller | its own crystal; sets microphone arrival | **yes** |
+
+**U and B are the same oscillator related by an exact integer ratio:**
+
+    46.875 reports/s x 1024 samples/report = 48 000 samples/s
+
+The pump is a **1/1024 divider of the frame clock, not a second clock.** No
+rate conversion, no accumulator, no possible drift. Only *phase* varies (the
+host delivers audio in ~10 ms bursts against a 21.3 ms tick), and phase is a
+buffering problem — solved with buffering, never with rate steering.
+
+**C is genuinely independent** and is the only place drift accumulates. Two
+crystals at ±100 ppm differ by ~9.6 samples/s: 0.7 s per hour, past any sane
+buffer. So the mic ring is *steered*.
+
+Policies (all in `ds5emu/bridge.py`, all unit-tested by `ClockSeamTests`):
+
+* **U→B** encoded-frame queue: target **4 frames (42.7 ms)**, ceiling 8
+  (85.3 ms), transmission starts *at* target. Starting at "anything available"
+  meant the steady-state latency was whatever the startup burst happened to
+  leave — and because U and B never drift, it stayed there forever. Above the
+  ceiling the oldest frames are dropped back to target and **counted**
+  (`audio_q_drop_frames`): dropping encoded audio is audible and must never be
+  silent in the logs. The 120 ms out-ring is the hard ceiling behind it.
+* **C→U** mic ring: outside **[10 ms, 90 ms]** the governor adds or removes
+  exactly **one** 48 kHz frame per `read_audio_in()` call. At 1000 calls/s that
+  is ±2 % authority against a crystal error of order 0.01 % — always a slew,
+  never a jump, and inside the band it does nothing at all. Skew corrections
+  are counted separately from overflow so the two can never be confused.
+* `clock_seam()` publishes the whole seam as JSON under `--stats-json`.
+
+**One real bug fell out of this.** `set_alt_setting` and `on_uac_control` are
+called from the asyncio thread that owes the isochronous endpoints a 1 ms
+deadline, and both did blocking hidapi I/O. Mic arming is two writes with a
+20 ms settle between them, so `SET_INTERFACE alt 1` stalled *every* endpoint
+for ~40 ms at exactly the moment the host opens the audio stream. Phase 3b
+never saw it: its harnesses called the backend from their own thread, with no
+event loop to block. All such work is now posted to a bounded queue drained by
+the writer thread; the state flag still flips synchronously so the next `0x39`
+carries `mic_enabled`.
+
+## 17.4 The two merge regressions — READ THIS BEFORE CHANGING PACING
+
+Both are the same shape: **two independently correct pieces that are wrong
+together.** Neither unit tests nor either agent's own harness could have caught
+them; both needed a live attach.
+
+### (1) The interrupt IN endpoint had no clock — 13 415 reports/s, 54x too fast
+
+3a fixed the free-running endpoint *inside* `SyntheticBackend`. 3b's
+`BridgeBackend` never inherited it and **cannot**: `repeat_stale_input` is
+correct — a wired DualSense really does emit a report every 4 ms whether or not
+anything moved — so the backend answers every poll by design.
+
+The data was already perfect in that run (988/988 = 100 % parity). The bridge
+worked; the endpoint had no clock.
+
+**The gate now lives in `DualSenseDevice`, where `bInterval = 6` comes from**,
+so no backend can opt out of physics by accident. The backend is not even
+*asked* while the interval is open, which keeps its own bookkeeping honest —
+`BridgeBackend` renumbers the device sequence byte per delivered report, and it
+had been advancing ~50 counts between two reports the host kept.
+
+### (2) The gate then under-delivered — 220.2/s, with 10 % of gaps at 8 ms
+
+Two causes, both "scheduling latency turned into rate error":
+
+* **The schedule absorbed its own lateness.** `max(now, next) + period` re-adds
+  the delivery latency every cycle, so the period becomes 4 ms + latency
+  permanently. It advances **on the grid** now (`next += period`) — what
+  `FrameClock.reserve()` already does with integer frames — and resynchronises
+  only when a whole interval has genuinely lapsed (to `now + period`, so two
+  reports can never leave back to back).
+* **The transport polled when it could have known.** `asyncio.sleep(0.001)`
+  overshoots on Windows, so the open interval was found late — often late
+  enough that it had lapsed. `SubmitResult` grew **`retry_at`**: when the reply
+  is empty *because the service interval has not come round*, the device says
+  exactly when it will and the server sleeps to that instant. When the backend
+  is merely empty, `retry_at` is `None` and the polling fallback applies,
+  because nobody can predict that.
+
+**220.27 → 249.90 Hz; empty polls 10.3 % → 0.027 %.**
+
+## 17.5 Hardware state — THE CONTROLLERS SWAPPED AGAIN
+
+§15.6 warned about this; it happened again overnight, in the other direction.
+
+| | 2026-08-24 (§15.6) | 2026-08-25 (end of 3c) |
+|---|---|---|
+| `d42f4ba1485d` (fw `Sep 18 2025 13:15:28`) | Bluetooth, 90 % | **USB cable, 100 % / charging** |
+| `a0fa9c0dd8bb` (fw `Jul  4 2025 10:38:40`) | stale paired entry | **Bluetooth, 10 % / discharging** |
+
+**This is why (c), (d) and (e) did not run.** The only Bluetooth-reachable unit
+was at 10 % — below the abort threshold, and the same unit §16.2 records as
+having *died* at exactly that level during Phase 3b, producing a tail of
+symptoms that looked exactly like protocol bugs. The fully-charged unit was on
+the USB cable, and a DualSense disables its radio while wired.
+
+(a) and (b) were run anyway because they drive no speaker, no haptic actuator
+and no microphone — battery read **10 % before and 10 % after**.
+
+**Never cache a serial, a HID path or a battery level across sessions.** Always
+`python -m ds5bridge list`, then read the battery out of the input report at
+claim and log it.
+
+## 17.6 What the next agent should do, in order
+
+1. **Finish stages (c), (d) and (e)** — `docs/e2e-results.md` §5 has the exact
+   procedure. Unplug `d42f4ba1485d` from USB, let it reconnect over Bluetooth
+   (already paired), confirm the `Sep 18 2025` firmware on the BT entry, read
+   the battery, then run the audio stages. **This is the biggest open gap:
+   3a proved the transport carries 1 ms isochronous with a synthetic backend,
+   3b proved `BridgeBackend` drives speaker/haptics/mic through its own API,
+   and nobody has yet joined the two.** Capture the mic in WASAPI **exclusive**
+   mode (shared mode gates a steady tone to silence in ~250 ms — it is Windows,
+   the physical controller does it too; e1-results §7.2).
+2. The U→B and C→U buffering policies are unit-tested but **never exercised on
+   hardware**. Stage (c)/(e) is what exercises them; watch `clock_seam()` in
+   `--stats-json`.
+3. Capture the real UAC1 volume ranges with USBPcap on the physical wired unit
+   and replace the assumed constants in `uac.py` (risk R7, still open).
+4. Extend the feature-report prefetch list. Only `0x05` and `0x20` are cached;
+   everything else STALLs and is counted in `feature_misses`. This run recorded
+   **no** misses, so Windows asked for nothing else — but no game has been run.
+5. **Run a game or a Sony PC SDK title.** Still the real acceptance test.
+6. Force a Bluetooth disconnect/reconnect. Implemented, never tested;
+   `reconnects` stayed 0.
+
+## 17.7 How to bring the whole thing up
+
+```powershell
+# 1. server. --backend bridge is the live Bluetooth one; the default is still
+#    synthetic, deliberately, because experiment E1 wants the hardware-free one.
+cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+..\prototype\.venv\Scripts\python.exe -m ds5emu serve --backend bridge --port 3241 --stats-json C:\Temp\ds5c_stats.json --stats-every 2
+
+# 2. attach.  usbipd owns 3240 and is NEVER touched; --tcp-port is a GLOBAL
+#    option and must come before the subcommand.
+& "C:\Program Files\USBip\usbip.exe" --tcp-port 3241 attach -r 127.0.0.1 -b 1-1
+
+# 3. which endpoints are the virtual ones?  Do NOT guess, and do NOT stop at
+#    the hub -- see 17.8 trap 9.
+powershell -File tools\e2e_endpoints.ps1
+
+# 4. the stages
+..\prototype\.venv\Scripts\python.exe tools\e2e_input_parity.py --seconds 30
+..\prototype\.venv\Scripts\python.exe tools\e2e_setstate.py
+
+# 5. TEARDOWN -- idempotent, safe to run twice, safe when nothing is up
+powershell -File tools\e2e_teardown.ps1
+```
+
+Unit tests, no hardware, ~4 s, 173 tests:
+
+```powershell
+cd emulator
+..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .
+```
+
+## 17.8 Operational traps — continuing §15.5's numbering
+
+7. **A stale emulator is invisible to a command-line-based kill, and the new
+   one starts anyway.** `Win32_Process.CommandLine` comes back **empty** for
+   some python processes (the venv `python.exe` launcher spawns a child whose
+   command line the query cannot read), so a teardown matching on
+   `CommandLine -match 'ds5emu'` misses the process actually holding the socket.
+   The stale server keeps port 3241, a new one appears to start normally, and
+   **you measure the old emulator while reading the new one's stats file.** The
+   give-away here was `connections: 0` in a stats file written by a process that
+   could not possibly have been serving the device that was plainly working.
+   `tools/e2e_teardown.ps1` now kills by `Get-NetTCPConnection -LocalPort 3241`
+   **first**; the command-line match is the fallback.
+8. **A process started from a `nohup ... &` background shell can be
+   un-killable** from a later shell in the same session — `Stop-Process` says
+   *Access is denied*, and so does `taskkill /T /F`. Start the emulator with
+   `Start-Process` from PowerShell and it stays under your control.
+9. **Do not tell the virtual device from the physical one by its hub.** BOTH
+   report `USB\ROOT_HUB30\...` two levels up (UDE emulates a root hub too) and
+   BOTH report `USB\VID_054C&PID_0CE6\...` one level up. The distinguishing
+   fact is **four** levels up, at the host controller — virtual:
+   `ROOT\USB\0000`, service **`usbip2_ude`**; physical:
+   `PCI\VEN_8086&DEV_43ED&…`, service `USBXHCI`. `tools/e2e_endpoints.ps1` does
+   the walk and prints `RENDER=`, `CAPTURE=`, `HIDNODE=`. Together with §15.5
+   trap 2 (never trust the `2-`/`3-` name prefix) this is the only reliable way
+   to know what you are measuring.
+
+## 17.9 State left behind
+
+- **Nothing is attached.** `usbip.exe port` prints nothing.
+- **No emulator process is running**; TCP 3241 is free.
+- **`usbipd` is Running / Automatic** — never stopped or reconfigured.
+- The only present `VID_054C&PID_0CE6` devnodes are the physically-plugged unit
+  and its two children.
+- **No system configuration was changed.** No driver installed, no service
+  reconfigured, no registry write, no reboot.
+- `master` is at the Phase 3c merge; the `worktree-agent-a93cf7482d1451b3b`
+  branch and its worktree are gone (fully merged).
+
+<!-- ====================== END PHASE 3c SECTION ====================== -->
