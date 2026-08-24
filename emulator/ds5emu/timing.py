@@ -36,6 +36,7 @@ import ctypes
 import statistics
 import time
 from collections import deque
+from itertools import islice
 from dataclasses import dataclass, field
 
 #: Isochronous service intervals per second. Both audio endpoints declare
@@ -114,44 +115,106 @@ class UrbMeter:
 
     Deliberately cheap: two floats and two ints appended per URB, ~100 URBs/s
     per isochronous endpoint. `maxlen` bounds memory on a long run.
+
+    READING IT MUST BE CHEAP TOO (Phase 3c). `summary()` used to sort every gap
+    it had ever recorded — tens of thousands after a few minutes — which took
+    ~15 ms. `--stats-every 2` therefore blocked the emulator for 15 consecutive
+    1 ms service intervals every 2 seconds, and the frame clock dutifully
+    resynchronised. The resync times came out spaced at *exactly* 2.00 s:
+
+        --stats-every 2, summarising everything   iso OUT resyncs 41
+        no snapshot at all                        iso OUT resyncs 1 (stream start)
+
+    **Moving the snapshot to a thread does not fix this**, which is worth
+    knowing: `sorted()` on a list of floats is one C call that never releases
+    the GIL, so the event loop is blocked wherever the work runs. The fix is to
+    make it cheap. Totals are now running counters, exact and O(1); the
+    distribution stats are computed over the last `window` records only.
     """
+
+    #: How many recent URBs the distribution stats look at. 4000 iso URBs is
+    #: ~40 s of history at the usbaudio burst rate, and sorting 4000 floats is
+    #: ~0.2 ms — under one service interval, so it cannot cost a frame.
+    SUMMARY_WINDOW = 4000
 
     def __init__(self, maxlen: int = 400_000):
         self.records: dict[int, deque[UrbRecord]] = {}
         self.maxlen = maxlen
         self.t0 = time.perf_counter()
+        #: Exact cumulative totals, maintained incrementally so that bounding
+        #: the summary window never makes a *count* wrong.
+        self.totals: dict[int, dict] = {}
 
     def record(self, ep: int, rec: UrbRecord) -> None:
         d = self.records.get(ep)
         if d is None:
             d = self.records[ep] = deque(maxlen=self.maxlen)
+            self.totals[ep] = {"urbs": 0, "packets": 0, "bytes": 0,
+                               "t_first": rec.t_recv, "t_last": rec.t_recv}
         d.append(rec)
+        t = self.totals[ep]
+        t["urbs"] += 1
+        t["packets"] += rec.packets
+        t["bytes"] += rec.nbytes
+        t["t_last"] = rec.t_recv
 
     def endpoints(self) -> list[int]:
         return sorted(self.records)
 
+    def records_snapshot(self, ep: int, window: int | None = -1) -> list:
+        """A stable copy of the last `window` records for one endpoint.
+
+        `window=None` means everything, which is only for offline analysis —
+        never call it from a live server (see the class docstring). The default
+        is `SUMMARY_WINDOW`.
+
+        `itertools.islice` over the deque takes only the tail without copying
+        the whole thing. The snapshot may run while the event loop is still
+        appending, and iterating a `deque` during mutation raises
+        `RuntimeError`, so retry — the window is microseconds wide and a
+        second attempt has always been enough.
+        """
+        if window == -1:
+            window = self.SUMMARY_WINDOW
+        for _ in range(4):
+            try:
+                d = self.records.get(ep, ())
+                if window is None or len(d) <= window:
+                    return list(d)
+                return list(islice(d, len(d) - window, len(d)))
+            except RuntimeError:      # "deque mutated during iteration"
+                continue
+        return []
+
     def summary(self, ep: int) -> dict:
-        recs = list(self.records.get(ep, ()))
-        if len(recs) < 2:
-            return {"urbs": len(recs), "packets": sum(r.packets for r in recs),
-                    "bytes": sum(r.nbytes for r in recs)}
-        span = recs[-1].t_recv - recs[0].t_recv
+        # Counts come from the exact running totals; only the distribution is
+        # computed over the recent window, so bounding the work never makes a
+        # reported count wrong.
+        tot = self.totals.get(ep)
+        recs = self.records_snapshot(ep)
+        if tot is None or len(recs) < 2:
+            n = tot["urbs"] if tot else len(recs)
+            return {"urbs": n,
+                    "packets": tot["packets"] if tot else 0,
+                    "bytes": tot["bytes"] if tot else 0}
+        span = tot["t_last"] - tot["t_first"]
         gaps = [b.t_recv - a.t_recv for a, b in zip(recs, recs[1:])]
         gaps_sorted = sorted(gaps)
-        packets = sum(r.packets for r in recs)
-        nbytes = sum(r.nbytes for r in recs)
+        packets = tot["packets"]
+        nbytes = tot["bytes"]
         # Late completions: the deadline we promised vs. when we actually
         # finished the work. `t_done` is stamped after the reply is handed to
         # the socket, so this is the honest end-to-end server-side lateness.
         return {
-            "urbs": len(recs),
+            "urbs": tot["urbs"],
             "packets": packets,
             "bytes": nbytes,
             "span_s": span,
-            "urbs_per_s": len(recs) / span if span else 0.0,
+            "gap_window_urbs": len(recs),
+            "urbs_per_s": tot["urbs"] / span if span else 0.0,
             "packets_per_s": packets / span if span else 0.0,
             "bytes_per_s": nbytes / span if span else 0.0,
-            "packets_per_urb_mean": packets / len(recs),
+            "packets_per_urb_mean": packets / tot["urbs"],
             "gap_ms_median": statistics.median(gaps) * 1e3,
             "gap_ms_p99": gaps_sorted[int(len(gaps_sorted) * 0.99)] * 1e3,
             "gap_ms_max": gaps_sorted[-1] * 1e3,
@@ -164,7 +227,7 @@ class UrbMeter:
         }
 
     def gap_histogram(self, ep: int, edges_ms=(1, 2, 4, 8, 12, 16, 24, 32, 64)) -> list:
-        recs = list(self.records.get(ep, ()))
+        recs = self.records_snapshot(ep)
         gaps = [(b.t_recv - a.t_recv) * 1e3 for a, b in zip(recs, recs[1:])]
         out = []
         prev = 0.0
