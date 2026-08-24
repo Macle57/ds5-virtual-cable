@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import time
 
 from . import wire as W
 from .backend import Backend
@@ -39,8 +40,9 @@ class UsbIpServer:
         host: str = "127.0.0.1",
         port: int = W.TCP_PORT,
         busid: str = DEFAULT_BUSID,
-        hid_in_timeout: float = 0.010,
+        hid_in_timeout: float = 0.200,
         hid_in_poll: float = 0.001,
+        pace_iso: bool = True,
     ):
         self.backend = backend
         self.host = host
@@ -53,7 +55,7 @@ class UsbIpServer:
         self.hid_in_timeout = hid_in_timeout
         self.hid_in_poll = hid_in_poll
 
-        self.device = DualSenseDevice(backend)
+        self.device = DualSenseDevice(backend, pace_iso=pace_iso)
         self._server: asyncio.AbstractServer | None = None
         self.connections = 0
 
@@ -196,11 +198,23 @@ class UsbIpServer:
             pending.pop(cmd.seqnum, None)
 
     async def _run_submit(self, cmd: W.CmdSubmit, payload: bytes) -> bytes:
-        reply = self.device.handle_submit(cmd, payload)
+        res = self.device.handle_submit_ex(cmd, payload)
 
-        # Interrupt IN with nothing queued: hold the URB briefly rather than
-        # completing a zero-length transfer, which is what a real endpoint does
-        # (it simply NAKs until data is available).
+        # Isochronous: the device reserved service intervals for this URB and
+        # told us when the last packet is due. Completing early makes the audio
+        # stack run fast (see ds5emu/timing.py); completing late glitches it.
+        if res.deadline is not None:
+            delay = res.deadline - time.perf_counter()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            return res.reply
+
+        reply = res.reply
+        # Interrupt IN with nothing queued: hold the URB rather than completing
+        # a zero-length transfer, which is what a real endpoint does (it simply
+        # NAKs until data is available). The backend paces reports at the
+        # endpoint's 4 ms service interval, so this loop normally spins two or
+        # three times.
         if cmd.is_in and (cmd.ep & 0x7F) == (D.EP_HID_IN & 0x7F) and not cmd.is_iso:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + self.hid_in_timeout
