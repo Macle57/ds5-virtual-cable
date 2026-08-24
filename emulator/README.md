@@ -1,20 +1,20 @@
 # emulator/ — user-mode USB/IP device emulator for a wired DualSense
 
-Phase 2 deliverable. Serves the **real** wired controller's descriptors (read
-off the physical device in Phase 0, `docs/usb-ground-truth.md`) over the USB/IP
-wire protocol, so that vadimgrn/usbip-win2's Microsoft-signed UDE driver can
-attach it as a local USB device.
+Serves the **real** wired controller's descriptors (read off the physical device
+in Phase 0, `docs/usb-ground-truth.md`) over the USB/IP wire protocol, so that
+vadimgrn/usbip-win2's Microsoft-signed UDE driver can attach it as a local USB
+device. Written in Phase 2; **validated against the live driver in Phase 3a**.
 
-**Nothing here installs, loads or requires a driver.** The full test suite runs
-on a bare machine. Attaching for real is Phase 3, after the user approves the
-changes listed in `docs/virtualization-options.md` §7.
+**Nothing here installs or loads a driver.** The full test suite runs on a bare
+machine with no driver present. Attaching for real needs usbip-win2 installed
+(`docs/install-record.md`).
 
 ## Quick start
 
 ```powershell
 cd D:\Codes\dualSense\ds5-virtual-usb\emulator
 
-# 91 protocol tests, no driver, no hardware
+# 102 protocol + timing tests, no driver, no hardware
 ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .
 
 # dump the descriptors we would serve
@@ -35,6 +35,8 @@ ds5emu/
   wire.py         USB/IP wire protocol. Pure bytes in / bytes out, no I/O.
   descriptors.py  Ground-truth descriptor tables + derived constants.
   uac.py          UAC1 mixer control state (mute/volume on the two feature units).
+  timing.py       FrameClock (WE are the isochronous clock -- read it), UrbMeter,
+                  TimerResolution.
   device.py       The emulated device: CMD_SUBMIT -> RET_SUBMIT. Pure, no threads.
   backend.py      Backend ABC; SyntheticBackend (hardware-free); BridgeBackend stub.
   server.py       asyncio TCP shell. Thin on purpose.
@@ -44,6 +46,7 @@ tests/
   test_descriptors.py  14 tests: descriptors vs docs/usb-ground-truth.md
   test_device.py       41 tests: control / interrupt / isochronous behaviour
   test_server.py       12 tests: full client-server round trips over loopback TCP
+  test_timing.py       11 tests: frame clock, iso pacing, input-report cadence
 ```
 
 The layering is deliberate: **everything protocol-shaped is a pure function**,
@@ -137,12 +140,43 @@ citations in `docs/virtualization-options.md` §2.8.
 8. Everything in the op phase and every header field is **big endian**;
    descriptor contents and USB setup packets stay **little endian**.
 
+## The one thing to read before changing anything
+
+**`timing.py`. The emulator is the audio clock.** Over USB/IP + UDE there is no
+SOF and `usbip2_filter.sys` fakes `QueryBusTime` with a constant, so the audio
+stream runs exactly as fast as this server completes isochronous URBs — nothing
+else paces it. Measured on 2026-08-24 before pacing existed: a 48 kHz stream ran
+at **174 429 frames/s, 3.63x real time, with Windows reporting zero underruns.**
+`FrameClock` reserves 1 ms service intervals per endpoint and `server.py` sleeps
+until the deadline. `docs/e1-results.md` §6 has the full story.
+
+## Validated against the real driver (Phase 3a)
+
+Experiments E1/E2/E3 ran against usbip-win2 0.9.7.7 on 2026-08-24 and **passed**:
+Windows binds `usbccgp` + `usbaudio` + `HidUsb`, exposes a 4-channel render and a
+2-channel capture endpoint, and the emulator sustains 384 kB/s out + 192 kB/s in
+for 60 s with **zero underruns**. The descriptors Windows reads back are
+byte-identical to the physical controller's. See `docs/e1-results.md` and
+`docs/identity-comparison.md`.
+
+Measurement is built in:
+
+```powershell
+..\prototype\.venv\Scripts\python.exe -m ds5emu serve --port 3241 `
+    --stats-json C:\Temp\stats.json --stats-every 2 --record-out C:\Temp\out.raw
+```
+
+`--stats-json` is rewritten atomically while the server runs;
+`endpoints.<ep>.resyncs` is the underrun counter (one at stream start is
+expected). `--record-out` dumps the received speaker stream as raw 4ch s16le
+48 kHz for offline FFT.
+
 ## What is NOT done
 
 - `BridgeBackend` — stub only, never executed.
-- No driver has been attached, so **nothing here has been validated against a
-  real USB/IP client.** The tests validate the format against usbip-win2's
-  *source*, which is strong but is not the same as a live attach.
 - UAC1 volume MIN/MAX/RES are **assumed** values, not captured from the
-  physical controller (risk R7).
-- No timing measurement. That is experiment E1 and needs the driver.
+  physical controller (risk R7). Windows accepted them and built a working
+  mixer, which is weaker evidence than sniffing the real answers.
+- `SyntheticBackend`'s feature reports `0x05`/`0x20` are correctly *sized* but
+  zero-filled, so anything parsing calibration or firmware strings sees garbage.
+- No game or Sony PC SDK title has been run against the attached device.
