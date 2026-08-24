@@ -79,7 +79,19 @@ class UsbIpServer:
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
+            # BOUNDED. `Server.wait_closed()` waits for every connection handler
+            # to finish, and a handler can hang forever: when the usbip driver
+            # detaches it resets the TCP connection, the proactor transport
+            # raises ConnectionResetError from inside `_call_connection_lost`,
+            # and the transport's closed-future is then never resolved -- so the
+            # `writer.wait_closed()` in `_handle_client` never returns and this
+            # never returns either. Measured 2026-08-25: teardown hung
+            # indefinitely on every normal detach, and only the caller's own
+            # timeout ended it.
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=1.0)
+            except (asyncio.TimeoutError, Exception):  # noqa: B014
+                log.debug("wait_closed did not settle; continuing shutdown")
             self._server = None
         self.backend.stop()
 
@@ -105,7 +117,10 @@ class UsbIpServer:
         finally:
             writer.close()
             try:
-                await writer.wait_closed()
+                # Bounded for the same reason `stop()` is: a reset connection
+                # can leave this awaitable unresolved forever, and this task is
+                # one of the ones `Server.wait_closed()` waits for.
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
             except Exception:  # pragma: no cover
                 pass
 
