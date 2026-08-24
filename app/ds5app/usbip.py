@@ -183,13 +183,19 @@ class Usbip:
         """
         return self._run(["attach", "-X"])
 
-    def port(self) -> Result:
-        """`usbip port`. Prints nothing at all when nothing is attached."""
+    def list_ports(self) -> Result:
+        """`usbip port`. Prints nothing at all when nothing is attached.
+
+        Not named `port()`: `self.port` is the TCP port number, and the two
+        collided silently until the first call raised "'int' object is not
+        callable" at exactly the wrong moment (during teardown).
+        """
         return self._run(["port"], timeout=15.0)
 
     def attached_ports(self) -> list[int]:
         import re
-        return [int(m.group(1)) for m in re.finditer(r"Port\s+(\d+):", self.port().out)]
+        return [int(m.group(1))
+                for m in re.finditer(r"Port\s+(\d+):", self.list_ports().out)]
 
     def is_clean(self) -> bool:
         return not self.attached_ports()
