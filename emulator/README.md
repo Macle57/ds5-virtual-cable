@@ -84,11 +84,14 @@ adapts `prototype/ds5bridge` onto a live Bluetooth DualSense: rate conversion
 buffer, and the `mic_active` gotcha from STATUS.md §8.1. Run it with
 `serve --backend bridge`.
 
-Phase 3c attached it to Windows and verified the HID path end to end:
+Phase 3c attached it to Windows and verified **all five e2e stages**:
 **249.90 Hz input with 100.00 % field parity** against a simultaneous direct
-Bluetooth read, and adaptive triggers driven by a hidapi write to the virtual
-device. **The audio path through the virtual device is still unverified** --
-see `docs/e2e-results.md` §7.
+Bluetooth read; adaptive triggers driven by a hidapi write to the virtual
+device; a tone played to the virtual render endpoint coming out of the real
+speaker (+64.4 dB) and haptic voice coils (+27.8 dB) and heard back through the
+controller's own microphone at the virtual capture endpoint; and a 120 s
+concurrent soak at **1000.3 / 1001.1 isochronous packets/s with one frame-clock
+resync per endpoint, both at stream start**. See `docs/e2e-results.md`.
 
 ## Language choice: Python, with an explicit escape hatch
 
@@ -187,10 +190,12 @@ expected). `--record-out` dumps the received speaker stream as raw 4ch s16le
 
 ## What is NOT done
 
-- **Audio through the virtual device, in either direction.** Phase 3a proved
-  the transport carries 1 ms isochronous with `SyntheticBackend`; Phase 3b
-  proved `BridgeBackend` drives speaker, haptics and mic through its own API;
-  nobody has joined the two yet. Biggest open gap (`docs/e2e-results.md` §5).
+- **A game, or a Sony PC SDK title.** Now the only thing between "the pipe
+  works" and "it is a controller". Biggest open gap.
+- **Audio *fidelity*.** Every audio result is band energy at a commanded
+  frequency against a silent baseline -- it proves the path carries the signal
+  and the channel mapping is right, not that it is undistorted.
+- **Anything longer than four minutes.** Longest continuous run: 120 s.
 - UAC1 volume MIN/MAX/RES are **assumed** values, not captured from the
   physical controller (risk R7). Windows accepted them and built a working
   mixer, which is weaker evidence than sniffing the real answers.

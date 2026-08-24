@@ -1173,8 +1173,8 @@ Bluetooth), reconciled their two clocking designs, and attached the combined
 system to Windows for the first time.
 
 **A virtual *wired* DualSense, backed live by a physical *Bluetooth* one, is
-real and works.** Input and output both verified end to end through the real
-Windows driver stack. Audio was not verified — see §17.5.
+real and works.** All five e2e stages pass. Full numbers in
+`docs/e2e-results.md`.
 
 | | |
 |---|---|
@@ -1182,7 +1182,10 @@ Windows driver stack. Audio was not verified — see §17.5.
 | clock reconciliation | three domains, not two; §17.3 |
 | **(a) INPUT** | **PASS** — 249.90 Hz, **100.00 %** field parity vs a live direct BT read, 0 sequence discontinuities |
 | **(b) OUTPUT** | **PASS** — adaptive triggers driven from a hidapi write to the virtual device, 4/4 byte-exact |
-| (c)(d)(e) audio + soak | **NOT RUN** — battery blocker, §17.5 |
+| **(c) AUDIO OUT** | **PASS** — +64.4 dB speaker, +27.8 dB haptic, channel mapping *proven* |
+| **(d) MIC IN** | **PASS** — controller's own mic at the virtual capture endpoint, WASAPI exclusive |
+| **(e) SOAK** | **PASS** — 120 s concurrent; 250.33 Hz HID, 1000.3/1001.1 iso packets/s, **1 resync per endpoint, both at stream start** |
+| defects found | **3**, all needed a live attach; §17.4 |
 | tests | **173**, up from 3a's 102 and 3b's 132 |
 
 ## 17.2 The merge — what conflicted and how it was resolved
@@ -1248,6 +1251,15 @@ Policies (all in `ds5emu/bridge.py`, all unit-tested by `ClockSeamTests`):
   are counted separately from overflow so the two can never be confused.
 * `clock_seam()` publishes the whole seam as JSON under `--stats-json`.
 
+**Both policies are now confirmed on hardware** (120 s soak, full duplex):
+U→B recorded **0 underrun frames and 0 queue drops** with the out-ring peaking
+at 50 ms of its 120 ms cap — which is what "same oscillator, exact integer
+ratio" predicts. C→U made 842 single-frame corrections in 5 760 000 samples
+(**0.015 %**), sitting at 56 ms inside its [10, 90] ms band and never
+overflowing. Depth settles above the 25 ms target because the governor
+deliberately does nothing inside the band; that is latency traded for not
+correcting when it does not have to.
+
 **One real bug fell out of this.** `set_alt_setting` and `on_uac_control` are
 called from the asyncio thread that owes the isochronous endpoints a 1 ms
 deadline, and both did blocking hidapi I/O. Mic arming is two writes with a
@@ -1258,11 +1270,13 @@ event loop to block. All such work is now posted to a bounded queue drained by
 the writer thread; the state flag still flips synchronously so the next `0x39`
 carries `mic_enabled`.
 
-## 17.4 The two merge regressions — READ THIS BEFORE CHANGING PACING
+## 17.4 Three defects — READ THIS BEFORE CHANGING PACING OR INSTRUMENTATION
 
-Both are the same shape: **two independently correct pieces that are wrong
-together.** Neither unit tests nor either agent's own harness could have caught
-them; both needed a live attach.
+The first two are merge regressions and share a shape: **two independently
+correct pieces that are wrong together.** Neither unit tests nor either agent's
+own harness could have caught them. The third was not a merge regression at
+all — it had been latent since Phase 3a and only a live, loaded, long run could
+expose it.
 
 ### (1) The interrupt IN endpoint had no clock — 13 415 reports/s, 54x too fast
 
@@ -1300,23 +1314,66 @@ Two causes, both "scheduling latency turned into rate error":
 
 **220.27 → 249.90 Hz; empty polls 10.3 % → 0.027 %.**
 
-## 17.5 Hardware state — THE CONTROLLERS SWAPPED AGAIN
+### (3) The underrun counter was reporting its own instrumentation
 
-§15.6 warned about this; it happened again overnight, in the other direction.
+The best find of the run. The first 120 s soak logged **39 iso OUT resyncs**
+while the audio was demonstrably fine, and the timestamps were spaced at
+**exactly 2.00 s** — the `--stats-every 2` interval.
 
-| | 2026-08-24 (§15.6) | 2026-08-25 (end of 3c) |
+`UrbMeter.summary()` sorted every URB gap it had ever recorded and
+`gap_histogram()` re-walked the deque, for both endpoints, every two seconds:
+~15 ms on the asyncio thread that owes the isochronous endpoints a slot every
+1 ms. **The measurement manufactured the fault it existed to report.** A
+control run with the first snapshot deferred past the audio gave 1 resync
+instead of 41.
+
+**`asyncio.to_thread` did not fix it, and that is the lesson.** `sorted()` on a
+list of floats is one C call that never releases the GIL, so CPU-bound work
+blocks the event loop wherever it runs. Threads move blocking *I/O*; they do
+nothing for computation. The fix was to make the work cheap: exact totals are
+now O(1) running counters updated in `record()`, and the distribution stats are
+computed over the last `UrbMeter.SUMMARY_WINDOW = 4000` URBs via
+`itertools.islice`.
+
+| same `--stats-every 2`, same soak | before | after |
 |---|---|---|
-| `d42f4ba1485d` (fw `Sep 18 2025 13:15:28`) | Bluetooth, 90 % | **USB cable, 100 % / charging** |
-| `a0fa9c0dd8bb` (fw `Jul  4 2025 10:38:40`) | stale paired entry | **Bluetooth, 10 % / discharging** |
+| iso OUT resyncs | 39 | **1** (stream start) |
+| iso OUT packets/s | 514.3 | **1000.3** |
+| U→B underrun frames | 32 | **0** |
+| HID rate | 248.49/s | **250.33/s** |
+| HID gap max | 30.8 ms | **12.4 ms** |
 
-**This is why (c), (d) and (e) did not run.** The only Bluetooth-reachable unit
-was at 10 % — below the abort threshold, and the same unit §16.2 records as
-having *died* at exactly that level during Phase 3b, producing a tail of
-symptoms that looked exactly like protocol bugs. The fully-charged unit was on
-the USB cable, and a DualSense disables its radio while wired.
+The reported *throughput* was wrong too, because the snapshot's own stalls sat
+inside the span it measured — and the fix improved the real system, not just
+the metric: every endpoint was losing those 15 ms, only one had a counter that
+noticed.
 
-(a) and (b) were run anyway because they drive no speaker, no haptic actuator
-and no microphone — battery read **10 % before and 10 % after**.
+## 17.5 Hardware state — THE CONTROLLERS SWAP, AND BOTH ENUMERATE
+
+§15.6 warned about this; it happened twice more during Phase 3c.
+
+| | 2026-08-24 (§15.6) | 3c stages (a)(b) | 3c stages (c)(d)(e) | end state |
+|---|---|---|---|---|
+| `d42f4ba1485d` (fw `Sep 18 2025`) | BT, 90 % | USB cable, 100 % | **BT, 90 %** | **BT, 80 %** |
+| `a0fa9c0dd8bb` (fw `Jul  4 2025`) | stale entry | **BT, 10 %** | USB cable | USB, charging |
+
+Stages (a) and (b) ran on the 10 % unit — acceptable, because they drive no
+speaker, no haptic actuator and no microphone, and the battery read 10 % before
+and after. Stages (c)(d)(e) waited for the healthy unit, because they drive
+both actuators continuously for minutes and `a0fa9c0dd8bb` is the unit §16.2
+records as having *died* at exactly 10 %.
+
+**SELECT THE CONTROLLER BY SERIAL.** A unit charging over USB *still enumerates
+over Bluetooth*, as a stale entry whose feature reads fail, and
+`enumerate_devices()` orders by path — so the dead one can sort first:
+
+```
+[1] BT a0fa9c0dd8bb   feature read failed: read error      <- charging on USB
+[2] BT d42f4ba1485d   fw 'Sep 18 2025 13:15:28'            <- the live one
+```
+
+`serve --bt-serial d42f4ba1485d` (or `BridgeBackend(serial=...)`) exists for
+exactly this. "First BT match" would have claimed the dying unit.
 
 **Never cache a serial, a HID path or a battery level across sessions.** Always
 `python -m ds5bridge list`, then read the battery out of the input report at
@@ -1324,26 +1381,33 @@ claim and log it.
 
 ## 17.6 What the next agent should do, in order
 
-1. **Finish stages (c), (d) and (e)** — `docs/e2e-results.md` §5 has the exact
-   procedure. Unplug `d42f4ba1485d` from USB, let it reconnect over Bluetooth
-   (already paired), confirm the `Sep 18 2025` firmware on the BT entry, read
-   the battery, then run the audio stages. **This is the biggest open gap:
-   3a proved the transport carries 1 ms isochronous with a synthetic backend,
-   3b proved `BridgeBackend` drives speaker/haptics/mic through its own API,
-   and nobody has yet joined the two.** Capture the mic in WASAPI **exclusive**
-   mode (shared mode gates a steady tone to silence in ~250 ms — it is Windows,
-   the physical controller does it too; e1-results §7.2).
-2. The U→B and C→U buffering policies are unit-tested but **never exercised on
-   hardware**. Stage (c)/(e) is what exercises them; watch `clock_seam()` in
-   `--stats-json`.
-3. Capture the real UAC1 volume ranges with USBPcap on the physical wired unit
-   and replace the assumed constants in `uac.py` (risk R7, still open).
-4. Extend the feature-report prefetch list. Only `0x05` and `0x20` are cached;
-   everything else STALLs and is counted in `feature_misses`. This run recorded
-   **no** misses, so Windows asked for nothing else — but no game has been run.
-5. **Run a game or a Sony PC SDK title.** Still the real acceptance test.
+The concept is proven end to end. What remains is breadth, not feasibility.
+
+1. **Run a game, or a Sony PC SDK title.** This is now the only thing standing
+   between "the pipe works" and "it is a controller". Everything structural such
+   a title is believed to need — a shared, well-formed `ContainerId` linking HID
+   to audio — is in place; see `identity-comparison.md` §3. Cheap first steps:
+   `dualsense-tester` (WebHID) and an SDL/pygame check.
+2. **Measure audio *fidelity*, not just presence.** Every audio number in
+   `e2e-results.md` is band energy at a commanded frequency against a silent
+   baseline. That proves the path carries the signal and the channel mapping is
+   right; it says nothing about distortion, latency, or the quality of the
+   48→45 kHz conversion. Use `serve --record-out` to dump what the emulator
+   actually received and compare it sample-for-sample against what was played.
+3. **Run longer than four minutes.** The longest continuous run was 120 s.
+   Thermal behaviour, long-run drift and battery sag are unmeasured — and the
+   C→U governor is exactly the thing a multi-hour run would stress.
+4. Capture the real UAC1 volume ranges with USBPcap on the physical wired unit
+   and replace the assumed constants in `uac.py` (risk R7, still open). The
+   `on_uac_control` mapping cannot be better than those constants are.
+5. Extend the feature-report prefetch list. Only `0x05` and `0x20` are cached;
+   everything else STALLs and is counted in `feature_misses`. Both sessions
+   recorded **no** misses, so Windows itself asks for nothing else — but a game
+   may.
 6. Force a Bluetooth disconnect/reconnect. Implemented, never tested;
-   `reconnects` stayed 0.
+   `reconnects` stayed 0 throughout.
+7. Headphone routing is still unverified — nothing has ever been plugged into
+   the 3.5 mm jack. `target='headphone'` is settable and untested.
 
 ## 17.7 How to bring the whole thing up
 
@@ -1351,7 +1415,7 @@ claim and log it.
 # 1. server. --backend bridge is the live Bluetooth one; the default is still
 #    synthetic, deliberately, because experiment E1 wants the hardware-free one.
 cd D:\Codes\dualSense\ds5-virtual-usb\emulator
-..\prototype\.venv\Scripts\python.exe -m ds5emu serve --backend bridge --port 3241 --stats-json C:\Temp\ds5c_stats.json --stats-every 2
+..\prototype\.venv\Scripts\python.exe -m ds5emu serve --backend bridge --bt-serial d42f4ba1485d --port 3241 --stats-json C:\Temp\ds5c_stats.json --stats-every 2
 
 # 2. attach.  usbipd owns 3240 and is NEVER touched; --tcp-port is a GLOBAL
 #    option and must come before the subcommand.
@@ -1364,6 +1428,10 @@ powershell -File tools\e2e_endpoints.ps1
 # 4. the stages
 ..\prototype\.venv\Scripts\python.exe tools\e2e_input_parity.py --seconds 30
 ..\prototype\.venv\Scripts\python.exe tools\e2e_setstate.py
+..\prototype\.venv\Scripts\python.exe tools\e2e_audio.py --mode both
+..\prototype\.venv\Scripts\python.exe tools\e2e_audio.py --mode speaker
+..\prototype\.venv\Scripts\python.exe tools\e2e_audio.py --mode haptics
+..\prototype\.venv\Scripts\python.exe tools\e2e_soak.py --seconds 120
 
 # 5. TEARDOWN -- idempotent, safe to run twice, safe when nothing is up
 powershell -File tools\e2e_teardown.ps1
@@ -1403,6 +1471,18 @@ cd emulator
    trap 2 (never trust the `2-`/`3-` name prefix) this is the only reliable way
    to know what you are measuring.
 
+10. **Instrumentation can manufacture the fault it measures, and a thread will
+    not save you.** See §17.4(3). Two rules fall out of it: anything that runs
+    on the emulator's event loop must cost well under one 1 ms service
+    interval, and `asyncio.to_thread` is not an escape hatch for CPU-bound work
+    because the GIL is held by the C call either way. If a periodic readout
+    grows with run length, bound its window.
+
+11. **Verify the controller you claimed is the one you meant.** Both units
+    enumerate over Bluetooth even when one is charging over USB, and the stale
+    entry can sort first. Pass `--bt-serial`, and check the emulator's
+    `opened BT serial=...` log line before trusting a measurement (§17.5).
+
 ## 17.9 State left behind
 
 - **Nothing is attached.** `usbip.exe port` prints nothing.
@@ -1410,6 +1490,8 @@ cd emulator
 - **`usbipd` is Running / Automatic** — never stopped or reconfigured.
 - The only present `VID_054C&PID_0CE6` devnodes are the physically-plugged unit
   and its two children.
+- Controllers: `d42f4ba1485d` on Bluetooth at **80 %**; `a0fa9c0dd8bb` on the
+  USB cable, charging.
 - **No system configuration was changed.** No driver installed, no service
   reconfigured, no registry write, no reboot.
 - `master` is at the Phase 3c merge; the `worktree-agent-a93cf7482d1451b3b`
