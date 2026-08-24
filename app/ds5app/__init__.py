@@ -1,4 +1,4 @@
-"""ds5app — the product layer over the Phase 1-3 bridge.
+"""ds5app -- the product layer over the Phase 1-3 bridge.
 
 `emulator/ds5emu` is the USB/IP device and the Bluetooth backend; this package
 is everything that turns those into something a person can run: finding
