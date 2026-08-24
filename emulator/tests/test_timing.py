@@ -141,5 +141,84 @@ class InputReportPacingTests(unittest.TestCase):
             self.assertEqual(info["actual_length"], 64)
 
 
+class EndpointOwnsTheHidInIntervalTests(unittest.TestCase):
+    """Phase 3c: the 4 ms gate belongs to endpoint 0x84, not to a backend.
+
+    Phase 3a fixed the free-running interrupt IN endpoint inside
+    `SyntheticBackend`. `BridgeBackend` — written in parallel, and correct to
+    repeat unchanged state, because a wired DualSense does — therefore answered
+    every poll, and the first live attach of the merged emulator measured
+    12 684 reports/s against the real 250 Hz. The gate is in `device.py` now,
+    so a backend cannot opt out of physics by accident.
+    """
+
+    @staticmethod
+    def _in_urb():
+        return W.CmdSubmit(
+            seqnum=1, devid=0, direction=W.DIR_IN, ep=D.EP_HID_IN & 0x7F,
+            transfer_flags=0, transfer_buffer_length=64, start_frame=0,
+            number_of_packets=-1, interval=6, setup=b"\0" * 8,
+        )
+
+    class _AlwaysReady(SyntheticBackend):
+        """A backend with no pacing of its own — like the real BridgeBackend,
+        which repeats the current state rather than ever saying 'nothing new'."""
+
+        def __init__(self):
+            super().__init__(input_report_hz=0)
+
+    def test_an_unpaced_backend_is_still_held_to_250_hz(self):
+        dev = DualSenseDevice(self._AlwaysReady())
+        cmd = self._in_urb()
+        first = W.unpack_ret_submit(dev.handle_submit(cmd, b""))
+        self.assertEqual(first["actual_length"], 64)
+        for _ in range(20):          # same millisecond: the interval is open
+            info = W.unpack_ret_submit(dev.handle_submit(cmd, b""))
+            self.assertEqual(info["actual_length"], 0)
+        self.assertEqual(dev.stats["hid_in"], 1)
+
+    def test_the_backend_is_not_even_asked_while_the_interval_is_open(self):
+        # Otherwise the backend's own freshness bookkeeping — BridgeBackend
+        # renumbers the device sequence byte per call — advances 50 counts
+        # between two reports the host actually keeps.
+        b = self._AlwaysReady()
+        dev = DualSenseDevice(b)
+        cmd = self._in_urb()
+        dev.handle_submit(cmd, b"")
+        before = b._counter
+        for _ in range(20):
+            dev.handle_submit(cmd, b"")
+        self.assertEqual(b._counter, before)
+
+    def test_the_interval_opens_again_after_4_ms(self):
+        dev = DualSenseDevice(self._AlwaysReady())
+        cmd = self._in_urb()
+        dev.handle_submit(cmd, b"")
+        time.sleep(0.005)
+        info = W.unpack_ret_submit(dev.handle_submit(cmd, b""))
+        self.assertEqual(info["actual_length"], 64)
+        self.assertEqual(dev.stats["hid_in"], 2)
+
+    def test_a_stall_resynchronises_instead_of_bursting(self):
+        # After a long gap the endpoint must not deliver the backlog it "owes";
+        # a real one simply NAKs until the next interval. Same rule as
+        # FrameClock.reserve().
+        dev = DualSenseDevice(self._AlwaysReady())
+        cmd = self._in_urb()
+        dev.handle_submit(cmd, b"")
+        dev._next_hid_in_at = time.perf_counter() - 1.0     # pretend a 1 s stall
+        self.assertEqual(
+            W.unpack_ret_submit(dev.handle_submit(cmd, b""))["actual_length"], 64)
+        self.assertEqual(
+            W.unpack_ret_submit(dev.handle_submit(cmd, b""))["actual_length"], 0)
+
+    def test_pacing_can_be_switched_off_for_tests(self):
+        dev = DualSenseDevice(self._AlwaysReady(), hid_in_hz=0)
+        cmd = self._in_urb()
+        for _ in range(5):
+            info = W.unpack_ret_submit(dev.handle_submit(cmd, b""))
+            self.assertEqual(info["actual_length"], 64)
+
+
 if __name__ == "__main__":
     unittest.main()

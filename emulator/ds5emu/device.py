@@ -97,10 +97,19 @@ class DualSenseDevice:
     #: Micro-frames per millisecond, for the synthetic frame counter.
     FRAMES_PER_SECOND = 1000
 
+    #: Interrupt IN 0x84's service interval, as a rate. `bInterval = 6` at high
+    #: speed is 4 ms; Phase 0 measured the physical wired unit at 250.07 Hz.
+    HID_IN_HZ = 250.0
+
     def __init__(self, backend: Backend, pace_iso: bool = True,
-                 meter: UrbMeter | None = None):
+                 meter: UrbMeter | None = None,
+                 hid_in_hz: float | None = None):
         self.backend = backend
         self.uac = UacState()
+        #: 0 or None answers every interrupt IN poll immediately. Tests only —
+        #: against a live UDE client it runs the HID endpoint ~50x too fast.
+        self.hid_in_hz = self.HID_IN_HZ if hid_in_hz is None else hid_in_hz
+        self._next_hid_in_at = 0.0
         #: When False the device answers isochronous URBs immediately. That is
         #: only useful for unit tests — against a live UDE client it makes the
         #: audio stream run several times faster than real time (see timing.py).
@@ -430,19 +439,68 @@ class DualSenseDevice:
 
     # -- interrupt endpoints ----------------------------------------------
 
+    def _hid_in_early(self) -> bool:
+        """True while interrupt IN 0x84's 4 ms service interval has not elapsed.
+
+        WHY THIS IS IN THE DEVICE AND NOT IN A BACKEND (Phase 3c).
+        Endpoint 0x84 declares `bInterval = 6` — 2^(6-1) = 32 microframes = 4 ms
+        at high speed — so a real controller NAKs 250 times a second no matter
+        what its firmware has to say. On a UDE bus nothing enforces that: the
+        URB completes the instant we answer it and Windows resubmits at once.
+
+        Phase 3a found this (STATUS §15.3 bug 2) and fixed it *inside*
+        `SyntheticBackend`, which is the wrong home for it. Phase 3b's
+        `BridgeBackend` therefore never inherited the fix, and its
+        `repeat_stale_input` — correct in itself, a wired DualSense really does
+        repeat unchanged state — answers every single poll. Measured on the
+        first live attach of the merged emulator, 2026-08-24:
+
+            hid_in 6 164 441 in 486 s = 12 684/s, 51x the real 250 Hz,
+            97 % of them repeats, and the renumbered sequence byte advancing
+            50 counts between two reports the host actually kept.
+
+        The gate lives here now, so every backend gets it and the sequence byte
+        advances once per *delivered* report. `read_input_report()` is not even
+        called while the interval is open, which also keeps the backend's own
+        freshness bookkeeping honest.
+        """
+        if not self.hid_in_hz:
+            return False
+        now = time.perf_counter()
+        if self._next_hid_in_at == 0.0:
+            self._next_hid_in_at = now
+        return now < self._next_hid_in_at
+
+    def _hid_in_commit(self) -> None:
+        """A report was delivered: schedule the next service interval.
+
+        `max(now, next)` before adding the period, rather than `next += period`,
+        so a stall resynchronises instead of building a backlog it then delivers
+        as a burst — the same rule `FrameClock.reserve()` uses for the
+        isochronous endpoints. Adding the period *after* the max also
+        guarantees a full 4 ms between two delivered reports even across a
+        resync, which `max(now, next + period)` does not: that form leaves the
+        next report due immediately and lets two through back to back.
+        """
+        if not self.hid_in_hz:
+            return
+        self._next_hid_in_at = (max(time.perf_counter(), self._next_hid_in_at)
+                                + 1.0 / self.hid_in_hz)
+
     def _interrupt(self, cmd: W.CmdSubmit, out_data: bytes) -> bytes:
         ep = cmd.ep & 0x7F
         if cmd.is_in:
             if ep != (D.EP_HID_IN & 0x7F):
                 raise Stall
             n = min(cmd.transfer_buffer_length, D.HID_MAX_PACKET)
-            report = self.backend.read_input_report(n)
+            report = None if self._hid_in_early() else self.backend.read_input_report(n)
             if report is None:
                 # Nothing queued. Returning a zero-length transfer is legal and
                 # is what the server layer relies on when it decides not to
                 # block; the server may also choose to retry instead.
                 return self._ok(cmd, b"")
             self.stats["hid_in"] += 1
+            self._hid_in_commit()
             self._last_input_report = report
             return self._ok(cmd, report[:n])
 
