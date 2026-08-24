@@ -1498,3 +1498,168 @@ cd emulator
   branch and its worktree are gone (fully merged).
 
 <!-- ====================== END PHASE 3c SECTION ====================== -->
+
+<!-- ===================== BEGIN PHASE 4a SECTION ===================== -->
+
+# 18. PHASE 4a HANDOFF — from a developer tool to something a gamer can install
+
+Written for an agent starting with no context but this repository.
+End-user documentation is `docs/USER-GUIDE.md`; the layer's own notes are
+`app/README.md`. This section is the operational summary and the numbers.
+
+## 18.1 What this run did
+
+Phase 3c proved the pipeline; the user then validated it in *Spider-Man: Miles
+Morales* ("all DualSense features worked straight away"). Phase 4a turns that
+into a product: **one command**, teardown that survives being crashed, the
+robustness §17.6 listed as untested, a tray app, a packaged exe, and a guide.
+
+| | |
+|---|---|
+| new tree | `app/` — `ds5app` (product layer), `tests/`, `tools/`, `packaging/` |
+| entry point | `ds5bridge` — run / devices / cleanup / doctor / tray |
+| tests | **208** (185 in `emulator/`, up from 173; **23** new in `app/`) |
+| launcher lifecycle | **17/17** on hardware, four scenarios |
+| reconnect | **20/20** on hardware, three cycles — §17.6(6) closed |
+| soak | **30 minutes** continuous — §17.6(3) partially closed |
+| packaged | one-dir and one-file both built and run end to end |
+| defects found | **6**, every one of them only by running the thing |
+
+## 18.2 What an end user does now
+
+Two installs, then one double-click.
+
+```
+1. Install usbip-win2 0.9.7.7 from
+   https://github.com/vadimgrn/usbip-win2/releases/tag/v0.9.7.7
+   (NOT 0.9.7.8 -- its own maintainer warns it corrupts memory)
+2. Unzip the ds5bridge folder anywhere
+3. Pair the DualSense over Bluetooth; UNPLUG THE CABLE
+4. Double-click ds5bridge.exe   (or ds5bridge-tray.exe for a tray icon)
+5. Play
+6. Ctrl+C, close the window, or Quit in the tray -- all three tear down cleanly
+```
+
+`ds5bridge doctor` checks the whole setup and names anything wrong.
+`ds5bridge cleanup` is the rescue path after a crash. `ds5bridge devices` lists
+controllers with battery levels and marks the ones that only *look* connected.
+
+Everything the two-terminal Phase-3 procedure did by hand is now one object,
+`app/ds5app/service.py::BridgeService`, shared byte for byte by the CLI and the
+tray. **The USB/IP server runs in-process on its own asyncio thread**, not as a
+child, which deletes the entire failure class §17.8 traps 7 and 8 describe.
+
+## 18.3 The six defects, all found by running it
+
+The pattern is worth naming: **none of these could be found by reading, and
+none by unit tests.** Four were found by tests that deliberately crash,
+double-launch or race the thing; two by running the packaged build.
+
+### (1) A hard kill leaves the auto-re-attach ARMED, and hides it
+
+`taskkill /F` a running bridge and both `usbip port` and TCP 3241 come back
+empty — the driver detaches when the socket dies. The machine looks clean. It
+is not: the background auto-re-attach §15.5 trap 1 describes is still armed, and
+it fires the instant *any* server listens on that port again. Measured
+2026-08-25: start `ds5emu serve` with no attach command at all, and 15 s later
+`usbip port` lists a device. Our own attach then adds a second.
+
+**Nothing about the state of the machine reveals this beforehand**, so
+`attach -X` now runs **unconditionally at every start**, not only when something
+looks stale. Plus a post-attach check that detaches extras if one slipped in.
+
+### (2) `usbip port` is machine-wide — "attached" is not "mine"
+
+The worst one. Testing the frozen exe on port 3242 while a 30-minute soak ran on
+3241 **killed the soak six minutes in**: the exe's stale-state cleanup read the
+soak's device as leftovers and detached it. "Is anything attached?" was being
+used to answer "is anything of *mine* attached?".
+
+Each `usbip port` entry carries `-> usbip://host:port/busid`.
+`Usbip.parse_ports()` reads it and `our_ports()` filters on it; every cleanup
+and teardown path uses that now. Seven pure tests, including that `3241` must
+not match `32410`.
+
+### (3) A second launch used to kill the first
+
+Port held + device attached is indistinguishable from "leftovers from a crashed
+run" — so the second instance's auto-cleanup killed the healthy first one and
+detached the controller out from under whatever was using it. Port state cannot
+tell a corpse from a sibling; a **named mutex** (`Local\ds5bridge-<port>`) can,
+so the instance check happens before anything looks at the port.
+
+### (4) `Server.wait_closed()` hangs forever on every normal detach
+
+Teardown took exactly the caller's timeout, every time, and never reached
+`BridgeBackend.stop()`. When the usbip driver detaches it **resets** the TCP
+connection; the proactor transport raises `ConnectionResetError` from inside
+`_call_connection_lost`, the transport's closed-future is never resolved, so
+`writer.wait_closed()` in the connection handler never returns — and
+`Server.wait_closed()`, which waits for every handler, never returns either.
+
+Both are bounded at 1 s in `ds5emu/server.py`. **Teardown: 15.08 s → 2.09 s.**
+`BridgeBackend.stop()` also joins its three threads against one shared 3 s
+deadline rather than 3 s each (a 9 s worst case, on the thread holding up exit).
+
+### (5) The tray tore down correctly and then would not go away
+
+`raise KeyboardInterrupt` from a signal handler does **not** escape pystray's
+Win32 `GetMessage` loop. Ctrl+Break detached the device properly and left a live
+process with a dead bridge and a stale icon by the clock. `service.ON_TEARDOWN`
+is a hook list every teardown path runs; the tray registers one that stops its
+icon. Exit 0 in 1.2 s afterwards.
+
+Note for whoever touches this next: **Ctrl+Break does not reach the FROZEN
+windowed build at all** — a GUI-subsystem process has no console for the event
+to arrive at. The frozen tray is quit through its menu (verified end to end),
+Task Manager, or a shutdown. A hard kill remains safe because of (1)'s
+unconditional `attach -X` and the driver's detach-on-socket-loss.
+
+### (6) A zero-filled input report reads as "d-pad UP held"
+
+The low nibble of `digital_keys` is a hat switch, and 0 means NORTH. Clearing a
+report by zeroing bytes therefore pins the d-pad up forever. `DPAD_RELEASED = 8`
+exists for this and there is a test that asserts the wrong version is wrong.
+
+## 18.4 Robustness — what was measured
+
+### Bluetooth dropout and reconnect (§17.6(6): "implemented, never force-tested")
+
+`app/tools/reconnect_test.py`, three cycles, virtual device attached, a 250 Hz
+reader on it behaving like a game. **20/20 checks.**
+
+| | |
+|---|---|
+| virtual device through the drop | **stays attached**, `ports=[1]` every cycle |
+| reports while the link is down | **249.6 – 250.2/s** (nominal 250) |
+| every report neutral while down | **0 actuated of 624 / 625 / 626** |
+| controls released after the drop | **1.00, 1.01, 1.01 s** (`INPUT_NEUTRAL_S` = 1.0) |
+| link back | **5.06 s of a 5.0 s hold** → 0.06 s to notice and reopen |
+| bare reopen latency (`--hold 0`) | **1.03 s** |
+| live again | **250 reports/s**, battery read intact |
+| the game's HID handle | **never died** — 0 read errors, 0 empty polls |
+| a blip shorter than the threshold | correctly does **not** neutralise |
+
+**The policy, and why.** The virtual device **stays attached** and reports a
+neutral controller — sticks centred, buttons released, gyro zeroed, touch
+lifted — while battery/headphone/mic status pass through untouched. The
+alternative, a clean detach, tears the device out from under a running game and
+most titles drop to a "reconnect your controller" screen they do not always
+recover from. Repeating the last report forever is worse still: a controller
+switched off mid-sprint leaves the stick pinned.
+
+Two mechanisms, because there are two ways to lose a link:
+
+* `hid.read()` raises → 5 consecutive raises → reconnect (already existed).
+* the link goes **quiet** — every read times out cleanly and returns `b""`
+  forever, so nothing above ever trips. `LINK_DEAD_S` (4 s without a control
+  payload) is the watchdog that was missing.
+
+**What is NOT covered.** `force_disconnect()` closes the HID handle underneath
+the reader; the device never leaves Windows' enumeration, so the reopen always
+succeeds on the first try. A genuinely switched-off controller makes
+`_pick_device()` raise until it returns — the same 2 s-backoff loop, more laps.
+`force_disconnect(hold_s=)` simulates that half. **The manual test is in
+`app/tools/reconnect_test.py`'s docstring and has not been run**: bridge, start
+a game, hold PS ~10 s, confirm the game keeps running with a neutral
+controller, press PS, confirm it responds again.
