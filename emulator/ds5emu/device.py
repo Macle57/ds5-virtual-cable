@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import struct
 import time
+from dataclasses import dataclass
 
 from . import descriptors as D
 from . import wire as W
 from .backend import Backend
+from .timing import FrameClock, UrbMeter, UrbRecord
 from .uac import UacState
 
 # ---- bmRequestType ---------------------------------------------------------
@@ -73,15 +75,35 @@ class Stall(Exception):
     """Raised by a handler to complete the transfer with -EPIPE (STALL)."""
 
 
+@dataclass(frozen=True)
+class SubmitResult:
+    """A finished RET_SUBMIT plus, for isochronous URBs, when to send it.
+
+    `deadline` is a `time.perf_counter()` value. `None` means "send now".
+    The transport layer is responsible for honouring it; see `timing.py` for
+    why the emulator, not the host, owns the isochronous clock.
+    """
+
+    reply: bytes
+    deadline: float | None = None
+
+
 class DualSenseDevice:
     """Emulated USB device state machine."""
 
     #: Micro-frames per millisecond, for the synthetic frame counter.
     FRAMES_PER_SECOND = 1000
 
-    def __init__(self, backend: Backend):
+    def __init__(self, backend: Backend, pace_iso: bool = True,
+                 meter: UrbMeter | None = None):
         self.backend = backend
         self.uac = UacState()
+        #: When False the device answers isochronous URBs immediately. That is
+        #: only useful for unit tests — against a live UDE client it makes the
+        #: audio stream run several times faster than real time (see timing.py).
+        self.pace_iso = pace_iso
+        self.clock = FrameClock()
+        self.meter = meter if meter is not None else UrbMeter()
 
         self.configuration = 0
         # alt setting per interface; audio streaming interfaces boot at alt 0
@@ -95,6 +117,7 @@ class DualSenseDevice:
         self.halted: set[int] = set()
         self.hid_idle = 0
         self.hid_protocol = 1  # report protocol
+        self._last_input_report: bytes | None = None
 
         self._t0 = time.perf_counter()
         self.stats = {
@@ -145,22 +168,31 @@ class DualSenseDevice:
         `start_frame` straight back into `URB.StartFrame`, so this value has to
         look like a real 1 kHz frame counter.
         """
-        return int((time.perf_counter() - self._t0) * self.FRAMES_PER_SECOND) & 0x7FFFFFFF
+        return self.clock.current_frame() & 0x7FFFFFFF
 
     # -- top-level dispatch ------------------------------------------------
 
     def handle_submit(self, cmd: W.CmdSubmit, payload: bytes) -> bytes:
+        """Convenience wrapper: the reply bytes only, pacing discarded.
+
+        Kept because the whole unit-test suite is written against it. The
+        transport layer must use `handle_submit_ex` instead, or isochronous
+        streams run as fast as the socket allows (timing.py explains why).
+        """
+        return self.handle_submit_ex(cmd, payload).reply
+
+    def handle_submit_ex(self, cmd: W.CmdSubmit, payload: bytes) -> SubmitResult:
         buf, iso = cmd.split_payload(payload)
         ep = cmd.ep & 0x7F
         try:
             if ep == 0:
-                return self._control(cmd, buf)
+                return SubmitResult(self._control(cmd, buf))
             if cmd.is_iso or iso:
                 return self._isochronous(cmd, buf, iso)
-            return self._interrupt(cmd, buf)
+            return SubmitResult(self._interrupt(cmd, buf))
         except Stall:
             self.stats["stalled"] += 1
-            return self._stall(cmd)
+            return SubmitResult(self._stall(cmd))
 
     def _stall(self, cmd: W.CmdSubmit) -> bytes:
         return W.pack_ret_submit(
@@ -330,7 +362,16 @@ class DualSenseDevice:
                 body = self.backend.get_feature_report(report_id, wLength)
                 return body
             if report_type == HID_REPORT_TYPE_INPUT:
-                return self.backend.read_input_report(wLength)
+                # A control GET_REPORT(Input) asks for the *current* state, so
+                # unlike the interrupt endpoint it must not depend on a new
+                # report having been produced. The backend paces reports at
+                # 250 Hz and returns None in between, so fall back to the last
+                # one we saw rather than stalling the control transfer.
+                report = self.backend.read_input_report(wLength)
+                if report is None:
+                    return self._last_input_report
+                self._last_input_report = report
+                return report
             return None
 
         if bRequest == HID_SET_REPORT:
@@ -369,6 +410,7 @@ class DualSenseDevice:
                 # block; the server may also choose to retry instead.
                 return self._ok(cmd, b"")
             self.stats["hid_in"] += 1
+            self._last_input_report = report
             return self._ok(cmd, report[:n])
 
         if ep != D.EP_HID_OUT:
@@ -387,18 +429,34 @@ class DualSenseDevice:
 
     # -- isochronous endpoints --------------------------------------------
 
-    def _isochronous(self, cmd: W.CmdSubmit, out_data: bytes, iso) -> bytes:
+    def _isochronous(self, cmd: W.CmdSubmit, out_data: bytes, iso) -> SubmitResult:
+        """Reserve service intervals, build the reply, and say when to send it.
+
+        THE PACING IS NOT OPTIONAL. There is no SOF on a UDE bus and
+        usbip2_filter answers QueryBusTime with a constant, so if we complete
+        these URBs as fast as they arrive the audio stack simply runs the stream
+        at socket speed — measured 3.63x real time on 2026-08-24. See timing.py.
+        """
         ep = cmd.ep & 0x7F
-        start_frame = self.frame_number()
+        t_recv = time.perf_counter()
+        start_frame, deadline = self.clock.reserve(cmd.ep, len(iso))
 
         if cmd.is_in:
             if ep != (D.EP_ISO_IN & 0x7F):
                 raise Stall
-            return self._iso_in(cmd, iso, start_frame)
+            reply = self._iso_in(cmd, iso, start_frame)
+            nbytes = W.unpack_ret_submit(reply)["actual_length"]
+        else:
+            if ep != D.EP_ISO_OUT:
+                raise Stall
+            reply = self._iso_out(cmd, out_data, iso, start_frame)
+            nbytes = len(out_data)
 
-        if ep != D.EP_ISO_OUT:
-            raise Stall
-        return self._iso_out(cmd, out_data, iso, start_frame)
+        self.meter.record(cmd.ep, UrbRecord(
+            t_recv=t_recv, t_done=time.perf_counter(), packets=len(iso),
+            nbytes=nbytes, start_frame=start_frame,
+        ))
+        return SubmitResult(reply, deadline if self.pace_iso else None)
 
     def _iso_out(self, cmd: W.CmdSubmit, out_data: bytes, iso, start_frame: int) -> bytes:
         """Speaker + haptics stream from the host.
@@ -446,7 +504,15 @@ class DualSenseDevice:
         chunks = []
         replies = []
         for p in iso:
-            n = min(p.length, D.ISO_IN_MAX_PACKET)
+            # ONE SERVICE INTERVAL OF AUDIO, not one wMaxPacketSize.
+            # The host asks for p.length = wMaxPacketSize = 196 B, but 196 B is
+            # 49 stereo frames, and returning that every 1 ms runs the mic at
+            # 49 kHz. Measured 2026-08-24: WASAPI reported 48 983 frames/s
+            # against a nominal 48 000 until this clamp was added. The 4 bytes of
+            # headroom in wMaxPacketSize exist so an *asynchronous* endpoint can
+            # occasionally send one extra frame to express clock drift; our
+            # frame clock is exactly 48 kHz, so we never need it.
+            n = min(p.length, D.ISO_IN_BYTES_PER_MS)
             data = self.backend.read_audio_in(n) if n else b""
             data = data[:n]
             chunks.append(data)

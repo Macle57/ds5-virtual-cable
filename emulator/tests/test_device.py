@@ -342,15 +342,24 @@ class IsochronousTests(unittest.TestCase):
         self.assertEqual(left, right)
         self.assertNotEqual(data, b"\0" * 192)
 
-    def test_iso_in_clamps_to_wmaxpacketsize(self):
+    def test_iso_in_returns_one_service_interval_not_wmaxpacketsize(self):
+        """An over-large request yields 192 B (48 stereo frames), not 196.
+
+        Regression test for the Phase-3 E1 bug: the host always asks for
+        wMaxPacketSize = 196 B, and returning 196 B per 1 ms interval ran the
+        microphone at 49 kHz (measured 48 983 frames/s through WASAPI against a
+        nominal 48 000). The 4 spare bytes exist only so an asynchronous
+        endpoint can express clock drift; our frame clock does not drift.
+        """
         cmd = self._iso_in_cmd(npackets=1, pkt=1024)
         descs = [W.IsoPacket(offset=0, length=1024)]
         reply = self.dev.handle_submit(cmd, W.pack_iso_packets(descs))
         info = W.unpack_ret_submit(reply)
-        self.assertEqual(info["actual_length"], D.ISO_IN_MAX_PACKET)
+        self.assertEqual(info["actual_length"], D.ISO_IN_BYTES_PER_MS)
+        self.assertLess(D.ISO_IN_BYTES_PER_MS, D.ISO_IN_MAX_PACKET)
         iso = W.unpack_iso_packets(reply[W.HEADER_SIZE:], 1, info["actual_length"])
         self.assertEqual(iso[0].length, 1024)
-        self.assertEqual(iso[0].actual_length, D.ISO_IN_MAX_PACKET)
+        self.assertEqual(iso[0].actual_length, D.ISO_IN_BYTES_PER_MS)
 
     def test_iso_start_frame_is_monotonic(self):
         cmd = self._iso_out_cmd(npackets=1)

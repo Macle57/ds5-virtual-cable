@@ -87,15 +87,25 @@ class SyntheticBackend(Backend):
     experiment E1 needs.
     """
 
+    #: Interrupt IN 0x84 declares bInterval = 6, i.e. 2^(6-1) = 32 microframes
+    #: = 4 ms at high speed. Phase 0 measured the physical wired controller at
+    #: 250.07 Hz (docs/STATUS.md §5.3), so that is the rate to emulate.
+    INPUT_REPORT_HZ = 250.0
+
     def __init__(self, tone_hz: float = 1000.0, amplitude: float = 0.25,
-                 record_timing: bool = True):
+                 record_timing: bool = True, input_report_hz: float | None = None):
         self.tone_hz = tone_hz
         self.amplitude = amplitude
         self.record_timing = record_timing
+        #: 0 or None disables pacing (tests that want a report on every call).
+        self.input_report_hz = (
+            self.INPUT_REPORT_HZ if input_report_hz is None else input_report_hz
+        )
 
         self._lock = threading.Lock()
         self._phase = 0.0
         self._counter = 0
+        self._next_report_at = 0.0
 
         # observability, consumed by tools and tests
         self.audio_out_packets = 0
@@ -108,8 +118,23 @@ class SyntheticBackend(Backend):
     # ---- HID ------------------------------------------------------------
 
     def read_input_report(self, max_len: int) -> bytes | None:
-        """A plausible idle USB input report: id 0x01, sticks centred."""
+        """A plausible idle USB input report: id 0x01, sticks centred.
+
+        Returns None until the next 4 ms service interval is due. Without this
+        the interrupt IN URB completes the instant it arrives and the host
+        resubmits immediately — measured 15 526 reports/s through hidapi on
+        2026-08-24, 62x the real device's 250 Hz. A real endpoint NAKs instead.
+        The clock-driven schedule (rather than sleeping) is the same trick
+        `prototype/ds5bridge/pacing.py::Pacer` uses.
+        """
         with self._lock:
+            if self.input_report_hz:
+                now = time.perf_counter()
+                if now < self._next_report_at:
+                    return None
+                period = 1.0 / self.input_report_hz
+                # Resynchronise rather than accumulate backlog after a stall.
+                self._next_report_at = max(now, self._next_report_at + period)
             self._counter = (self._counter + 1) & 0xFF
             counter = self._counter
         body = bytearray(64)
@@ -157,6 +182,7 @@ class SyntheticBackend(Backend):
                 out += struct.pack("<hh", v, v)
                 phase += step
             self._phase = math.fmod(phase, 2.0 * math.pi)
+            self.audio_in_bytes += nbytes
         return bytes(out).ljust(nbytes, b"\0")[:nbytes]
 
 
