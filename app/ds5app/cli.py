@@ -227,6 +227,36 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _owns_console() -> bool:
+    """True when this process is the only one on its console.
+
+    Which is the same as "somebody double-clicked me": launched from an existing
+    terminal, that terminal's shell is on the console too. It matters because a
+    double-clicked program that exits with an error closes its window
+    instantly, taking the error message with it -- and the error message is the
+    entire point of `doctor` and of every failure path here.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        buf = (ctypes.c_uint * 8)()
+        n = ctypes.windll.kernel32.GetConsoleProcessList(buf, 8)
+        return n == 1
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _pause_if_double_clicked() -> None:
+    if not _owns_console():
+        return
+    try:
+        input("\nPress Enter to close this window ...")
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Bare `ds5bridge` means `ds5bridge run`, and so does `ds5bridge --serial X`.
@@ -236,9 +266,12 @@ def main(argv=None) -> int:
     if not getattr(args, "func", None):
         args = build_parser().parse_args(["run"])
     try:
-        return args.func(args)
+        code = args.func(args)
     except KeyboardInterrupt:
         return 130
+    if code:
+        _pause_if_double_clicked()
+    return code
 
 
 if __name__ == "__main__":
