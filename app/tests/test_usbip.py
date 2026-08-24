@@ -11,9 +11,12 @@ to answer "is anything of MINE attached?".
 
 from __future__ import annotations
 
+import os
 import unittest
+from unittest import mock
 
-from ds5app.usbip import Usbip
+from ds5app import usbip as U
+from ds5app.usbip import Usbip, UsbipNotFound
 
 
 class _P(Usbip):
@@ -94,6 +97,53 @@ class OwnershipTests(unittest.TestCase):
     def test_3241_does_not_match_32410(self):
         text = ONE.replace(":3241/", ":32410/")
         self.assertEqual(self.ports(text, 3241), [])
+
+
+class FindUsbipTests(unittest.TestCase):
+    """The absent-driver path. This message is the entire failure UX for a user
+    who skipped step 1 of the guide, so it is asserted rather than assumed."""
+
+    def test_missing_message_names_the_release_the_url_and_the_bad_version(self):
+        m = U.MISSING_MESSAGE
+        self.assertIn("0.9.7.7", m)
+        self.assertIn("github.com/vadimgrn/usbip-win2", m)
+        # 0.9.7.8 carries its own maintainer's memory-corruption warning.
+        self.assertIn("0.9.7.8", m)
+        self.assertIn("USER-GUIDE", m)
+
+    def test_nothing_anywhere_raises_with_that_message(self):
+        with mock.patch.object(U, "_from_registry", return_value=[]), \
+                mock.patch.object(U.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"ProgramFiles": r"X:\nope",
+                                             "ProgramW6432": r"X:\nope",
+                                             "ProgramFiles(x86)": r"X:\nope"},
+                                clear=False):
+            os.environ.pop("DS5_USBIP_EXE", None)
+            with self.assertRaises(UsbipNotFound) as cm:
+                U.find_usbip()
+        self.assertIn("0.9.7.7", str(cm.exception))
+
+    def test_an_explicit_path_is_the_only_candidate(self):
+        # An override that silently falls back to the thing it overrides is not
+        # an override -- and this is also what makes the missing-driver message
+        # reproducible on a machine that HAS the driver installed.
+        with mock.patch.object(U, "_from_registry",
+                               return_value=[r"C:\Program Files\USBip\usbip.exe"]):
+            with self.assertRaises(UsbipNotFound):
+                U.find_usbip(r"X:\definitely\not\here\usbip.exe")
+
+    def test_the_env_var_works_the_same_way(self):
+        with mock.patch.dict(os.environ,
+                             {"DS5_USBIP_EXE": r"X:\nope\usbip.exe"}), \
+                mock.patch.object(U, "_from_registry",
+                                  return_value=[r"C:\Program Files\USBip\usbip.exe"]):
+            with self.assertRaises(UsbipNotFound):
+                U.find_usbip()
+
+    def test_registry_lookup_ignores_usbipd_win(self):
+        # `usbipd-win` matches a naive "usbip" search, is a completely different
+        # product, owns port 3240, and must never be driven by this code.
+        self.assertNotIn("usbipd", U.MISSING_MESSAGE.lower())
 
 
 if __name__ == "__main__":

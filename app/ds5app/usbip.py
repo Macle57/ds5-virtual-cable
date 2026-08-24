@@ -99,13 +99,21 @@ def _from_registry() -> list[str]:
 
 
 def find_usbip(explicit: str | None = None) -> str:
-    """Absolute path to usbip.exe, or raise `UsbipNotFound` with the guide text."""
-    candidates: list[str] = []
+    """Absolute path to usbip.exe, or raise `UsbipNotFound` with the guide text.
+
+    An explicit path (`--usbip`, or `DS5_USBIP_EXE`) is the ONLY candidate when
+    given -- an override that quietly falls back to the thing it was overriding
+    is not an override. It is also what makes the "usbip-win2 is missing"
+    message testable on a machine that has it installed.
+    """
+    explicit = explicit or os.environ.get("DS5_USBIP_EXE")
     if explicit:
-        candidates.append(explicit)
-    env = os.environ.get("DS5_USBIP_EXE")
-    if env:
-        candidates.append(env)
+        p = os.path.abspath(explicit)
+        if os.path.isfile(p):
+            return p
+        raise UsbipNotFound(f"usbip.exe not found at {p}\n\n" + MISSING_MESSAGE)
+
+    candidates: list[str] = []
     candidates += _from_registry()
     for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
                  os.environ.get("ProgramW6432", r"C:\Program Files"),
