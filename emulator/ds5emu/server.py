@@ -210,17 +210,35 @@ class UsbIpServer:
             return res.reply
 
         reply = res.reply
-        # Interrupt IN with nothing queued: hold the URB rather than completing
+        # Interrupt IN with nothing to send: hold the URB rather than completing
         # a zero-length transfer, which is what a real endpoint does (it simply
-        # NAKs until data is available). The backend paces reports at the
-        # endpoint's 4 ms service interval, so this loop normally spins two or
-        # three times.
+        # NAKs until data is available).
+        #
+        # Two different reasons to wait, and they want different waits:
+        #
+        #   res.retry_at set — the endpoint's 4 ms service interval has not come
+        #     round yet, and the device knows exactly when it will. Sleep to
+        #     that instant. Polling every `hid_in_poll` instead cost 10 % of the
+        #     endpoint's reports on the live driver (220.2/s against a nominal
+        #     250): `asyncio.sleep(0.001)` overshoots on Windows, so the open
+        #     interval was found late enough that it had already lapsed.
+        #
+        #   retry_at None — the backend genuinely has nothing (no Bluetooth
+        #     report has ever arrived, say). Nobody knows when that changes, so
+        #     fall back to polling until `hid_in_timeout`.
         if cmd.is_in and (cmd.ep & 0x7F) == (D.EP_HID_IN & 0x7F) and not cmd.is_iso:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + self.hid_in_timeout
             while self._is_empty(reply) and loop.time() < deadline:
-                await asyncio.sleep(self.hid_in_poll)
-                reply = self.device.handle_submit(cmd, payload)
+                if res.retry_at is not None:
+                    delay = res.retry_at - time.perf_counter()
+                    # Cap the sleep at the remaining hold time so a bad clock
+                    # can never park this URB past `hid_in_timeout`.
+                    await asyncio.sleep(max(0.0, min(delay, deadline - loop.time())))
+                else:
+                    await asyncio.sleep(self.hid_in_poll)
+                res = self.device.handle_submit_ex(cmd, payload)
+                reply = res.reply
         return reply
 
     @staticmethod

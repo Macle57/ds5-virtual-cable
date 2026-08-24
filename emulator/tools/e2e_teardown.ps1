@@ -23,6 +23,17 @@ foreach ($m in [regex]::Matches($ports, 'Port\s+(\d+):')) {
 }
 
 Write-Host '--- stopping any ds5emu server ---'
+# BY PORT FIRST, and this is not belt-and-braces -- it is the only reliable
+# half. Win32_Process.CommandLine comes back EMPTY for some python processes
+# (the venv launcher spawns a child whose command line this query cannot read),
+# so a CommandLine match silently misses the process that actually holds the
+# socket. A stale server then keeps port 3241, the new one appears to start
+# normally, and you spend an afternoon measuring the OLD emulator while reading
+# the NEW one's stats file. Cost here: one confusing stage-(a) run.
+foreach ($conn in (Get-NetTCPConnection -LocalPort 3241 -State Listen -ErrorAction SilentlyContinue)) {
+    Write-Host "kill $($conn.OwningProcess): listening on 3241"
+    Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
+}
 Get-CimInstance Win32_Process -Filter "Name like '%python%'" |
     Where-Object { $_.CommandLine -match 'ds5emu' } |
     ForEach-Object {
@@ -31,6 +42,9 @@ Get-CimInstance Win32_Process -Filter "Name like '%python%'" |
     }
 
 Start-Sleep -Milliseconds 700
+$still = Get-NetTCPConnection -LocalPort 3241 -State Listen -ErrorAction SilentlyContinue
+if ($still) { Write-Host "WARNING: port 3241 still held by PID $($still.OwningProcess)" }
+else { Write-Host 'port 3241 free' }
 
 Write-Host '--- final state ---'
 $final = & $usbip port 2>&1 | Out-String
