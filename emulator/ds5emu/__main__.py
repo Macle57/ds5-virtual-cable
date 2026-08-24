@@ -83,21 +83,65 @@ class RecordingBackend(SyntheticBackend):
             pass
 
 
+def _wrap_recording(backend, path: str):
+    """Tee `write_audio_out` to a raw file without subclassing the backend.
+
+    `RecordingBackend` is a `SyntheticBackend` subclass; the bridge needs the
+    same dump for offline FFT but must stay the live object, so the method is
+    wrapped instead.
+    """
+    fh = open(path, "wb")
+    inner_write = backend.write_audio_out
+    inner_stop = backend.stop
+
+    def write_audio_out(pcm: bytes) -> None:
+        fh.write(pcm)
+        inner_write(pcm)
+
+    def stop() -> None:
+        try:
+            inner_stop()
+        finally:
+            try:
+                fh.close()
+            except Exception:  # pragma: no cover
+                pass
+
+    backend.write_audio_out = write_audio_out
+    backend.stop = stop
+    return backend
+
+
 def _snapshot(server, backend) -> dict:
-    """Everything experiment E1 needs, as plain JSON-able data."""
+    """Everything experiment E1 needs, as plain JSON-able data.
+
+    Backend-agnostic since Phase 3c: `SyntheticBackend` publishes counters as
+    attributes, `BridgeBackend` publishes a `stats` dict plus `clock_seam()`.
+    Both shapes end up under the same keys so `--stats-json` can be read the
+    same way for an E1 rerun and for a live bridged run.
+    """
     dev = server.device
+    bstats = getattr(backend, "stats", None)
     snap = {
         "wall_clock": time.time(),
         "uptime_s": time.perf_counter() - dev.meter.t0,
         "connections": server.connections,
         "stats": dict(dev.stats),
-        "output_reports": len(backend.output_reports),
-        "feature_writes": len(backend.feature_writes),
-        "audio_out_packets": backend.audio_out_packets,
-        "audio_out_bytes": backend.audio_out_bytes,
-        "audio_in_bytes": backend.audio_in_bytes,
+        "output_reports": (bstats["setstate_in"] if bstats
+                           else len(backend.output_reports)),
+        "feature_writes": len(getattr(backend, "feature_writes", ())),
+        "audio_out_packets": (bstats["audio_out_calls"] if bstats
+                              else backend.audio_out_packets),
+        "audio_out_bytes": (bstats["audio_out_bytes"] if bstats
+                            else backend.audio_out_bytes),
+        "audio_in_bytes": (bstats["audio_in_bytes"] if bstats
+                           else backend.audio_in_bytes),
         "endpoints": {},
     }
+    if bstats is not None:
+        snap["backend"] = dict(bstats)
+        if hasattr(backend, "clock_seam"):
+            snap["clock_seam"] = backend.clock_seam()
     for ep in dev.meter.endpoints():
         s = dev.meter.summary(ep)
         s["gap_histogram_ms"] = [
@@ -126,6 +170,25 @@ def _print_report(snap: dict) -> None:
     print(f"audio OUT {snap['audio_out_bytes']} B in {snap['audio_out_packets']} packets; "
           f"audio IN {snap['audio_in_bytes']} B; "
           f"HID output reports {snap['output_reports']}; feature writes {snap['feature_writes']}")
+    seam = snap.get("clock_seam")
+    if seam:
+        print("\n  clock seam (U=USB FrameClock / B=0x39 Pacer / C=controller crystal)")
+        print(f"    U->B  0x39 {seam['reports_39']} (err {seam['report_39_errors']}), "
+              f"underrun frames {seam['audio_underrun_frames']}, "
+              f"queue drops {seam['audio_q_drop_frames']}, "
+              f"depth {seam['audio_q_depth_frames']}/{seam['audio_q_target_frames']} frames, "
+              f"out-ring peak {seam['out_ring_peak_ms']} ms "
+              f"(overflow {seam['out_ring_overflow_bytes']} B)")
+        print(f"    C->U  mic payloads {seam['mic_payloads']} "
+              f"(decode err {seam['mic_decode_errors']}), "
+              f"underrun calls {seam['mic_underrun_calls']}, reprimes {seam['mic_reprimes']}")
+        print(f"          depth mean {seam['mic_depth_ms_mean']} ms "
+              f"[{seam['mic_depth_ms_min']}..{seam['mic_depth_ms_max']}] "
+              f"target {seam['mic_depth_target_ms']} ms; skew pad/drop "
+              f"{seam['mic_skew_pad_frames']}/{seam['mic_skew_drop_frames']} frames; "
+              f"ring overflow {seam['mic_ring_overflow_bytes']} B")
+        print(f"    control jobs deferred off the URB path: {seam['control_jobs']} "
+              f"(dropped {seam['control_jobs_dropped']})")
     for key, s in snap["endpoints"].items():
         ep = int(key, 16)
         print(f"\n  {_EP_NAMES.get(ep, key)}")
@@ -154,7 +217,16 @@ def cmd_serve(args) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-    if args.record_out:
+    if args.backend == "bridge":
+        # Imported here, not at module scope: `bridge` pulls in numpy, PyAV and
+        # hidapi, and `serve --backend synthetic` must keep working without them.
+        from .bridge import BridgeBackend
+
+        backend = BridgeBackend(target=args.audio_target,
+                                mic_always_on=args.mic_always_on)
+        if args.record_out:
+            backend = _wrap_recording(backend, args.record_out)
+    elif args.record_out:
         backend = RecordingBackend(args.record_out, tone_hz=args.tone)
     else:
         backend = SyntheticBackend(tone_hz=args.tone)
@@ -223,6 +295,15 @@ def main(argv=None) -> int:
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=W.TCP_PORT)
     s.add_argument("--busid", default=DEFAULT_BUSID)
+    s.add_argument("--backend", choices=("synthetic", "bridge"), default="synthetic",
+                   help="synthetic: no hardware, a generated tone (experiment E1). "
+                        "bridge: a live Bluetooth DualSense behind the virtual "
+                        "wired one (needs numpy/PyAV/hidapi and the controller)")
+    s.add_argument("--audio-target", choices=("speaker", "headphone"),
+                   default="speaker", help="bridge backend: where 0x39 audio goes")
+    s.add_argument("--mic-always-on", action="store_true",
+                   help="bridge backend: arm the microphone at start() instead of "
+                        "waiting for the host to SET_INTERFACE alt 1")
     s.add_argument("--tone", type=float, default=1000.0,
                    help="synthetic microphone tone in Hz")
     s.add_argument("--record-out", default=None, metavar="PATH",
