@@ -40,6 +40,55 @@ Rate arithmetic (all exact, no drift)
     48000/45000 = 16/15 and 48000/3000 = 16, so 1024 -> 960 and 1024 -> 64 are
     integer ratios: a 1024-sample USB block maps onto exactly one 0x39 report.
 
+THE THREE CLOCK DOMAINS (Phase 3c — read this before touching the buffering)
+----------------------------------------------------------------------------
+This backend sits between clocks that are NOT the same thing, and the merge of
+Phase 3a and Phase 3b is precisely the seam between the first two:
+
+  U — the USB domain.  `ds5emu.timing.FrameClock`, 1 ms service intervals off
+      `time.perf_counter()`. It paces URB *completion*, and therefore sets the
+      long-run rate at which `write_audio_out()` is fed and `read_audio_in()`
+      is drained: 48 000 frames/s each, by construction. Note the data itself
+      moves in ~10 ms bursts (usbaudio batches 10 packets per URB and submits
+      one or two URBs every ~15 ms); only the *average* is smooth.
+
+  B — the Bluetooth send domain.  `ds5bridge.pacing.Pacer` in `_pump_loop`,
+      one tick per 0x39 report. Also off `time.perf_counter()`.
+
+  C — the controller's own crystal.  Sets when microphone Opus payloads
+      actually arrive (~100/s). Nothing on this PC can influence it.
+
+**U and B are the same oscillator and an exact integer ratio, so they cannot
+drift against each other:**
+
+    46.875 reports/s x 1024 samples/report = 48 000 samples/s   (48000/46.875)
+
+There is no rate conversion, no accumulator and no resampling error between the
+USB timebase and the 0x39 timebase — the pump is not a second clock, it is a
+1/1024 divider off the same one. What CAN go wrong between U and B is purely
+*phase*: burst arrival against a 21.3 ms tick. That is a buffering problem, and
+it is solved by an explicit target depth (`AUDIO_Q_*` below), not by rate
+steering. Double-clocking is avoided by the pump never sleeping on behalf of
+the USB side and the USB side never waiting on the pump: they meet only in
+`_out_ring`, which is bounded.
+
+**U and C are different oscillators, so the microphone path is the one place
+real drift accumulates.** Two crystals at +/-100 ppm differ by up to 9.6
+samples/s. Over an hour that is ~35 000 samples = 0.7 s, far more than any
+sane buffer, so the mic ring is *steered* rather than merely sized: see
+`_mic_depth_correction()`. The correction is bounded to one 48 kHz frame per
+`read_audio_in()` call (<= 1000 frames/s, i.e. +/-2 %, ~200x the worst crystal
+error) so it is always a slew and never a jump.
+
+**No Bluetooth I/O ever happens on the USB request path.** `write_audio_out`,
+`read_audio_in`, `read_input_report`, `write_output_report`, `set_alt_setting`
+and `on_uac_control` are all called from the single asyncio server thread that
+also has to hit 1 ms isochronous deadlines. Anything that talks to hidapi —
+microphone arming (which sleeps 20 ms twice) and UAC volume mirroring — is
+posted to `_control_q` and executed by the writer thread. Blocking that thread
+for 40 ms in `SET_INTERFACE` would stall every endpoint at exactly the moment
+the audio stream opens.
+
 Hardware gotchas honoured here (docs/STATUS.md §8)
 --------------------------------------------------
 
@@ -60,6 +109,7 @@ import fractions
 import logging
 import threading
 import time
+from collections import deque
 
 from . import _bootstrap  # noqa: F401  (sys.path side effect)
 from . import descriptors as D
@@ -101,12 +151,42 @@ assert 16 <= AUDIO_BUFFER_LENGTH <= 128
 AUDIO_OUT_RING_MS = 120
 AUDIO_OUT_RING_BYTES = int(AUDIO_OUT_RING_MS * USB_RATE / 1000) * USB_OUT_FRAME_BYTES
 
+# --- the U -> B buffering policy (Phase 3c) ---------------------------------
+# Encoded frames waiting for their 0x39 tick. Because U and B share an
+# oscillator and an exact ratio, the steady-state depth is whatever the startup
+# burst left in it and it never self-corrects -- so it has to be *chosen*, not
+# inherited. Depth is the audio latency the host pays, one Opus frame = 10.667 ms.
+#
+#   TARGET  4 frames = 42.7 ms   covers the ~16 ms Windows audio-engine burst
+#                                period plus scheduling jitter with room to spare
+#   HIGH    8 frames = 85.3 ms   above this the oldest frames are dropped back to
+#                                TARGET and counted; the alternative is latency
+#                                that grows and never comes back
+#   START   TARGET             transmission begins only once the queue is at target,
+#                                so the first 0x39 is not followed by silence
+AUDIO_Q_TARGET_FRAMES = 4
+AUDIO_Q_HIGH_FRAMES = 8
+assert AUDIO_Q_TARGET_FRAMES < AUDIO_Q_HIGH_FRAMES
+
 #: Microphone jitter buffer. Bluetooth delivers 10 ms bursts; the host asks in
 #: 1 ms slices, so a little slack removes almost all underruns.
 MIC_RING_MS = 200
 MIC_RING_BYTES = int(MIC_RING_MS * USB_RATE / 1000) * USB_IN_FRAME_BYTES
 MIC_PRIME_MS = 25
 MIC_PRIME_BYTES = int(MIC_PRIME_MS * USB_RATE / 1000) * USB_IN_FRAME_BYTES
+
+# --- the C -> U drift governor (Phase 3c) -----------------------------------
+# The controller's crystal and this PC's are independent, so the mic ring drifts
+# for real. Steer it back towards MIC_PRIME_MS by adding or removing at most ONE
+# 48 kHz frame per read_audio_in() call: at 1000 calls/s that is a +/-2 %
+# correction authority against a crystal error of order 0.01 %, and one sample
+# per millisecond is inaudible. Outside the band nothing is touched at all, so
+# in normal operation the governor does nothing most of the time.
+MIC_LOW_MS = 10
+MIC_HIGH_MS = 90
+MIC_LOW_BYTES = int(MIC_LOW_MS * USB_RATE / 1000) * USB_IN_FRAME_BYTES
+MIC_HIGH_BYTES = int(MIC_HIGH_MS * USB_RATE / 1000) * USB_IN_FRAME_BYTES
+assert MIC_LOW_BYTES < MIC_PRIME_BYTES < MIC_HIGH_BYTES < MIC_RING_BYTES
 
 #: Stop transmitting 0x39 after this long with no host audio: it saves
 #: Bluetooth airtime and, on a 10 %-battery controller, real power.
@@ -136,6 +216,13 @@ class _ByteRing:
         self._lock = threading.Lock()
         self.dropped = 0
         self.underruns = 0
+        #: Bytes of silence that had to be invented because the ring was short.
+        self.underrun_bytes = 0
+        #: Bytes discarded by `drop_oldest` (drift steering), kept apart from
+        #: `dropped` so an overflow and a deliberate skew correction never look
+        #: like the same event.
+        self.skew_dropped = 0
+        self.peak = 0
 
     def __len__(self) -> int:
         with self._lock:
@@ -148,6 +235,21 @@ class _ByteRing:
             if over > 0:
                 del self._buf[:over]
                 self.dropped += over
+            if len(self._buf) > self.peak:
+                self.peak = len(self._buf)
+
+    def drop_oldest(self, n: int) -> int:
+        """Discard up to `n` bytes from the front. Returns how many went.
+
+        This is the drift governor's only tool on the overfull side; it is
+        counted separately from overflow so the two are never confused.
+        """
+        with self._lock:
+            n = min(n, len(self._buf))
+            if n:
+                del self._buf[:n]
+                self.skew_dropped += n
+            return n
 
     def take_all(self, limit: int | None = None) -> bytes:
         with self._lock:
@@ -164,6 +266,7 @@ class _ByteRing:
             del self._buf[:have]
             if have < n:
                 self.underruns += 1
+                self.underrun_bytes += n - have
                 out += fill * (n - have)
             return out
 
@@ -337,11 +440,20 @@ class BridgeBackend(Backend):
         self._setstate_last: bytes | None = None
         self._setstate_event = threading.Event()
 
+        # --- deferred Bluetooth control work ------------------------------
+        #: Jobs posted from the USB request path (mic arming, UAC mirroring)
+        #: and executed on the writer thread. NOTHING that can block on hidapi
+        #: may run on the asyncio server thread — it owes the isochronous
+        #: endpoints a 1 ms deadline. See the module docstring.
+        self._control_q: deque = deque(maxlen=64)
+
         # --- audio --------------------------------------------------------
         self._out_ring = _ByteRing(AUDIO_OUT_RING_BYTES)
         self._mic_ring = _ByteRing(MIC_RING_BYTES)
         self._mic_primed = False
         self._last_audio_out = 0.0
+        #: Encoded-frame queue depth, published by the pump for the stats snapshot.
+        self.audio_q_depth = 0
 
         self._audio_armed = threading.Event()
         self._mic_armed = threading.Event()
@@ -370,9 +482,22 @@ class BridgeBackend(Backend):
             "report_39_errors": 0,
             "opus_frames": 0,
             "audio_underrun_frames": 0,
+            "audio_q_drop_frames": 0,
             "mic_decode_errors": 0,
+            "mic_underrun_calls": 0,
+            "mic_skew_pad_frames": 0,
+            "mic_skew_drop_frames": 0,
+            "mic_reprimes": 0,
+            "control_jobs": 0,
+            "control_jobs_dropped": 0,
             "reconnects": 0,
         }
+        #: Sampled mic-ring depth in bytes, for the drift report. Cheap: three
+        #: integers updated per `read_audio_in`.
+        self._mic_depth_n = 0
+        self._mic_depth_sum = 0
+        self._mic_depth_min = 1 << 30
+        self._mic_depth_max = 0
         self.connected = threading.Event()
 
     # =====================================================================
@@ -634,9 +759,15 @@ class BridgeBackend(Backend):
                     hap_acc = hap_acc[A.HAPTIC_SAMPLES_PER_FRAME :]
                     hap_q.extend(A.pcm_to_haptic_frames(frame))
 
-                # ---- start only once there is a little to work with --------
+                # ---- start only once the queue is AT TARGET DEPTH ----------
+                # Not "once there is something": starting early means the first
+                # 0x39 reports are followed by invented silence, and because U
+                # and B never drift apart the queue then sits at that unlucky
+                # depth forever. Starting at target makes the steady-state
+                # latency a chosen 42.7 ms instead of a startup accident.
                 if not running:
-                    if len(opus_q) < 4 and len(hap_q) < 4:
+                    if (len(opus_q) < AUDIO_Q_TARGET_FRAMES
+                            and len(hap_q) < AUDIO_Q_TARGET_FRAMES):
                         self._stop.wait(0.002)
                         continue
                     pacer.reset()
@@ -660,12 +791,20 @@ class BridgeBackend(Backend):
                     packet_counter = (packet_counter + FRAMES_PER_REPORT_39) & 0xFF
                     pacer.commit(1)
 
-                # Keep latency bounded: if the encoder ever ran ahead (a stall
-                # elsewhere), drop the oldest frames rather than accumulate.
-                if len(opus_q) > 12:
-                    del opus_q[: len(opus_q) - 12]
-                if len(hap_q) > 12:
-                    del hap_q[: len(hap_q) - 12]
+                # ---- depth governor on the U -> B seam ---------------------
+                # U and B share an oscillator, so depth only moves when phase
+                # does: a stall on either side, or the host restarting its
+                # stream. Above HIGH, cut back to TARGET rather than to HIGH,
+                # so one correction settles it instead of hovering at the
+                # ceiling. Counted, because dropping encoded audio is audible
+                # and must never be silent in the logs.
+                if len(opus_q) > AUDIO_Q_HIGH_FRAMES:
+                    n = len(opus_q) - AUDIO_Q_TARGET_FRAMES
+                    del opus_q[:n]
+                    self.stats["audio_q_drop_frames"] += n
+                if len(hap_q) > AUDIO_Q_HIGH_FRAMES:
+                    del hap_q[: len(hap_q) - AUDIO_Q_TARGET_FRAMES]
+                self.audio_q_depth = len(opus_q)
 
     def _send_39(self, opus2, hap2, packet_counter: int) -> None:
         dev = self._dev
@@ -691,6 +830,30 @@ class BridgeBackend(Backend):
     # thread 3: SetState passthrough
     # =====================================================================
 
+    def _post_control(self, fn, *args) -> None:
+        """Queue Bluetooth control work for the writer thread.
+
+        Called from the asyncio server thread (SET_INTERFACE, UAC SET_CUR),
+        which must never block on hidapi. The deque is bounded, so a host that
+        spams controls cannot grow memory; overflow is counted, not fatal.
+        """
+        if len(self._control_q) == self._control_q.maxlen:
+            self.stats["control_jobs_dropped"] += 1
+        self._control_q.append((fn, args))
+        self._setstate_event.set()
+
+    def _drain_control_q(self) -> None:
+        while True:
+            try:
+                fn, args = self._control_q.popleft()
+            except IndexError:
+                return
+            self.stats["control_jobs"] += 1
+            try:
+                fn(*args)
+            except Exception as e:  # noqa: BLE001
+                log.warning("control job %s failed: %s", getattr(fn, "__name__", fn), e)
+
     def _writer_loop(self) -> None:
         last_sent_at = 0.0
         while not self._stop.is_set():
@@ -698,6 +861,7 @@ class BridgeBackend(Backend):
             self._setstate_event.clear()
             if self._stop.is_set():
                 return
+            self._drain_control_q()
             with self._setstate_lock:
                 body = self._setstate_pending
                 self._setstate_pending = None
@@ -815,18 +979,59 @@ class BridgeBackend(Backend):
         self._out_ring.write(pcm)
 
     def read_audio_in(self, nbytes: int) -> bytes:
-        """Exactly `nbytes` of 2-channel interleaved s16le @48 kHz."""
+        """Exactly `nbytes` of 2-channel interleaved s16le @48 kHz.
+
+        Called once per isochronous IN packet from the asyncio server thread,
+        which owes the endpoint a 1 ms deadline: this is a memcpy plus at most
+        one 4-byte skew correction, and it never touches Bluetooth.
+        """
         self.stats["audio_in_bytes"] += nbytes
         if self.auto_arm and not self._mic_armed.is_set() and self.mic_always_on:
+            # Arming sleeps 20 ms twice inside hidapi — off the URB path it goes.
             self.arm_mic(True)
+
+        depth = len(self._mic_ring)
+        self._mic_depth_n += 1
+        self._mic_depth_sum += depth
+        self._mic_depth_min = min(self._mic_depth_min, depth)
+        self._mic_depth_max = max(self._mic_depth_max, depth)
+
         if not self._mic_primed:
-            if len(self._mic_ring) < MIC_PRIME_BYTES:
+            if depth < MIC_PRIME_BYTES:
                 return b"\0" * nbytes
             self._mic_primed = True
-        data = self._mic_ring.read_exact(nbytes)
-        if len(self._mic_ring) == 0:
+
+        pad = self._mic_depth_correction(depth)
+        before = self._mic_ring.underruns
+        data = self._mic_ring.read_exact(max(0, nbytes - pad))
+        if pad:
+            data = b"\0" * pad + data
+        if self._mic_ring.underruns != before:
+            # Genuinely dry: re-prime rather than dribble one packet at a time,
+            # which would turn one gap into a run of them.
+            self.stats["mic_underrun_calls"] += 1
+            self.stats["mic_reprimes"] += 1
             self._mic_primed = False
         return data
+
+    def _mic_depth_correction(self, depth: int) -> int:
+        """Steer the mic ring back towards MIC_PRIME_BYTES. Returns bytes to pad.
+
+        The controller's crystal and this PC's are independent (domain C vs U in
+        the module docstring), so this buffer really does drift — the only one in
+        the system that does. Authority is deliberately tiny: one 48 kHz frame
+        per call, which at 1000 calls/s is +/-2 % against a crystal error of
+        order 0.01 %. Inside [MIC_LOW, MIC_HIGH] nothing happens at all.
+        """
+        frame = USB_IN_FRAME_BYTES
+        if depth > MIC_HIGH_BYTES:
+            if self._mic_ring.drop_oldest(frame):
+                self.stats["mic_skew_drop_frames"] += 1
+            return 0
+        if depth < MIC_LOW_BYTES:
+            self.stats["mic_skew_pad_frames"] += 1
+            return frame
+        return 0
 
     # =====================================================================
     # additive hooks (see the Backend base class)
@@ -840,6 +1045,11 @@ class BridgeBackend(Backend):
         switches to alt 1 exactly when an application opens the endpoint, which
         makes this the correct trigger for arming the Bluetooth microphone —
         arming it earlier would drain a 10 %-battery controller for nothing.
+
+        Runs on the asyncio server thread. The Bluetooth half of arming (two
+        writes with a 20 ms settle between them) is posted to the writer thread
+        — blocking here would stall every endpoint, isochronous included, at
+        exactly the moment the host opens the stream.
         """
         if interface == D.IFACE_AUDIO_OUT:
             if alt:
@@ -856,6 +1066,11 @@ class BridgeBackend(Backend):
         The mapping is a heuristic (see `_uac_db_to_byte`): the emulator's UAC
         volume range is itself an assumed value, so this cannot be exact until
         the real wired controller is sniffed (risk R7).
+
+        Runs on the asyncio server thread, so the Bluetooth write is posted to
+        the writer thread rather than performed here (module docstring, last
+        paragraph). The SetState body is built here — it is pure arithmetic —
+        and only the `hid.write()` is deferred.
         """
         from .uac import FU_MUTE_CONTROL, FU_VOLUME_CONTROL
 
@@ -872,18 +1087,36 @@ class BridgeBackend(Backend):
                 st.speaker_volume(vol)
         elif unit == D.UNIT_FU_MIC:
             if selector == FU_MUTE_CONTROL:
-                self._arm_mic_now(self._mic_armed.is_set(), muted=bool(value))
+                self._defer(self._arm_mic_now, self._mic_armed.is_set(), bool(value))
                 return
             st.mic_volume(_uac_db_to_byte(value) if selector == FU_VOLUME_CONTROL else 0x08)
         else:
             return
-        self._write_raw(P.build_bt_setstate(bytes(st.body), self._next_bt_seq()))
+        self._defer(self._write_setstate_body, bytes(st.body))
+
+    def _defer(self, fn, *args) -> None:
+        """Post to the writer thread if it exists, else run inline (tests)."""
+        if self._threads:
+            self._post_control(fn, *args)
+        else:
+            fn(*args)
+
+    def _write_setstate_body(self, body: bytes) -> None:
+        self._write_raw(P.build_bt_setstate(body, self._next_bt_seq()))
 
     # =====================================================================
     # microphone arming
     # =====================================================================
 
     def arm_mic(self, on: bool, muted: bool = False) -> None:
+        """Arm/disarm the Bluetooth microphone. Safe to call from any thread.
+
+        The state flag flips immediately (so `_send_39` picks up `mic_enabled`
+        on its very next report) and the two blocking hidapi writes are posted
+        to the writer thread. When no threads are running — unit tests, or a
+        caller driving the backend by hand — the work is done inline so the
+        behaviour is unchanged.
+        """
         if on == self._mic_armed.is_set():
             return
         if on:
@@ -892,7 +1125,7 @@ class BridgeBackend(Backend):
             self._mic_armed.clear()
             self._mic_ring.clear()
             self._mic_primed = False
-        self._arm_mic_now(on, muted)
+        self._defer(self._arm_mic_now, on, muted)
 
     def _arm_mic_now(self, on: bool, muted: bool = False) -> None:
         """The Phase-1 arming pair: 0x31 mic-state then 0x32 mic-control."""
@@ -929,7 +1162,57 @@ class BridgeBackend(Backend):
             f"setstate in/sent/coalesced={s['setstate_in']}/{s['setstate_sent']}/"
             f"{s['setstate_coalesced']}  0x39={s['reports_39']} "
             f"(err {s['report_39_errors']}, underrun frames "
-            f"{s['audio_underrun_frames']})  audio_out={s['audio_out_bytes']}B "
+            f"{s['audio_underrun_frames']}, q-drop {s['audio_q_drop_frames']})  "
+            f"audio_out={s['audio_out_bytes']}B "
             f"audio_in={s['audio_in_bytes']}B  mic_ring_drop={self._mic_ring.dropped}B "
-            f"out_ring_drop={self._out_ring.dropped}B"
+            f"out_ring_drop={self._out_ring.dropped}B  "
+            f"mic skew pad/drop={s['mic_skew_pad_frames']}/{s['mic_skew_drop_frames']} "
+            f"underrun_calls={s['mic_underrun_calls']}"
         )
+
+    def clock_seam(self) -> dict:
+        """The U<->B and C->U clock-seam health, as JSON-able data.
+
+        This is the Phase 3c measurement: everything that says whether the two
+        clock domains stayed in step, and by how much they had to be corrected
+        when they did not. See the module docstring for what each domain is.
+        `ds5emu.__main__` renders this under `--stats-json` and at shutdown.
+        """
+        s = self.stats
+        n = max(1, self._mic_depth_n)
+        in_ms = 1000.0 / (USB_RATE * USB_IN_FRAME_BYTES)    # bytes -> ms, 2ch
+        out_ms = 1000.0 / (USB_RATE * USB_OUT_FRAME_BYTES)  # bytes -> ms, 4ch
+        seen = self._mic_depth_min <= self._mic_depth_max
+        return {
+            # -- U -> B: host speaker/haptics -> 0x39. One oscillator, so any
+            # movement here is phase (burst arrival), never rate.
+            "audio_q_depth_frames": self.audio_q_depth,
+            "audio_q_target_frames": AUDIO_Q_TARGET_FRAMES,
+            "audio_q_high_frames": AUDIO_Q_HIGH_FRAMES,
+            "audio_q_drop_frames": s["audio_q_drop_frames"],
+            "audio_underrun_frames": s["audio_underrun_frames"],
+            "out_ring_ms": round(len(self._out_ring) * out_ms, 3),
+            "out_ring_peak_ms": round(self._out_ring.peak * out_ms, 3),
+            "out_ring_cap_ms": AUDIO_OUT_RING_MS,
+            "out_ring_overflow_bytes": self._out_ring.dropped,
+            "reports_39": s["reports_39"],
+            "report_39_errors": s["report_39_errors"],
+            # -- C -> U: controller mic -> host. Independent oscillator; this
+            # is the one path where drift is real, so the governor is counted.
+            "mic_payloads": s["bt_mic"],
+            "mic_decode_errors": s["mic_decode_errors"],
+            "mic_depth_ms_mean": round(self._mic_depth_sum / n * in_ms, 3),
+            "mic_depth_ms_min": round((self._mic_depth_min if seen else 0) * in_ms, 3),
+            "mic_depth_ms_max": round(self._mic_depth_max * in_ms, 3),
+            "mic_depth_target_ms": MIC_PRIME_MS,
+            "mic_depth_band_ms": [MIC_LOW_MS, MIC_HIGH_MS],
+            "mic_skew_pad_frames": s["mic_skew_pad_frames"],
+            "mic_skew_drop_frames": s["mic_skew_drop_frames"],
+            "mic_underrun_calls": s["mic_underrun_calls"],
+            "mic_reprimes": s["mic_reprimes"],
+            "mic_ring_overflow_bytes": self._mic_ring.dropped,
+            # -- the URB path never blocks on Bluetooth: every job counted here
+            # is one that would otherwise have run on the asyncio thread.
+            "control_jobs": s["control_jobs"],
+            "control_jobs_dropped": s["control_jobs_dropped"],
+        }
