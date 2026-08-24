@@ -136,9 +136,11 @@ class DualSense:
         return self.write_raw(P.build_usb_setstate(bytes(st.body)))
 
     def send_report_36(self, opus: bytes, haptic: bytes, frame_counter: int,
-                       target: str = "speaker", volume: int = 0x4B) -> int:
+                       target: str = "speaker", volume: int = 0x4B,
+                       mic_active: bool = False) -> int:
         return self.write_raw(
-            P.build_report_36(opus, haptic, self._next_seq(), frame_counter, target, volume)
+            P.build_report_36(opus, haptic, self._next_seq(), frame_counter, target,
+                              volume, mic_active)
         )
 
     def send_report_39(self, opus2: tuple[bytes, bytes], hap2: tuple[bytes, bytes],

@@ -234,10 +234,19 @@ def build_report_36(
     frame_counter: int,
     target: str = "speaker",
     volume: int = 0x4B,
+    mic_active: bool = False,
 ) -> bytes:
     """398-byte BT audio+haptics report (report id included).
 
     Port of btAudioStream.ts:buildReportSix. Payload index = report offset - 1.
+
+    `mic_active` controls p[68], the low bit of the audio subpacket header that
+    the 0x32 mic-control report also carries (0xFF active / 0xFE inactive, see
+    microphoneProtocol.ts:buildBtMicControlReport report[3]). The tester hardcodes
+    0xFE, which silently tears down mic streaming the moment audio playback starts
+    -- verified on hardware here: mic payloads drop from ~105/s to 0 as soon as
+    0x36 reports with 0xFE begin. Pass mic_active=True for full duplex.
+    DS5Dongle expresses the same bit as pkt[4] 0x7F/0x7E in report 0x39.
     """
     p = bytearray(BT_OUT_36_PAYLOAD)
     p[0] = (seq & 0x0F) << 4  # seq high nibble, flags low nibble = 0
@@ -257,7 +266,7 @@ def build_report_36(
     # audio subpacket
     p[66] = 0x91
     p[67] = 0x07
-    p[68] = 0xFE
+    p[68] = 0xFF if mic_active else 0xFE
     p[69:74] = b"\x40" * 5
     p[74] = frame_counter & 0xFF
     p[75] = 0x96 if target == "headphone" else 0x93
