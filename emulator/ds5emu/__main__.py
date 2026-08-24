@@ -223,7 +223,8 @@ def cmd_serve(args) -> int:
         from .bridge import BridgeBackend
 
         backend = BridgeBackend(target=args.audio_target,
-                                mic_always_on=args.mic_always_on)
+                                mic_always_on=args.mic_always_on,
+                                serial=args.bt_serial)
         if args.record_out:
             backend = _wrap_recording(backend, args.record_out)
     elif args.record_out:
@@ -301,6 +302,12 @@ def main(argv=None) -> int:
                         "wired one (needs numpy/PyAV/hidapi and the controller)")
     s.add_argument("--audio-target", choices=("speaker", "headphone"),
                    default="speaker", help="bridge backend: where 0x39 audio goes")
+    s.add_argument("--bt-serial", default=None, metavar="BDADDR",
+                   help="bridge backend: pick the controller by BD address "
+                        "(e.g. d42f4ba1485d). STRONGLY RECOMMENDED once more "
+                        "than one controller has been paired -- a unit charging "
+                        "over USB still enumerates over Bluetooth as a stale "
+                        "entry, and index order is not stable across sessions")
     s.add_argument("--mic-always-on", action="store_true",
                    help="bridge backend: arm the microphone at start() instead of "
                         "waiting for the host to SET_INTERFACE alt 1")

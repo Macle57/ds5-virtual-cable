@@ -382,6 +382,7 @@ class BridgeBackend(Backend):
         transport: str = "BT",
         *,
         device_index: int = 0,
+        serial: str | None = None,
         target: str = "speaker",
         speaker_volume: int = 0x60,
         haptic_volume: int = 0xFF,
@@ -395,6 +396,14 @@ class BridgeBackend(Backend):
     ):
         self.transport = transport
         self.device_index = device_index
+        #: Pick the controller by BD address rather than by position. USE THIS
+        #: whenever more than one controller has ever been paired: a unit that
+        #: is charging over USB *still enumerates over Bluetooth* as a stale
+        #: entry whose feature reads fail, and `enumerate_devices()` orders by
+        #: path, so "first BT match" can hand you the wrong — or a dead —
+        #: controller. Observed on 2026-08-25 with `a0fa9c0dd8bb` (charging,
+        #: stale, feature read failed) sorting ahead of `d42f4ba1485d` (live).
+        self.serial = serial.lower() if serial else None
         self.target = target
         self.speaker_volume = speaker_volume
         self.haptic_volume = haptic_volume
@@ -544,8 +553,26 @@ class BridgeBackend(Backend):
 
     # -- device open / reopen ------------------------------------------------
 
+    def _pick_device(self):
+        """Choose the controller, by BD address when one was given.
+
+        Selecting by serial is not a nicety once two controllers have been
+        paired. A unit charging over USB keeps a *stale Bluetooth entry* whose
+        feature reads fail, and `enumerate_devices()` orders by path, so index 0
+        is not stable across sessions and can be the dead one.
+        """
+        if not self.serial:
+            return DEV.pick(self.transport, self.device_index)
+        want = self.serial
+        for d in DEV.enumerate_devices():
+            if d.transport == self.transport and (d.serial or "").lower() == want:
+                return d
+        seen = [(d.transport, d.serial) for d in DEV.enumerate_devices()]
+        raise RuntimeError(
+            f"no {self.transport} DualSense with serial {self.serial!r}; saw {seen}")
+
     def _open_device(self) -> None:
-        info = DEV.pick(self.transport, self.device_index)
+        info = self._pick_device()
         dev = DEV.DualSense(info)
         dev.open(flip_extended=False)
         if dev.is_bt:
