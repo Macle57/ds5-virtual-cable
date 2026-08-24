@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+target/
+build/
+*.wav
+*.log
