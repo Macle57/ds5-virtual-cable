@@ -104,10 +104,49 @@ def port_owner_pids(port: int) -> list[int]:
     return sorted(set(pids))
 
 
-def kill_pids(pids: list[int]) -> list[int]:
+#: Image names this program is willing to kill to reclaim its port. Anything
+#: else holding 3241 is somebody else's program and is none of our business.
+_KILLABLE = ("python.exe", "pythonw.exe", "python3.exe", "ds5bridge.exe",
+             "ds5bridge-tray.exe")
+
+
+def process_name(pid: int) -> str:
+    """Image name for a PID, or "" .
+
+    The image NAME, deliberately, not the command line. `Win32_Process.
+    CommandLine` comes back empty for some python processes -- the venv
+    launcher spawns a child whose command line the query cannot read -- which
+    is STATUS.md 17.8 trap 7 and the reason a command-line match must never be
+    load-bearing. The name is always there.
+    """
+    if sys.platform != "win32":
+        return ""
+    try:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                             capture_output=True, text=True, timeout=15,
+                             creationflags=_CREATE_NO_WINDOW).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+    line = out.strip().splitlines()[0] if out.strip() else ""
+    return line.split('","')[0].lstrip('"') if line.startswith('"') else ""
+
+
+def kill_pids(pids: list[int], log_fn=None) -> list[int]:
+    """Kill only processes that could plausibly be ours.
+
+    Reclaiming a port must never turn into killing a stranger's program because
+    it happened to bind 3241 first. If the holder is not one of ours, say so and
+    leave it alone -- the user can then decide.
+    """
     killed = []
     for pid in pids:
-        if pid <= 4 or pid == 0:
+        if pid <= 4:
+            continue
+        name = process_name(pid)
+        if name and name.lower() not in _KILLABLE:
+            if log_fn:
+                log_fn(f"REFUSING to kill PID {pid} ({name}) -- that is not "
+                       f"ds5bridge. Close it, or use --port to pick another port.")
             continue
         try:
             subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
@@ -142,8 +181,8 @@ def cleanup(port: int = DEFAULT_PORT, usbip_exe: str | None = None,
 
     pids = port_owner_pids(port)
     if pids:
-        log_fn(f"killing the process holding TCP {port}: {pids}")
-        kill_pids(pids)
+        log_fn(f"stopping the process holding TCP {port}: {pids}")
+        kill_pids(pids, log_fn=log_fn)
         time.sleep(0.7)
 
     if not port_free(port):
