@@ -112,6 +112,15 @@ def _wrap_recording(backend, path: str):
     return backend
 
 
+def _write_json(path: str, snap: dict) -> None:
+    """Atomically replace `path` with `snap`, so a reader never sees a partial
+    file while a run is in progress."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(snap, fh, indent=1)
+    os.replace(tmp, path)
+
+
 def _snapshot(server, backend) -> dict:
     """Everything experiment E1 needs, as plain JSON-able data.
 
@@ -245,12 +254,26 @@ def cmd_serve(args) -> int:
     async def snapshotter():
         while True:
             await asyncio.sleep(args.stats_every)
-            snap = _snapshot(server, backend)
+            # OFF THE EVENT LOOP, and the JSON write with it.
+            #
+            # `_snapshot` sorts every recorded URB gap and walks the histogram
+            # edges over the whole deque -- ~15 ms once the meter holds tens of
+            # thousands of records. Run on the asyncio thread that owes the
+            # isochronous endpoints a 1 ms service interval, that is 15
+            # consecutive intervals missed, and the frame clock resynchronises.
+            #
+            # Measured on 2026-08-25, and it is a lovely trap because the
+            # measurement manufactured exactly the fault it was there to report:
+            #
+            #   --stats-every 2   iso OUT resyncs 35, spaced EXACTLY 2 s apart
+            #   no snapshot       iso OUT resyncs 1, at stream start (E1's rule)
+            #
+            # The audio never suffered -- the buffers absorbed it -- but the
+            # underrun counter, which is the project's primary health metric,
+            # was reporting its own instrumentation.
+            snap = await asyncio.to_thread(_snapshot, server, backend)
             if args.stats_json:
-                tmp = args.stats_json + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(snap, fh, indent=1)
-                os.replace(tmp, args.stats_json)
+                await asyncio.to_thread(_write_json, args.stats_json, snap)
 
     async def main():
         await server.start()
@@ -270,10 +293,11 @@ def cmd_serve(args) -> int:
         except KeyboardInterrupt:
             pass
         finally:
+            # Shutdown: the loop is finished, so the cost no longer matters and
+            # this one runs inline. Written atomically like the periodic ones.
             snap = _snapshot(server, backend)
             if args.stats_json:
-                with open(args.stats_json, "w", encoding="utf-8") as fh:
-                    json.dump(snap, fh, indent=1)
+                _write_json(args.stats_json, snap)
             _print_report(snap)
     return 0
 
