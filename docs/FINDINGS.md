@@ -1,5 +1,14 @@
 # DualSense BT Protocol — Findings
 
+> **SUPERSEDED IN PARTS — read `STATUS.md` first.** Phase 0/1 hardware verification corrected three claims below and found two protocol bugs:
+> 1. Real wired DualSense USB HID polls at **4 ms / 250 Hz** (bInterval=6 @ high speed), not 1 ms — BT at ~476 Hz is the *faster* link.
+> 2. The real device has **no BOS descriptor / no MS OS string**; the MS OS 2.0 selective-suspend note was DS5Dongle's own addition, not Sony's.
+> 3. USB mic input terminal is **Headset (0x0402)**, not Microphone (0x0201).
+> 4. `0x36` byte `p[68]` is a **mic-active flag** — the tester's hardcoded `0xFE` kills mic streaming during playback; use `0xFF`-style active for full duplex.
+> 5. `0x39` `audio_buffer_length` (pkt[5..8]) must be in **[16,128]**; out-of-range values make the controller silently discard every report.
+>
+> `docs/usb-ground-truth.md` holds the real wired controller's verbatim descriptors — use it, not `fake_ds5.h`, as the emulation source of truth.
+
 Reverse-engineering notes extracted from two working implementations, both cloned as siblings of this repo:
 
 - `../dualsense-tester` — browser WebHID app; does **everything over BT** (input, rumble, HD haptics, adaptive triggers, LEDs, speaker/headphone audio, **and mic**). Key files:
