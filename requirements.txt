@@ -1,0 +1,18 @@
+# Runtime dependencies for the Bluetooth side (prototype/ds5bridge and
+# emulator/ds5emu/bridge.py).
+#
+# The USB/IP emulator itself -- emulator/ds5emu, everything except bridge.py --
+# needs NONE of these. It is standard library only, deliberately, which is why
+# 132 of the 173 unit tests run on a bare Python. See CONTRIBUTING.md.
+#
+#   python -m venv prototype\.venv
+#   prototype\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+hidapi>=0.14      # the `hid` module; talks to the controller
+numpy>=1.26       # audio buffer maths
+av>=13            # PyAV: Opus encode/decode + swresample, libopus bundled in
+                  # the Windows wheels. opuslib was rejected -- ships no DLL.
+
+# Dev/test only, not needed to run the bridge:
+#   sounddevice    WASAPI capture for prototype/tools/cross_mic_test.py and the
+#                  emulator/tools/e2e_* hardware harnesses
