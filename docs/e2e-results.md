@@ -662,3 +662,7 @@ system configuration           unchanged -- no driver installed, no service
 controllers                    d42f4ba1485d on Bluetooth at 80 %;
                                a0fa9c0dd8bb on the USB cable, charging
 ```
+
+## 6. Game validation — 2026-08-25 (user-run)
+
+**Spider-Man: Miles Morales (Sony PC port): PASS — user-reported "worked flawlessly, all DualSense features worked straight away."** The game detected the virtual device as a wired DualSense and enabled adaptive triggers, HD haptics, speaker and lightbar without any configuration. This settles open question R2 (identity): the missing `LocationPaths` and the `usbip2_ude` parent controller do NOT matter to Sony's PC SDK. The pipeline is validated end-to-end by the target workload.
