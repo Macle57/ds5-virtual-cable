@@ -1,5 +1,12 @@
 # emulator/ — user-mode USB/IP device emulator for a wired DualSense
 
+> **Just want to use it?** Go to `docs/USER-GUIDE.md` and `app/`. Since Phase 4a
+> the whole bring-up is one command — `ds5bridge` — which finds the controller,
+> serves this emulator in-process, runs `usbip attach`, supervises, and tears
+> everything down again on Ctrl+C, a closed window or a crash. The two-terminal
+> procedure below still works and is what you want when developing *this*
+> directory.
+
 Serves the **real** wired controller's descriptors (read off the physical device
 in Phase 0, `docs/usb-ground-truth.md`) over the USB/IP wire protocol, so that
 vadimgrn/usbip-win2's Microsoft-signed UDE driver can attach it as a local USB
@@ -14,7 +21,7 @@ machine with no driver present. Attaching for real needs usbip-win2 installed
 ```powershell
 cd D:\Codes\dualSense\ds5-virtual-usb\emulator
 
-# 102 protocol + timing tests, no driver, no hardware
+# 185 protocol / timing / translation tests, no driver, no hardware
 ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .
 
 # dump the descriptors we would serve
@@ -52,9 +59,10 @@ tests/
   test_server.py       12 tests: full client-server round trips over loopback TCP
   test_timing.py       22 tests: frame clock, iso pacing, and the 4 ms
                        interrupt IN gate the endpoint owns
-  test_translate.py    19 tests: BT<->USB report translation
-  test_bridge.py       41 tests: BridgeBackend internals + the clock seam
-                       (skipped without numpy/PyAV/hidapi)
+  test_translate.py    24 tests: BT<->USB report translation, incl. the
+                       neutral report served while the link is down
+  test_bridge.py       48 tests: BridgeBackend internals, the clock seam and
+                       the link-loss policy (skipped without numpy/PyAV/hidapi)
 ```
 
 The layering is deliberate: **everything protocol-shaped is a pure function**,
@@ -187,6 +195,37 @@ Measurement is built in:
 `endpoints.<ep>.resyncs` is the underrun counter (one at stream start is
 expected). `--record-out` dumps the received speaker stream as raw 4ch s16le
 48 kHz for offline FFT.
+
+## Phase 4a additions
+
+Two behaviours were added here for the product layer, both about a Bluetooth
+link that goes away mid-session (STATUS.md §17.6(6) had this as "implemented,
+never force-tested"):
+
+* **`bridge.py` notices a link that goes quiet, not only one that errors.**
+  `hid.read()` on a vanished device usually raises, and five raises trip the
+  reconnect path — but a link can also simply stop delivering, every read
+  timing out cleanly, in which case nothing ever trips. `LINK_DEAD_S` (4 s
+  without a control payload) is the watchdog.
+* **`translate.neutralize_usb01()` releases the controls while it is gone.**
+  `repeat_stale_input` is right in normal operation, but repeating forever
+  hands the game whatever was held when the link died. After `INPUT_NEUTRAL_S`
+  (1 s) the repeated report has sticks centred, buttons released, the d-pad at
+  8 (**not** 0 — a zero-filled report reads as UP held) and the touch points
+  lifted, while battery/headphone/mic status survive untouched. The virtual
+  device stays attached throughout, so a game sees somebody who stopped
+  playing rather than a controller being unplugged.
+
+`force_disconnect(hold_s=)` is the scriptable stand-in for a long PS-button
+press; `app/tools/reconnect_test.py` drives it. Measured: controls released
+1.00 s after the drop, link back 0.06 s after it becomes reopenable, 250
+reports/s throughout, and the game's HID handle never dies.
+
+`server.py`'s shutdown is also bounded now: `Server.wait_closed()` waits for
+every connection handler, and when the usbip driver detaches it *resets* the
+TCP connection, leaving the proactor transport's closed-future unresolved
+forever. Teardown used to hang until the caller's timeout (15 s); both waits are
+capped at 1 s and it now takes 2.1 s.
 
 ## What is NOT done
 
