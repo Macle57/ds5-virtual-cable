@@ -219,6 +219,90 @@ class EndpointOwnsTheHidInIntervalTests(unittest.TestCase):
             info = W.unpack_ret_submit(dev.handle_submit(cmd, b""))
             self.assertEqual(info["actual_length"], 64)
 
+    # -- the schedule must not absorb scheduling latency -------------------
+
+    def test_the_interval_advances_on_the_grid_not_from_delivery_time(self):
+        """The 12 % shortfall that `max(now, next) + period` produced.
+
+        Delivery is always a little late — the URB has to cross a socket and an
+        event loop. Advancing from *now* re-adds that lateness every cycle, so
+        the period becomes 4 ms + latency, forever. Measured on the live
+        driver: 220.2 reports/s against a nominal 250, with 10 % of gaps at
+        exactly 8 ms. Advancing from the previous scheduled instant instead
+        keeps the endpoint on a true 4 ms grid however late any one report was.
+        """
+        dev = DualSenseDevice(self._AlwaysReady())
+        period = 1.0 / dev.hid_in_hz
+        dev.handle_submit(self._in_urb(), b"")
+        scheduled = dev._next_hid_in_at
+
+        # deliver the next four reports each 1 ms "late", as a real event loop
+        # would, and check the grid has not drifted by a single period
+        for i in range(1, 5):
+            dev._next_hid_in_at = scheduled + (i - 1) * period   # interval open
+            time.sleep(0)                                        # (no real wait)
+            dev._hid_in_commit()
+            self.assertAlmostEqual(dev._next_hid_in_at, scheduled + i * period,
+                                   places=9)
+
+    def test_a_whole_missed_interval_still_resynchronises(self):
+        # Staying on the grid must not mean replaying a backlog after a stall:
+        # a real endpoint just NAKs until the next interval comes round.
+        dev = DualSenseDevice(self._AlwaysReady())
+        period = 1.0 / dev.hid_in_hz
+        dev._next_hid_in_at = time.perf_counter() - 10.0    # long stall
+        dev._hid_in_commit()
+        self.assertGreater(dev._next_hid_in_at, time.perf_counter())
+        self.assertLess(dev._next_hid_in_at, time.perf_counter() + 2 * period)
+
+    # -- the device tells the transport when to come back ------------------
+
+    def test_an_early_poll_reports_when_the_interval_opens(self):
+        dev = DualSenseDevice(self._AlwaysReady())
+        cmd = self._in_urb()
+        dev.handle_submit_ex(cmd, b"")                 # first report, opens grid
+        res = dev.handle_submit_ex(cmd, b"")           # same millisecond: early
+        self.assertEqual(W.unpack_ret_submit(res.reply)["actual_length"], 0)
+        self.assertIsNotNone(res.retry_at)
+        self.assertEqual(res.retry_at, dev._next_hid_in_at)
+        # and it is in the future, so the transport has something to sleep on
+        self.assertGreater(res.retry_at, time.perf_counter())
+
+    def test_an_empty_backend_gives_no_retry_time(self):
+        """`retry_at` means "the interval is closed", not "there is no data".
+
+        Nobody can say when a backend with nothing queued will have something,
+        so the transport must fall back to polling rather than sleep on a
+        number that means something else.
+        """
+        class _NeverReady(SyntheticBackend):
+            def read_input_report(self, max_len):
+                return None
+
+        dev = DualSenseDevice(_NeverReady())
+        res = dev.handle_submit_ex(self._in_urb(), b"")
+        self.assertEqual(W.unpack_ret_submit(res.reply)["actual_length"], 0)
+        self.assertIsNone(res.retry_at)
+
+    def test_a_delivered_report_carries_no_retry_time(self):
+        dev = DualSenseDevice(self._AlwaysReady())
+        res = dev.handle_submit_ex(self._in_urb(), b"")
+        self.assertEqual(W.unpack_ret_submit(res.reply)["actual_length"], 64)
+        self.assertIsNone(res.retry_at)
+        self.assertIsNone(res.deadline)
+
+    def test_interrupt_out_still_answers_immediately(self):
+        dev = DualSenseDevice(self._AlwaysReady())
+        cmd = W.CmdSubmit(
+            seqnum=2, devid=0, direction=W.DIR_OUT, ep=D.EP_HID_OUT,
+            transfer_flags=0, transfer_buffer_length=8, start_frame=0,
+            number_of_packets=-1, interval=6, setup=b"\0" * 8,
+        )
+        res = dev.handle_submit_ex(cmd, b"\x02" + b"\x00" * 7)
+        self.assertIsNone(res.deadline)
+        self.assertIsNone(res.retry_at)
+        self.assertEqual(dev.stats["hid_out"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
