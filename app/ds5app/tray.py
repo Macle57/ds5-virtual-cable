@@ -18,6 +18,7 @@ single file.
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -132,13 +133,37 @@ class TrayApp:
                 self._refresh_now()
         threading.Thread(target=work, name="tray-stop", daemon=True).start()
 
-    def _quit(self, *_):
+    def _shutdown_icon(self) -> None:
+        """Break the message loop. Safe from any thread and safe twice.
+
+        Followed by a hard-exit watchdog, which is not paranoia: measured
+        2026-08-25 on the FROZEN tray, a Ctrl+Break tore the bridge down
+        correctly (the virtual device really did detach) and the process then
+        stayed alive with a dead bridge and a stale icon. A windowed build has
+        no console, the signal never becomes a `KeyboardInterrupt` the message
+        loop can see, and something in the GUI stack keeps a thread alive. By
+        the time this fires the teardown has already completed and been
+        verified, so there is nothing left to lose by leaving abruptly -- and a
+        tray icon that will not go away is a genuinely bad user experience.
+        """
         self._stop.set()
+        if self.icon is not None:
+            try:
+                self.icon.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _hard_exit():
+            time.sleep(3.0)
+            os._exit(0)
+
+        threading.Thread(target=_hard_exit, name="tray-exit", daemon=True).start()
+
+    def _quit(self, *_):
         try:
             self.svc.stop()
         finally:
-            if self.icon is not None:
-                self.icon.stop()
+            self._shutdown_icon()
 
     def _copy_status(self, *_):
         # No clipboard dependency: printing to the console the tray was
@@ -209,6 +234,13 @@ class TrayApp:
         self.icon = pystray.Icon(
             "ds5bridge", _icon_image(COLORS[S.STOPPED], None),
             "ds5bridge -- stopped", menu=self._menu(self.svc.snapshot()))
+        # Ctrl+Break, SIGTERM, logoff and shutdown all reach `_teardown_all`,
+        # which stops the bridge correctly -- but the `raise KeyboardInterrupt`
+        # that ends the CLI does not escape pystray's Win32 GetMessage loop, so
+        # without this the tray tears down and then lives on as a process with a
+        # dead bridge and a stale icon. Measured 2026-08-25: CTRL_BREAK detached
+        # the device and the process never exited.
+        S.ON_TEARDOWN.append(self._shutdown_icon)
         threading.Thread(target=self._poll, name="tray-poll", daemon=True).start()
         if getattr(self.args, "autostart", False):
             self._start()
