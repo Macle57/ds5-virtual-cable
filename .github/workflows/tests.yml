@@ -1,0 +1,78 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  # The point of this job: prove that the USB/IP protocol, the descriptors, the
+  # device state machine and the frame clock are testable on a machine with
+  # NOTHING installed -- no driver, no controller, no pip packages. That
+  # property is a design constraint of emulator/ds5emu, not a happy accident,
+  # and this job is what stops it eroding.
+  #
+  # 132 of the 173 tests run here. The other 41 cover BridgeBackend and skip
+  # without numpy/PyAV/hidapi -- they still need no hardware, and the
+  # with-deps job below runs them. Nothing in either job needs a driver or a
+  # controller, and neither installs one.
+  stdlib-only:
+    name: emulator (stdlib only, py${{ matrix.python }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Show that nothing is installed
+        run: python -m pip list
+
+      - name: Unit tests
+        working-directory: emulator
+        run: python -m unittest discover -s tests -t . -v
+
+      # A third-party import that creeps into wire.py / device.py / timing.py
+      # fails nothing on a developer machine with the venv active. It only
+      # breaks later, on someone else's bare Python. Check it directly.
+      - name: ds5emu must import stdlib only
+        working-directory: emulator
+        run: python tools/check_stdlib_only.py
+
+  # The same suite with the packages the Bluetooth side needs, so the 41
+  # BridgeBackend tests actually execute. Still no hardware: they exercise the
+  # ring buffers, the rate arithmetic and the clock-domain seam against fakes.
+  with-deps:
+    name: emulator + bridge (numpy / PyAV / hidapi)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime dependencies
+        run: python -m pip install --upgrade pip hidapi numpy av
+
+      - name: Unit tests (nothing should skip)
+        working-directory: emulator
+        run: python -m unittest discover -s tests -t . -v
+
+      # The live harnesses cannot be run without a controller, but they can at
+      # least be kept syntactically valid.
+      - name: Byte-compile the hardware harnesses
+        run: python -m compileall -q emulator/tools prototype/ds5bridge prototype/tools

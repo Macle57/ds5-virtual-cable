@@ -1,0 +1,64 @@
+name: Bug report
+description: Something does not work the way it should
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Two things first, because they account for most reports:**
+
+        1. **Check the controller's battery.** A dying DualSense drops reports,
+           times out and stops streaming audio — indistinguishable from a real
+           bug. Charge it and try again before filing.
+        2. **If more than one controller has been paired**, pass
+           `--bt-serial <bdaddr>`. A controller charging over USB still shows up
+           over Bluetooth as a stale entry that can sort first, and the emulator
+           will happily claim the wrong one.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: The controller battery was above ~30% and I checked it
+          required: true
+        - label: I selected the controller explicitly with `--bt-serial`, or only one is paired
+          required: true
+        - label: This is not a usbip-win2 driver install or bugcheck problem (those go upstream)
+          required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Exact commands you ran
+      description: Including the `ds5emu serve` line and the `usbip.exe attach` line.
+      render: powershell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Emulator output
+      description: >-
+        Paste the console output, including the `opened BT serial=...` line.
+        If you have a `--stats-json` file, attach it — `endpoints.<ep>.resyncs`
+        is the underrun counter and is usually the answer.
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Windows version, usbip-win2 version, Python version
+      placeholder: "Windows 11 26200, usbip-win2 0.9.7.7, Python 3.12.5"
+    validations:
+      required: true
+  - type: input
+    id: tests
+    attributes:
+      label: Does the unit test suite pass?
+      description: "`cd emulator; python -m unittest discover -s tests -t .`"
+      placeholder: "173 tests, OK (skipped=41)"

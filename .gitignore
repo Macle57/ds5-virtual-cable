@@ -1,9 +1,29 @@
+# Python
 __pycache__/
 *.pyc
-.venv/
-target/
-build/
-*.wav
-*.log
-prototype/.venv/
 *.egg-info/
+.venv/
+prototype/.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build output
+build/
+dist/
+target/
+
+# Editors
+.vscode/
+.idea/
+
+# Test signals and captures. `samples/*.wav` is deliberately not committed:
+# regenerate it with `python -m ds5bridge gen-wav ../samples/test-sweep.wav`,
+# which is deterministic, so nothing is lost.
+*.wav
+*.raw
+*.log
+
+# Emulator run artefacts
+stats*.json
+ds5*_stats.json

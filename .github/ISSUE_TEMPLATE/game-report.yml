@@ -1,0 +1,67 @@
+name: Game report
+description: Tell us whether a game works. This is the single most useful report right now.
+title: "[Game] "
+labels: ["game-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Exactly one game has ever been tested. Whether it worked or not, this
+        helps — a failure is as useful as a success, often more.
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      placeholder: "Marvel's Spider-Man: Miles Morales (Steam)"
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Overall result
+      options:
+        - Works — detected as a wired controller
+        - Partly works — see below
+        - Does not detect the controller at all
+        - Crashes or hangs
+    validations:
+      required: true
+  - type: checkboxes
+    id: features
+    attributes:
+      label: Which features worked?
+      description: Tick what you actually observed. Leave the rest blank.
+      options:
+        - label: Buttons, sticks and triggers
+        - label: Adaptive triggers (resistance you can feel)
+        - label: HD haptics (texture, not just rumble)
+        - label: Controller speaker
+        - label: Headphone jack on the controller
+        - label: Controller microphone
+        - label: Lightbar / player LEDs
+        - label: Gyro / motion
+        - label: Touchpad
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: >-
+        Anything unexpected — audio crackle, input that lags or sticks, features
+        that appear then stop, a controller that disconnects.
+    validations:
+      required: true
+  - type: input
+    id: battery
+    attributes:
+      label: Controller battery level during the test
+      description: Please check. A low battery mimics almost every bug there is.
+      placeholder: "about 80%"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Windows version, usbip-win2 version, Python version
+      placeholder: "Windows 11 26200, usbip-win2 0.9.7.7, Python 3.12.5"
+    validations:
+      required: true
