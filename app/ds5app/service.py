@@ -135,7 +135,7 @@ def cleanup(port: int = DEFAULT_PORT, usbip_exe: str | None = None,
     log_fn("stopping the auto-re-attach ...")
     u.stop_auto_reattach()
 
-    ports = u.attached_ports()
+    ports = u.our_ports()
     for p in ports:
         log_fn(f"detaching port {p} ...")
         u.detach(p)
@@ -150,7 +150,7 @@ def cleanup(port: int = DEFAULT_PORT, usbip_exe: str | None = None,
         log_fn(f"WARNING: TCP {port} is still held by {port_owner_pids(port)}")
         ok = False
     if not u.is_clean():
-        log_fn(f"WARNING: usbip still reports attached ports {u.attached_ports()}")
+        log_fn(f"WARNING: usbip still reports attached ports {u.our_ports()}")
         ok = False
     if ok:
         log_fn("clean: nothing attached, port free")
@@ -367,7 +367,7 @@ class BridgeService:
         # of the machine reveals this beforehand, so it is not conditional.
         self.usbip.stop_auto_reattach()
 
-        stale_ports = self.usbip.attached_ports()
+        stale_ports = self.usbip.our_ports()
         busy = not port_free(self.port)
         if stale_ports or busy:
             what = []
@@ -412,7 +412,7 @@ class BridgeService:
         # 7. verify -- `usbip port` prints nothing at all when nothing is attached
         ports: list[int] = []
         for _ in range(20):
-            ports = self.usbip.attached_ports()
+            ports = self.usbip.our_ports()
             if ports:
                 break
             time.sleep(0.25)
@@ -575,7 +575,7 @@ class BridgeService:
     @staticmethod
     def _safe_ports(u: Usbip) -> list[int]:
         try:
-            return u.attached_ports()
+            return u.our_ports()
         except Exception:  # noqa: BLE001
             return []
 

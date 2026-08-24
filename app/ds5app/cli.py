@@ -83,7 +83,7 @@ def cmd_doctor(args) -> int:
         print(str(e))
         return 1
 
-    ports = u.attached_ports()
+    ports = u.our_ports()
     if ports:
         print(f"[warn] something is already attached on port(s) {ports} -- "
               f"run `ds5bridge cleanup`")

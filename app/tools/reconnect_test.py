@@ -194,7 +194,7 @@ def main() -> int:
 
             # 1. the virtual device must NOT go away
             time.sleep(1.0)
-            ports = u.attached_ports()
+            ports = u.our_ports()
             check(f"cycle {cycle}: still attached through the drop", len(ports) == 1,
                   f"ports={ports}")
 
