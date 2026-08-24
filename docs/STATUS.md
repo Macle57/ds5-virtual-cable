@@ -609,3 +609,340 @@ full-duplex a wired DualSense always does) and #3 (never spin on a bare `pass`).
 5. Whether the emulated HID input path needs to *generate* anything CRC-like.
    USB HID reports carry no CRC — that is a Bluetooth-transport concern — so
    probably not, but it is untested. (R6, and §13 question 1.)
+
+---
+
+<!-- ===================== BEGIN PHASE 3b SECTION ===================== -->
+<!-- Owned by the Phase 3b agent (BridgeBackend). Self-contained on purpose:
+     it is safe to merge this whole block without reading anything above. -->
+
+# 15. PHASE 3b HANDOFF — `BridgeBackend`, the live Bluetooth seam
+
+Written for an agent with no context but this repository. This section covers
+**only** `BridgeBackend` and what it took to make it real. It touched no
+driver, no service, no `usbip.exe`, and never the wired controller — those
+belonged to the concurrent Phase 3a agent.
+
+## 15.1 One-line status
+
+`BridgeBackend` **is implemented and verified on hardware.** All four pipes run
+full duplex at once: input, SetState, speaker+haptics out, microphone in. The
+`NotImplementedError` stub is gone. 132 unit tests pass; four live harnesses
+pass against a real Bluetooth DualSense.
+
+## 15.2 Hardware used, and a warning about it
+
+| | |
+|---|---|
+| controller | Bluetooth DualSense, BD address **`d42f4ba1485d`** |
+| firmware (feature 0x20) | `Sep 18 2025 13:15:28` |
+| battery during the verified runs | **90 % / discharging**, unchanged start to finish |
+| BT input rate, steady state | **483.0 Hz** |
+
+**The controllers were physically swapped mid-phase.** The unit §3 calls "the
+Bluetooth unit" (`a0fa9c0dd8bb`, 10 % battery) died and was replaced by
+`d42f4ba1485d`, which §3 lists as merely *paired*. Every number in §15.5 is
+from the **new** unit unless it says otherwise.
+
+Two things follow, and they cost real time:
+
+1. **A dying controller mimics protocol bugs.** The first session's tail looked
+   like dropped reports and timeouts; it was a flat battery. Read the battery
+   level out of the input report the moment you claim the device, log it, and
+   re-read it whenever behaviour turns strange. §3's warning was right and is
+   worth repeating louder.
+2. **Never cache a HID path or serial across sessions.** Both changed. Always
+   re-enumerate through `ds5bridge.device.enumerate_devices()`.
+
+## 15.3 What was built
+
+```
+emulator/ds5emu/
+  _bootstrap.py   puts <repo>/prototype on sys.path, once, so emulator/ can
+                  IMPORT Phase-1 code instead of copy-pasting it
+  translate.py    pure BT<->USB report translation, stdlib only
+  bridge.py       BridgeBackend: 3 threads, 4 ring buffers, the rate conversions
+  backend.py      MODIFIED: 3 additive hooks; BridgeBackend re-exported lazily
+  device.py       MODIFIED: calls the 3 new hooks
+emulator/tests/
+  test_translate.py  19 tests, no hardware, no third-party packages
+  test_bridge.py     22 tests, no hardware, needs numpy/PyAV (skipped if absent)
+emulator/tools/
+  bridge_input_soak.py      live test (a)
+  bridge_setstate_test.py   live test (b)
+  bridge_audio_loopback.py  live tests (c) + (d)
+  bridge_e2e.py             live test (e): all four pipes through the real USB
+                            request path (handle_submit), not the backend API
+```
+
+### The input translation is one fact, not an offset table
+
+`ds5bridge.protocol.Offsets` is constructed with `n = 0` for USB and `n = 1`
+for BT, so **every** field in the BT `0x31` payload sits exactly one byte later
+than the same field in the USB `0x01` body. The translation is therefore a
+single slice:
+
+```
+usb_body[0:63] == bt_payload[1:64]
+```
+
+`translate.py` implements exactly that and asserts the invariant at import.
+The tests then check it *field by field* by running `protocol.decode_input()`
+over both shapes, rather than against a hand-copied table that could drift.
+What the BT report has and USB does not — payload bytes 64..72 plus the 4-byte
+CRC32 at 73..76 — is Bluetooth transport and is dropped. What USB has that BT
+does not: nothing. The USB body's last 8 bytes are the AES-CMAC field, which
+lands at BT payload 56..63 and copies through verbatim.
+
+Output is even simpler. The USB `0x02` body and the BT `0x31` SetState body are
+the *same 47 bytes*, so `usb02_to_bt31()` is unwrap-then-rewrap, and a unit test
+asserts it is byte-identical to `protocol.build_bt_setstate()` — the builder
+Phase 1 already proved on hardware.
+
+### Threading
+
+| thread | job |
+|---|---|
+| `ds5-bt-reader` | `hid.read()` loop. Translates control payloads, decodes 71 B mic Opus frames. `hid.read()` releases the GIL. |
+| `ds5-audio-pump` | clock-driven `ds5bridge.pacing.Pacer` at **46.875 reports/s**; resample, Opus-encode, pack `0x39`, write. |
+| `ds5-setstate` | coalescing SetState writer. |
+
+The asyncio server thread only ever touches lock-guarded byte rings, so
+`write_audio_out`, `read_audio_in` and `read_input_report` are O(n) memcpy and
+can never block on Bluetooth.
+
+### The rate arithmetic is exact — no drift, no accumulator
+
+```
+one 0x39 report = 2 frames = 21.3333 ms
+                = 1024 samples of 48 kHz USB audio
+                =  960 samples at 45 kHz  (48000/45000 = 16/15)
+                =   64 samples at 3 kHz per haptic channel (48000/3000 = 16)
+```
+
+Both ratios are integer, so a 1024-sample USB block maps onto exactly one `0x39`
+report with nothing left over. `tests/test_bridge.py` asserts this.
+
+The 48 kHz → 3 kHz haptic path is a **stateful** `av.AudioResampler`, not
+sample picking. Decimating by 16 needs a real anti-alias filter with memory
+across blocks, or everything above 1.5 kHz folds straight back into the audible
+haptic band.
+
+## 15.4 Interface changes to the `Backend` contract
+
+**All additive.** Nothing that already existed changed shape, so Phase 3a work
+against this contract is unaffected.
+
+| addition | default | why |
+|---|---|---|
+| `latest_input_report(max_len)` | delegates to `read_input_report` | control `GET_REPORT(INPUT)` must read state without consuming freshness; only the interrupt endpoint has "nothing new" semantics |
+| `set_alt_setting(interface, alt)` | no-op | `SET_INTERFACE` alt 1 on a UAC1 streaming interface is the host actually opening the stream — the correct moment to arm the Bluetooth mic, and not a moment earlier on a battery-powered device |
+| `on_uac_control(unit, selector, value)` | no-op | a UAC1 `SET_CUR` on a feature unit (mute/volume) mirrored onto the DualSense |
+
+`device.py` now calls all three. `SyntheticBackend` records them
+(`alt_settings`, `uac_controls`), so they are testable.
+
+**One structural change worth knowing:** `BridgeBackend` now *lives* in
+`ds5emu/bridge.py` and `backend.py` re-exports it through a module-level
+`__getattr__`. `from .backend import BridgeBackend` and
+`backend.BridgeBackend` both still work. The reason is that `bridge.py` needs
+numpy + PyAV + hidapi and `backend.py` deliberately needs none, which is what
+keeps the stdlib-only unit tests importable on a bare Python.
+
+## 15.5 What is VERIFIED ON HARDWARE — with numbers
+
+All runs below: BT unit `d42f4ba1485d`, battery 90 %, no driver attached.
+
+### (a) Input pipe soak — `tools/bridge_input_soak.py --seconds 15`
+
+| measure | result |
+|---|---|
+| polls at the real 250 Hz USB cadence | 3749 = **249.93/s** |
+| reports delivered | 3749 = **249.93/s**, zero `None` |
+| inter-report gap | median **4.000 ms**, p99 **4.025 ms**, max 5.086 ms |
+| **field parity vs the Phase-1 decoder** | **3749/3749 exact** |
+| device sequence byte | **0 discontinuities** |
+| BT control reports consumed | 5853 |
+
+The parity check is the load-bearing part: every report handed to the USB side
+is re-decoded in its USB form and compared field by field against the Phase-1
+decode of the *Bluetooth payload it came from*, live. A translation regression
+fails the run.
+
+### (b) SetState passthrough — `tools/bridge_setstate_test.py --crc-negative`
+
+The Phase-1 §5.4 trigger-status oracle, re-run through `write_output_report()`
+so the whole USB-shaped path is under test:
+
+| sent as USB report `0x02` | observed `(at_status0, at_status1, at_status2)` | Phase 1 expected |
+|---|---|---|
+| triggers off (`0x05`) | `(9, 9, 0)` | `(9, 9, 0)` |
+| `0x21` feedback | `(16, 16, 17)` | `(16, 16, 17)` |
+| `0x26` vibration | `(1, 1, 51)` | `(1, 1, 51)` |
+| `0x05` off | `(9, 9, 0)` | `(9, 9, 0)` |
+| **`0x21` with one CRC bit flipped** | **`(9, 9, 0)` — ignored** | ignored |
+| same `0x21`, CRC intact | `(16, 16, 17)` | `(16, 16, 17)` |
+
+So the CRC32 this backend generates is genuinely being validated by the
+controller, not merely tolerated.
+
+### (c) + (d) Audio out and microphone in, simultaneously — `tools/bridge_audio_loopback.py`
+
+Driven at the real 1 ms isochronous cadence: 384 B of 4-channel/48 kHz/s16 into
+`write_audio_out()` and 192 B out of `read_audio_in()` per millisecond, exactly
+what `device._iso_out` / `._iso_in` do per packet. Judged by FFT of what
+`read_audio_in()` serves — i.e. the controller's own microphone, heard through
+the emulated USB capture endpoint. 3 s baseline + 3 s playing, each mode.
+
+| mode | ch0/1 band @1500 Hz | ch2/3 band @250 Hz | loudest bin |
+|---|---|---|---|
+| both driven | **+65.4 dB** | **+32.7 dB** | 1500.0 Hz |
+| speaker only | **+68.9 dB** | +1.6 dB *(not driven)* | 1500.0 Hz |
+| haptics only | +11.6 dB *(not driven)* | **+38.5 dB** | 250.1 Hz |
+
+The two single-channel rows are the **channel-mapping proof**. In `--mode
+haptics` the Opus stream carries literal digital silence, so the 250 Hz peak can
+only be the voice coils; and the 1500 Hz band moves +1.6 dB when only the
+speaker pair is silent. USB ch0/1 → speaker and ch2/3 → haptics is confirmed,
+not assumed. The test is frequency-selective — it only passes if energy rises at
+the exact frequency commanded — so room noise cannot fake it.
+
+Transport health during those runs: `0x39` at **46.00/s** (target 46.88),
+**0 write errors**, **0 underrun frames**, and **300 mic payloads in 3 s =
+100.0/s** arriving *while playing*.
+
+That last number is the live proof of gotcha #1: the mic-active flag in `0x39`
+`pkt[4]` is being set to `0x7F`. With `0x7E` the controller stops sending mic
+payloads the instant playback starts and this test reports zero samples.
+
+### (e) All four pipes through the real USB request path — `tools/bridge_e2e.py --seconds 6`
+
+Not the backend API — hand-built `USBIP_CMD_SUBMIT` frames through
+`DualSenseDevice.handle_submit()`, so the isochronous packing rules are
+exercised too. Only the TCP socket and usbip-win2's kernel client separate this
+from a real attach.
+
+| measure | result |
+|---|---|
+| enumeration | device/config/HID-report descriptors byte-exact; feature `0x05` 41 B, `0x20` = `Sep 18 202513:15:28`, **both read live off the controller** |
+| iso OUT | 750 URBs = **1000 packets/s**, **0 offset-echo errors** |
+| iso IN | 750 URBs, **0 compaction errors**, **0 short packets** (every packet a full 192 B) |
+| interrupt IN | 1499 = **249.8/s**, **0 empty**, **0 sequence discontinuities** |
+| interrupt OUT (SetState) | 12, all delivered |
+| mic during playback | 599 = **99.8/s** |
+| `0x39` | 279 = 46.5/s, 0 errors, 0 underrun frames |
+| device stats | `control 8, hid_in 2998, hid_out 24, iso_out 6000, iso_in 12000, stalled 0` |
+| FFT | speaker **+65.2 dB**, haptics **+33.6 dB**, loudest bin 1500.0 Hz |
+
+## 15.6 New empirical gotchas — these cost time
+
+Numbered continuing from §8.
+
+9. **A 1 ms pure-Python pacing loop starves the Bluetooth reader thread.**
+   `Pacer.sleep_until_next()` at `frame_ms = 1.0` never sleeps — the delta is
+   always under its 1.5 ms threshold — so it spends the entire millisecond in
+   the `time.sleep(0)` spin. Measured, in `bridge_e2e.py`: microphone payloads
+   fell to **52.7/s** with a 1 ms tick and recovered to **99.8/s** at a 4 ms
+   tick, with BT read errors appearing only in the 1 ms case. This is §8 gotcha
+   #3 seen from the other side: `sleep(0)` releases the GIL, but releasing it
+   100 000 times a second is its own denial of service. Pace host emulation at
+   the endpoint's real `bInterval` (4 ms) and batch isochronous URBs (8 packets
+   = 8 ms), which is what Windows does anyway.
+
+10. **Bluetooth delivery is bursty, so "only forward new reports" cannot hit
+    250 Hz.** With strict new-data-only semantics the emulated interrupt IN
+    endpoint delivered **191.9/s**, 23 % of polls found nothing, and gaps
+    reached 20 ms. A real wired DualSense emits a report every 4 ms whether or
+    not anything moved, so `BridgeBackend` repeats the current state when a poll
+    lands inside a burst gap (`repeat_stale_input`, default on). Result:
+    **249.93/s, p99 gap 4.025 ms, 0 empty polls**. About **32 %** of reports are
+    repeats — that is the Bluetooth burst structure, not a bug.
+
+11. **The BT input rate reads low for the first seconds after connect.** The
+    same unit measured 331 Hz, then 390 Hz, then a steady **483 Hz**. Do not
+    conclude anything about link health from a short measurement taken right
+    after `open()` or right after the extended-mode flip.
+
+12. **The device sequence byte has to be renumbered.** Bluetooth runs ~483 Hz
+    and the USB host polls 250 Hz, so passing the controller's own sequence byte
+    through would make it jump by 2 and stall on repeats. `BridgeBackend`
+    renumbers it to increment by exactly one per delivered report
+    (`renumber_input_seq`, default on) — verified: 0 discontinuities over 3749
+    reports, and over 1499 more in the e2e run.
+
+13. **The mic ring overflows whenever nothing is draining it.** Harmless — it
+    drops the oldest bytes by design — but `mic_ring_drop` will be non-zero
+    after any pause between capture passes. Do not read it as a fault.
+
+## 15.7 Design decisions specific to this phase
+
+- **Report `0x39`, not `0x36`.** Two frames per report halves the report rate
+  (46.875/s vs 93.75/s) for the same audio, which matters because the same
+  Bluetooth link is simultaneously carrying ~483 Hz of input and ~100 Hz of mic
+  payloads. `audio_buffer_length = 48`, inside the mandatory [16, 128].
+- **SetState is coalesced, not forwarded verbatim at 250 Hz.** Windows re-sends
+  an unchanged SetState at the full HID rate; forwarding all of it would burn
+  Bluetooth airtime the audio stream needs, and the controller would apply
+  identical bytes. Identical bodies are dropped and there is a 6 ms floor
+  between writes. In the e2e run: 24 in, 24 sent (all genuinely different); in
+  the SetState test, 7 in / 6 sent / 1 coalesced.
+- **Pure passthrough of the SetState body.** The controller applies a field only
+  when its valid-flag bit is set, so wrapping the host's bytes verbatim cannot
+  clobber state the host did not ask to change. The backend's own priming
+  SetState sets only the audio valid-flag bits.
+- **Feature *writes* are recorded and never forwarded.** Feature writes are how
+  a DualSense is re-paired (`0x09`) and how its firmware is touched. Nothing
+  here needs one, so a stray host-issued write must not reach the physical
+  controller. Feature *reads* are served from a cache primed at `start()`
+  (`0x05` calibration, `0x20` firmware info — the two Phase 1 proved safe).
+
+## 15.8 Known gaps — be honest about these
+
+1. **Never attached through usbip.** Everything above is the emulator's own
+   request path in-process. The `usbip.exe attach` half was Phase 3a's and is
+   not covered by any evidence here. Experiment E1 (isochronous timing under the
+   real driver, risk R1) remains the go/no-go.
+2. **Feature reports other than `0x05` and `0x20` STALL.** `get_feature_report`
+   counts the misses in `feature_misses`, so a future run can see exactly which
+   ids a real host asks for and extend the prefetch list. Nothing is read
+   lazily, because a blocking feature read from the request path would stall
+   isochronous traffic.
+3. **`on_uac_control`'s volume mapping is a heuristic** (`_uac_db_to_byte`:
+   amplitude = 10^(dB/20), scaled). It cannot be better than `uac.py`'s
+   MIN/MAX/RES, which are themselves assumed values — risk R7. Untested against
+   a real host mixer.
+4. **Headphone routing is still unverified** (§6 carries over). `target` is
+   settable but nothing was plugged into the 3.5 mm jack.
+5. **Reconnect is implemented but only lightly exercised.** The reader thread
+   reopens the device with 2 s backoff and re-arms the mic; a real
+   disconnect/reconnect cycle was not forced.
+6. **`--transport USB` is accepted but pointless.** `0x36`/`0x39` are Bluetooth
+   reports; `BridgeBackend` is a BT-side adapter by construction.
+7. **Long-run stability beyond ~30 s per test was not measured.** The longest
+   single run here was 15 s of input soak and 2 × 6 s of full duplex.
+
+## 15.9 How to re-run everything
+
+```powershell
+# unit tests -- no hardware, no driver, ~1.3 s, 132 tests
+cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .
+
+# live, needs the Bluetooth controller (and only it)
+..\prototype\.venv\Scripts\python.exe tools\bridge_input_soak.py --seconds 15 --print-hz 0
+..\prototype\.venv\Scripts\python.exe tools\bridge_setstate_test.py --crc-negative
+..\prototype\.venv\Scripts\python.exe tools\bridge_audio_loopback.py --mode both
+..\prototype\.venv\Scripts\python.exe tools\bridge_audio_loopback.py --mode speaker
+..\prototype\.venv\Scripts\python.exe tools\bridge_audio_loopback.py --mode haptics
+..\prototype\.venv\Scripts\python.exe tools\bridge_e2e.py --seconds 6
+```
+
+Each live tool prints `RESULT: PASS` or `FAIL` and exits accordingly, so they
+chain in CI style. Check the battery line first if anything fails.
+
+To serve the real backend over USB/IP instead of the synthetic one, construct
+`UsbIpServer(BridgeBackend())`. `ds5emu/__main__.py`'s `serve` command still
+defaults to `SyntheticBackend`, deliberately, because experiment E1 wants the
+hardware-free one.
+
+<!-- ====================== END PHASE 3b SECTION ====================== -->
