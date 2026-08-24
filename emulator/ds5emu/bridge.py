@@ -454,6 +454,8 @@ class BridgeBackend(Backend):
 
         self._dev: DEV.DualSense | None = None
         self._dev_lock = threading.Lock()
+        #: Set by `force_disconnect(hold_s=...)`; always 0 in production.
+        self._reconnect_blocked_until = 0.0
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -568,8 +570,17 @@ class BridgeBackend(Backend):
     def stop(self) -> None:
         self._stop.set()
         self._setstate_event.set()
+        # ONE shared deadline, not one per thread. `for t: t.join(timeout=3)`
+        # is a 9 s worst case, and shutdown runs on the caller's thread -- which
+        # for the packaged app is the one holding up the whole exit. All three
+        # threads check `_stop` on the same tick, so they finish together and
+        # the deadline is only ever reached when something is genuinely wedged.
+        deadline = time.monotonic() + 3.0
         for t in self._threads:
-            t.join(timeout=3.0)
+            t.join(timeout=max(0.05, deadline - time.monotonic()))
+        stuck = [t.name for t in self._threads if t.is_alive()]
+        if stuck:
+            log.warning("threads still running after stop(): %s", stuck)
         self._threads.clear()
         self._disarm_mic_best_effort()
         with self._dev_lock:
@@ -676,14 +687,22 @@ class BridgeBackend(Backend):
                         "and will report a neutral controller until it returns")
         self.connected.clear()
 
-    def force_disconnect(self) -> None:
+    def force_disconnect(self, hold_s: float = 0.0) -> None:
         """Simulate a link loss. TEST HOOK — closes the HID handle underneath
         the reader thread, which is the closest scriptable analogue of the
         controller being switched off (a long PS-button press is not
         scriptable). The next `hid.read()` raises, the reconnect path runs, and
         everything downstream sees exactly what a real dropout looks like.
+
+        `hold_s` keeps the reconnect from succeeding for that long. Without it
+        the handle reopens in well under a second — the device never actually
+        left Windows' enumeration — which is a *better* outcome than a real
+        power-off but exercises none of the down-state behaviour. A controller
+        that is switched off cannot be reopened at all until it comes back, and
+        `hold_s` is how that half gets tested.
         """
-        log.warning("force_disconnect(): closing the HID handle")
+        log.warning("force_disconnect(hold_s=%.1f): closing the HID handle", hold_s)
+        self._reconnect_blocked_until = time.monotonic() + hold_s
         with self._dev_lock:
             dev = self._dev
         if dev is not None:
@@ -703,6 +722,12 @@ class BridgeBackend(Backend):
                     pass
                 self._dev = None
         while not self._stop.is_set():
+            if time.monotonic() < self._reconnect_blocked_until:
+                # Test hook only (force_disconnect(hold_s=...)); zero in
+                # production, so this branch never runs for a real user.
+                if self._stop.wait(0.25):
+                    return False
+                continue
             try:
                 self._open_device()
                 self.stats["reconnects"] += 1

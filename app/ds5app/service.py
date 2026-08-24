@@ -432,6 +432,11 @@ class BridgeService:
         self._our_ports = list(ports)
         self._attached = True
         self.started_at = time.time()
+        # Prime the rate differencer so the first snapshot reports a real number
+        # rather than 0.0 -- a tray that says "0 reports/s" for its first second
+        # reads as broken.
+        self._rate_prev = (time.perf_counter(),
+                           self._backend.stats["input_delivered"])
         self.state = RUNNING
         self._emit("ready",
                    f"virtual wired DualSense attached (controller {self.serial})")
@@ -460,6 +465,17 @@ class BridgeService:
             with TimerResolution(1):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                # The usbip driver drops the TCP connection on detach, so the
+                # proactor transport raises ConnectionResetError from its own
+                # callback during every normal teardown. That is not an error
+                # and must not print a traceback at a user.
+                def _quiet(_loop, ctx):
+                    exc = ctx.get("exception")
+                    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+                        log.debug("transport closed: %s", exc)
+                        return
+                    _loop.default_exception_handler(ctx)
+                loop.set_exception_handler(_quiet)
                 self._loop = loop
                 try:
                     loop.run_until_complete(self._server.start())
@@ -532,9 +548,13 @@ class BridgeService:
             except RuntimeError:
                 pass
         if thread is not None:
-            thread.join(timeout=10.0)
+            # The loop thread runs backend.stop() on its way out: three thread
+            # joins, a mic disarm (two Bluetooth writes with a 20 ms settle) and
+            # the HID close. Bounded by the backend's own 3 s deadline, but a
+            # wedged hidapi call can sit on top of it.
+            thread.join(timeout=15.0)
             if thread.is_alive():
-                log.warning("the server thread did not exit within 10 s")
+                log.warning("the server thread did not exit within 15 s")
         self._thread = None
 
         if u is not None and not quiet:
