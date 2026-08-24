@@ -52,19 +52,19 @@ controller supplies the actual data on the other side.
 ```mermaid
 flowchart LR
     PAD["🎮 DualSense<br/>on Bluetooth"]
-    subgraph UM ["your PC — user mode (this project)"]
+    subgraph UM ["your PC — user mode — this project"]
         BR["bridge<br/>BT ⇄ USB report translation<br/>Opus 45 kHz ⇄ PCM 48 kHz<br/>haptic channel split"]
-        EMU["USB/IP device emulator<br/>real descriptors · owns the audio clock"]
+        EMU["USB/IP device emulator<br/>real descriptors<br/>owns the audio clock"]
     end
-    subgraph KM ["your PC — kernel mode (already signed, not ours)"]
+    subgraph KM ["your PC — kernel mode — already signed, not ours"]
         UDE["usbip-win2 UDE driver"]
         WIN["usbccgp · HidUsb · USBAUDIO"]
     end
     GAME["🕹️ the game<br/>sees a wired DualSense"]
 
-    PAD <-- "HID over Bluetooth<br/>~480 Hz" --> BR
+    PAD <-->|"HID over Bluetooth, ~480 Hz"| BR
     BR <--> EMU
-    EMU <-- "USB/IP over 127.0.0.1" --> UDE
+    EMU <-->|"USB/IP over 127.0.0.1"| UDE
     UDE <--> WIN
     WIN <--> GAME
 ```
