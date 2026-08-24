@@ -9,4 +9,3 @@ prototype/.venv/
 *.egg-info/
 .claude/worktrees/
 dist/
-*.spec

@@ -20,6 +20,7 @@ Everything here is read-only with respect to the system except `attach`,
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -192,10 +193,50 @@ class Usbip:
         """
         return self._run(["port"], timeout=15.0)
 
+    #: `usbip port` prints, per attached device:
+    #:     Port 01: device in use at High Speed(480Mbps)
+    #:              Sony Corp. : DualSense wireless controller (PS5) (054c:0ce6)
+    #:                -> usbip://127.0.0.1:3241/1-1
+    #: The third line is what makes a port attributable to a particular server.
+    _PORT_RE = re.compile(r"Port\s+(\d+):")
+    _URL_RE = re.compile(r"usbip://([^/\s]+)/(\S+)")
+
+    def parse_ports(self, text: str | None = None) -> list[tuple[int, str]]:
+        """-> [(port number, `host:port/busid` or "")] for every attached device."""
+        out: list[tuple[int, str]] = []
+        cur: int | None = None
+        for line in (self.list_ports().out if text is None else text).splitlines():
+            m = self._PORT_RE.search(line)
+            if m:
+                if cur is not None:
+                    out.append((cur, ""))
+                cur = int(m.group(1))
+                continue
+            u = self._URL_RE.search(line)
+            if u and cur is not None:
+                out.append((cur, f"{u.group(1)}/{u.group(2)}"))
+                cur = None
+        if cur is not None:
+            out.append((cur, ""))
+        return out
+
     def attached_ports(self) -> list[int]:
-        import re
-        return [int(m.group(1))
-                for m in re.finditer(r"Port\s+(\d+):", self.list_ports().out)]
+        """EVERY attached usbip device, whoever owns it."""
+        return [p for p, _ in self.parse_ports()]
+
+    def our_ports(self) -> list[int]:
+        """Only devices served by THIS host:port.
+
+        The distinction is not academic. `usbip port` is a machine-wide table,
+        so "is anything attached?" answers a different question from "is
+        anything of MINE attached?" -- and treating the first as the second
+        makes stale-state cleanup detach somebody else's device. Measured
+        2026-08-25: a second bridge started on port 3242 read the first one's
+        device on 3241 as leftovers and detached it, killing a running soak six
+        minutes in.
+        """
+        want = f"{self.host}:{self.port}/"
+        return [p for p, url in self.parse_ports() if url.startswith(want)]
 
     def is_clean(self) -> bool:
-        return not self.attached_ports()
+        return not self.our_ports()

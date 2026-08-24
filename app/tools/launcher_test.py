@@ -117,7 +117,7 @@ class Bridge:
 
 
 def clean_state(u: Usbip, port: int) -> tuple[bool, str]:
-    ports = u.attached_ports()
+    ports = u.our_ports()
     free = S.port_free(port)
     return (not ports and free,
             f"attached={ports} tcp_{port}_free={free}")
@@ -132,7 +132,7 @@ def scenario_1_ctrl_c(serial: str, port: int, u: Usbip) -> None:
         check("bridge came up", ok)
         if not ok:
             return
-        ports = u.attached_ports()
+        ports = u.our_ports()
         check("exactly one device attached", len(ports) == 1, f"ports={ports}")
         b.drain(5.0)
         b.ctrl_break()
@@ -170,7 +170,7 @@ def scenario_2_hard_kill_then_restart(serial: str, port: int, u: Usbip) -> None:
         b2.start()
         if not check("bridge came up again", b2.wait_for("virtual wired DualSense attached", 60)):
             return
-        ports = u.attached_ports()
+        ports = u.our_ports()
         check("still exactly ONE device (no phantom from the armed re-attach)",
               len(ports) == 1, f"ports={ports}")
         b2.ctrl_break()
@@ -228,7 +228,7 @@ def scenario_4_double_start(serial: str, port: int, u: Usbip) -> None:
         check("second bridge refused", code not in (0, None), f"exit={code}")
         check("...and said it is already running", "already running" in out,
               out.strip()[-160:])
-        ports = u.attached_ports()
+        ports = u.our_ports()
         check("first bridge is untouched, still one device", len(ports) == 1,
               f"ports={ports}")
         check("first bridge is still alive", b.p.poll() is None)
