@@ -81,6 +81,7 @@ def _snapshot(server, backend) -> dict:
         ]
         s["backlog_frames"] = dev.clock.backlog_frames(ep)
         s["resyncs"] = dev.clock.resyncs.get(ep, 0)
+        s["resync_times_s"] = [round(t, 4) for t in dev.clock.resync_times.get(ep, [])[:64]]
         snap["endpoints"][f"0x{ep:02x}"] = s
     return snap
 
@@ -113,8 +114,9 @@ def _print_report(snap: dict) -> None:
               f"bytes {s['bytes']} = {s['bytes_per_s']/1000:.2f} kB/s")
         print(f"    urb inter-arrival: min {s['gap_ms_min']:.3f} median "
               f"{s['gap_ms_median']:.3f} p99 {s['gap_ms_p99']:.3f} max {s['gap_ms_max']:.3f} ms")
-        print(f"    UNDERRUNS (frame-clock resyncs): {s.get('resyncs', 0)}"
-              f"   backlog now {s.get('backlog_frames', 0)} frames")
+        print(f"    UNDERRUNS (frame-clock resyncs): {s.get('resyncs', 0)} at t="
+              f"{s.get('resync_times_s', [])}s   backlog now "
+              f"{s.get('backlog_frames', 0)} frames")
         hist = " ".join(
             f"[{h['lo']:g}-{'inf' if h['hi'] is None else format(h['hi'], 'g')}):{h['n']}"
             for h in s["gap_histogram_ms"] if h["n"]

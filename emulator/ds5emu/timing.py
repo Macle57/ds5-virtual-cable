@@ -66,6 +66,9 @@ class FrameClock:
         #: stream starts; more than that mid-stream means the host could not
         #: keep the pipe fed and the audio actually glitched.
         self.resyncs: dict[int, int] = {}
+        #: Seconds since t0 at which each resync happened, so "was that an
+        #: underrun or just the stream starting?" is answerable after the fact.
+        self.resync_times: dict[int, list[float]] = {}
 
     def current_frame(self) -> int:
         return int((time.perf_counter() - self.t0) / self.period)
@@ -82,6 +85,7 @@ class FrameClock:
         queued = self._next.get(ep, 0)
         if now >= queued:
             self.resyncs[ep] = self.resyncs.get(ep, 0) + 1
+            self.resync_times.setdefault(ep, []).append(now * self.period)
             start = now
         else:
             start = queued
