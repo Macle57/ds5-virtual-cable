@@ -145,7 +145,7 @@ class DualSense:
 
     def send_report_39(self, opus2: tuple[bytes, bytes], hap2: tuple[bytes, bytes],
                        packet_counter: int, target: str = "speaker",
-                       mic_enabled: bool = False, audio_buffer_length: int = 0x04) -> int:
+                       mic_enabled: bool = False, audio_buffer_length: int = 48) -> int:
         return self.write_raw(
             P.build_report_39(opus2, hap2, self._next_seq(), packet_counter, target,
                               mic_enabled, audio_buffer_length)
@@ -189,4 +189,4 @@ def wait(seconds: float) -> None:
     if coarse > 0:
         time.sleep(coarse)
     while time.perf_counter() < end:
-        pass
+        time.sleep(0)
