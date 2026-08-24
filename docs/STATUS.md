@@ -1498,3 +1498,249 @@ cd emulator
   branch and its worktree are gone (fully merged).
 
 <!-- ====================== END PHASE 3c SECTION ====================== -->
+
+<!-- ===================== BEGIN PHASE 4b SECTION ===================== -->
+<!-- Owned by the Phase 4b agent (open-source release preparation).
+     Written to be self-contained: safe to merge this whole block without
+     reading anything above it. Section 18 belongs to the concurrent Phase 4a
+     agent (end-user app + USER-GUIDE) working in the main tree; this is 19 so
+     the two cannot collide. -->
+
+# 19. PHASE 4b HANDOFF — the open-source release
+
+Written for an agent, or a maintainer, starting with no context but this
+repository. This phase touched **no hardware, made no system change, installed
+nothing, and published nothing**. It prepared the repository to be made public
+and stopped exactly there.
+
+## 19.1 One-line status
+
+**The repository is clean to publish under MIT.** No copied code was found; the
+one file with real derived expression is a port of MIT-licensed functions, and
+both upstream projects' notices are now reproduced in `NOTICE`. Machine-specific
+identifiers are scrubbed. Licence, credits, README, contributor docs, security
+policy, issue templates and CI all exist. **Publishing itself — repo creation,
+rename, first push — is deliberately left to the user.**
+
+Full audit: **`docs/provenance.md`**. Read it before answering any licensing
+question about this project; it is the document with the evidence in it.
+
+## 19.2 The provenance verdict, in short
+
+| question | answer |
+|---|---|
+| licence of `dualsense-tester` | **MIT**, © 2023 Xuezhou Dai (daidr) — read from its `LICENSE` |
+| licence of `DS5Dongle` | **MIT**, © 2026 awalol — read from its `LICENSE` |
+| licence of `usbip-win2` | **BSD-2-Clause** since 0.9.7.0 (GPL-3.0 before that). We target 0.9.7.7. Confirmed from its own `Readme.md`, shipped with the installed package |
+| was anything copied verbatim? | **No.** Nothing anywhere in the tree |
+| is anything a derived port? | **Yes, one file.** `prototype/ds5bridge/protocol.py` — five functions ported by hand from MIT sources, all self-declared in its docstring |
+| does that create a problem? | **No.** MIT-in-MIT. The whole obligation is the notice, which `NOTICE` now carries in full |
+| are the USB descriptors copied from `fake_ds5.h`? | **No, and this was proved rather than asserted** — see below |
+
+**The descriptor proof, because it is the one that mattered.** Our HID report
+descriptor is **289 bytes**; DS5Dongle's `desc_hid_report_ds` is **321**. The
+first 288 bytes are byte-identical, then ours ends (`0xC0`) while theirs
+continues with four more vendor feature reports (`0x85 F6`…`F9`). That is
+exactly the signature of two independent dumps of the same Sony hardware at
+different firmware revisions — and a copy would have been 321 bytes long.
+`docs/usb-ground-truth.md` records the capture method and ships the tool that
+reproduces it; `tests/test_descriptors.py` re-parses that markdown so the tables
+cannot drift from the measurement.
+
+**The strongest negative evidence**: `dualsense-tester` is commented almost
+entirely in Chinese. A grep for CJK characters across every `.py`, `.md` and
+`.ps1` in this repository returns **zero hits**. Copy-paste almost always drags
+a comment along.
+
+**One honest caveat, stated plainly rather than argued away**:
+`build_report_36()` follows `btAudioStream.ts:buildReportSix` closely — same
+parameter list in the same order, same sequence of byte assignments. Rather than
+litigate where the idea/expression line falls, this project takes the cheap
+route: MIT, notice preserved, done. No rewrite is warranted and none was made.
+
+**What is deliberately NOT credited**: earlier release planning suggested
+crediting `pydualsense` and the DS4Windows lineage. Neither appears anywhere in
+this repository's code, comments, docs or history, and neither was used.
+`ATTRIBUTIONS.md` names them only as ecosystem, never as a source — crediting
+them otherwise would be inventing provenance. Nielk1 **is** credited, precisely
+and with its scope stated: the adaptive-trigger effect vocabulary in
+`cli.TRIGGER_MODES` is the community naming most commonly traced to that work,
+and no code was taken.
+
+## 19.3 The name is a placeholder — **PhantomCable**
+
+The project must not carry "DualSense", "PlayStation" or "Sony" in its *name*,
+so it does not. **`PhantomCable` is a placeholder, chosen to be trivially
+renameable**: it appears only in prose — `README.md`, `LICENSE`, `NOTICE`,
+`ATTRIBUTIONS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `.github/` — and in **no**
+Python package, module, import or CLI name. `ds5emu` and `ds5bridge` are
+untouched and should stay untouched; internal identifiers naming the device you
+interoperate with are normal and are not the trademark problem.
+
+The rename one-liner is in `CONTRIBUTING.md` §"Renaming the project". After it,
+`git grep -i phantomcable` must come back empty.
+
+Shortlist, with GitHub/PyPI collision checks done by search:
+
+| candidate | collisions found | note |
+|---|---|---|
+| **PhantomCable** ← used | none on GitHub/PyPI | `phantomcables.com` is a physical-cable retailer — different field, low risk, but it exists |
+| NullCable | none found | developer-flavoured, cleanest clearance |
+| FauxWire | none found | short, clear |
+| WireFeint | none found | obscure word, ages badly |
+| GhostCord / CableGhost | none exact | "ghost" is heavily used generally |
+| PadWire | not checked | descriptive fallback |
+| **VirtualCable** | **REJECTED** | VB-Audio Virtual Cable is a well-known Windows audio driver |
+| **GhostWire** | **REJECTED** | *Ghostwire: Tokyo*, a published game |
+| **PseudoWire** | **REJECTED** | established MPLS networking term (RFC 3985) |
+
+The trademark disclaimer block is at the bottom of `README.md`: SIE owns the
+marks, nominative fair use, no affiliation, no Sony code shipped.
+
+## 19.4 What was scrubbed, and the policy behind it
+
+Commit "Phase 4b: scrub machine-specific identifiers". All replacements are
+byte-for-byte and width-preserving, so no markdown table moved.
+
+**Redacted:** both development controllers' Bluetooth BD addresses
+(`→ 0011223344aa` / `0011223344bb`, same 12 characters wide), the developer's
+Windows user name (`→ <you>`), and the absolute repo path
+`D:\Codes\dualSense\ds5-virtual-usb` (`→ <repo>`).
+
+**Kept, on purpose:** Windows devnode instance fragments (`4&127b94db`) and
+audio endpoint friendly names in `docs/` — enumeration artefacts, machine-local,
+not identifying, and they *are* the evidence in `identity-comparison.md` and
+`e2e-results.md`. Where those values appeared as **command-line defaults** in
+`emulator/tools/e2e_*.py` they were annotated as machine-specific and pointed at
+`tools/e2e_endpoints.ps1`, which prints the right ones. They were silent
+wrong-for-everyone defaults.
+
+**No `docs/internal/` split was created.** After the scrub nothing in `docs/`
+needs withholding, and a two-tier layout would only invite the next contributor
+to put something private in the wrong tier. The policy is written down in
+`docs/provenance.md` §7 so it survives this handoff.
+
+**Git history was checked and is clean** — 29 commits, no secrets, no private
+paths in messages, no vendored third-party trees at any point.
+
+## 19.5 CI — what it actually runs, and one correction
+
+`.github/workflows/tests.yml`, two jobs on `windows-latest`, **neither needing
+hardware or a driver**.
+
+**A correction to the phase brief**: it stated that all 173 tests run driverless
+on a bare runner. Measured locally with a clean `PYTHONPATH` on a plain Python
+with nothing installed:
+
+```
+Ran 173 tests in 3.6s — OK (skipped=41)
+```
+
+**132 run, 41 skip.** The 41 are `tests/test_bridge.py`, which needs
+numpy/PyAV/hidapi — but still **no hardware**. So CI has two jobs rather than
+one:
+
+| job | python | result |
+|---|---|---|
+| `stdlib-only` | 3.12 **and** 3.13 | 132 run, 41 skip, nothing pip-installed |
+| `with-deps` | 3.12 | installs hidapi/numpy/av → **all 173 run** (verified locally against `prototype/.venv`) |
+
+Nothing leaks: no test in `tests/` touches a controller or the driver. The live
+harnesses live in `emulator/tools/` and `prototype/tools/` and are never
+collected by `unittest discover`.
+
+`stdlib-only` also runs the new **`emulator/tools/check_stdlib_only.py`**, which
+imports every `ds5emu` module except `bridge` and fails if `numpy`, `av`, `hid`
+or `sounddevice` ends up in `sys.modules`. The stdlib-only property of `ds5emu`
+is a design constraint (it is what makes the protocol testable anywhere), and it
+is exactly the kind of thing that erodes invisibly on a developer machine with
+the venv active.
+
+**Untested locally: Python 3.13.** Only 3.12.5 is installed on this machine.
+Nothing in the code looked version-sensitive, but watch the first CI run.
+
+## 19.6 What a maintainer must do to publish
+
+In order. None of it was done here.
+
+1. **Pick the final name**, run the rename one-liner in `CONTRIBUTING.md`, and
+   verify with `git grep -i phantomcable`. Use the same name for the GitHub
+   repository itself — the working directory is still called
+   `ds5-virtual-usb`, which is a fine local name but a poor public one.
+2. **Fix the one placeholder URL**: `OWNER/REPO` in
+   `.github/ISSUE_TEMPLATE/config.yml`. GitHub requires an absolute URL there;
+   it is the only placeholder of its kind and it is commented in the file.
+3. **Decide on the copyright line** in `LICENSE` and `NOTICE`. It currently
+   reads "PhantomCable contributors", which is valid as-is. Substitute a legal
+   name only if that is wanted.
+4. **Decide about the git history's author identity.** All 29 commits carry a
+   real name and a personal email address, and publishing makes them public.
+   That is normal for open source and is entirely the author's call — but it is
+   a decision, and after a push it cannot be undone without rewriting history.
+5. **Merge Phase 4a** (the end-user app and `docs/USER-GUIDE.md`) before or
+   with this. `README.md` links `docs/USER-GUIDE.md` and describes a packaged
+   release; both are Phase 4a's and neither exists in this branch.
+6. **Create the repository and push.** Enable Issues and GitHub's private
+   vulnerability reporting (`SECURITY.md` links to it). Add topics —
+   `dualsense`, `usbip`, `windows`, `bluetooth`, `gamepad` — as *topics*, which
+   is descriptive metadata, not naming.
+7. **Watch the first CI run**, particularly the 3.13 leg.
+8. Optional but valuable: record a short clip of the triggers working in a game.
+   The README's pitch is one line and one screenshot away from landing.
+
+## 19.7 What must NOT be published as-is
+
+Short list, and none of it is a blocker if step 5 above happens first:
+
+- **`README.md` currently links `docs/USER-GUIDE.md`, which does not exist in
+  this branch.** Merge Phase 4a first or the link is dead on the front page.
+  It also references a packaged release; if none is shipped at launch, trim the
+  "easy way" paragraph.
+- **`.github/ISSUE_TEMPLATE/config.yml` contains `OWNER/REPO`.** It renders as a
+  broken link in the new-issue chooser.
+- **The name `PhantomCable`** should be a decision, not a default.
+- Nothing else. There is no secret, no credential, no private path and no
+  third-party code in this tree.
+
+## 19.8 State left behind
+
+- **No hardware was touched.** Neither controller was opened, enumerated or read
+  from. `docs/STATUS.md` §17.9's hardware state is unchanged and still current.
+- **No system change.** Nothing installed, no service, no registry, no driver,
+  no reboot. `usbipd` untouched, usbip-win2 untouched.
+- **Nothing published.** No repository created, no remote added, no push, no
+  release, no package uploaded anywhere.
+- **Network use was read-only research only**: licence texts and name-collision
+  searches.
+- Work is on a worktree branch, five commits, all ending
+  `Co-Authored-By: Claude Opus 5`. Nothing was merged to `master`.
+
+## 19.9 Files this phase added or changed
+
+```
+added    LICENSE                          MIT
+added    NOTICE                           daidr's + awalol's notices, in full
+added    ATTRIBUTIONS.md                  the human credits
+added    CONTRIBUTING.md                  dev setup, tests, hardware protocol
+added    SECURITY.md                      it is a local privileged-adjacent tool
+added    requirements.txt                 runtime deps, with what is dev-only
+added    .gitattributes                   ends the CRLF warnings
+added    docs/provenance.md               THE AUDIT — read this one
+added    .github/workflows/tests.yml      two jobs, no hardware
+added    .github/ISSUE_TEMPLATE/{bug,game-report,config}.yml
+added    .github/PULL_REQUEST_TEMPLATE.md
+added    emulator/tools/check_stdlib_only.py
+rewrote  README.md                        public-facing, gamers first
+edited   .gitignore                       reviewed and grouped
+edited   docs/STATUS.md                   this section, plus the scrub
+edited   docs/{e1,e2e}-results.md         scrub only
+edited   emulator/README.md               scrub only
+edited   emulator/ds5emu/{__main__,bridge}.py           scrub (comments only)
+edited   emulator/tools/e2e_{soak,audio,setstate}.py    machine-specific
+                                                        defaults annotated
+```
+
+Untouched by design: `docs/USER-GUIDE.md` and anything under `app/` — those
+belong to the concurrent Phase 4a agent in the main tree.
+
+<!-- ====================== END PHASE 4b SECTION ====================== -->

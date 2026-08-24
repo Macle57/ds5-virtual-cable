@@ -142,8 +142,13 @@ and without it you quietly collect a second virtual device.
 
 **If you have paired more than one controller, pass `--bt-serial <bdaddr>`.**
 A controller charging over a USB cable *still* enumerates over Bluetooth as a
-stale entry whose reads fail, and it can sort first. Run
-`python -m ds5bridge list` to see what is actually there.
+stale entry whose reads fail, and it can sort first. To see what is actually
+there:
+
+```powershell
+cd <repo>\prototype
+.venv\Scripts\python.exe -m ds5bridge list
+```
 
 **Port 3240 is usually taken** by `usbipd-win` (the Microsoft WSL passthrough
 tool), which is why everything above uses 3241. Nothing needs to be stopped or
