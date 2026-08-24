@@ -197,6 +197,31 @@ AUDIO_IDLE_TIMEOUT = 0.5
 SETSTATE_MIN_INTERVAL = 0.006
 SETSTATE_REFRESH = 0.0
 
+# --- link-loss handling (Phase 4a) ------------------------------------------
+# Two independent things have to happen when the controller goes away, and only
+# one of them was implemented before Phase 4a.
+#
+# 1. NOTICE. `hid.read()` on a vanished device usually raises, and five
+#    consecutive raises trip the reconnect path — but a Bluetooth link can also
+#    simply go *quiet*, in which case every read times out cleanly and returns
+#    b"" forever and nothing ever trips. So there is a watchdog: no control
+#    payload for LINK_DEAD_S while the device is nominally open means the link
+#    is gone, full stop.
+#
+# 2. STOP PRESSING THINGS. `repeat_stale_input` is right in normal operation —
+#    a wired DualSense emits a report every 4 ms whether or not anything moved —
+#    but repeating forever hands the game whatever was held when the link died.
+#    After INPUT_NEUTRAL_S of staleness the repeated report is neutralised
+#    (sticks centred, buttons released, gyro zeroed) while the device stays
+#    attached, so the reconnect is invisible to the game rather than fatal to it.
+#
+# Chosen over a clean detach on purpose: detaching tears the device out from
+# under a running game, and every game tested treats that as "controller
+# removed" and pauses to a "reconnect your controller" screen — from which it
+# does NOT always recover when the device comes back on a different USB port.
+LINK_DEAD_S = 4.0
+INPUT_NEUTRAL_S = 1.0
+
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -436,6 +461,9 @@ class BridgeBackend(Backend):
         self._input_lock = threading.Lock()
         self._latest_input: bytes | None = None
         self._latest_bt_payload: bytes | None = None   # only when keep_raw
+        #: perf_counter of the last control payload from the controller. Drives
+        #: both the link watchdog and the neutralise-on-stale rule.
+        self._latest_input_at = 0.0
         self._input_serial = 0        # bumped by the reader
         self._delivered_serial = 0    # last value handed to the USB side
         #: BT payload that produced the report `read_input_report` just
@@ -500,6 +528,15 @@ class BridgeBackend(Backend):
             "control_jobs": 0,
             "control_jobs_dropped": 0,
             "reconnects": 0,
+            #: Polls answered with a neutralised report because the link had
+            #: been silent for INPUT_NEUTRAL_S. Non-zero means the controller
+            #: went away; it is the counter to look at first after a dropout.
+            "input_neutral": 0,
+            #: Times the watchdog declared the link dead on silence alone
+            #: (no read error at all) and forced a reopen.
+            "link_watchdog_trips": 0,
+            #: Disconnect events seen from any cause.
+            "disconnects": 0,
         }
         #: Sampled mic-ring depth in bytes, for the drift report. Cheap: three
         #: integers updated per `read_audio_in`.
@@ -633,7 +670,28 @@ class BridgeBackend(Backend):
             return False
 
     def _on_io_error(self) -> None:
+        if self.connected.is_set():
+            self.stats["disconnects"] += 1
+            log.warning("Bluetooth link lost; the virtual device stays attached "
+                        "and will report a neutral controller until it returns")
         self.connected.clear()
+
+    def force_disconnect(self) -> None:
+        """Simulate a link loss. TEST HOOK — closes the HID handle underneath
+        the reader thread, which is the closest scriptable analogue of the
+        controller being switched off (a long PS-button press is not
+        scriptable). The next `hid.read()` raises, the reconnect path runs, and
+        everything downstream sees exactly what a real dropout looks like.
+        """
+        log.warning("force_disconnect(): closing the HID handle")
+        with self._dev_lock:
+            dev = self._dev
+        if dev is not None:
+            try:
+                dev.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._on_io_error()
 
     def _reconnect_loop(self) -> bool:
         """Try to reopen the controller. Returns True once connected."""
@@ -681,6 +739,14 @@ class BridgeBackend(Backend):
                     self._on_io_error()
                 continue
             if not raw:
+                # A quiet link, not a broken one: every read timed out cleanly.
+                # Nothing above will ever trip, so the watchdog has to.
+                if (self._latest_input_at
+                        and time.perf_counter() - self._latest_input_at > LINK_DEAD_S):
+                    self.stats["link_watchdog_trips"] += 1
+                    log.warning("no Bluetooth report for %.1fs -- treating the link "
+                                "as dead", LINK_DEAD_S)
+                    self._on_io_error()
                 continue
             consecutive_errors = 0
             self.stats["bt_reports"] += 1
@@ -695,6 +761,7 @@ class BridgeBackend(Backend):
                 if usb is not None:
                     with self._input_lock:
                         self._latest_input = usb
+                        self._latest_input_at = time.perf_counter()
                         if self.keep_raw:
                             self._latest_bt_payload = payload
                         self._input_serial += 1
@@ -937,13 +1004,18 @@ class BridgeBackend(Backend):
             if self._latest_input is None:
                 self.stats["input_none"] += 1
                 return None
+            report = self._latest_input
             if self._input_serial == self._delivered_serial:
                 if not self.repeat_stale_input:
                     self.stats["input_none"] += 1
                     return None
                 self.stats["input_repeated"] += 1
+                # Link gone: release everything rather than repeating whatever
+                # was held when it died. See LINK_DEAD_S / INPUT_NEUTRAL_S.
+                if time.perf_counter() - self._latest_input_at > INPUT_NEUTRAL_S:
+                    self.stats["input_neutral"] += 1
+                    report = T.neutralize_usb01(report)
             self._delivered_serial = self._input_serial
-            report = self._latest_input
             self.last_bt_payload = self._latest_bt_payload
             if self.renumber_input_seq:
                 b = bytearray(report)
@@ -1180,6 +1252,38 @@ class BridgeBackend(Backend):
     # =====================================================================
     # reporting
     # =====================================================================
+
+    def device_status(self) -> dict:
+        """Battery and link health, decoded on demand from the latest report.
+
+        Deliberately NOT computed on the hot path: `read_input_report` runs 250
+        times a second on the request path and must stay a memcpy. This decodes
+        one 63-byte report when somebody asks (a tray refresh, a battery log
+        line) — a few microseconds, off the event loop.
+        """
+        with self._input_lock:
+            report = self._latest_input
+            at = self._latest_input_at
+        stale = (time.perf_counter() - at) if at else None
+        out = {
+            "connected": self.connected.is_set(),
+            "serial": self.serial,
+            "stale_s": round(stale, 3) if stale is not None else None,
+            "battery_percent": None,
+            "battery_state": "",
+            "headphone": None,
+            "mic_muted": None,
+        }
+        if report is None:
+            return out
+        st = P.decode_input(report[1:], usb=True)
+        if st is None:
+            return out
+        out["battery_percent"] = min(100, st.battery_level * 10)
+        out["battery_state"] = st.battery_state
+        out["headphone"] = st.headphone
+        out["mic_muted"] = st.mic_muted
+        return out
 
     def summary(self) -> str:
         s = self.stats
