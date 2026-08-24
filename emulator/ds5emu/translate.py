@@ -123,6 +123,45 @@ def is_mic_payload(payload: bytes) -> bool:
     return P.is_mic_audio_payload(payload)
 
 
+#: D-pad "nothing pressed". The low nibble of digital_keys is a hat switch, so
+#: 0 means NORTH, not neutral — a zero-filled report reads as "up held".
+DPAD_RELEASED = 8
+
+
+def neutralize_usb01(report: bytes) -> bytes:
+    """The same report with every *actuated* control released.
+
+    Used when the Bluetooth link has gone away. The alternative — keep
+    repeating the last report the controller sent — hands the game whatever was
+    held at the instant the link dropped, so a controller switched off mid-sprint
+    leaves the stick pinned forever. A wired DualSense that is unplugged simply
+    stops existing; a virtual one that stays attached must at least stop
+    pressing things.
+
+    Preserved on purpose: the status bytes (battery, headphone, mic), the
+    adaptive-trigger status, the timestamps and the AES-CMAC field. Those are
+    device state, not user input, and games read the battery byte.
+    """
+    o = P.OFFSETS_USB
+    body = bytearray(report[1:] if report and report[0] == USB_INPUT_ID else report)
+    if len(body) < USB_INPUT_BODY_LEN:
+        body.extend(b"\0" * (USB_INPUT_BODY_LEN - len(body)))
+    for off in (o.stick_lx, o.stick_ly, o.stick_rx, o.stick_ry):
+        body[off] = 0x80                      # centred
+    body[o.trigger_l] = 0
+    body[o.trigger_r] = 0
+    body[o.digital_keys] = DPAD_RELEASED      # hat neutral, face buttons clear
+    body[o.digital_keys + 1] = 0
+    body[o.digital_keys + 2] = 0
+    for off in (o.gyro_pitch, o.gyro_yaw, o.gyro_roll):
+        body[off] = 0
+        body[off + 1] = 0
+    # Touch: bit 7 of the id byte set == no finger down. Both points.
+    body[o.touch_data] |= 0x80
+    body[o.touch_data + 4] |= 0x80
+    return bytes([USB_INPUT_ID]) + bytes(body)
+
+
 # --- output: USB 0x02 -> BT 0x31 --------------------------------------------
 
 

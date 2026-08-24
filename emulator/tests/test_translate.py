@@ -205,5 +205,59 @@ class OutputTranslationTests(unittest.TestCase):
         self.assertEqual(T.usb02_body(bytes(body)), bytes(body))
 
 
+class NeutralizeTests(unittest.TestCase):
+    """Phase 4a: what the virtual device reports while the link is gone.
+
+    The rule is "release everything the user was touching, keep everything the
+    device was telling you". Getting the split wrong in either direction is a
+    real bug: keep the sticks and a game strafes into a wall forever; blank the
+    status bytes and it thinks the battery just hit 0 %.
+    """
+
+    def report(self, seed: int = 7) -> bytes:
+        usb = T.bt31_payload_to_usb01(make_bt_payload(seed))
+        assert usb is not None
+        return usb
+
+    def test_every_control_reads_as_released(self):
+        st = P.decode_input(T.neutralize_usb01(self.report())[1:], usb=True)
+        self.assertEqual((st.lx, st.ly, st.rx, st.ry), (0x80, 0x80, 0x80, 0x80))
+        self.assertEqual((st.l2, st.r2), (0, 0))
+        self.assertEqual(st.dpad, "-")
+        self.assertFalse(any(st.buttons.values()), st.buttons)
+        self.assertEqual(st.gyro, (0, 0, 0))
+        self.assertFalse(st.touch[0].active)
+        self.assertFalse(st.touch[1].active)
+
+    def test_device_state_survives(self):
+        src = self.report()
+        before = P.decode_input(src[1:], usb=True)
+        after = P.decode_input(T.neutralize_usb01(src)[1:], usb=True)
+        self.assertEqual(after.battery_level, before.battery_level)
+        self.assertEqual(after.battery_state, before.battery_state)
+        self.assertEqual(after.headphone, before.headphone)
+        self.assertEqual(after.mic, before.mic)
+        self.assertEqual(after.motion_timestamp, before.motion_timestamp)
+
+    def test_shape_is_unchanged_and_idempotent(self):
+        src = self.report()
+        once = T.neutralize_usb01(src)
+        self.assertEqual(len(once), T.USB_INPUT_LEN)
+        self.assertEqual(once[0], T.USB_INPUT_ID)
+        self.assertEqual(T.neutralize_usb01(once), once)
+
+    def test_accepts_a_bare_body_and_a_short_one(self):
+        body = self.report()[1:]
+        self.assertEqual(len(T.neutralize_usb01(body)), T.USB_INPUT_LEN)
+        self.assertEqual(len(T.neutralize_usb01(b"\x01\x00\x00")), T.USB_INPUT_LEN)
+
+    def test_a_zero_filled_report_would_read_as_dpad_north(self):
+        # Why DPAD_RELEASED is 8 and not 0: this is the trap the constant exists
+        # to avoid. A "cleared" report built by zeroing bytes holds UP forever.
+        zeros = bytes([T.USB_INPUT_ID]) + bytes(T.USB_INPUT_BODY_LEN)
+        self.assertEqual(P.decode_input(zeros[1:], usb=True).dpad, "N")
+        self.assertEqual(P.decode_input(T.neutralize_usb01(zeros)[1:], usb=True).dpad, "-")
+
+
 if __name__ == "__main__":
     unittest.main()

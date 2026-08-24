@@ -411,5 +411,98 @@ class ClockSeamTests(unittest.TestCase):
         self.assertEqual(s["mic_depth_ms_max"], 0)
 
 
+@unittest.skipUnless(HAVE_DEPS, "numpy / PyAV / hidapi not available")
+class LinkLossTests(unittest.TestCase):
+    """Phase 4a: what the interrupt endpoint answers while the link is down.
+
+    No hardware: the reader thread's only contribution to this path is
+    `_latest_input` + `_latest_input_at`, so setting those directly reproduces
+    "a report arrived, then the controller went away" exactly.
+    """
+
+    HELD = 0x20   # digital_keys bit for X, i.e. a button held at the moment of loss
+
+    def held_report(self) -> bytes:
+        from ds5emu import translate as T
+        from ds5bridge import protocol as P
+        body = bytearray(T.USB_INPUT_BODY_LEN)
+        body[P.OFFSETS_USB.stick_lx] = 0xFF          # stick shoved fully right
+        body[P.OFFSETS_USB.digital_keys] = self.HELD | 8
+        body[P.OFFSETS_USB.status0] = 0x08           # 80 %, discharging
+        return bytes([T.USB_INPUT_ID]) + bytes(body)
+
+    def backend(self, age_s: float):
+        import time
+        be = B.BridgeBackend()
+        be._latest_input = self.held_report()
+        be._latest_input_at = time.perf_counter() - age_s
+        be._input_serial = 1
+        be._delivered_serial = 1     # nothing new since -> the repeat path
+        return be
+
+    def decode(self, report):
+        from ds5bridge import protocol as P
+        return P.decode_input(report[1:], usb=True)
+
+    def test_a_fresh_stale_repeat_keeps_the_held_state(self):
+        be = self.backend(age_s=0.0)
+        st = self.decode(be.read_input_report(64))
+        self.assertTrue(st.buttons["x"])
+        self.assertEqual(st.lx, 0xFF)
+        self.assertEqual(be.stats["input_repeated"], 1)
+        self.assertEqual(be.stats["input_neutral"], 0)
+
+    def test_past_the_threshold_the_repeat_is_neutralised(self):
+        be = self.backend(age_s=B.INPUT_NEUTRAL_S + 0.5)
+        st = self.decode(be.read_input_report(64))
+        self.assertFalse(st.buttons["x"])
+        self.assertEqual(st.lx, 0x80)
+        self.assertEqual(be.stats["input_neutral"], 1)
+        # ...and the battery the game reads is still the real one
+        self.assertEqual(st.battery_level, 8)
+
+    def test_neutralising_never_stops_the_endpoint_answering(self):
+        # The device must keep delivering at 250 Hz: a virtual wired DualSense
+        # that goes silent is a *removed* controller as far as a game is
+        # concerned, which is the outcome this whole policy exists to avoid.
+        be = self.backend(age_s=5.0)
+        for _ in range(10):
+            self.assertIsNotNone(be.read_input_report(64))
+        self.assertEqual(be.stats["input_none"], 0)
+        self.assertEqual(be.stats["input_neutral"], 10)
+
+    def test_a_new_report_ends_the_neutral_state_immediately(self):
+        import time
+        be = self.backend(age_s=5.0)
+        self.decode(be.read_input_report(64))
+        be._latest_input = self.held_report()
+        be._latest_input_at = time.perf_counter()
+        be._input_serial += 1
+        st = self.decode(be.read_input_report(64))
+        self.assertTrue(st.buttons["x"])
+        self.assertEqual(be.stats["input_neutral"], 1)
+
+    def test_device_status_decodes_battery_and_staleness(self):
+        be = self.backend(age_s=2.0)
+        st = be.device_status()
+        self.assertEqual(st["battery_percent"], 80)
+        self.assertEqual(st["battery_state"], "discharging")
+        self.assertFalse(st["connected"])
+        self.assertGreater(st["stale_s"], 1.5)
+
+    def test_device_status_before_anything_arrives(self):
+        st = B.BridgeBackend().device_status()
+        self.assertIsNone(st["battery_percent"])
+        self.assertIsNone(st["stale_s"])
+        self.assertFalse(st["connected"])
+
+    def test_force_disconnect_is_safe_with_no_device_open(self):
+        be = B.BridgeBackend()
+        be.connected.set()
+        be.force_disconnect()
+        self.assertFalse(be.connected.is_set())
+        self.assertEqual(be.stats["disconnects"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
