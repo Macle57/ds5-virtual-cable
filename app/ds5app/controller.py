@@ -19,6 +19,7 @@ re-paired (0x09) and how its firmware is touched; reads of 0x20 (firmware) and
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -37,6 +38,24 @@ PROBE_READ_MS = 400
 #: project has lost time to it.
 BATTERY_WARN_PERCENT = 20
 BATTERY_CRITICAL_PERCENT = 15
+
+
+_FW_RE = re.compile(r"([A-Z][a-z]{2} [ \d]\d \d{4})(\d{2}:\d{2}:\d{2})")
+
+
+def _firmware_string(raw: bytes) -> str:
+    """The build stamp out of feature report 0x20, made readable.
+
+    The device packs an 11-character `__DATE__` immediately followed by an
+    8-character `__TIME__` with no separator, so a naive decode reads
+    "Sep 18 202513:15:28". Split them back apart; anything that does not match
+    that shape is returned as the printable ASCII it is.
+    """
+    body = raw[1:] if raw and raw[0] == 0x20 else raw
+    text = "".join(chr(b) if 32 <= b < 127 else "\0" for b in body)
+    field = next((p for p in text.split("\0") if p.strip()), "")
+    m = _FW_RE.match(field.strip())
+    return f"{m.group(1)} {m.group(2)}" if m else field.strip()
 
 
 @dataclass
@@ -76,8 +95,7 @@ def _probe(info: DEV.DeviceInfo, want_battery: bool = True) -> Candidate:
         return Candidate(info, alive=False, error=str(e))
     try:
         try:
-            fw = dev.firmware_info()
-            firmware = bytes(fw[1:]).split(b"\x00")[0].decode("ascii", "replace").strip()
+            firmware = _firmware_string(bytes(dev.firmware_info()))
         except Exception as e:  # noqa: BLE001
             return Candidate(info, alive=False, error=str(e))
 
