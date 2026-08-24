@@ -200,14 +200,21 @@ class TrayApp:
         if (snap["state"], bucket) != getattr(self, "_last_art", None):
             self._last_art = (snap["state"], bucket)
             self.icon.icon = _icon_image(COLORS.get(snap["state"], (128, 128, 128)), bat)
-        self.icon.menu = self._menu(snap)
+        # The menu only changes shape when Start has to become Stop. Reassigning
+        # it every two seconds because the uptime ticked would rebuild it under
+        # the cursor of somebody who has it open; the live numbers are in the
+        # hover title, which is free to change.
+        running = snap["state"] not in (S.STOPPED, S.ERROR)
+        if running != getattr(self, "_last_menu_running", None):
+            self._last_menu_running = running
+            self.icon.menu = self._menu(snap)
 
     def _menu(self, snap: dict):
         import pystray
 
         running = snap["state"] not in (S.STOPPED, S.ERROR)
-        lines = [pystray.MenuItem(self._title(snap).replace("\n", "  |  "),
-                                  self._copy_status, default=True, enabled=True),
+        lines = [pystray.MenuItem("ds5bridge", self._copy_status,
+                                  default=True, enabled=True),
                  pystray.Menu.SEPARATOR]
         if running:
             lines.append(pystray.MenuItem("Stop bridging", self._stop_bridge))
