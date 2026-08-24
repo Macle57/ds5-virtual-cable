@@ -8,10 +8,14 @@
 #   python -m venv prototype\.venv
 #   prototype\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-hidapi>=0.14      # the `hid` module; talks to the controller
-numpy>=1.26       # audio buffer maths
+# Lower bounds are conservative; the versions everything was actually verified
+# against are noted alongside.
+
+hidapi>=0.14      # the `hid` module; talks to the controller. verified: 0.15.0
+numpy>=1.26       # audio buffer maths.                        verified: 2.5.2
 av>=13            # PyAV: Opus encode/decode + swresample, libopus bundled in
-                  # the Windows wheels. opuslib was rejected -- ships no DLL.
+                  # the Windows wheels. opuslib was rejected -- it ships no
+                  # DLL on Windows.                            verified: 18.1.0
 
 # Dev/test only, not needed to run the bridge:
 #   sounddevice    WASAPI capture for prototype/tools/cross_mic_test.py and the
