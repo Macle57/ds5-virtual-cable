@@ -189,12 +189,20 @@ The name is a placeholder and lives only in prose — no module, package or impo
 uses it. To change it:
 
 ```powershell
-Get-ChildItem -Recurse -Include *.md,*.yml,LICENSE,NOTICE -Exclude .git |
-  ForEach-Object { (Get-Content -Raw $_) -replace 'PhantomCable','NewName' |
-  Set-Content -NoNewline $_ }
+$old = 'PhantomCable'; $new = 'NewName'
+git ls-files | ForEach-Object {
+    $text = Get-Content -Raw -LiteralPath $_
+    if ($text -and $text.Contains($old)) {
+        Set-Content -NoNewline -LiteralPath $_ -Value $text.Replace($old, $new)
+        "renamed in $_"
+    }
+}
 ```
 
-Then check `git grep -i phantomcable` comes back empty.
+Driving it off `git ls-files` means nothing untracked or ignored is touched,
+and only files that actually contain the name get rewritten. Then check
+`git grep -i phantomcable` comes back empty, and rename the GitHub repository
+to match.
 
 ## Code of conduct
 
