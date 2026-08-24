@@ -73,10 +73,10 @@ def cmd_doctor(args) -> int:
     try:
         u = Usbip(args.usbip, port=args.port)
         ver = u.version()
-        print(f"[ok]   usbip.exe  {u.exe}")
-        print(f"       version    {ver}")
+        print(f"{'[ok]':7}usbip.exe  {u.exe}")
+        print(f"{'':7}version    {ver}")
         if REQUIRED_RELEASE not in ver:
-            print(f"[warn] this project is validated against {REQUIRED_RELEASE}. "
+            print(f"{'[warn]':7}this project is validated against {REQUIRED_RELEASE}. "
                   f"Do NOT use 0.9.7.8 -- its maintainer warns it can corrupt memory.")
     except UsbipNotFound as e:
         print("[FAIL] usbip.exe not found\n")
@@ -85,23 +85,23 @@ def cmd_doctor(args) -> int:
 
     ports = u.our_ports()
     if ports:
-        print(f"[warn] something is already attached on port(s) {ports} -- "
+        print(f"{'[warn]':7}something is already attached on port(s) {ports} -- "
               f"run `ds5bridge cleanup`")
         problems += 1
     else:
-        print("[ok]   nothing attached")
+        print(f"{'[ok]':7}nothing attached")
 
     if S.port_free(args.port):
-        print(f"[ok]   TCP {args.port} free")
+        print(f"{'[ok]':7}TCP {args.port} free")
     else:
-        print(f"[warn] TCP {args.port} held by PID(s) {S.port_owner_pids(args.port)}"
+        print(f"{'[warn]':7}TCP {args.port} held by PID(s) {S.port_owner_pids(args.port)}"
               f" -- run `ds5bridge cleanup`")
         problems += 1
 
     cands = C.probe_all("BT", want_battery=True)
     live = [c for c in cands if c.alive]
     if not live:
-        print("[FAIL] no live Bluetooth DualSense")
+        print(f"{'[FAIL]':7}no live Bluetooth DualSense")
         problems += 1
     else:
         for c in live:
@@ -109,10 +109,10 @@ def cmd_doctor(args) -> int:
             flag = "warn" if (c.battery_percent is not None
                               and c.battery_percent <= C.BATTERY_WARN_PERCENT
                               and not c.battery_state.startswith("charging")) else "ok"
-            print(f"[{flag}]   controller {c.serial}  {note}")
+            print(f"{'[' + flag + ']':7}controller {c.serial}  {note}")
     for c in cands:
         if not c.alive:
-            print(f"[note] {c.serial} enumerates but does not answer "
+            print(f"{'[note]':7}{c.serial} enumerates but does not answer "
                   f"(charging on a cable?)")
 
     print()
