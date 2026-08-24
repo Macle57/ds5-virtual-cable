@@ -5,3 +5,5 @@ target/
 build/
 *.wav
 *.log
+prototype/.venv/
+*.egg-info/
