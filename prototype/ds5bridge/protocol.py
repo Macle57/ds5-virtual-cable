@@ -296,7 +296,7 @@ def build_report_39(
     packet_counter: int,
     target: str = "speaker",
     mic_enabled: bool = False,
-    audio_buffer_length: int = 0x04,
+    audio_buffer_length: int = 48,
 ) -> bytes:
     """547-byte BT audio+haptics report carrying two 10 ms frames.
 

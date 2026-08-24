@@ -84,8 +84,12 @@ class Pacer:
             return
         if delta > 0.0015:
             time.sleep(delta - 0.001)
+        # sleep(0) rather than a bare `pass`: a tight `pass` loop never releases the
+        # GIL, which starves other Python threads. That is not theoretical -- it made
+        # a concurrent PortAudio capture return near-silence while this loop paced
+        # audio out, and looked exactly like a hardware failure.
         while time.perf_counter() < next_at:
-            pass
+            time.sleep(0)
 
     def stats(self) -> str:
         el = self.elapsed

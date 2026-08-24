@@ -43,10 +43,11 @@ class Player(threading.Thread):
     """Pace 0x36 reports from a background thread while the main thread reads."""
 
     def __init__(self, dev: D.DualSense, frames: list[bytes], volume: int, target: str,
-                 mic_active: bool = True):
+                 mic_active: bool = True, report: int = 36):
         super().__init__(daemon=True)
         self.dev, self.frames, self.volume, self.target = dev, frames, volume, target
         self.mic_active = mic_active
+        self.report = report
         self.stop_flag = threading.Event()
         self.sent = 0
         self.errors = 0
@@ -54,27 +55,40 @@ class Player(threading.Thread):
 
     def run(self) -> None:
         silent_h = A.silent_haptic_frame()
-        pacer = Pacer(frame_ms=A.FRAME_MS, max_backlog=8, max_burst=4)
+        per = 1 if self.report == 36 else 2
+        pacer = Pacer(frame_ms=A.FRAME_MS * per, max_backlog=8, max_burst=4)
         fc = 0
+        n = len(self.frames)
+
+        def at(i: int) -> bytes:
+            return self.frames[i] if i < n else A.silent_opus_frame()
+
         with TimerResolution(1):
             pacer.reset()
-            while not self.stop_flag.is_set() and pacer.emitted < len(self.frames):
+            while not self.stop_flag.is_set() and pacer.emitted * per < n:
                 due = pacer.frames_due()
                 if due == 0:
                     pacer.sleep_until_next()
                     continue
                 for _ in range(due):
-                    if pacer.emitted >= len(self.frames):
+                    i = pacer.emitted * per
+                    if i >= n:
                         break
                     try:
-                        self.dev.send_report_36(
-                            self.frames[pacer.emitted], silent_h, fc,
-                            self.target, self.volume, mic_active=self.mic_active,
-                        )
+                        if self.report == 36:
+                            self.dev.send_report_36(
+                                at(i), silent_h, fc,
+                                self.target, self.volume, mic_active=self.mic_active,
+                            )
+                        else:
+                            self.dev.send_report_39(
+                                (at(i), at(i + 1)), (silent_h, silent_h), fc,
+                                self.target, mic_enabled=self.mic_active,
+                            )
                         self.sent += 1
                     except Exception:  # noqa: BLE001
                         self.errors += 1
-                    fc = (fc + 1) & 0xFF
+                    fc = (fc + per) & 0xFF
                     pacer.commit(1)
         self.stats = pacer.stats()
 
@@ -125,6 +139,7 @@ def main() -> int:
     ap.add_argument("--volume", type=int, default=120)
     ap.add_argument("--target", choices=["speaker", "headphone"], default="speaker")
     ap.add_argument("--amp", type=float, default=0.6)
+    ap.add_argument("--report", type=int, choices=[36, 39], default=36)
     ap.add_argument("--mic-off", action="store_true",
                     help="send 0x36 with p[68]=0xFE (the tester's value) to show it "
                          "tears down mic streaming")
@@ -153,7 +168,8 @@ def main() -> int:
     )
     time.sleep(0.05)
 
-    player = Player(d, frames, args.volume, args.target, mic_active=not args.mic_off)
+    player = Player(d, frames, args.volume, args.target, mic_active=not args.mic_off,
+                    report=args.report)
     player.start()
     time.sleep(0.3)
     print(f"[tone] capturing {args.seconds:.1f}s WHILE playing")
