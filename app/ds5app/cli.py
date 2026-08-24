@@ -1,4 +1,4 @@
-"""`ds5bridge` — one command that turns a Bluetooth DualSense into a wired one.
+"""`ds5bridge` -- one command that turns a Bluetooth DualSense into a wired one.
 
     ds5bridge                 do the whole thing; Ctrl+C to stop
     ds5bridge devices         which controllers can I see, and how charged?

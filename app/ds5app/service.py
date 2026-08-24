@@ -1,4 +1,4 @@
-"""`BridgeService` — the whole bring-up and tear-down dance, in one object.
+"""`BridgeService` -- the whole bring-up and tear-down dance, in one object.
 
 Before Phase 4a, using this project meant two terminals and two commands, and
 getting the *shutdown* order wrong left a half-attached device behind that the
@@ -16,7 +16,7 @@ Bring-up order
     6. usbip attach                      -> the virtual wired DualSense appears
     7. verify it attached                -> `usbip port` must now list it
 
-Tear-down order — the part that is not obvious
+Tear-down order -- the part that is not obvious
 ----------------------------------------------
     1. `usbip attach -X` FIRST. `usbip attach` arms a background auto-re-attach;
        detaching without stopping it silently reacquires the device the instant
