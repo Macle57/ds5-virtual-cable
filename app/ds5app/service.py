@@ -220,6 +220,12 @@ _ACTIVE: list["BridgeService"] = []
 _handlers_installed = False
 _console_handler = None  # keep a reference or ctypes garbage-collects it
 
+#: Extra callables run after every service has been torn down. The tray adds
+#: one that stops its icon: `raise KeyboardInterrupt` from a signal handler does
+#: NOT escape pystray's Win32 message loop, so the tray tore down correctly on
+#: Ctrl+Break and then sat there forever as a live process with a dead bridge.
+ON_TEARDOWN: list = []
+
 
 def _teardown_all() -> None:
     for svc in list(_ACTIVE):
@@ -227,6 +233,11 @@ def _teardown_all() -> None:
             svc.stop()
         except Exception:  # noqa: BLE001
             log.exception("teardown failed")
+    for fn in list(ON_TEARDOWN):
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            log.exception("teardown hook failed")
 
 
 def install_crash_handlers() -> None:
