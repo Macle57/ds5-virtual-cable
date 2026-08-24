@@ -126,9 +126,20 @@ def read_seam(path: str) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seconds", type=float, default=120.0)
-    ap.add_argument("--render-name", default="Speakers (3- DualSense")
-    ap.add_argument("--capture-name", default="Headset Microphone (3- DualSense")
-    ap.add_argument("--virtual-path-contains", default="4&127b94db")
+    # The three defaults below are MACHINE-SPECIFIC and are only the values that
+    # happened to be right on the machine this was developed on. The "2-"/"3-"
+    # prefix and the "4&xxxxxxxx" instance fragment are assigned by Windows at
+    # enumeration time and move between runs. Run tools/e2e_endpoints.ps1 to
+    # print the correct RENDER=/CAPTURE=/HIDNODE= values for your machine.
+    ap.add_argument("--render-name", default="Speakers (3- DualSense",
+                    help="substring of the virtual render endpoint's friendly name "
+                         "(machine-specific; see tools/e2e_endpoints.ps1)")
+    ap.add_argument("--capture-name", default="Headset Microphone (3- DualSense",
+                    help="substring of the virtual capture endpoint's friendly name "
+                         "(machine-specific; see tools/e2e_endpoints.ps1)")
+    ap.add_argument("--virtual-path-contains", default="4&127b94db",
+                    help="substring of the virtual HID devnode instance path "
+                         "(machine-specific; see tools/e2e_endpoints.ps1)")
     ap.add_argument("--spk-hz", type=float, default=1500.0)
     ap.add_argument("--hap-hz", type=float, default=250.0)
     ap.add_argument("--amp", type=float, default=0.5)
