@@ -19,6 +19,9 @@ from . import descriptors as D
 from . import wire as W
 from .backend import Backend
 from .uac import UacState
+from .uac import FU_MUTE_CONTROL as UAC_FU_MUTE
+from .uac import FU_VOLUME_CONTROL as UAC_FU_VOLUME
+from .uac import SET_CUR as UAC_SET_CUR
 
 # ---- bmRequestType ---------------------------------------------------------
 RT_DIR_MASK = 0x80
@@ -250,6 +253,10 @@ class DualSenseDevice:
                 if not self._alt_is_valid(iface, alt):
                     return None
                 self.alt_setting[iface] = alt
+                # Tell the backend a stream opened/closed. On the two UAC1
+                # AudioStreaming interfaces alt 1 is the host actually opening
+                # the endpoint, which is when hardware should be armed.
+                self.backend.set_alt_setting(iface, alt)
                 return b""
             if bRequest == REQ_GET_INTERFACE:
                 return bytes([self.alt_setting[iface]])
@@ -319,7 +326,29 @@ class DualSenseDevice:
         # Everything else class-typed belongs to the audio function: the
         # AudioControl interface (0) for unit controls, or the streaming
         # endpoints (which declare no controls, so uac.py stalls them).
-        return self.uac.handle(bmRequestType, bRequest, wValue, wIndex, wLength, out_data)
+        reply = self.uac.handle(bmRequestType, bRequest, wValue, wIndex, wLength, out_data)
+        if reply is not None and bRequest == UAC_SET_CUR:
+            self._notify_uac(wValue, wIndex)
+        return reply
+
+    def _notify_uac(self, wValue: int, wIndex: int) -> None:
+        """Forward an accepted UAC1 SET_CUR to the backend (mute/volume).
+
+        The value is re-read from `self.uac` rather than re-parsed from the
+        setup packet, so the backend always sees the clamped, canonical state
+        that `uac.py` actually stored.
+        """
+        unit = (wIndex >> 8) & 0xFF
+        selector = (wValue >> 8) & 0xFF
+        if unit not in self.uac.mute:
+            return
+        if selector == UAC_FU_MUTE:
+            value = 1 if self.uac.mute[unit] else 0
+        elif selector == UAC_FU_VOLUME:
+            value = self.uac.volume[unit]
+        else:
+            return
+        self.backend.on_uac_control(unit, selector, value)
 
     def _hid_class(self, bRequest, wValue, wLength, out_data):
         report_type = (wValue >> 8) & 0xFF
@@ -330,7 +359,9 @@ class DualSenseDevice:
                 body = self.backend.get_feature_report(report_id, wLength)
                 return body
             if report_type == HID_REPORT_TYPE_INPUT:
-                return self.backend.read_input_report(wLength)
+                # Control GET_REPORT reads the current state; unlike the
+                # interrupt endpoint it must not consume "freshness".
+                return self.backend.latest_input_report(wLength)
             return None
 
         if bRequest == HID_SET_REPORT:
