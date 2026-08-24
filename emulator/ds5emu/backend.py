@@ -15,9 +15,17 @@ Two implementations live here:
 * `SyntheticBackend` — no hardware at all. Used by the unit tests and by
   Phase-3 experiment E1 (see docs/virtualization-options.md §8), which measures
   isochronous timing without involving Bluetooth.
-* `BridgeBackend` — adapts `prototype/ds5bridge`. **Skeleton only, never run.**
-  Phase 3 owns finishing and verifying it; the TODOs mark exactly what is
-  missing and STATUS.md records it as unverified.
+* `BridgeBackend` — adapts `prototype/ds5bridge` onto a live Bluetooth
+  DualSense. **Phase 3b: implemented and hardware-verified.** It lives in
+  `bridge.py` because it needs numpy + PyAV + hidapi, which this module
+  deliberately does not; `from .backend import BridgeBackend` still works and
+  imports it on demand (see `__getattr__` at the bottom of this file), so the
+  stdlib-only unit tests never pull those in.
+
+Phase 3b added three **optional** hooks to `Backend`, all with no-op or
+delegating defaults so every existing implementation keeps working unchanged:
+`latest_input_report()`, `set_alt_setting()` and `on_uac_control()`. Nothing
+that already existed changed shape.
 """
 
 from __future__ import annotations
@@ -60,6 +68,33 @@ class Backend(ABC):
 
     def set_feature_report(self, report_id: int, data: bytes) -> None:
         pass
+
+    def latest_input_report(self, max_len: int) -> bytes | None:
+        """Current input state WITHOUT consuming it — for control GET_REPORT.
+
+        A real device answers HID GET_REPORT(INPUT) with its state every time;
+        "nothing new" semantics belong only to the interrupt endpoint. Backends
+        that do not distinguish the two get the old behaviour for free.
+        """
+        return self.read_input_report(max_len)
+
+    # ---- stream lifecycle (optional) ------------------------------------
+
+    def set_alt_setting(self, interface: int, alt: int) -> None:
+        """SET_INTERFACE succeeded on `interface`.
+
+        For the two UAC1 AudioStreaming interfaces this is the host opening
+        (alt 1) or closing (alt 0) an audio stream, which is the correct moment
+        to arm hardware. Default: ignore.
+        """
+
+    def on_uac_control(self, unit: int, selector: int, value: int) -> None:
+        """A UAC1 SET_CUR was accepted on feature `unit`.
+
+        `selector` is a UAC1 Feature Unit control selector (mute = 0x01,
+        volume = 0x02) and `value` is the decoded payload (0/1 for mute,
+        signed 1/256 dB for volume). Default: ignore.
+        """
 
     # ---- audio ----------------------------------------------------------
 
@@ -114,6 +149,8 @@ class SyntheticBackend(Backend):
         self.output_reports: list[bytes] = []
         self.feature_writes: list[tuple[int, bytes]] = []
         self.iso_out_timestamps: list[float] = []
+        self.alt_settings: list[tuple[int, int]] = []
+        self.uac_controls: list[tuple[int, int, int]] = []
 
     # ---- HID ------------------------------------------------------------
 
@@ -163,6 +200,12 @@ class SyntheticBackend(Backend):
     def set_feature_report(self, report_id: int, data: bytes) -> None:
         self.feature_writes.append((report_id, bytes(data)))
 
+    def set_alt_setting(self, interface: int, alt: int) -> None:
+        self.alt_settings.append((interface, alt))
+
+    def on_uac_control(self, unit: int, selector: int, value: int) -> None:
+        self.uac_controls.append((unit, selector, value))
+
     # ---- audio ----------------------------------------------------------
 
     def write_audio_out(self, pcm: bytes) -> None:
@@ -188,46 +231,21 @@ class SyntheticBackend(Backend):
         return bytes(out).ljust(nbytes, b"\0")[:nbytes]
 
 
-class BridgeBackend(Backend):
-    """Adapter onto `prototype/ds5bridge`. SKELETON — NOT YET EXERCISED.
+# ---------------------------------------------------------------------------
+# BridgeBackend lives in bridge.py — see the module docstring.
+#
+# It is exposed here on demand rather than imported eagerly so that this
+# module, and therefore the whole stdlib-only unit-test suite, never imports
+# numpy / PyAV / hidapi. `from .backend import BridgeBackend` and
+# `backend.BridgeBackend` both work exactly as before.
+# ---------------------------------------------------------------------------
 
-    Phase 3 must finish and verify this. The hard parts, all of which are
-    already solved on the Bluetooth side by Phase 1 and are only a matter of
-    wiring here:
+__all__ = ["Backend", "SyntheticBackend", "BridgeBackend"]
 
-    * USB input report `0x01`/64 B vs BT input `0x31`/78 B — the payload bodies
-      line up after the BT seq-nibble/CRC wrapper is stripped; reuse
-      `ds5bridge.protocol` decode/encode rather than re-deriving offsets.
-    * USB output report `0x02` body is the same SetState body the BT `0x31`
-      wrapper carries, so this is unwrap-then-rewrap, not a translation.
-    * Audio: the host hands us 4ch/48 kHz in 1 ms chunks; the BT side wants
-      45 kHz resampled, Opus-encoded 10.667 ms frames (STATUS.md §5.6, §7).
-      A jitter buffer between the two rates belongs here, NOT in the USB layer.
-    * Haptics: ch2/ch3 -> int8 stereo at 3 kHz, 64-byte subpacket.
-    * Mic: BT delivers 10 ms Opus frames at ~99/s; the USB side asks for 1 ms
-      slices, so a decode + ring buffer is needed, with silence on underrun.
-    * `write_audio_out` and `read_audio_in` are called from the USB/IP request
-      path. They must not block on Bluetooth I/O. Hand off to the existing
-      `ds5bridge.pacing.Pacer` thread.
-    * STATUS.md gotcha #1: `mic_active=True` in report 0x36 is REQUIRED for
-      simultaneous playback + capture, which a wired DualSense always does.
-    """
 
-    def __init__(self, transport: str = "BT"):
-        self.transport = transport
-        self._dev = None
-        raise NotImplementedError(
-            "BridgeBackend is a Phase-3 deliverable; use SyntheticBackend for now"
-        )
+def __getattr__(name: str):
+    if name == "BridgeBackend":
+        from .bridge import BridgeBackend as _B
 
-    def read_input_report(self, max_len: int):  # pragma: no cover
-        raise NotImplementedError
-
-    def write_output_report(self, data: bytes) -> None:  # pragma: no cover
-        raise NotImplementedError
-
-    def write_audio_out(self, pcm: bytes) -> None:  # pragma: no cover
-        raise NotImplementedError
-
-    def read_audio_in(self, nbytes: int) -> bytes:  # pragma: no cover
-        raise NotImplementedError
+        return _B
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
