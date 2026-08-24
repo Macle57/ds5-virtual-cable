@@ -43,13 +43,13 @@ combined system against Windows for the first time.
 | | |
 |---|---|
 | date | 2026-08-24 / 25 |
-| emulator | `python -m ds5emu serve --backend bridge --bt-serial d42f4ba1485d --port 3241` |
+| emulator | `python -m ds5emu serve --backend bridge --bt-serial 0011223344bb --port 3241` |
 | client | `usbip.exe --tcp-port 3241 attach -r 127.0.0.1 -b 1-1` |
 | virtual devnode | `USB\VID_054C&PID_0CE6\2&3b7c36a2&0&1`, host controller `ROOT\USB\0000`, service `usbip2_ude` |
 | virtual HID | `HID\VID_054C&PID_0CE6&MI_03\4&127b94db&0&0000` |
 | virtual endpoints | `Speakers (3- DualSense Wireless Controller)`, `Headset Microphone (3- DualSense Wireless Controller)` |
-| Bluetooth controller, stages (a)(b) | `a0fa9c0dd8bb`, firmware `Jul  4 2025 10:38:40`, **10 %** throughout |
-| Bluetooth controller, stages (c)(d)(e) | `d42f4ba1485d`, firmware `Sep 18 2025 13:15:28` |
+| Bluetooth controller, stages (a)(b) | `0011223344aa`, firmware `Jul  4 2025 10:38:40`, **10 %** throughout |
+| Bluetooth controller, stages (c)(d)(e) | `0011223344bb`, firmware `Sep 18 2025 13:15:28` |
 | battery, (c)(d)(e) | **90 % at claim → 80 % after the soak** |
 | `usbipd` | Running / Automatic throughout, **never touched** (it owns 3240, we own 3241) |
 
@@ -61,8 +61,8 @@ it had inverted:
 
 | | 2026-08-24 (§15.6) | 2026-08-25, stages (a)(b) | 2026-08-25, stages (c)(d)(e) |
 |---|---|---|---|
-| `d42f4ba1485d` (fw `Sep 18 2025`) | Bluetooth, 90 % | USB cable, 100 % charging | **Bluetooth, 90 %** |
-| `a0fa9c0dd8bb` (fw `Jul  4 2025`) | stale paired entry | **Bluetooth, 10 %** | USB cable, charging |
+| `0011223344bb` (fw `Sep 18 2025`) | Bluetooth, 90 % | USB cable, 100 % charging | **Bluetooth, 90 %** |
+| `0011223344aa` (fw `Jul  4 2025`) | stale paired entry | **Bluetooth, 10 %** | USB cable, charging |
 
 Never cache a serial, a HID path or a battery reading across sessions. Read the
 battery out of the input report at claim, log it, and re-read it when behaviour
@@ -75,11 +75,11 @@ entry whose feature reads fail, and `enumerate_devices()` orders by path — so
 the dead one can sort first:
 
 ```
-[1] BT a0fa9c0dd8bb   feature read failed: read error      <- charging on USB
-[2] BT d42f4ba1485d   fw 'Sep 18 2025 13:15:28'            <- the live one
+[1] BT 0011223344aa   feature read failed: read error      <- charging on USB
+[2] BT 0011223344bb   fw 'Sep 18 2025 13:15:28'            <- the live one
 ```
 
-`BridgeBackend(serial=...)` / `serve --bt-serial d42f4ba1485d` exists for
+`BridgeBackend(serial=...)` / `serve --bt-serial 0011223344bb` exists for
 exactly this. "First BT match" would have claimed the dying unit.
 
 ---
@@ -504,20 +504,20 @@ frequent correction; nothing observed here justifies it.
 
 ## 5. The stage that ran in two sittings
 
-Stages (a) and (b) ran on `a0fa9c0dd8bb` at **10 % battery** — acceptable
+Stages (a) and (b) ran on `0011223344aa` at **10 % battery** — acceptable
 because they drive no speaker, no haptic actuator and no microphone, and the
 battery read 10 % before and 10 % after. Stages (c)(d)(e) waited for the
 healthy unit: they drive both actuators continuously for minutes at a time, and
-`a0fa9c0dd8bb` is the same unit STATUS §16.2 records as having **died at 10 %**
+`0011223344aa` is the same unit STATUS §16.2 records as having **died at 10 %**
 during Phase 3b, producing a tail of symptoms that looked exactly like protocol
 bugs.
 
-Once `d42f4ba1485d` was moved back to Bluetooth at **90 %**, (c)(d)(e) ran and
+Once `0011223344bb` was moved back to Bluetooth at **90 %**, (c)(d)(e) ran and
 passed. The split is recorded here because the two halves of §2 were measured
 on different controllers, over a different-quality link — which is visible in
 the data and worth reading as signal rather than noise:
 
-| | (a)(b) on `a0fa9c0dd8bb` @10 % | (c)(d)(e) on `d42f4ba1485d` @90 % |
+| | (a)(b) on `0011223344aa` @10 % | (c)(d)(e) on `0011223344bb` @90 % |
 |---|---|---|
 | BT input rate | 320–322 Hz | 400–480 Hz |
 | input repeats | 50.3 % | ~32 % (matches §16.2) |
@@ -617,11 +617,11 @@ Continuing STATUS §15.5's numbering.
 ## 8. How to re-run all five stages
 
 ```powershell
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+cd <repo>\emulator
 
 # 1. emulator. SELECT THE CONTROLLER BY SERIAL (see §1).
 ..\prototype\.venv\Scripts\python.exe -m ds5emu serve --backend bridge `
-    --bt-serial d42f4ba1485d --port 3241 `
+    --bt-serial 0011223344bb --port 3241 `
     --stats-json C:\Temp\ds5c_stats.json --stats-every 2
 
 # 2. attach. usbipd owns 3240 and is never touched; --tcp-port is GLOBAL and
@@ -659,8 +659,8 @@ usbip2_ude, usbip2_filter      Running / Manual (as installed)
 present VID_054C&PID_0CE6      the physically-plugged unit and its two children only
 system configuration           unchanged -- no driver installed, no service
                                reconfigured, no registry write, no reboot
-controllers                    d42f4ba1485d on Bluetooth at 80 %;
-                               a0fa9c0dd8bb on the USB cable, charging
+controllers                    0011223344bb on Bluetooth at 80 %;
+                               0011223344aa on the USB cable, charging
 ```
 
 ## 6. Game validation — 2026-08-25 (user-run)

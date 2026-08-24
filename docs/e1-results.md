@@ -26,7 +26,7 @@ Experiment E1 as specified in `docs/virtualization-options.md` §8, run on
 
 ```powershell
 # terminal 1 -- the emulator, on a port that does not collide with usbipd
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+cd <repo>\emulator
 ..\prototype\.venv\Scripts\python.exe -m ds5emu serve --port 3241 `
     --stats-json C:\...\stats.json --stats-every 2 [--record-out out.raw]
 

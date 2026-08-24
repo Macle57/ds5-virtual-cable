@@ -43,13 +43,13 @@ for that to work over Windows' UDE stack.
 
 | tool | state |
 |---|---|
-| Python | 3.12.5 (`C:\Users\adity\.pyenv\pyenv-win\versions\3.12.5`), pip 24.2 |
+| Python | 3.12.5 (`C:\Users\<you>\.pyenv\pyenv-win\versions\3.12.5`), pip 24.2 |
 | venv | `prototype/.venv` — **gitignored, must be recreated** (see §4) |
 | Visual Studio | Community 2022, 17.14.37531.7, MSVC toolset 14.44.35207 |
 | Windows SDK | 10.0.26100.0 |
 | **WDK** | **NOT INSTALLED** — `Include\10.0.26100.0\km` is absent and there are no `udecx*` libs anywhere under `Windows Kits`. Option B needs a WDK install first. |
 | CMake | 3.30.0 |
-| Ninja | present at `C:\Users\adity\.mcuxpressotools\ninja\ninja.exe` (not on PATH) |
+| Ninja | present at `C:\Users\<you>\.mcuxpressotools\ninja\ninja.exe` (not on PATH) |
 | Rust | **NOT INSTALLED** (no `rustc`, no `cargo`) |
 | git | 2.43.0.windows.1 |
 
@@ -61,7 +61,7 @@ Two physical DualSense controllers, both `054C:0CE6`:
 
 | | Bluetooth unit | USB unit |
 |---|---|---|
-| hidapi serial | `a0fa9c0dd8bb` (the BD address) | `''` (empty) |
+| hidapi serial | `0011223344aa` (the BD address) | `''` (empty) |
 | hidapi path contains | `{00001124-0000-1000-8000-00805f9b34fb}` (the HID-over-BT profile GUID) | `VID_054C&PID_0CE6&MI_03` |
 | `interface_number` | `-1` | `3` |
 | firmware (feature 0x20) | `Jul  4 2025 10:38:40` | `Sep 18 2025 13:15:28` |
@@ -72,7 +72,7 @@ Both expose exactly one HID collection (usage page `0x0001`, usage `0x0005`), so
 on this machine there is no multi-path ambiguity — but do not rely on that, keep
 using the classifier in `ds5bridge/device.py`.
 
-Note: a second BD address `d42f4ba1485d` is *paired* in Windows but not
+Note: a second BD address `0011223344bb` is *paired* in Windows but not
 connected; `Get-PnpDevice` lists stale entries with `Status: Unknown`. Filter
 with `-PresentOnly`, and prefer hidapi enumeration over PnP for anything real.
 
@@ -82,7 +82,7 @@ fast. Charge it before long test sessions, or results will start drifting.
 ## 4. Getting a working environment
 
 ```powershell
-cd D:\Codes\dualSense\ds5-virtual-usb
+cd <repo>
 python -m venv prototype\.venv
 prototype\.venv\Scripts\python.exe -m pip install hidapi numpy av sounddevice
 ```
@@ -559,7 +559,7 @@ URL:
 ## 14.4 `emulator/` — what exists
 
 ```powershell
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+cd <repo>\emulator
 ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .   # 91 tests
 ..\prototype\.venv\Scripts\python.exe -m ds5emu descr                      # dump descriptors
 ..\prototype\.venv\Scripts\python.exe -m ds5emu serve                      # 127.0.0.1:3240
@@ -710,7 +710,7 @@ All three are covered by `emulator/tests/test_timing.py`. **102 tests pass.**
 ```powershell
 # 1. server (terminal 1). --record-out is optional; it dumps the received
 #    speaker stream as raw 4ch s16le 48 kHz for offline FFT.
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+cd <repo>\emulator
 ..\prototype\.venv\Scripts\python.exe -m ds5emu serve --port 3241 --stats-json C:\Temp\stats.json --stats-every 2
 
 # 2. attach (terminal 2)
@@ -768,11 +768,11 @@ stale. As of the end of Phase 3a:
 | | wired (USB) | Bluetooth |
 |---|---|---|
 | firmware (feature `0x20`) | `Jul  4 2025 10:38:40` | `Sep 18 2025 13:15:28` |
-| serial / BD address | `''` (empty, as always on USB) | `d42f4ba1485d` |
+| serial / BD address | `''` (empty, as always on USB) | `0011223344bb` |
 | battery | **0 % / charging** | not read by this agent |
 | measured input rate | 250.30 Hz | — |
 
-`a0fa9c0dd8bb` still appears in `hid.enumerate()` as a stale paired entry whose
+`0011223344aa` still appears in `hid.enumerate()` as a stale paired entry whose
 feature reads fail. Ignore it. Always re-run `python -m ds5bridge list` before
 trusting any per-unit identifier, and **read the battery early** — a dying
 controller produces failure modes that look like driver bugs. (The terminal
@@ -845,14 +845,14 @@ pass against a real Bluetooth DualSense.
 
 | | |
 |---|---|
-| controller | Bluetooth DualSense, BD address **`d42f4ba1485d`** |
+| controller | Bluetooth DualSense, BD address **`0011223344bb`** |
 | firmware (feature 0x20) | `Sep 18 2025 13:15:28` |
 | battery during the verified runs | **90 % / discharging**, unchanged start to finish |
 | BT input rate, steady state | **483.0 Hz** |
 
 **The controllers were physically swapped mid-phase.** The unit §3 calls "the
-Bluetooth unit" (`a0fa9c0dd8bb`, 10 % battery) died and was replaced by
-`d42f4ba1485d`, which §3 lists as merely *paired*. Every number in §16.5 is
+Bluetooth unit" (`0011223344aa`, 10 % battery) died and was replaced by
+`0011223344bb`, which §3 lists as merely *paired*. Every number in §16.5 is
 from the **new** unit unless it says otherwise.
 
 Two things follow, and they cost real time:
@@ -962,7 +962,7 @@ keeps the stdlib-only unit tests importable on a bare Python.
 
 ## 16.5 What is VERIFIED ON HARDWARE — with numbers
 
-All runs below: BT unit `d42f4ba1485d`, battery 90 %, no driver attached.
+All runs below: BT unit `0011223344bb`, battery 90 %, no driver attached.
 
 ### (a) Input pipe soak — `tools/bridge_input_soak.py --seconds 15`
 
@@ -1136,7 +1136,7 @@ Numbered continuing from §8.
 
 ```powershell
 # unit tests -- no hardware, no driver, ~1.3 s, 132 tests
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+cd <repo>\emulator
 ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .
 
 # live, needs the Bluetooth controller (and only it)
@@ -1354,13 +1354,13 @@ noticed.
 
 | | 2026-08-24 (§15.6) | 3c stages (a)(b) | 3c stages (c)(d)(e) | end state |
 |---|---|---|---|---|
-| `d42f4ba1485d` (fw `Sep 18 2025`) | BT, 90 % | USB cable, 100 % | **BT, 90 %** | **BT, 80 %** |
-| `a0fa9c0dd8bb` (fw `Jul  4 2025`) | stale entry | **BT, 10 %** | USB cable | USB, charging |
+| `0011223344bb` (fw `Sep 18 2025`) | BT, 90 % | USB cable, 100 % | **BT, 90 %** | **BT, 80 %** |
+| `0011223344aa` (fw `Jul  4 2025`) | stale entry | **BT, 10 %** | USB cable | USB, charging |
 
 Stages (a) and (b) ran on the 10 % unit — acceptable, because they drive no
 speaker, no haptic actuator and no microphone, and the battery read 10 % before
 and after. Stages (c)(d)(e) waited for the healthy unit, because they drive
-both actuators continuously for minutes and `a0fa9c0dd8bb` is the unit §16.2
+both actuators continuously for minutes and `0011223344aa` is the unit §16.2
 records as having *died* at exactly 10 %.
 
 **SELECT THE CONTROLLER BY SERIAL.** A unit charging over USB *still enumerates
@@ -1368,11 +1368,11 @@ over Bluetooth*, as a stale entry whose feature reads fail, and
 `enumerate_devices()` orders by path — so the dead one can sort first:
 
 ```
-[1] BT a0fa9c0dd8bb   feature read failed: read error      <- charging on USB
-[2] BT d42f4ba1485d   fw 'Sep 18 2025 13:15:28'            <- the live one
+[1] BT 0011223344aa   feature read failed: read error      <- charging on USB
+[2] BT 0011223344bb   fw 'Sep 18 2025 13:15:28'            <- the live one
 ```
 
-`serve --bt-serial d42f4ba1485d` (or `BridgeBackend(serial=...)`) exists for
+`serve --bt-serial 0011223344bb` (or `BridgeBackend(serial=...)`) exists for
 exactly this. "First BT match" would have claimed the dying unit.
 
 **Never cache a serial, a HID path or a battery level across sessions.** Always
@@ -1414,8 +1414,8 @@ The concept is proven end to end. What remains is breadth, not feasibility.
 ```powershell
 # 1. server. --backend bridge is the live Bluetooth one; the default is still
 #    synthetic, deliberately, because experiment E1 wants the hardware-free one.
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
-..\prototype\.venv\Scripts\python.exe -m ds5emu serve --backend bridge --bt-serial d42f4ba1485d --port 3241 --stats-json C:\Temp\ds5c_stats.json --stats-every 2
+cd <repo>\emulator
+..\prototype\.venv\Scripts\python.exe -m ds5emu serve --backend bridge --bt-serial 0011223344bb --port 3241 --stats-json C:\Temp\ds5c_stats.json --stats-every 2
 
 # 2. attach.  usbipd owns 3240 and is NEVER touched; --tcp-port is a GLOBAL
 #    option and must come before the subcommand.
@@ -1490,7 +1490,7 @@ cd emulator
 - **`usbipd` is Running / Automatic** — never stopped or reconfigured.
 - The only present `VID_054C&PID_0CE6` devnodes are the physically-plugged unit
   and its two children.
-- Controllers: `d42f4ba1485d` on Bluetooth at **80 %**; `a0fa9c0dd8bb` on the
+- Controllers: `0011223344bb` on Bluetooth at **80 %**; `0011223344aa` on the
   USB cable, charging.
 - **No system configuration was changed.** No driver installed, no service
   reconfigured, no registry write, no reboot.

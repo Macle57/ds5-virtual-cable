@@ -12,7 +12,7 @@ machine with no driver present. Attaching for real needs usbip-win2 installed
 ## Quick start
 
 ```powershell
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+cd <repo>\emulator
 
 # 102 protocol + timing tests, no driver, no hardware
 ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .
