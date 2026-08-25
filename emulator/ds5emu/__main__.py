@@ -328,7 +328,7 @@ def main(argv=None) -> int:
                    default="speaker", help="bridge backend: where 0x39 audio goes")
     s.add_argument("--bt-serial", default=None, metavar="BDADDR",
                    help="bridge backend: pick the controller by BD address "
-                        "(e.g. d42f4ba1485d). STRONGLY RECOMMENDED once more "
+                        "(e.g. 0011223344bb). STRONGLY RECOMMENDED once more "
                         "than one controller has been paired -- a unit charging "
                         "over USB still enumerates over Bluetooth as a stale "
                         "entry, and index order is not stable across sessions")

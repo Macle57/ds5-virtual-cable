@@ -43,13 +43,13 @@ for that to work over Windows' UDE stack.
 
 | tool | state |
 |---|---|
-| Python | 3.12.5 (`C:\Users\adity\.pyenv\pyenv-win\versions\3.12.5`), pip 24.2 |
+| Python | 3.12.5 (`C:\Users\<you>\.pyenv\pyenv-win\versions\3.12.5`), pip 24.2 |
 | venv | `prototype/.venv` — **gitignored, must be recreated** (see §4) |
 | Visual Studio | Community 2022, 17.14.37531.7, MSVC toolset 14.44.35207 |
 | Windows SDK | 10.0.26100.0 |
 | **WDK** | **NOT INSTALLED** — `Include\10.0.26100.0\km` is absent and there are no `udecx*` libs anywhere under `Windows Kits`. Option B needs a WDK install first. |
 | CMake | 3.30.0 |
-| Ninja | present at `C:\Users\adity\.mcuxpressotools\ninja\ninja.exe` (not on PATH) |
+| Ninja | present at `C:\Users\<you>\.mcuxpressotools\ninja\ninja.exe` (not on PATH) |
 | Rust | **NOT INSTALLED** (no `rustc`, no `cargo`) |
 | git | 2.43.0.windows.1 |
 
@@ -61,7 +61,7 @@ Two physical DualSense controllers, both `054C:0CE6`:
 
 | | Bluetooth unit | USB unit |
 |---|---|---|
-| hidapi serial | `a0fa9c0dd8bb` (the BD address) | `''` (empty) |
+| hidapi serial | `0011223344aa` (the BD address) | `''` (empty) |
 | hidapi path contains | `{00001124-0000-1000-8000-00805f9b34fb}` (the HID-over-BT profile GUID) | `VID_054C&PID_0CE6&MI_03` |
 | `interface_number` | `-1` | `3` |
 | firmware (feature 0x20) | `Jul  4 2025 10:38:40` | `Sep 18 2025 13:15:28` |
@@ -72,7 +72,7 @@ Both expose exactly one HID collection (usage page `0x0001`, usage `0x0005`), so
 on this machine there is no multi-path ambiguity — but do not rely on that, keep
 using the classifier in `ds5bridge/device.py`.
 
-Note: a second BD address `d42f4ba1485d` is *paired* in Windows but not
+Note: a second BD address `0011223344bb` is *paired* in Windows but not
 connected; `Get-PnpDevice` lists stale entries with `Status: Unknown`. Filter
 with `-PresentOnly`, and prefer hidapi enumeration over PnP for anything real.
 
@@ -82,7 +82,7 @@ fast. Charge it before long test sessions, or results will start drifting.
 ## 4. Getting a working environment
 
 ```powershell
-cd D:\Codes\dualSense\ds5-virtual-usb
+cd <repo>
 python -m venv prototype\.venv
 prototype\.venv\Scripts\python.exe -m pip install hidapi numpy av sounddevice
 ```
@@ -559,7 +559,7 @@ URL:
 ## 14.4 `emulator/` — what exists
 
 ```powershell
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+cd <repo>\emulator
 ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .   # 91 tests
 ..\prototype\.venv\Scripts\python.exe -m ds5emu descr                      # dump descriptors
 ..\prototype\.venv\Scripts\python.exe -m ds5emu serve                      # 127.0.0.1:3240
@@ -710,7 +710,7 @@ All three are covered by `emulator/tests/test_timing.py`. **102 tests pass.**
 ```powershell
 # 1. server (terminal 1). --record-out is optional; it dumps the received
 #    speaker stream as raw 4ch s16le 48 kHz for offline FFT.
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+cd <repo>\emulator
 ..\prototype\.venv\Scripts\python.exe -m ds5emu serve --port 3241 --stats-json C:\Temp\stats.json --stats-every 2
 
 # 2. attach (terminal 2)
@@ -768,11 +768,11 @@ stale. As of the end of Phase 3a:
 | | wired (USB) | Bluetooth |
 |---|---|---|
 | firmware (feature `0x20`) | `Jul  4 2025 10:38:40` | `Sep 18 2025 13:15:28` |
-| serial / BD address | `''` (empty, as always on USB) | `d42f4ba1485d` |
+| serial / BD address | `''` (empty, as always on USB) | `0011223344bb` |
 | battery | **0 % / charging** | not read by this agent |
 | measured input rate | 250.30 Hz | — |
 
-`a0fa9c0dd8bb` still appears in `hid.enumerate()` as a stale paired entry whose
+`0011223344aa` still appears in `hid.enumerate()` as a stale paired entry whose
 feature reads fail. Ignore it. Always re-run `python -m ds5bridge list` before
 trusting any per-unit identifier, and **read the battery early** — a dying
 controller produces failure modes that look like driver bugs. (The terminal
@@ -845,14 +845,14 @@ pass against a real Bluetooth DualSense.
 
 | | |
 |---|---|
-| controller | Bluetooth DualSense, BD address **`d42f4ba1485d`** |
+| controller | Bluetooth DualSense, BD address **`0011223344bb`** |
 | firmware (feature 0x20) | `Sep 18 2025 13:15:28` |
 | battery during the verified runs | **90 % / discharging**, unchanged start to finish |
 | BT input rate, steady state | **483.0 Hz** |
 
 **The controllers were physically swapped mid-phase.** The unit §3 calls "the
-Bluetooth unit" (`a0fa9c0dd8bb`, 10 % battery) died and was replaced by
-`d42f4ba1485d`, which §3 lists as merely *paired*. Every number in §16.5 is
+Bluetooth unit" (`0011223344aa`, 10 % battery) died and was replaced by
+`0011223344bb`, which §3 lists as merely *paired*. Every number in §16.5 is
 from the **new** unit unless it says otherwise.
 
 Two things follow, and they cost real time:
@@ -962,7 +962,7 @@ keeps the stdlib-only unit tests importable on a bare Python.
 
 ## 16.5 What is VERIFIED ON HARDWARE — with numbers
 
-All runs below: BT unit `d42f4ba1485d`, battery 90 %, no driver attached.
+All runs below: BT unit `0011223344bb`, battery 90 %, no driver attached.
 
 ### (a) Input pipe soak — `tools/bridge_input_soak.py --seconds 15`
 
@@ -1136,7 +1136,7 @@ Numbered continuing from §8.
 
 ```powershell
 # unit tests -- no hardware, no driver, ~1.3 s, 132 tests
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+cd <repo>\emulator
 ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .
 
 # live, needs the Bluetooth controller (and only it)
@@ -1354,13 +1354,13 @@ noticed.
 
 | | 2026-08-24 (§15.6) | 3c stages (a)(b) | 3c stages (c)(d)(e) | end state |
 |---|---|---|---|---|
-| `d42f4ba1485d` (fw `Sep 18 2025`) | BT, 90 % | USB cable, 100 % | **BT, 90 %** | **BT, 80 %** |
-| `a0fa9c0dd8bb` (fw `Jul  4 2025`) | stale entry | **BT, 10 %** | USB cable | USB, charging |
+| `0011223344bb` (fw `Sep 18 2025`) | BT, 90 % | USB cable, 100 % | **BT, 90 %** | **BT, 80 %** |
+| `0011223344aa` (fw `Jul  4 2025`) | stale entry | **BT, 10 %** | USB cable | USB, charging |
 
 Stages (a) and (b) ran on the 10 % unit — acceptable, because they drive no
 speaker, no haptic actuator and no microphone, and the battery read 10 % before
 and after. Stages (c)(d)(e) waited for the healthy unit, because they drive
-both actuators continuously for minutes and `a0fa9c0dd8bb` is the unit §16.2
+both actuators continuously for minutes and `0011223344aa` is the unit §16.2
 records as having *died* at exactly 10 %.
 
 **SELECT THE CONTROLLER BY SERIAL.** A unit charging over USB *still enumerates
@@ -1368,11 +1368,11 @@ over Bluetooth*, as a stale entry whose feature reads fail, and
 `enumerate_devices()` orders by path — so the dead one can sort first:
 
 ```
-[1] BT a0fa9c0dd8bb   feature read failed: read error      <- charging on USB
-[2] BT d42f4ba1485d   fw 'Sep 18 2025 13:15:28'            <- the live one
+[1] BT 0011223344aa   feature read failed: read error      <- charging on USB
+[2] BT 0011223344bb   fw 'Sep 18 2025 13:15:28'            <- the live one
 ```
 
-`serve --bt-serial d42f4ba1485d` (or `BridgeBackend(serial=...)`) exists for
+`serve --bt-serial 0011223344bb` (or `BridgeBackend(serial=...)`) exists for
 exactly this. "First BT match" would have claimed the dying unit.
 
 **Never cache a serial, a HID path or a battery level across sessions.** Always
@@ -1414,8 +1414,8 @@ The concept is proven end to end. What remains is breadth, not feasibility.
 ```powershell
 # 1. server. --backend bridge is the live Bluetooth one; the default is still
 #    synthetic, deliberately, because experiment E1 wants the hardware-free one.
-cd D:\Codes\dualSense\ds5-virtual-usb\emulator
-..\prototype\.venv\Scripts\python.exe -m ds5emu serve --backend bridge --bt-serial d42f4ba1485d --port 3241 --stats-json C:\Temp\ds5c_stats.json --stats-every 2
+cd <repo>\emulator
+..\prototype\.venv\Scripts\python.exe -m ds5emu serve --backend bridge --bt-serial 0011223344bb --port 3241 --stats-json C:\Temp\ds5c_stats.json --stats-every 2
 
 # 2. attach.  usbipd owns 3240 and is NEVER touched; --tcp-port is a GLOBAL
 #    option and must come before the subcommand.
@@ -1490,7 +1490,7 @@ cd emulator
 - **`usbipd` is Running / Automatic** — never stopped or reconfigured.
 - The only present `VID_054C&PID_0CE6` devnodes are the physically-plugged unit
   and its two children.
-- Controllers: `d42f4ba1485d` on Bluetooth at **80 %**; `a0fa9c0dd8bb` on the
+- Controllers: `0011223344bb` on Bluetooth at **80 %**; `0011223344aa` on the
   USB cable, charging.
 - **No system configuration was changed.** No driver installed, no service
   reconfigured, no registry write, no reboot.
@@ -1862,3 +1862,248 @@ In the order the next agent should care about them.
   all this session. **Re-enumerate before trusting either** (§17.5).
 
 <!-- ====================== END PHASE 4a SECTION ====================== -->
+<!-- ===================== BEGIN PHASE 4b SECTION ===================== -->
+<!-- Owned by the Phase 4b agent (open-source release preparation).
+     Written to be self-contained: safe to merge this whole block without
+     reading anything above it. Section 18 belongs to the concurrent Phase 4a
+     agent (end-user app + USER-GUIDE) working in the main tree; this is 19 so
+     the two cannot collide. -->
+
+# 19. PHASE 4b HANDOFF — the open-source release
+
+Written for an agent, or a maintainer, starting with no context but this
+repository. This phase touched **no hardware, made no system change, installed
+nothing, and published nothing**. It prepared the repository to be made public
+and stopped exactly there.
+
+## 19.1 One-line status
+
+**The repository is clean to publish under MIT.** No copied code was found; the
+one file with real derived expression is a port of MIT-licensed functions, and
+both upstream projects' notices are now reproduced in `NOTICE`. Machine-specific
+identifiers are scrubbed. Licence, credits, README, contributor docs, security
+policy, issue templates and CI all exist. **Publishing itself — repo creation,
+rename, first push — is deliberately left to the user.**
+
+Full audit: **`docs/provenance.md`**. Read it before answering any licensing
+question about this project; it is the document with the evidence in it.
+
+## 19.2 The provenance verdict, in short
+
+| question | answer |
+|---|---|
+| licence of `dualsense-tester` | **MIT**, © 2023 Xuezhou Dai (daidr) — read from its `LICENSE` |
+| licence of `DS5Dongle` | **MIT**, © 2026 awalol — read from its `LICENSE` |
+| licence of `usbip-win2` | **BSD-2-Clause** since 0.9.7.0 (GPL-3.0 before that). We target 0.9.7.7. Confirmed from its own `Readme.md`, shipped with the installed package |
+| was anything copied verbatim? | **No.** Nothing anywhere in the tree |
+| is anything a derived port? | **Yes, one file.** `prototype/ds5bridge/protocol.py` — five functions ported by hand from MIT sources, all self-declared in its docstring |
+| does that create a problem? | **No.** MIT-in-MIT. The whole obligation is the notice, which `NOTICE` now carries in full |
+| are the USB descriptors copied from `fake_ds5.h`? | **No, and this was proved rather than asserted** — see below |
+
+**The descriptor proof, because it is the one that mattered.** Our HID report
+descriptor is **289 bytes**; DS5Dongle's `desc_hid_report_ds` is **321**. The
+first 288 bytes are byte-identical, then ours ends (`0xC0`) while theirs
+continues with four more vendor feature reports (`0x85 F6`…`F9`). That is
+exactly the signature of two independent dumps of the same Sony hardware at
+different firmware revisions — and a copy would have been 321 bytes long.
+`docs/usb-ground-truth.md` records the capture method and ships the tool that
+reproduces it; `tests/test_descriptors.py` re-parses that markdown so the tables
+cannot drift from the measurement.
+
+**The strongest negative evidence**: `dualsense-tester` is commented almost
+entirely in Chinese. A grep for CJK characters across every `.py`, `.md` and
+`.ps1` in this repository returns **zero hits**. Copy-paste almost always drags
+a comment along.
+
+**One honest caveat, stated plainly rather than argued away**:
+`build_report_36()` follows `btAudioStream.ts:buildReportSix` closely — same
+parameter list in the same order, same sequence of byte assignments. Rather than
+litigate where the idea/expression line falls, this project takes the cheap
+route: MIT, notice preserved, done. No rewrite is warranted and none was made.
+
+**What is deliberately NOT credited**: earlier release planning suggested
+crediting `pydualsense` and the DS4Windows lineage. Neither appears anywhere in
+this repository's code, comments, docs or history, and neither was used.
+`ATTRIBUTIONS.md` names them only as ecosystem, never as a source — crediting
+them otherwise would be inventing provenance. Nielk1 **is** credited, precisely
+and with its scope stated: the adaptive-trigger effect vocabulary in
+`cli.TRIGGER_MODES` is the community naming most commonly traced to that work,
+and no code was taken.
+
+## 19.3 The name is a placeholder — **PhantomCable**
+
+The project must not carry "DualSense", "PlayStation" or "Sony" in its *name*,
+so it does not. **`PhantomCable` is a placeholder, chosen to be trivially
+renameable**: it appears only in prose — `README.md`, `LICENSE`, `NOTICE`,
+`ATTRIBUTIONS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `.github/` — and in **no**
+Python package, module, import or CLI name. `ds5emu` and `ds5bridge` are
+untouched and should stay untouched; internal identifiers naming the device you
+interoperate with are normal and are not the trademark problem.
+
+The rename one-liner is in `CONTRIBUTING.md` §"Renaming the project". After it,
+`git grep -i phantomcable` must come back empty.
+
+Shortlist, with GitHub/PyPI collision checks done by search:
+
+| candidate | collisions found | note |
+|---|---|---|
+| **PhantomCable** ← used | none on GitHub/PyPI | `phantomcables.com` is a physical-cable retailer — different field, low risk, but it exists |
+| NullCable | none found | developer-flavoured, cleanest clearance |
+| FauxWire | none found | short, clear |
+| WireFeint | none found | obscure word, ages badly |
+| GhostCord / CableGhost | none exact | "ghost" is heavily used generally |
+| PadWire | not checked | descriptive fallback |
+| **VirtualCable** | **REJECTED** | VB-Audio Virtual Cable is a well-known Windows audio driver |
+| **GhostWire** | **REJECTED** | *Ghostwire: Tokyo*, a published game |
+| **PseudoWire** | **REJECTED** | established MPLS networking term (RFC 3985) |
+
+The trademark disclaimer block is at the bottom of `README.md`: SIE owns the
+marks, nominative fair use, no affiliation, no Sony code shipped.
+
+## 19.4 What was scrubbed, and the policy behind it
+
+Commit "Phase 4b: scrub machine-specific identifiers". All replacements are
+byte-for-byte and width-preserving, so no markdown table moved.
+
+**Redacted:** both development controllers' Bluetooth BD addresses
+(`→ 0011223344aa` / `0011223344bb`, same 12 characters wide), the developer's
+Windows user name (`→ <you>`), and the absolute repo path
+`D:\Codes\dualSense\ds5-virtual-usb` (`→ <repo>`).
+
+**Kept, on purpose:** Windows devnode instance fragments (`4&127b94db`) and
+audio endpoint friendly names in `docs/` — enumeration artefacts, machine-local,
+not identifying, and they *are* the evidence in `identity-comparison.md` and
+`e2e-results.md`. Where those values appeared as **command-line defaults** in
+`emulator/tools/e2e_*.py` they were annotated as machine-specific and pointed at
+`tools/e2e_endpoints.ps1`, which prints the right ones. They were silent
+wrong-for-everyone defaults.
+
+**No `docs/internal/` split was created.** After the scrub nothing in `docs/`
+needs withholding, and a two-tier layout would only invite the next contributor
+to put something private in the wrong tier. The policy is written down in
+`docs/provenance.md` §7 so it survives this handoff.
+
+**Git history was checked and is clean** — 29 commits, no secrets, no private
+paths in messages, no vendored third-party trees at any point.
+
+## 19.5 CI — what it actually runs, and one correction
+
+`.github/workflows/tests.yml`, two jobs on `windows-latest`, **neither needing
+hardware or a driver**.
+
+**A correction to the phase brief**: it stated that all 173 tests run driverless
+on a bare runner. Measured locally with a clean `PYTHONPATH` on a plain Python
+with nothing installed:
+
+```
+Ran 173 tests in 3.6s — OK (skipped=41)
+```
+
+**132 run, 41 skip.** The 41 are `tests/test_bridge.py`, which needs
+numpy/PyAV/hidapi — but still **no hardware**. So CI has two jobs rather than
+one:
+
+| job | python | result |
+|---|---|---|
+| `stdlib-only` | 3.12 **and** 3.13 | 132 run, 41 skip, nothing pip-installed |
+| `with-deps` | 3.12 | installs hidapi/numpy/av → **all 173 run** (verified locally against `prototype/.venv`) |
+
+Nothing leaks: no test in `tests/` touches a controller or the driver. The live
+harnesses live in `emulator/tools/` and `prototype/tools/` and are never
+collected by `unittest discover`.
+
+`stdlib-only` also runs the new **`emulator/tools/check_stdlib_only.py`**, which
+imports every `ds5emu` module except `bridge` and fails if `numpy`, `av`, `hid`
+or `sounddevice` ends up in `sys.modules`. The stdlib-only property of `ds5emu`
+is a design constraint (it is what makes the protocol testable anywhere), and it
+is exactly the kind of thing that erodes invisibly on a developer machine with
+the venv active.
+
+**Untested locally: Python 3.13.** Only 3.12.5 is installed on this machine.
+Nothing in the code looked version-sensitive, but watch the first CI run.
+
+## 19.6 What a maintainer must do to publish
+
+In order. None of it was done here.
+
+1. **Pick the final name**, run the rename one-liner in `CONTRIBUTING.md`, and
+   verify with `git grep -i phantomcable`. Use the same name for the GitHub
+   repository itself — the working directory is still called
+   `ds5-virtual-usb`, which is a fine local name but a poor public one.
+2. **Fix the one placeholder URL**: `OWNER/REPO` in
+   `.github/ISSUE_TEMPLATE/config.yml`. GitHub requires an absolute URL there;
+   it is the only placeholder of its kind and it is commented in the file.
+3. **Decide on the copyright line** in `LICENSE` and `NOTICE`. It currently
+   reads "PhantomCable contributors", which is valid as-is. Substitute a legal
+   name only if that is wanted.
+4. **Decide about the git history's author identity.** All 29 commits carry a
+   real name and a personal email address, and publishing makes them public.
+   That is normal for open source and is entirely the author's call — but it is
+   a decision, and after a push it cannot be undone without rewriting history.
+5. **Merge Phase 4a** (the end-user app and `docs/USER-GUIDE.md`) before or
+   with this. `README.md` links `docs/USER-GUIDE.md` and describes a packaged
+   release; both are Phase 4a's and neither exists in this branch.
+6. **Create the repository and push.** Enable Issues and GitHub's private
+   vulnerability reporting (`SECURITY.md` links to it). Add topics —
+   `dualsense`, `usbip`, `windows`, `bluetooth`, `gamepad` — as *topics*, which
+   is descriptive metadata, not naming.
+7. **Watch the first CI run**, particularly the 3.13 leg.
+8. Optional but valuable: record a short clip of the triggers working in a game.
+   The README's pitch is one line and one screenshot away from landing.
+
+## 19.7 What must NOT be published as-is
+
+Short list, and none of it is a blocker if step 5 above happens first:
+
+- **`README.md` currently links `docs/USER-GUIDE.md`, which does not exist in
+  this branch.** Merge Phase 4a first or the link is dead on the front page.
+  It also references a packaged release; if none is shipped at launch, trim the
+  "easy way" paragraph.
+- **`.github/ISSUE_TEMPLATE/config.yml` contains `OWNER/REPO`.** It renders as a
+  broken link in the new-issue chooser.
+- **The name `PhantomCable`** should be a decision, not a default.
+- Nothing else. There is no secret, no credential, no private path and no
+  third-party code in this tree.
+
+## 19.8 State left behind
+
+- **No hardware was touched.** Neither controller was opened, enumerated or read
+  from. `docs/STATUS.md` §17.9's hardware state is unchanged and still current.
+- **No system change.** Nothing installed, no service, no registry, no driver,
+  no reboot. `usbipd` untouched, usbip-win2 untouched.
+- **Nothing published.** No repository created, no remote added, no push, no
+  release, no package uploaded anywhere.
+- **Network use was read-only research only**: licence texts and name-collision
+  searches.
+- Work is on a worktree branch, five commits, all ending
+  `Co-Authored-By: Claude Opus 5`. Nothing was merged to `master`.
+
+## 19.9 Files this phase added or changed
+
+```
+added    LICENSE                          MIT
+added    NOTICE                           daidr's + awalol's notices, in full
+added    ATTRIBUTIONS.md                  the human credits
+added    CONTRIBUTING.md                  dev setup, tests, hardware protocol
+added    SECURITY.md                      it is a local privileged-adjacent tool
+added    requirements.txt                 runtime deps, with what is dev-only
+added    .gitattributes                   ends the CRLF warnings
+added    docs/provenance.md               THE AUDIT — read this one
+added    .github/workflows/tests.yml      two jobs, no hardware
+added    .github/ISSUE_TEMPLATE/{bug,game-report,config}.yml
+added    .github/PULL_REQUEST_TEMPLATE.md
+added    emulator/tools/check_stdlib_only.py
+rewrote  README.md                        public-facing, gamers first
+edited   .gitignore                       reviewed and grouped
+edited   docs/STATUS.md                   this section, plus the scrub
+edited   docs/{e1,e2e}-results.md         scrub only
+edited   emulator/README.md               scrub only
+edited   emulator/ds5emu/{__main__,bridge}.py           scrub (comments only)
+edited   emulator/tools/e2e_{soak,audio,setstate}.py    machine-specific
+                                                        defaults annotated
+```
+
+Untouched by design: `docs/USER-GUIDE.md` and anything under `app/` — those
+belong to the concurrent Phase 4a agent in the main tree.
+
+<!-- ====================== END PHASE 4b SECTION ====================== -->

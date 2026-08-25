@@ -426,8 +426,8 @@ class BridgeBackend(Backend):
         #: is charging over USB *still enumerates over Bluetooth* as a stale
         #: entry whose feature reads fail, and `enumerate_devices()` orders by
         #: path, so "first BT match" can hand you the wrong — or a dead —
-        #: controller. Observed on 2026-08-25 with `a0fa9c0dd8bb` (charging,
-        #: stale, feature read failed) sorting ahead of `d42f4ba1485d` (live).
+        #: controller. Observed on 2026-08-25 with `0011223344aa` (charging,
+        #: stale, feature read failed) sorting ahead of `0011223344bb` (live).
         self.serial = serial.lower() if serial else None
         self.target = target
         self.speaker_volume = speaker_volume
