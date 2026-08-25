@@ -1663,3 +1663,202 @@ succeeds on the first try. A genuinely switched-off controller makes
 `app/tools/reconnect_test.py`'s docstring and has not been run**: bridge, start
 a game, hold PS ~10 s, confirm the game keeps running with a neutral
 controller, press PS, confirm it responds again.
+
+### 30-minute soak (§17.6(3): "the longest continuous run was 120 s")
+
+`app/tools/soak.py --minutes 30`, running `BridgeService` — the object the
+product actually launches — with a 250 Hz reader on the virtual device standing
+in for a game, one sample a minute to a JSONL.
+
+| over 30.0 minutes | |
+|---|---|
+| reports delivered | **449 990 = 249.99/s** (nominal 250) |
+| per-minute rate | min **249.96**, median **250.00**, max **250.02** |
+| first 15 min vs last 15 min | **249.993 vs 249.993/s** — no drift at all |
+| gap median | **4.019 – 4.033 ms** across all 30 samples |
+| gap p99 | **7.21 – 7.70 ms** |
+| worst single gap | **15.76 ms** (one sample; every other max ≤ 12.0) |
+| **sequence discontinuities** | **0** |
+| **empty polls** | **0** |
+| **read errors** | **0** |
+| Bluetooth read errors | **0** |
+| disconnects / reconnects / watchdog trips | **0 / 0 / 0** |
+| neutral reports | **0** — the link never dropped |
+| Bluetooth link rate | 485.3/s first minute, 472.2/s last |
+| input repeat fraction | 30.2 % (matches §16.2's ~32 % on a healthy link) |
+
+**Nothing degraded.** The 30th minute is statistically indistinguishable from
+the first, which is the question a soak exists to answer.
+
+**Why no audio.** The Phase 3c full-duplex soak cost 10 % of battery in about
+four minutes (`e2e-results.md` §2(e)) — roughly **2.5 %/min** with both
+actuators driven. Thirty minutes of that is not something a battery can do; the
+run would end as a dead-controller test, and §16.2 records exactly what a dead
+controller looks like. HID-only is what a long session looks like between
+cutscenes and is the regime where drift and thermal effects are measurable.
+`soak.py --audio` exists for a short full-duplex run on a charged unit.
+
+### The battery gauge is coarse and it lags under load — do not trust it live
+
+Worth knowing before anyone reads a battery number as a fuel gauge:
+
+```
+03:20 -> 04:24   reads 70 % continuously, through an hour of bridging
+04:24            soak ends
+04:26            reads 30 %, stable across four consecutive re-reads
+```
+
+The DualSense's battery nibble held at level 7 for the entire 30-minute soak and
+then dropped four levels within two minutes of the load coming off. Actual drain
+over the whole session was roughly **0.7 %/min** for input-only bridging
+(80 % → 30 % across ~75 min), so the *number* was wrong long before it moved.
+
+Treat the in-run reading as a **floor that updates lazily**, not a gauge. It is
+still the right thing to surface — a controller reading 15 % really is about to
+misbehave — but "it said 70 % the whole time" is not evidence that it was.
+
+### Battery surfacing
+
+Three places, because the failure it prevents is a *diagnosis* failure:
+
+* **At claim.** `ds5bridge` reads the level before it attaches anything and
+  prints it. Below 20 % it prints a warning instead of a note.
+* **Every 60 s while running** (`controller.BatteryWatcher`), decoded on demand
+  from the report the backend already holds — never on the 250 Hz request path.
+* **In the tray**, as a bar across the bottom of the icon, red below 20 %, and
+  as a balloon notification the first time it crosses a threshold downwards.
+
+The message itself is the point:
+
+```
+battery 12% -- CRITICAL. A DualSense this low produces dropouts and timeouts
+that look exactly like software faults. Charge it.
+```
+
+It warns **once per level, not once per minute** (an alert every 60 s for an
+hour is an alert people learn to ignore) and **never while charging**, however
+low. 11 hardware-free tests cover exactly those properties.
+
+## 18.5 Packaging
+
+Both variants built and run end to end on this machine, `PyInstaller 6.22.2`:
+
+| | exe | total on disk | cold start (3 runs) |
+|---|---|---|---|
+| **one-dir** (default) | 5.1 MB | **134.3 MB**, 192 files | **0.23 / 0.17 / 0.18 s** |
+| one-file | **53.5 MB** | 53.5 MB | 2.32 / 2.03 / 2.17 s |
+
+**One-dir is the default.** A one-file build is a self-extracting archive: it
+unpacks ~90 MB of numpy, PyAV and libopus into `%TEMP%\_MEIxxxxx` on *every*
+launch, which is both the 12x startup cost and the heuristic shape antivirus
+scores badly — a packed executable that writes DLLs to a temp path and then
+executes them. One-dir's DLLs sit where they were installed. The one-file build
+is kept working (`build.ps1 -OneFile`) because it is genuinely nicer to hand
+somebody as one attachment.
+
+**Antivirus, honestly.** Windows Defender with real-time protection **on**
+scanned both builds and found nothing (`MpCmdRun -Scan -ScanType 3`). That is
+one engine on one machine, and it is not the same question as reputation:
+**neither build is code-signed, so both raise SmartScreen's "Windows protected
+your PC" on a machine that has not seen them before.** That is a signing
+problem, not a packaging one, and it is unsolved here. The user guide says so
+plainly rather than telling people to click through a security warning.
+
+**No driver is bundled and none is installed.** usbip-win2 stays the user's
+decision, made once. When it is absent, `usbip.MISSING_MESSAGE` names the
+release (0.9.7.7), the URL, the "do not use 0.9.7.8" warning and the guide.
+`--usbip` / `DS5_USBIP_EXE` is an *exclusive* override — which is also the only
+way to exercise that message on a machine that has the driver installed.
+
+Two entry points from one spec: `ds5bridge.exe` (console) and
+`ds5bridge-tray.exe` (windowed). The windowed one replaces `sys.stdout`/`stderr`
+with a sink first: under `console=False` they are `None`, and a bare `print()`
+then raises `AttributeError` deep inside a callback.
+
+## 18.6 The tray
+
+`pystray` + `Pillow`, a thin layer over the same `BridgeService`. Icon colour is
+the state (grey/blue/green/**amber = controller offline**/red), with a battery
+bar; hover gives serial, battery, reports/s and uptime; right-click gives
+Start / Stop / Quit. Balloon notifications come from pystray's own
+`icon.notify()` — no third dependency (`win10toast` is unmaintained, `plyer`
+pulls a stack in for one call). The icon is *drawn* at runtime, so no image file
+has to ship or be located.
+
+Chosen over a tkinter status window because a background utility should be an
+icon, not another window to minimise — and tkinter would have added ~10 MB to
+the bundle for a worse result.
+
+## 18.7 How to run everything
+
+```powershell
+# unit tests -- no hardware, no driver
+cd D:\Codes\dualSense\ds5-virtual-usb\emulator
+..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .   # 185
+cd ..\app
+..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .   # 23
+
+# the product, from source
+..\prototype\.venv\Scripts\python.exe -m ds5app --serial d42f4ba1485d
+..\prototype\.venv\Scripts\python.exe -m ds5app doctor
+..\prototype\.venv\Scripts\python.exe -m ds5app cleanup
+
+# hardware tests (each prints RESULT: PASS/FAIL and exits accordingly)
+..\prototype\.venv\Scripts\python.exe tools\launcher_test.py  --serial d42f4ba1485d
+..\prototype\.venv\Scripts\python.exe tools\reconnect_test.py --serial d42f4ba1485d --cycles 3
+..\prototype\.venv\Scripts\python.exe tools\soak.py --serial d42f4ba1485d --minutes 30 `
+    --jsonl C:\Temp\ds5-soak.jsonl
+
+# build the exe
+powershell -File app\packaging\build.ps1            # one-dir  (default)
+powershell -File app\packaging\build.ps1 -OneFile   # one-file (comparison)
+```
+
+The Phase-3 two-terminal procedure in §17.7 still works and is what you want
+when developing `emulator/` itself.
+
+## 18.8 Gaps remaining
+
+In the order the next agent should care about them.
+
+1. **Code signing.** The single biggest thing between this and "an average
+   gamer can install it". SmartScreen warns on first run and there is nothing
+   in the software that can fix it. Needs a certificate.
+2. **Audio over a long run is unmeasured.** The 30-minute soak is HID-only,
+   and deliberately so: the Phase 3c full-duplex soak cost ~2.5 % of battery a
+   minute, so 30 minutes of audio is not something a battery can do. A
+   mains-powered equivalent (controller on a cable is impossible — the radio
+   goes off) does not exist. **Audio drift over an hour is still unknown**, and
+   the C→U governor is exactly what a long run would stress.
+3. **The manual reconnect test has not been run.** Everything scripted passes;
+   a real long PS-press power-off, which also removes the device from Windows'
+   enumeration, has not been done. Procedure is in
+   `app/tools/reconnect_test.py`'s docstring.
+4. **One machine, one Windows build, one game.** Nothing here has been run on
+   another PC. In particular, `find_usbip`'s registry probe has only ever seen
+   one install layout.
+5. **No installer.** The user unzips a folder. A real installer would place the
+   Start-menu shortcut, offer the Startup-folder tray option and chain the
+   usbip-win2 install (with consent).
+6. **Multiple controllers simultaneously.** One bridge, one controller. The
+   architecture allows a second instance on another port — the mutex is
+   per-port — but nothing has been tested that way beyond two bridges
+   co-existing during these tests.
+7. Carried over from §17.6 and still open: audio *fidelity* as opposed to
+   presence; the real UAC1 volume ranges (risk R7); the feature-report prefetch
+   list; headphone routing, which `--audio-target headphone` exposes and nobody
+   has ever plugged anything into.
+
+## 18.9 State left behind
+
+- **Nothing is attached**; `usbip port` prints nothing. TCP 3241 free.
+- **No emulator, bridge or tray process is running.**
+- **`usbipd` Running / Automatic** — never stopped or reconfigured.
+- **No system configuration was changed by this run.** No driver installed, no
+  service reconfigured, no registry write, no reboot. The only installs were
+  `pystray`, `pillow` and `pyinstaller` into `prototype/.venv`.
+- `dist/` and `dist-onefile/` hold the built exes and are gitignored.
+- Controllers: `d42f4ba1485d` on Bluetooth; `a0fa9c0dd8bb` did not enumerate at
+  all this session. **Re-enumerate before trusting either** (§17.5).
+
+<!-- ====================== END PHASE 4a SECTION ====================== -->
