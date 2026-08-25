@@ -151,8 +151,15 @@ def make_tone(seconds: float, spk_hz: float, hap_hz: float,
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--render-name", default="Speakers (3- DualSense")
-    ap.add_argument("--capture-name", default="Headset Microphone (3- DualSense")
+    # MACHINE-SPECIFIC defaults: the "2-"/"3-" prefix Windows puts in an audio
+    # endpoint's friendly name is assigned at enumeration time and moves between
+    # runs. Run tools/e2e_endpoints.ps1 to print RENDER=/CAPTURE= for your machine.
+    ap.add_argument("--render-name", default="Speakers (3- DualSense",
+                    help="substring of the virtual render endpoint's friendly name "
+                         "(machine-specific; see tools/e2e_endpoints.ps1)")
+    ap.add_argument("--capture-name", default="Headset Microphone (3- DualSense",
+                    help="substring of the virtual capture endpoint's friendly name "
+                         "(machine-specific; see tools/e2e_endpoints.ps1)")
     ap.add_argument("--mode", choices=("both", "speaker", "haptics"), default="both")
     ap.add_argument("--seconds", type=float, default=3.0)
     ap.add_argument("--spk-hz", type=float, default=1500.0)

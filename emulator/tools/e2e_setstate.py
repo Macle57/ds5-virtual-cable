@@ -102,7 +102,12 @@ def battery(h, settle: float = 0.5) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--virtual-path-contains", default="4&127b94db")
+    # MACHINE-SPECIFIC default: the "4&xxxxxxxx" devnode instance fragment is
+    # assigned by Windows at enumeration time. Run tools/e2e_endpoints.ps1 to
+    # print HIDNODE= for your machine.
+    ap.add_argument("--virtual-path-contains", default="4&127b94db",
+                    help="substring of the virtual HID devnode instance path "
+                         "(machine-specific; see tools/e2e_endpoints.ps1)")
     ap.add_argument("--settle", type=float, default=0.6,
                     help="seconds to watch the input stream after each write")
     args = ap.parse_args(argv)

@@ -1,0 +1,16 @@
+# !! BEFORE PUBLISHING: replace OWNER/REPO in the first URL below with the real
+# repository path. GitHub requires absolute URLs in contact_links, so this one
+# cannot be relative. It is the only placeholder of its kind in the repo.
+blank_issues_enabled: true
+contact_links:
+  - name: Read the handoff document first
+    url: https://github.com/OWNER/REPO/blob/main/docs/STATUS.md
+    about: >-
+      docs/STATUS.md records what is verified, what is only implemented, and
+      every trap found so far. A surprising number of questions are answered
+      there, especially the battery and controller-selection ones.
+  - name: usbip-win2 driver problems
+    url: https://github.com/vadimgrn/usbip-win2/issues
+    about: >-
+      Install failures, driver crashes, bugchecks, or anything involving
+      usbip2_ude / usbip2_filter belong upstream, not here.
