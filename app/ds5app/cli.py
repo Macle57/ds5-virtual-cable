@@ -137,14 +137,16 @@ def cmd_run(args) -> int:
         for c in e.candidates:
             print(f"    ds5bridge --serial {c.serial}      ({c.describe()})")
         return 2
-    except UsbipNotFound as e:
-        print("\n" + str(e))
+    # The service already emitted every one of these through `_log`, so these
+    # handlers add the *next step* and nothing else. Printing `str(e)` again
+    # here showed the whole 12-line "install usbip-win2" message twice.
+    except UsbipNotFound:
         return 3
-    except S.AlreadyRunningError as e:
-        print(f"\n{e}")
+    except S.AlreadyRunningError:
         return 5
-    except (C.NoControllerError, RuntimeError) as e:
-        print(f"\nCould not start: {e}")
+    except (C.NoControllerError, RuntimeError):
+        print("\nNothing was changed on this machine. `ds5bridge doctor` checks "
+              "the whole setup.")
         return 4
     except KeyboardInterrupt:
         return 130
