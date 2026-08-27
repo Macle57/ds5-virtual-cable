@@ -279,6 +279,43 @@ def _teardown_all() -> None:
             log.exception("teardown hook failed")
 
 
+_swept = False
+
+
+def hidhide_sweep_once(log_fn=None) -> int:
+    """Repay any hide debt left by a previous run. Once per process, always.
+
+    Hooked to `install_crash_handlers()` rather than called from one place,
+    because that function is already what every entry point reaches -- a bare
+    `ds5bridge run`, `--all`, the tray and `BridgeManager.__init__` all call it,
+    so this runs on every process start for one line and cannot be forgotten by
+    a future entry point.
+
+    Unconditional: it does not care whether the hide feature is switched on,
+    whether a controller is connected, or whether HidHide is still installed.
+    The whole point is that a user who lost a controller to a `taskkill /F` or a
+    power cut gets it back by launching ANY part of this program.
+
+    Costs nothing on the happy path -- `sweep()` returns immediately on an empty
+    journal directory, which is the normal case, without so much as looking for
+    HidHide.
+    """
+    global _swept
+    if _swept:
+        return 0
+    _swept = True
+    try:
+        from . import hidhide as HH
+
+        n = HH.sweep(log_fn=log_fn)
+        if n:
+            log.info("unhid %d controller(s) left over from a previous run", n)
+        return n
+    except Exception:  # noqa: BLE001
+        log.exception("the HidHide sweep failed")
+        return 0
+
+
 def install_crash_handlers() -> None:
     """atexit + signals + the Windows console-control handler.
 
@@ -296,6 +333,7 @@ def install_crash_handlers() -> None:
         return
     _handlers_installed = True
     atexit.register(_teardown_all)
+    hidhide_sweep_once()
 
     def _sig(signum, frame):  # noqa: ARG001
         _teardown_all()
@@ -330,7 +368,8 @@ class BridgeService:
     def __init__(self, serial: str | None = None, port: int = DEFAULT_PORT,
                  host: str = "127.0.0.1", busid: str = "1-1",
                  usbip_exe: str | None = None, audio_target: str = "speaker",
-                 auto_cleanup: bool = True, on_event=None):
+                 auto_cleanup: bool = True, on_event=None,
+                 hide_bluetooth: bool = False, hidhide_cli: str | None = None):
         self.serial = serial
         self.port = port
         self.host = host
@@ -339,6 +378,17 @@ class BridgeService:
         self.audio_target = audio_target
         self.auto_cleanup = auto_cleanup
         self.on_event = on_event or (lambda kind, text: None)
+        #: Hide the real Bluetooth pad from everything else while bridged.
+        #: Owned HERE rather than in the manager or the tray so that ONE code
+        #: path serves the tray, `ds5bridge --all` and a bare `ds5bridge run` --
+        #: the same argument `manager.default_child_command()` makes for reusing
+        #: `ds5bridge run`. The invariant is "unhide is part of stop", not
+        #: "unhide is part of the tray", so every path that stops a bridge
+        #: unhides: the tray toggle, the master switch, hotplug's vanish_grace,
+        #: a child crash, Quit, Ctrl+C and a closed console.
+        self.hide_bluetooth = bool(hide_bluetooth)
+        self.hidhide_cli = hidhide_cli
+        self._hidden_ids: list[str] = []
 
         self.state = STOPPED
         self.error: str | None = None
@@ -491,6 +541,19 @@ class BridgeService:
         self._emit("ready",
                    f"virtual wired DualSense attached (controller {self.serial})")
 
+        # 8. hide the real Bluetooth pad, if asked. AFTER the attach succeeded,
+        # so a hide can never be the reason a bridge did not come up, and so the
+        # window in which something is hidden is exactly the window in which the
+        # virtual replacement exists. Wrapped: `hide_for_bridge` already returns
+        # [] rather than raising for every failure, and this is belt and braces
+        # on top of that, because bridging is the product and hiding is not.
+        if self.hide_bluetooth:
+            try:
+                self._hidden_ids = self._hide()
+            except Exception:  # noqa: BLE001
+                log.exception("hiding the Bluetooth pad failed")
+                self._hidden_ids = []
+
         self._battery = C.BatteryWatcher(
             self._backend,
             on_report=lambda p, s: self._emit("battery", C.battery_note(p, s)),
@@ -570,6 +633,20 @@ class BridgeService:
             self._battery.stop()
             self._battery = None
 
+        # Unhide BEFORE the detach, not after. If the unhide fails we have not
+        # yet begun tearing the virtual device down, so the failure is
+        # recoverable and reportable while the bridge is still coherent -- and
+        # the user is never left with neither pad.
+        #
+        # Unconditional, deliberately NOT `if self.hide_bluetooth`: the journal
+        # on disk is the record of what was hidden, and it outlives an in-memory
+        # flag that a config reload or a mid-run toggle could have moved. No
+        # record means this is a no-op.
+        try:
+            self._unhide(quiet=quiet)
+        except Exception:  # noqa: BLE001
+            log.exception("unhiding the Bluetooth pad failed")
+
         u = self.usbip
         if u is not None and self._attached:
             # ORDER MATTERS. -X first: `usbip attach` armed a background
@@ -621,6 +698,27 @@ class BridgeService:
             _ACTIVE.remove(self)
         self.state = STOPPED
         self.started_at = None
+
+    # -- HidHide -----------------------------------------------------------
+    #
+    # Two thin seams rather than direct calls, so `test_service.py` can watch
+    # the ORDERING (hide only after attach; unhide before detach; unhide on
+    # every stop path) with no driver and no hardware.
+
+    def _hide(self) -> list[str]:
+        from . import hidhide as HH
+
+        return HH.hide_for_bridge(self.serial, cli_override=self.hidhide_cli,
+                                  log_fn=lambda t: self._emit("info", t))
+
+    def _unhide(self, quiet: bool = False) -> bool:
+        from . import hidhide as HH
+
+        ok = HH.unhide_for_bridge(
+            self.serial, cli_override=self.hidhide_cli,
+            log_fn=(lambda t: None) if quiet else (lambda t: self._emit("info", t)))
+        self._hidden_ids = []
+        return ok
 
     @staticmethod
     def _safe_ports(u: Usbip) -> list[int]:

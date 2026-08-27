@@ -138,11 +138,112 @@ Double-click **`ds5bridge-tray.exe`**. An icon appears next to the clock:
 | red | something failed — hover for the reason |
 
 The little bar across the bottom of the icon is the battery, and it turns red
-below 20 %. Hover for controller address, battery and report rate. Right-click
-for **Start bridging / Stop bridging / Quit**.
+below 20 %. Hover for the per-controller detail. A second dot in the corner
+means more than one controller is bridged.
 
-`ds5bridge-tray.exe --autostart` starts bridging the moment it launches — handy
-in your Startup folder.
+**You do not have to click anything.** The tray bridges every controller that is
+switched on, and picks up ones you turn on later — so the normal routine is
+"turn the controller on, start the game".
+
+Right-click for the menu:
+
+| item | what it does |
+|---|---|
+| **Bridging enabled** | the master switch. Unticking it stops every bridge |
+| one row per controller | tick to bridge it, untick to leave it alone |
+| **Hide Bluetooth pad while bridged** | optional, off by default — see below |
+| **Rescan for controllers** | look again now instead of waiting for the next sweep |
+| **Start at login** | run the tray when you log in |
+| **Quit** | stop everything and put it all back |
+
+Every one of those is remembered, in
+`%APPDATA%\ds5bridge\config.json`.
+
+#### Turning it off, and why you might
+
+Unticking a controller — or **Bridging enabled** for all of them — stops its
+bridge and hands the controller straight back to Windows' own Bluetooth stack.
+Nothing is uninstalled, no driver is touched, and the pad goes on working as an
+ordinary Bluetooth controller.
+
+That is the right thing to do when a game already supports a DualSense properly
+over Bluetooth, or when a launcher gets confused by seeing two pads. Tick it
+again when you want the wired features back.
+
+#### Optional: hiding the Bluetooth pad, so games see ONE controller
+
+While a controller is bridged, Windows has **two** DualSenses -- the real
+Bluetooth one and the virtual wired one. Most games take the wired one and all
+is well; that is the "The game sees TWO controllers" row in troubleshooting.
+Some do not. A few assign both to player slots, so one physical pad drives two
+players.
+
+If that is happening to you, ds5bridge can hide the Bluetooth pad from
+everything except itself for as long as the bridge is up. It needs one more
+free, Microsoft-signed driver:
+
+**[HidHide](https://github.com/nefarius/HidHide/releases)** -- download
+`HidHide_1.5.230_x64.exe` from that page, run it, and **reboot**.
+
+> **The reboot is not optional.** HidHide filters HID devices by attaching to
+> them as they are created, so until you restart, it has no effect on any
+> device that already existed -- including your controller. Skipping it makes the
+> feature look silently broken.
+
+> ### Uninstall HidHide only with its own uninstaller
+>
+> Settings -> Apps -> HidHide -> Uninstall. **Do not remove it from Device
+> Manager.** Doing that leaves its filter entries behind and *every* HID device
+> on the machine then fails to start -- no keyboard, no mouse -- which takes a
+> registry edit from the Windows Recovery Environment to undo. This is HidHide's
+> own documented hazard, not something ds5bridge does.
+
+After the reboot, check it actually works before you rely on it:
+
+```
+ds5bridge doctor
+```
+
+The `HidHide` rows say whether it is installed and whether it answers. If you
+have the source checkout, `python app\tools\hidhide_verify.py` goes further and
+proves both halves on your real controller -- that other programs stop seeing the
+pad, *and* that ds5bridge can still open it. It puts everything back when it is
+done.
+
+Then tick the controller under **Hide Bluetooth pad while bridged**. From that
+moment:
+
+* only ds5bridge can see the Bluetooth pad; games, Steam and tools such as
+  `dualsense-tester` see only the virtual wired one;
+* **games that are already running are unaffected.** HidHide blocks *opening*
+  the device, not devices that are already open, so hide it *before* you start
+  the game;
+* unticking it, unticking the controller, quitting the tray, Ctrl+C, closing the
+  window -- every one of those puts the pad back immediately.
+
+It is **off by default**, deliberately: the failure mode of this feature is a
+controller you cannot see, so nothing changes unless you go and ask for it.
+
+#### If a pad is ever left hidden
+
+Only a hard kill or a power cut can do this -- every normal exit puts the pad
+back. If it happens, the fix is one of these, in order of convenience:
+
+| | |
+|---|---|
+| **Just start ds5bridge again** | any part of it -- the tray, `ds5bridge run`, `ds5bridge cleanup` -- checks on startup and puts back anything a dead run left hidden. This is usually all you need. |
+| **Tray -> Hide Bluetooth pad while bridged -> Unhide everything now** | stops every bridge and returns every pad. Visible whenever something is hidden, even if HidHide has been uninstalled. |
+| `ds5bridge unhide` | the same, from a terminal, for when the tray will not start. |
+| `ds5bridge doctor` | says whether HidHide is installed, whether it answers, and lists anything still hidden along with whether the process that hid it is still alive. |
+
+And if you would rather not involve ds5bridge at all: HidHide ships its own
+tools. `HidHideCLI.exe --cloak-off` turns the whole thing off in one command, and
+`HidHideClient.exe` is a window where you can untick the device by hand. They are
+in `C:\Program Files\Nefarius Software Solutions\HidHide\x64`. Your controller is
+never locked behind ds5bridge being able to run.
+
+Non-standard install location? Point at it with `--hidhide-cli`, or set
+`"hidhide_cli"` in `config.json`.
 
 ### If you have two controllers
 
@@ -157,13 +258,28 @@ ds5bridge.exe devices
  x a0fa9c0dd8bb  -- not responding (read error)
 ```
 
-With more than one live, `ds5bridge` will not guess:
+Bridge all of them at once — each gets its own virtual controller, its own
+audio device and its own port:
+
+```
+ds5bridge.exe --all
+```
+
+```
+a0fa9c0dd8bb  running  port 3241  battery 50%  250 reports/s  up 8s
+d42f4ba1485d  running  port 3242  battery 20%  250 reports/s  up 8s
+```
+
+Or name just one. With more than one live, `ds5bridge` will not guess:
 
 ```
 ds5bridge.exe --serial d42f4ba1485d
 ```
 
 Use the address, never "the first one" — the order changes between sessions.
+
+Each controller keeps the same port run after run, which is what keeps Windows
+treating it as the same device rather than a new one each time.
 
 ---
 
@@ -193,14 +309,18 @@ drain faster than a cable ever would. Charge between sessions.
 |---|---|---|
 | **"no DualSense found over Bluetooth"** | not paired, or the controller is off | Hold CREATE+PS until the light bar flashes, then pair it in Windows Settings. |
 | **"is enumerated but not responding"**, or an `x` in `devices` | **the controller is on a USB cable.** A cabled DualSense turns its Bluetooth radio off but leaves a ghost entry behind | Unplug the cable. Then press PS to wake it over Bluetooth. |
-| **"More than one Bluetooth DualSense is connected"** | two live controllers, and guessing would be wrong | Run `ds5bridge devices`, then `ds5bridge --serial <address>`. |
+| **"More than one Bluetooth DualSense is connected"** | two live controllers, and guessing would be wrong | `ds5bridge --all` bridges both. To pick one, run `ds5bridge devices` then `ds5bridge --serial <address>`. The tray does all of them without asking. |
+| **A controller is connected but never gets bridged** | it is switched off in the tray menu, or the master switch is | `ds5bridge doctor` prints both, and the tray menu turns them back on. |
 | **Random dropouts, timeouts, weird stutters** | **check the battery first.** Below ~15 % a DualSense produces failures that look exactly like software bugs | `ds5bridge devices` shows the level. Charge it. This has fooled every phase of this project at least once. |
 | **"usbip-win2 is not installed"** | step 1 was skipped, or it went somewhere unusual | Install 0.9.7.7 from the link above. If it is installed somewhere odd, `ds5bridge --usbip "D:\path\to\usbip.exe"`. |
 | **"TCP 3241 held by PID..."** | a previous run crashed and its server is still alive | `ds5bridge cleanup`. It kills the leftover and detaches anything stale. |
 | **"left over from a previous run ... cleaning up"** | same thing, and it already fixed itself | Nothing. It is telling you, not asking. |
 | **"ds5bridge is already running"** | you launched it twice | Use the one that is already running. Two would fight over one controller. |
 | **The game does not see a controller** | usually the game was started first, or it is using a different input backend | Stop the game, make sure the status line says `running`, start the game again. Also check Windows **Settings → Bluetooth & devices → Devices** shows "Wireless Controller". |
-| **The game sees TWO controllers** | the real Bluetooth one *and* the virtual wired one | Expected — Windows sees both. Most games take the wired one. If yours does not, unpair the Bluetooth controller from the *game's* settings, not from Windows. |
+| **The game sees TWO controllers** | the real Bluetooth one *and* the virtual wired one | Expected — Windows sees both. Most games take the wired one. If yours does not, unpair the Bluetooth controller from the *game's* settings, not from Windows. Or install HidHide and tick **Hide Bluetooth pad while bridged** (see "Using it"), which removes the Bluetooth one for everything but ds5bridge. |
+| **My controller has vanished from Windows entirely** | a run was hard-killed while it had the Bluetooth pad hidden | Start ds5bridge again — it puts it back on startup. Or `ds5bridge unhide`. Or the tray's **Unhide everything now**. `ds5bridge doctor` shows what is still hidden. |
+| **I ticked "Hide Bluetooth pad" and nothing happened** | either HidHide is not installed, or the game was already running | `ds5bridge doctor` says which. HidHide cannot hide a device from a program that already has it open — close the game, then start it again. |
+| **"NOT hiding: this program is not on HidHide's whitelist"** | ds5bridge refused to hide, because it could not confirm it would still be able to read the controller itself | Deliberate, and the safe outcome: hiding a pad it cannot open would leave you with no working controller at all. Run `ds5bridge doctor` and read the `granting` row; `python app\tools\hidhide_verify.py` gives the full diagnosis. |
 | **Controller works, but no haptics or triggers** | the game is using the Bluetooth device, not the virtual wired one | See the row above. |
 | **Sound comes out of the controller speaker when you did not want it** | Windows picked the virtual DualSense as the default playback device | **Settings → System → Sound → Output**, choose your usual speakers. |
 | **"Windows protected your PC"** | SmartScreen; the build is not code-signed | More info → Run anyway, if you trust the source. |
@@ -224,19 +344,22 @@ do not recover cleanly when it comes back.)
 
 ```
 ds5bridge                      start bridging (Ctrl+C to stop)
+ds5bridge --all                every connected controller, one each
 ds5bridge --serial d42f4ba1485d   ...using that controller specifically
 ds5bridge devices              list controllers and battery levels
-ds5bridge doctor               check this machine's setup
+ds5bridge doctor               check this machine's setup, and your settings
 ds5bridge cleanup              undo a run that crashed
+ds5bridge unhide               give back a pad left hidden by a crash
 ds5bridge tray                 run with the tray icon
-ds5bridge tray --autostart     ...and start bridging immediately
+ds5bridge tray --serial <addr> ...limited to one controller, just this once
 ds5bridge --version
 ```
 
 Useful extras: `--status-every 5` (more frequent status lines), `--port 3242`
 (if something else wants 3241), `--audio-target headphone` (route audio to the
-controller's 3.5 mm jack instead of its speaker — untested), `-v` (verbose logs
-when reporting a problem).
+controller's 3.5 mm jack instead of its speaker — untested),
+`--hide-bluetooth` (hide the Bluetooth pad for this run; needs HidHide), `-v`
+(verbose logs when reporting a problem).
 
 ---
 
