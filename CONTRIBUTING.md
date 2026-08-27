@@ -77,6 +77,32 @@ prototype\.venv\Scripts\python.exe -m pip install hidapi numpy av sounddevice
 - `sounddevice` — only `prototype/tools/cross_mic_test.py` and the
   `emulator/tools/e2e_*` harnesses.
 
+## Running the app while you work on it
+
+Nothing has to be built or installed to get the real tray icon. `app/ds5app` is
+plain Python, and `app\tools\dev_tray.ps1` starts it the way the shipped exe
+starts it:
+
+```powershell
+powershell -File app\tools\dev_tray.ps1              # console window + live logs
+powershell -File app\tools\dev_tray.ps1 -Windowed    # no console, like ds5bridge-tray.exe
+powershell -File app\tools\dev_tray.ps1 -Isolated    # scratch DS5_CONFIG, not your real settings
+powershell -File app\tools\dev_tray.ps1 -Stop        # put it down again
+```
+
+Edit a file, run it again — each start stops the previous one first, because two
+bridges contend for the same instance mutex and port range and the resulting
+mess looks exactly like a bug in whatever you just changed.
+
+**Stop it through the script, the tray's Quit item, or Ctrl+C — not Task
+Manager.** A hard kill skips the teardown, and the teardown is what detaches the
+device and gives back a Bluetooth pad that HidHide is hiding. `-Stop` sends
+CTRL_BREAK where it can and runs `ds5bridge cleanup` where it cannot, so either
+way the debt is repaid; killing the process yourself repays neither.
+
+The underlying commands, if you would rather type them, are in `app/README.md`.
+Quit the installed build from its tray menu before starting a dev one.
+
 ## Running the tests
 
 ```powershell

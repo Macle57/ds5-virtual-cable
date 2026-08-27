@@ -601,7 +601,40 @@ def _pause_if_double_clicked() -> None:
         pass
 
 
+class _Sink:
+    """A stdout/stderr that swallows. Only ever used when there is no real one."""
+
+    def write(self, _s):
+        return 0
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def harden_streams() -> None:
+    """Give `sys.stdout`/`sys.stderr` something to be under `pythonw.exe`.
+
+    A GUI-subsystem interpreter has no standard handles, so CPython sets both
+    streams to None -- and then the first `print()` anywhere below raises
+    AttributeError from inside whatever callback happened to reach it, with no
+    console for the traceback to land on. The frozen windowed build has guarded
+    against this since it existed (`packaging/entry_tray.py`); the SOURCE form
+    did not, and the source form is exactly what `autostart.build_command()`
+    registers on a checkout -- `pythonw.exe -c "...main(['tray'])"`. Same
+    hazard, same fix, at the one door every source entry goes through.
+
+    Idempotent, and a no-op wherever the streams are real.
+    """
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, _Sink())
+
+
 def main(argv=None) -> int:
+    harden_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
     # Bare `ds5bridge` means `ds5bridge run`, and so does `ds5bridge --serial X`.
     if not argv or argv[0].startswith("-") and argv[0] not in ("--version", "-h", "--help"):
