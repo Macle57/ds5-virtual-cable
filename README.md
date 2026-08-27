@@ -199,7 +199,7 @@ hardware. Full evidence, including the failures, is in `docs/e2e-results.md`.
 | speaker output, heard back through the controller's own mic | **+64.4 dB** at the commanded frequency | detectable |
 | haptic output, same method, audio stream silent | **+27.8 dB** at the commanded frequency | detectable |
 | Bluetooth link rate, steady state | ~480 Hz | — |
-| unit tests | **343** — 185 for the protocol and the emulator, 158 for the settings, the multi-controller manager and the tray. None needs hardware or a driver; 137 need no third-party package either | — |
+| unit tests | **688** — 226 for the protocol and the emulator, 462 for the settings, the multi-controller manager and the tray. None needs hardware or a driver; a stdlib-only subset runs on bare Python (enforced in CI) | — |
 | two controllers at once | **250 reports/s each**, one process per controller | 250 |
 
 The audio tests are deliberately *frequency-selective* — they only pass if
@@ -250,7 +250,10 @@ DualSense. This bridges Bluetooth specifically.
 **Does it modify my controller, or my games?**
 No. Feature *writes* to the controller — the reports that re-pair it or touch
 its firmware — are deliberately blocked and never forwarded, even if a host
-asks. Feature reads are served from a small cache primed at startup.
+asks. The only writes allowed through are the two transient audio test
+commands (the "play a tone" pair that tools like dualsense-tester send),
+which change nothing persistent. Feature reads are served from a small cache
+primed at startup.
 
 **Will Sony break this in a firmware update?**
 Possibly. It speaks the controller's existing Bluetooth protocol, which Sony has

@@ -388,6 +388,50 @@ class NewControllerTests(_Temp):
         self.assertEqual(cfg.bridged_serials(), [])
 
 
+class HideDefaultTests(_Temp):
+    """`hide_bluetooth_default` -- the seed the tray's all-switch now writes.
+
+    It was read-only until the tray grew one checkbox for every controller at
+    once: a user who hides both pads and then buys a third means the third one
+    too, and a seed that nothing ever writes answers "no" forever.
+    """
+
+    def test_the_setter_round_trips_through_the_file(self):
+        cfg = CFG.load()
+        cfg.set_hide_bluetooth_default(True)
+        CFG.save(cfg)
+        self.assertTrue(CFG.load().hide_bluetooth_default)
+
+    def test_it_ships_off_because_the_failure_mode_is_an_invisible_pad(self):
+        self.assertFalse(CFG.load().hide_bluetooth_default)
+
+    def test_an_unseen_pad_inherits_the_seed(self):
+        cfg = CFG.load()
+        cfg.set_hide_bluetooth_default(True)
+        self.assertTrue(cfg.get("aabbccddeeff").hide_bluetooth)
+        self.assertTrue(cfg.should_hide("aabbccddeeff"))
+
+    def test_a_pad_already_in_the_file_keeps_its_own_answer(self):
+        self.write(json.dumps({"hide_bluetooth_default": True,
+                               "controllers": {SERIAL: {"hide_bluetooth": False}}}))
+        cfg = CFG.load()
+        self.assertFalse(cfg.should_hide(SERIAL))
+        self.assertTrue(cfg.get("aabbccddeeff").hide_bluetooth)
+
+    def test_a_hand_edited_string_seed_is_honoured(self):
+        self.write(json.dumps({"hide_bluetooth_default": "yes"}))
+        self.assertTrue(CFG.load().hide_bluetooth_default)
+
+    def test_the_seed_and_the_per_controller_flags_both_survive_a_save(self):
+        cfg = CFG.load()
+        cfg.set_hide_bluetooth_default(True)
+        cfg.set_hide_bluetooth(SERIAL, True)
+        CFG.save(cfg)
+        back = CFG.load()
+        self.assertTrue(back.hide_bluetooth_default)
+        self.assertTrue(back.controllers[SERIAL].hide_bluetooth)
+
+
 class PortTests(_Temp):
     def test_an_unpinned_controller_gets_the_port_base(self):
         self.assertEqual(CFG.load().port_for(SERIAL), 3241)

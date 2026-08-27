@@ -64,6 +64,60 @@ IOCTL, fall back to the CLI, and re-decide on every single call.** Nothing
 caches "the IOCTL works", because this machine demonstrates that answer
 changing underneath a running process.
 
+What 2026-08-27 measured, after "unhiding does not unhide"
+-----------------------------------------------------------
+A user turned the hide toggle off and the pad stayed invisible, while every
+layer of this module reported success. Three separate defects were reproduced
+on this machine, and each one on its own is enough to produce that outcome:
+
+* **`HidHideCLI.exe` reads further commands from STDIN until EOF.** The verb on
+  the command line is executed and printed, and then the process keeps reading.
+  Measured, HidHide 1.5.230 on build 26200::
+
+      HidHideCLI --version  <stdin=NUL>       -> "1.5.230.0", exit 0,  95 ms
+      HidHideCLI --version  <stdin=console>   -> "1.5.230.0", then HANGS forever
+      printf -- '--cloak-state\n' | HidHideCLI --version
+                                              -> "1.5.230.0"  AND  "--cloak-on"
+
+  That last line is the proof: the piped verb was executed too. `subprocess`
+  inherits the parent's stdin unless told otherwise, so every CLI call this
+  module made from a console host blocked until the 30 s timeout and came back
+  as `(-1, "")` -- indistinguishable from "HidHide refused". The CLI fallback,
+  which exists precisely for when the IOCTL device has gone away, was therefore
+  dead exactly when it was needed. `CliBackend._run` now passes
+  `stdin=subprocess.DEVNULL`, which is the whole fix and takes the call from
+  "never returns" to 95 ms.
+
+* **`--dev-list` prints re-runnable commands, not bare paths** -- the same shape
+  `--app-list` uses, which this module already knew about and stripped for the
+  whitelist only::
+
+      --dev-hide "HID\\{00001124-...}_VID&0002054c_PID&0ce6\\8&2fde51c0&0&0000"
+
+  `CliBackend.hidden()` returned that entire line as if it were a device
+  instance path, so nothing ever compared equal to it.
+
+* **Device instance paths are case-insensitive and every source spells them
+  differently.** For one physical pad, on one boot::
+
+      CM_Get_Device_Interface_PropertyW  HID\\{00001124-...f9b34fb}_VID&0002054c_...
+      HidHideCLI --dev-gaming            HID\\{00001124-...f9b34fb}_VID&0002054c_...
+      Get-PnpDevice                      HID\\{00001124-...F9B34FB}_VID&0002054C_...
+
+  A case-sensitive `not in` comparison against the blacklist therefore matches
+  nothing, and the old code read "I found nothing to remove" as "there is
+  nothing to remove" and returned success. Verified here: `unhide([ID.upper()])`
+  returned True with the entry still in the list afterwards.
+
+The rule those three add up to, and the reason `unhide()` looks the way it does
+now: **a removal is not a success because a call returned zero, it is a success
+because the entry is verifiably gone from HidHide's own list.** Nothing in this
+module may delete a journal record on any weaker evidence than a read-back.
+Neither hiding nor unhiding needs elevation on this build -- both the write
+IOCTL and `--dev-hide`/`--dev-unhide` were measured working from a normal
+non-elevated process -- so a write failure here is a real failure to report,
+never a silent "you should have run as admin".
+
 Concurrency
 -----------
 Only one process may hold `\\\\.\\HidHide` open at a time, and every list change is
@@ -456,9 +510,26 @@ class CliBackend:
         self.exe = exe
 
     def _run(self, *args) -> tuple[int, str]:
+        """One CLI invocation. `stdin=DEVNULL` is load-bearing, not tidiness.
+
+        `HidHideCLI.exe` executes the verbs on its command line and then goes on
+        reading MORE verbs from stdin until EOF -- the module docstring has the
+        measurement that proves it, including a piped `--cloak-state` being
+        obeyed by a process invoked as `--version`. `subprocess` inherits the
+        parent's stdin by default, so from a console host (`ds5bridge run`, the
+        dev launcher, any terminal) the child never saw EOF and never exited:
+        every verb blocked for the full timeout and came back as a failure.
+
+        That is what made "unhide reports success but the pad stays hidden"
+        possible, because the CLI is the fallback for exactly the situation --
+        the `\\\\.\\HidHide` control device having gone away -- in which unhiding
+        matters most. NUL gives an immediate EOF, and the same call that never
+        returned now takes 95 ms.
+        """
         try:
             r = subprocess.run([self.exe, *args], capture_output=True, text=True,
-                               timeout=30, creationflags=_CREATE_NO_WINDOW)
+                               timeout=30, stdin=subprocess.DEVNULL,
+                               creationflags=_CREATE_NO_WINDOW)
             return r.returncode, (r.stdout or "") + (r.stderr or "")
         except Exception as e:  # noqa: BLE001
             log.debug("HidHideCLI %s failed: %s", args, e)
@@ -468,36 +539,52 @@ class CliBackend:
         code, out = self._run("--version")
         return out.strip() if code == 0 else ""
 
-    def hidden(self) -> list[str] | None:
-        code, out = self._run("--dev-list")
-        if code != 0:
-            return None
-        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+    @staticmethod
+    def _parse_listing(out: str, verb: str) -> list[str]:
+        """Both HidHide listings print re-runnable commands, not bare values::
 
-    def allowed(self) -> list[str] | None:
-        """`--app-list` prints re-runnable commands, not bare paths.
+            --app-reg  "C:\\Program Files\\...\\HidHideCLI.exe"
+            --dev-hide "HID\\{00001124-...}_VID&0002054c_PID&0ce6\\8&2fde...&0&0000"
 
-            --app-reg "C:\\Program Files\\...\\HidHideCLI.exe"
+        so the value is what is inside the quotes. This module knew that about
+        `--app-list` and not about `--dev-list`, and the consequence was that
+        `hidden()` handed every caller the string `--dev-hide "HID\\..."` as if
+        it were a device instance path. Nothing ever compared equal to it, so
+        `unhide()` concluded there was nothing to remove and reported success
+        while the pad stayed cloaked, and `ds5bridge unhide --all-hidhide`
+        offered to clear a list of entries none of which it could match.
 
-        so the path is what is inside the quotes.
+        A bare value is still accepted: it costs one branch, and being wrong
+        about which shape a HidHide release prints is how this got here.
         """
-        code, out = self._run("--app-list")
-        if code != 0:
-            return None
-        paths = []
-        for line in out.splitlines():
+        values = []
+        for line in (out or "").splitlines():
             line = line.strip()
             if not line:
                 continue
             if '"' in line:
                 parts = line.split('"')
                 if len(parts) >= 2 and parts[1].strip():
-                    paths.append(parts[1].strip())
-            elif line.startswith("--app-reg"):
-                rest = line[len("--app-reg"):].strip()
+                    values.append(parts[1].strip())
+            elif line.startswith(verb):
+                rest = line[len(verb):].strip()
                 if rest:
-                    paths.append(rest)
-        return paths
+                    values.append(rest)
+            elif not line.startswith("--"):
+                values.append(line)
+        return values
+
+    def hidden(self) -> list[str] | None:
+        code, out = self._run("--dev-list")
+        if code != 0:
+            return None
+        return self._parse_listing(out, "--dev-hide")
+
+    def allowed(self) -> list[str] | None:
+        code, out = self._run("--app-list")
+        if code != 0:
+            return None
+        return self._parse_listing(out, "--app-reg")
 
     def hide_one(self, instance_id: str) -> bool:
         return self._run("--dev-hide", instance_id)[0] == 0
@@ -555,6 +642,26 @@ class CliBackend:
 # ---------------------------------------------------------------------------
 # device instance resolution
 # ---------------------------------------------------------------------------
+
+def norm_instance_id(value: str) -> str:
+    """A device instance path folded to its comparable form.
+
+    Windows device instance paths are case-INSENSITIVE, and on 2026-08-27 this
+    machine produced three different spellings of one physical DualSense within
+    a single boot: `CM_Get_Device_Interface_PropertyW` and HidHide's own
+    `--dev-gaming` both say `..._VID&0002054c_PID&0ce6\\8&2fde51c0...`, while
+    `Get-PnpDevice` -- and anything else reading the devnode directly -- says
+    `..._VID&0002054C_PID&0CE6\\8&2FDE51C0...`.
+
+    So `entry not in wanted` is not a membership test, it is a coin flip, and
+    the side it lands on decides whether a user gets their controller back.
+    Every comparison against HidHide's lists goes through here.
+
+    The stray-quote strip is for the same reason `_parse_listing` exists: a
+    value that arrived from a CLI listing may still be wearing them.
+    """
+    return (value or "").strip().strip('"').strip().casefold()
+
 
 class _GUID(ctypes.Structure):
     _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
@@ -751,6 +858,427 @@ def resolve_serial(serial: str, cli: "CliBackend | None" = None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# bringing the devnode back -- what an unhide on its own does NOT do
+# ---------------------------------------------------------------------------
+#
+# Measured on a user's machine, 2026-08-27, after a tray Quit:
+#
+#     HidHideCLI --dev-list        (empty)          <- the blacklist IS clear
+#     hid_enumerate                no DualSense     <- and the pad is still gone
+#
+# Clearing the blacklist is not what makes a device usable again; it only stops
+# HidHide failing the next IRP_MJ_CREATE. On that machine the HID child devnode
+# under the pad's Bluetooth node had gone PHANTOM, and nothing re-creates a
+# phantom child until somebody asks the bus to enumerate again. What fixed it:
+#
+#     pnputil /restart-device "BTHENUM\{00001124-...}_VID&0002054C_PID&0CE6\
+#                              7&16440032&0&<MAC>_C00000000"
+#
+# -- on the PARENT, not on the HID child, and elevated.
+#
+# Two consequences run through everything below:
+#
+# 1. **An unhide is not finished until the pad is visible again.** Every removal
+#    is followed by a re-enumeration and then VERIFIED with the same
+#    `enumerate_devices()` the bridge itself uses. If it cannot be made visible,
+#    the user is told to power-cycle the controller -- out loud, in the tray and
+#    on the console. Silence here is what left a user with a dead pad and a
+#    program insisting everything was fine.
+#
+# 2. **The instance ID that went in is not the instance ID that comes out.**
+#    Same machine, same physical pad, across one hide/revive cycle:
+#
+#        hidden:  HID\{00001124-...}\8&2FDE51C0&0&0000
+#        back as: HID\{00001124-...}\8&110FB383&11&0000   (&11& == re-enumerated)
+#
+#    So a recorded instance ID is a cleanup token for a string that may now be a
+#    phantom, and matching by it alone misses the entry that actually matters.
+#    The stable identity is the Bluetooth parent, whose own ID carries the MAC
+#    and does not churn -- `bt_parent_for_serial()`.
+
+
+#: `CM_Locate_DevNode` flags. PHANTOM is the whole point: the devnode this has
+#: to reach is, by definition, one Windows is no longer presenting.
+_CM_LOCATE_DEVNODE_NORMAL = 0x00000000
+_CM_LOCATE_DEVNODE_PHANTOM = 0x00000001
+
+#: `CM_Reenumerate_DevNode` flags. SYNCHRONOUS so the call returns after the
+#: bus has actually looked, rather than after it has been asked to.
+_CM_REENUMERATE_SYNCHRONOUS = 0x00000001
+
+#: `CM_Get_Device_ID_List` filter: everything under one enumerator. Deliberately
+#: NOT combined with FILTER_PRESENT -- a phantom BTHENUM node is still the right
+#: thing to restart.
+_CM_GETIDLIST_FILTER_ENUMERATOR = 0x00000001
+
+#: The enumerator a Bluetooth HID device's parent lives under.
+BT_ENUMERATOR = "BTHENUM"
+
+#: How long to give the bus to re-create the HID child, and how often to look.
+#: Two seconds is generous for a re-enumeration that has already returned
+#: synchronously; it costs nothing on the happy path, which returns before any
+#: of this on the first `pad_visible()` call.
+REVIVE_SETTLE_S = 2.0
+REVIVE_POLL_S = 0.25
+
+
+def _hex_only(value: str) -> str:
+    return "".join(c for c in (value or "").lower() if c in "0123456789abcdef")
+
+
+def _locate_devnode(instance_id: str, phantom: bool = True):
+    """A `DEVINST` for an instance ID, or None. Phantoms included by default."""
+    if sys.platform != "win32" or not instance_id:
+        return None
+    try:
+        cm = _cfgmgr()
+        devinst = ctypes.c_ulong(0)
+        flags = _CM_LOCATE_DEVNODE_PHANTOM if phantom else _CM_LOCATE_DEVNODE_NORMAL
+        if cm.CM_Locate_DevNodeW(ctypes.byref(devinst),
+                                 ctypes.c_wchar_p(instance_id.strip().strip('"')),
+                                 flags) != _CR_SUCCESS:
+            return None
+        return devinst
+    except Exception:  # noqa: BLE001
+        log.debug("could not locate devnode %s", instance_id, exc_info=True)
+        return None
+
+
+def devnode_present(instance_id: str) -> bool:
+    """Is this devnode PRESENT, as opposed to merely known to Windows?
+
+    The difference between the two states this feature has to tell apart, and
+    it is the whole of `revive_serial`'s first decision:
+
+    * a controller that is switched off has no present BTHENUM node -- there is
+      nothing wrong, nothing to repair, and nothing to tell the user;
+    * a controller that is connected, whose BTHENUM node IS present but whose
+      HID child has gone phantom, is the 2026-08-27 failure, and it is the only
+      state in which restarting a devnode is the right thing to do.
+
+    Without this, every ordinary "user switched the controller off" teardown
+    would re-enumerate a Bluetooth node for nothing and then advise the user to
+    power-cycle a controller they had just deliberately turned off.
+    """
+    return _locate_devnode(instance_id, phantom=False) is not None
+
+
+def parent_instance_id(instance_id: str) -> str:
+    """The devnode one level up. For a Bluetooth pad's HID child, its BTHENUM node.
+
+    "" when it cannot be answered, which includes the case where the child does
+    not exist even as a phantom -- there is then nothing to walk up FROM, and
+    `bt_parent_for_serial()` is the way in.
+    """
+    devinst = _locate_devnode(instance_id)
+    if devinst is None:
+        return ""
+    try:
+        cm = _cfgmgr()
+        parent = ctypes.c_ulong(0)
+        if cm.CM_Get_Parent(ctypes.byref(parent), devinst, 0) != _CR_SUCCESS:
+            return ""
+        size = ctypes.c_ulong(0)
+        if cm.CM_Get_Device_ID_Size(ctypes.byref(size), parent, 0) != _CR_SUCCESS:
+            return ""
+        buf = ctypes.create_unicode_buffer(size.value + 1)
+        if cm.CM_Get_Device_IDW(parent, buf, size.value + 1, 0) != _CR_SUCCESS:
+            return ""
+        return buf.value
+    except Exception:  # noqa: BLE001
+        log.debug("could not read the parent of %s", instance_id, exc_info=True)
+        return ""
+
+
+def device_ids_for_enumerator(enumerator: str = BT_ENUMERATOR) -> list[str]:
+    """Every device instance ID under one enumerator, phantoms included."""
+    if sys.platform != "win32":
+        return []
+    try:
+        cm = _cfgmgr()
+        size = ctypes.c_ulong(0)
+        if cm.CM_Get_Device_ID_List_SizeW(
+                ctypes.byref(size), ctypes.c_wchar_p(enumerator),
+                _CM_GETIDLIST_FILTER_ENUMERATOR) != _CR_SUCCESS or not size.value:
+            return []
+        buf = ctypes.create_unicode_buffer(size.value)
+        if cm.CM_Get_Device_ID_ListW(
+                ctypes.c_wchar_p(enumerator), buf, size.value,
+                _CM_GETIDLIST_FILTER_ENUMERATOR) != _CR_SUCCESS:
+            return []
+        return [s for s in buf[:size.value].split("\0") if s]
+    except Exception:  # noqa: BLE001
+        log.debug("could not list the %s enumerator", enumerator, exc_info=True)
+        return []
+
+
+def bt_parent_for_serial(serial: str) -> str:
+    """A controller's bdaddr -> its BTHENUM devnode ID, phantom or not. "" if none.
+
+    Found by MAC rather than by walking up from the HID child, because the child
+    is precisely what is missing whenever this is needed. Measured 2026-08-27::
+
+        BTHENUM\\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\\
+            7&16440032&0&D42F4BA1485D_C00000000
+
+    The address is in the parent's own ID and it does not churn, which is what
+    makes this the stable identity when the HID child's `8&2FDE51C0&0&0000` has
+    already become `8&110FB383&11&0000`.
+
+    A paired DualSense has more than one BTHENUM node (a device node and one
+    service node per profile). The HID service node is the one that parents the
+    gamepad, and it is the one carrying the HID service class GUID, so that is
+    preferred; anything else matching the address is a fallback rather than a
+    guess thrown away.
+    """
+    mac = _hex_only(serial)
+    if not mac:
+        return ""
+    fallback = ""
+    for dev in device_ids_for_enumerator(BT_ENUMERATOR):
+        low = dev.lower()
+        # The address appears as a bare hex run in the instance part; the rest
+        # of the ID carries VID/PID hex too, so the address is looked for in the
+        # LAST backslash-separated component only.
+        if mac not in _hex_only(low.rsplit("\\", 1)[-1]):
+            continue
+        if "00001124" in low:
+            return dev
+        fallback = fallback or dev
+    return fallback
+
+
+def entries_under_parent(entries, parent_id: str) -> list[str]:
+    """Which of these blacklist entries hang off `parent_id`. Phantoms included.
+
+    The answer to "the instance ID we recorded is not the one in the list any
+    more". Both the recorded token and the entry may name devnodes that no
+    longer exist, and `_locate_devnode` finds phantoms, so the relationship is
+    still readable after the child has churned.
+
+    Narrow by construction: an entry belonging to somebody else's controller has
+    a different parent, so a DS4Windows entry can never be swept up by this.
+    """
+    want = norm_instance_id(parent_id)
+    if not want:
+        return []
+    out = []
+    for entry in entries or []:
+        parent = parent_instance_id(entry)
+        if parent and norm_instance_id(parent) == want:
+            out.append(entry)
+    return out
+
+
+def is_elevated() -> bool:
+    """Is this process running as an administrator?
+
+    Asked before `pnputil` is reached for, not after it fails: unelevated it
+    fails with a message about administrator rights, and a failure we could have
+    predicted is one we should be explaining to the user instead of surfacing as
+    a mystery. Nothing else this program does needs elevation -- both hiding and
+    unhiding were measured working from a normal process -- so this must never
+    become a requirement, only an opportunity.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reenumerate(instance_id: str) -> bool:
+    """Ask the bus to look at this devnode again. NO elevation required.
+
+    The non-admin route, and the one tried first for that reason:
+    `pnputil /restart-device` and SetupDi's `DICS_PROPCHANGE` both need an
+    elevated process, and a tray utility that demands administrator rights to
+    give a controller back is a tray utility people stop running.
+    """
+    devinst = _locate_devnode(instance_id)
+    if devinst is None:
+        return False
+    try:
+        cm = _cfgmgr()
+        return cm.CM_Reenumerate_DevNode(
+            devinst, _CM_REENUMERATE_SYNCHRONOUS) == _CR_SUCCESS
+    except Exception:  # noqa: BLE001
+        log.debug("re-enumerating %s failed", instance_id, exc_info=True)
+        return False
+
+
+def _pnputil_restart(instance_id: str) -> tuple[int, str]:
+    """`pnputil /restart-device <id>` -> (exit code, output). Needs elevation.
+
+    The measured fix on the machine that produced this whole section, and the
+    heavier hammer: it tears the devnode down and brings it back, which is what
+    finally re-created the HID child. `stdin=DEVNULL` for the same reason
+    `CliBackend._run` needs it -- a console child that inherits a live stdin is
+    a child that can sit there.
+    """
+    if sys.platform != "win32" or not instance_id:
+        return (1, "")
+    try:
+        r = subprocess.run(["pnputil", "/restart-device", instance_id],
+                           capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL,
+                           creationflags=_CREATE_NO_WINDOW)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except Exception as e:  # noqa: BLE001
+        return (1, str(e))
+
+
+def pad_visible(serial: str) -> bool | None:
+    """Can the bridge's own enumeration see this controller? None = cannot tell.
+
+    Deliberately `enumerate_devices()` and not some cheaper devnode query: it
+    filters on usage page 1 / usage 5 and it is what `controller.select()` uses,
+    so a True here means visible TO THE THING THAT HAS TO OPEN IT rather than
+    merely present in some list.
+
+    None is a third answer and must not be rounded to either: no hidapi (the
+    stdlib-only salvage case) means the verification simply cannot be performed,
+    and acting as if it had failed would restart a devnode for no reason.
+    """
+    serial = (serial or "").strip().lower()
+    if not serial:
+        return None
+    try:
+        from ds5bridge import device as DEV
+
+        return any((i.serial or "").strip().lower() == serial
+                   for i in DEV.enumerate_devices())
+    except Exception:  # noqa: BLE001
+        log.debug("hidapi cannot say whether %s is visible", serial,
+                  exc_info=True)
+        return None
+
+
+def _wait_visible(serial: str, settle: float) -> bool | None:
+    """Poll `pad_visible` until it says yes, or `settle` runs out."""
+    seen = pad_visible(serial)
+    if seen is not False:
+        return seen
+    end = time.monotonic() + max(0.0, settle)
+    while time.monotonic() < end:
+        time.sleep(REVIVE_POLL_S)
+        seen = pad_visible(serial)
+        if seen is not False:
+            return seen
+    return False
+
+
+def power_cycle_hint(serial: str) -> str:
+    return (f"{serial} is unhidden but Windows still is not showing it. "
+            f"Switch the controller OFF (hold the PS button for ~10 s) and on "
+            f"again -- that re-creates its HID device. Running ds5bridge as "
+            f"administrator lets it do this for you.")
+
+
+def revive_serial(serial: str, parent_id: str = "", log_fn=None,
+                  settle: float = REVIVE_SETTLE_S) -> dict:
+    """Make an unhidden controller usable again, and PROVE it. Never raises.
+
+    -> `{"serial", "visible": True|False|None, "action", "parent", "hint"}`.
+
+    `visible` is the only field that means anything on its own, and `None` is
+    "could not be checked", never "fine". `action` is what it took:
+
+        "none"          it was already visible -- the normal case, one
+                        enumeration and out
+        "disconnected"  the controller is switched off or out of range, so
+                        there is nothing wrong and nothing to repair
+        "reenumerate"   `CM_Reenumerate_DevNode` on the Bluetooth parent, from
+                        an ordinary user process
+        "pnputil"       `pnputil /restart-device`, only when we are elevated
+        "unknown"       no Bluetooth parent could be found for this address
+        "failed"        everything was tried and the pad is still not there
+
+    The escalation stops the moment the pad is visible, and it never escalates
+    past what it can verify: if `pad_visible()` cannot answer at all, the
+    elevated restart is NOT attempted, because restarting a devnode on the
+    strength of an unverifiable suspicion is a worse failure than leaving it.
+
+    A "failed" says so out loud through `log_fn`. That is the whole point -- the
+    user this was written for was told everything had worked.
+    """
+    serial = (serial or "").strip().lower()
+    say = log_fn or (lambda t: log.info("%s", t))
+    out = {"serial": serial, "visible": None, "action": "none",
+           "parent": parent_id or "", "hint": ""}
+    try:
+        seen = pad_visible(serial)
+        if seen is not False:
+            out["visible"] = seen
+            return out
+
+        parent = parent_id or bt_parent_for_serial(serial)
+        out["parent"] = parent
+        if not parent:
+            out["action"] = "unknown"
+            out["visible"] = False
+            out["hint"] = power_cycle_hint(serial)
+            say(out["hint"])
+            return out
+
+        # IS THE CONTROLLER EVEN CONNECTED? A pad that is switched off is not
+        # broken and cannot be repaired, and this is the difference between the
+        # two states (`devnode_present`). Silent on purpose: switching a
+        # controller off is the most ordinary thing a user does, it is how most
+        # of this program's teardowns begin, and being told to power-cycle it
+        # every single time would train them to ignore the one message that
+        # matters.
+        if not devnode_present(parent):
+            out["action"] = "disconnected"
+            out["visible"] = False
+            log.debug("%s is not connected over Bluetooth; nothing to revive",
+                      serial)
+            return out
+
+        # The pad IS connected and still not enumerable. Before restarting
+        # anything, let a blacklist change that was made moments ago actually
+        # take effect -- an unhide is applied by the driver, not by us, and
+        # tearing a devnode down because we asked half a second too early would
+        # be this feature causing the failure it exists to fix.
+        seen = _wait_visible(serial, settle)
+        if seen is not False:
+            out["visible"] = seen
+            return out
+
+        if _reenumerate(parent):
+            out["action"] = "reenumerate"
+            seen = _wait_visible(serial, settle)
+            if seen is not False:
+                out["visible"] = seen
+                if seen:
+                    say(f"{serial} is visible to Windows again")
+                return out
+
+        if is_elevated():
+            code, text = _pnputil_restart(parent)
+            out["action"] = "pnputil"
+            log.debug("pnputil /restart-device %s -> %s %s", parent, code,
+                      (text or "").strip())
+            if code == 0:
+                seen = _wait_visible(serial, settle)
+                if seen is not False:
+                    out["visible"] = seen
+                    if seen:
+                        say(f"{serial} is visible to Windows again")
+                    return out
+
+        out["visible"] = False
+        out["action"] = "failed"
+        out["hint"] = power_cycle_hint(serial)
+        say(out["hint"])
+        return out
+    except Exception:  # noqa: BLE001
+        log.exception("reviving %s failed", serial)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # the facade
 # ---------------------------------------------------------------------------
 
@@ -855,10 +1383,7 @@ class HidHide:
         return self.active() is not None
 
     def hidden(self) -> list[str]:
-        got = self.ioctl.hidden()
-        if got is None and self.cli is not None:
-            got = self.cli.hidden()
-        return got or []
+        return self.hidden_raw() or []
 
     def allowed(self) -> list[str]:
         got = self.ioctl.allowed()
@@ -880,6 +1405,32 @@ class HidHide:
 
     # -- mutation ----------------------------------------------------------
 
+    def still_hidden(self, instance_ids) -> list[str] | None:
+        """Which of these HidHide still holds. None when the list is unreadable.
+
+        The read-back that every mutation is judged against. `None` is not
+        "none of them" -- it is "nobody can tell", which is the one answer that
+        must never be rounded up to success, because rounding it up is how a
+        journal record gets deleted while the pad is still cloaked.
+        """
+        current = self.hidden_raw()
+        if current is None:
+            return None
+        want = {norm_instance_id(i) for i in (instance_ids or []) if i}
+        return [e for e in current if norm_instance_id(e) in want]
+
+    def hidden_raw(self) -> list[str] | None:
+        """The blacklist as HidHide holds it, or None if no surface can answer.
+
+        `hidden()` flattens that None to `[]` for display callers, which is the
+        right shape for `doctor` and the wrong shape for anything deciding
+        whether a removal worked.
+        """
+        got = self.ioctl.hidden()
+        if got is None and self.cli is not None:
+            got = self.cli.hidden()
+        return got
+
     def hide(self, instance_ids) -> bool:
         """Add these to the blacklist. Idempotent. -> did the state end up right.
 
@@ -893,10 +1444,12 @@ class HidHide:
         with _Mutex():
             current = self.ioctl.hidden()
             if current is not None:
+                have = {norm_instance_id(e) for e in current}
                 merged = list(current)
                 for i in wanted:
-                    if i not in merged:
+                    if norm_instance_id(i) not in have:
                         merged.append(i)
+                        have.add(norm_instance_id(i))
                 if merged == current or self.ioctl.set_hidden(merged):
                     return True
             if self.cli is not None:
@@ -908,11 +1461,31 @@ class HidHide:
         return False
 
     def unhide(self, instance_ids) -> bool:
-        """Remove ONLY these from the blacklist. Idempotent.
+        """Remove ONLY these from the blacklist, and PROVE it. Idempotent.
 
         Never "clear the blacklist". The user may be hiding other pads with
         HidHide for DS4Windows, and blowing those away would be a serious
         breach of trust in a program they installed to make a controller work.
+
+        The return value is a read-back, not a report of what the writes said.
+        Every part of the old "did it work" story turned out to be a lie on
+        2026-08-27 (module docstring): a CLI verb that blocked on stdin and
+        timed out, a `--dev-list` line that could not be matched because it was
+        never parsed, and a case-sensitive comparison that found nothing to
+        remove and called that done. All three produced True with the pad still
+        invisible, and True is what deletes the journal record that was the
+        user's last way back. So:
+
+            1. remove, by whatever surface answers -- IOCTL first, then the CLI
+               for anything the IOCTL could not take out;
+            2. read the blacklist again;
+            3. report success only if none of `instance_ids` survive.
+
+        An unreadable list in step 2 is a failure. That is deliberately harsh
+        and deliberately safe: the caller keeps its record, `sweep()` tries
+        again on the next process start, and the worst case is one redundant
+        unhide of something already gone -- against a worst case on the other
+        side of a controller that no application can open.
         """
         wanted = [i for i in (instance_ids or []) if i]
         if not wanted:
@@ -920,13 +1493,32 @@ class HidHide:
         with _Mutex():
             current = self.ioctl.hidden()
             if current is not None:
-                keep = [i for i in current if i not in wanted]
-                if keep == current or self.ioctl.set_hidden(keep):
-                    return True
-            if self.cli is not None:
-                return all(self.cli.unhide_one(i) for i in wanted)
-        log.warning("could not unhide %s -- no working HidHide control surface",
-                    wanted)
+                drop = {norm_instance_id(i) for i in wanted}
+                keep = [e for e in current if norm_instance_id(e) not in drop]
+                if keep != current:
+                    self.ioctl.set_hidden(keep)
+
+            # The CLI is not an "else". The IOCTL may have written nothing
+            # because it could not read the list, or because the list it read
+            # is not the list the driver is enforcing; --dev-unhide of an entry
+            # that is already gone is a no-op, so trying both costs one process
+            # spawn and closes the gap between the two surfaces.
+            left = self.still_hidden(wanted)
+            if left and self.cli is not None:
+                for entry in left:
+                    self.cli.unhide_one(entry)
+                left = self.still_hidden(wanted)
+
+        if left == []:
+            return True
+        if left is None:
+            log.warning("unhid %s but could not read HidHide's blacklist back, "
+                        "so the removal is unproven -- treating it as a failure "
+                        "and keeping the record", wanted)
+        else:
+            log.warning("HidHide still holds %s after an unhide. Run "
+                        "`ds5bridge unhide --all-hidhide`, or untick the device "
+                        "in HidHideClient.exe.", left)
         return False
 
     def whitelist_covers_us(self) -> bool | None:
@@ -1152,12 +1744,20 @@ def _record_path(serial: str) -> str:
     return os.path.join(journal_dir(), f"{(serial or '').strip().lower()}.json")
 
 
-def write_record(serial: str, instance_ids, cloak_enabled_by_us: bool = False) -> bool:
+def write_record(serial: str, instance_ids, cloak_enabled_by_us: bool = False,
+                 parent_id: str = "") -> bool:
     """Record what we are ABOUT to hide. Called BEFORE the hide, always.
 
     Same `.tmp` + `fsync` + `os.replace` dance as `config.save()`, for the same
     reason: a half-written record is what a power cut during this produces, and
     a record that cannot be parsed is a controller nobody knows to un-hide.
+
+    `parent_id` is the controller's BTHENUM devnode, and it is written for the
+    benefit of a run that is not this one. A crash leaves the pad hidden; the
+    next start's `sweep()` clears the blacklist and then has to make the devnode
+    come back -- and by then hidapi cannot see the pad, so nothing can resolve
+    the address to a devnode any more. Recording the parent while the pad IS
+    visible is what makes that recoverable (`revive_serial`).
     """
     serial = (serial or "").strip().lower()
     if not serial:
@@ -1167,6 +1767,7 @@ def write_record(serial: str, instance_ids, cloak_enabled_by_us: bool = False) -
     data = {
         "serial": serial,
         "instance_ids": list(instance_ids or []),
+        "parent_id": parent_id or "",
         "pid": os.getpid(),
         "image": os.path.basename(sys.executable),
         "cloak_enabled_by_us": bool(cloak_enabled_by_us),
@@ -1226,6 +1827,33 @@ def remove_record(serial_or_path: str) -> None:
 
 def journal_count() -> int:
     return len(read_records())
+
+
+def unrecorded_hidden(hh: "HidHide | None" = None) -> list[str] | None:
+    """Blacklist entries no journal record accounts for. None if unreadable.
+
+    The journal answers "what do we still owe an unhide"; this answers the
+    question a user actually asks, which is "is anything still hidden". They
+    came apart on 2026-08-27 and the gap is the whole bug: a record is deleted
+    when an unhide claims success, so one lying unhide leaves an entry that no
+    record points at -- and from then on `journal_count()` says zero while the
+    pad is invisible to every application on the machine.
+
+    Nothing here removes anything. Some entries legitimately belong to somebody
+    else (DS4Windows hides pads through the same driver), so this reports and
+    lets the human decide, which is the same rule `ds5bridge unhide` follows.
+    """
+    if hh is None:
+        hh = HidHide.detect()
+    if hh is None:
+        return []
+    current = hh.hidden_raw()
+    if current is None:
+        return None
+    ours = {norm_instance_id(i)
+            for rec in read_records()
+            for i in (rec.get("instance_ids") or []) if i}
+    return [e for e in current if norm_instance_id(e) not in ours]
 
 
 # -- the verification marker ------------------------------------------------
@@ -1353,6 +1981,14 @@ def sweep(hh: "HidHide | None" = None, force: bool = False, log_fn=None) -> int:
     now" and `ds5bridge unhide`: the "I do not care what is running, give me my
     controller back" path.
 
+    Every record it clears is followed by `revive_serial()`, for the reason that
+    section of this module exists: the run this is cleaning up after died
+    without unhiding, so its pad's HID child is very likely a phantom, and an
+    empty blacklist does not bring a phantom back. This is the one place that
+    can fix it before the user has even noticed, because it runs on every
+    process start -- and if it cannot, it says "power-cycle the controller"
+    rather than leaving the user to work that out.
+
     Silent on the happy path -- an empty journal is the normal case.
     """
     records = read_records()
@@ -1371,14 +2007,23 @@ def sweep(hh: "HidHide | None" = None, force: bool = False, log_fn=None) -> int:
             continue
         ids = [i for i in (rec.get("instance_ids") or []) if i]
         serial = rec.get("serial") or "?"
+        parent = (rec.get("parent_id") or "").strip()
         if hh is not None and ids:
             # Idempotent: entries that are already absent are a no-op, which is
-            # exactly what the record-before-hide ordering relies on.
-            if not hh.unhide(ids):
+            # exactly what the record-before-hide ordering relies on. The
+            # recorded IDs may also be phantoms by now, so anything else in the
+            # blacklist under the same Bluetooth parent goes with them.
+            targets = list(ids)
+            for entry in entries_under_parent(hh.hidden_raw(), parent):
+                if not any(norm_instance_id(entry) == norm_instance_id(t)
+                           for t in targets):
+                    targets.append(entry)
+            if not hh.unhide(targets):
                 say(f"could not unhide {serial}; its record is kept so the next "
                     f"run tries again")
                 continue
-            say(f"unhid {serial} ({len(ids)} HID interface(s))")
+            say(f"unhid {serial} ({len(targets)} HID interface(s))")
+            revive_serial(serial, parent_id=parent, log_fn=say)
         elif hh is None and ids:
             # No HidHide at all any more -- the driver was uninstalled while we
             # had something hidden. The blacklist went with it, so the record is
@@ -1463,7 +2108,13 @@ def hide_for_bridge(serial: str, cli_override: str | None = None,
         was_active = hh.active()
         need_cloak = was_active is False
 
-        if not write_record(serial, ids, cloak_enabled_by_us=need_cloak):
+        # Read the Bluetooth parent NOW, while the pad is still enumerable. It
+        # is the only identity that survives both the cloak and a re-enumeration
+        # of the HID child, and after the hide nothing can look it up any more.
+        parent = parent_instance_id(ids[0]) or bt_parent_for_serial(serial)
+
+        if not write_record(serial, ids, cloak_enabled_by_us=need_cloak,
+                            parent_id=parent):
             return []
 
         if not hh.hide(ids):
@@ -1483,12 +2134,30 @@ def hide_for_bridge(serial: str, cli_override: str | None = None,
 
 
 def unhide_for_bridge(serial: str, cli_override: str | None = None,
-                      log_fn=None) -> bool:
+                      log_fn=None, revive: bool = True) -> bool:
     """The exact reverse, run from every path that stops a bridge.
 
     Called unconditionally on stop -- there is no "did we hide it" flag to get
     out of step, because the journal on disk IS that flag and it survives things
-    an in-memory flag does not. No record means nothing to do.
+    an in-memory flag does not.
+
+    "No record means nothing to do" is NOT good enough, and that assumption is
+    half of the 2026-08-27 bug report. A record is deleted the instant an unhide
+    reports success, and until this commit an unhide could report success having
+    removed nothing at all. One such round leaves a blacklist entry with no
+    record pointing at it, and from then on this function, `sweep()` and
+    `ds5bridge unhide` all agree there is nothing to do while the pad is
+    invisible to every application on the machine -- permanently, because
+    nothing else ever looks.
+
+    So the no-record case now asks HidHide instead of asking the journal. It
+    stays free in the normal case: an empty blacklist IS the proof that nothing
+    of ours is hidden, and that is one list read with no device resolution
+    behind it. Only a blacklist with something in it costs a `resolve_serial()`.
+
+    `revive=False` stops at the blacklist. Nothing in this program passes it;
+    it exists so a caller that is about to restart the devnode itself, or that
+    is deliberately only editing the list, can say so.
     """
     say = log_fn or (lambda t: log.info("%s", t))
     serial = (serial or "").strip().lower()
@@ -1498,27 +2167,116 @@ def unhide_for_bridge(serial: str, cli_override: str | None = None,
             if (r.get("serial") or "").lower() == serial:
                 rec = r
                 break
-        if rec is None:
-            return True
 
         hh = HidHide.detect(cli_override)
-        ids = [i for i in (rec.get("instance_ids") or []) if i]
-        if hh is not None and ids and not hh.unhide(ids):
-            say(f"could not unhide {serial}; run `ds5bridge unhide`")
-            return False
+        if rec is None:
+            return _unhide_unrecorded(hh, serial, say, revive=revive)
 
-        if rec.get("cloak_enabled_by_us") and hh is not None:
-            remove_record(rec.get("_path") or serial)
-            if not read_records():
-                hh.set_active(False)
-        else:
-            remove_record(rec.get("_path") or serial)
-        if ids:
+        ids = [i for i in (rec.get("instance_ids") or []) if i]
+        parent = (rec.get("parent_id") or "").strip()
+        if hh is not None and ids:
+            # THE RECORDED IDS ARE A CLEANUP TOKEN, NOT IDENTITY
+            # (`resolve_serial`), and the two can disagree: a re-pair between
+            # the hide and the stop changes the instance ID, a DualSense
+            # exposes more than one HID collection, and a hide/revive cycle
+            # bumps the child's re-enumeration counter -- `8&2FDE51C0&0&0000`
+            # became `8&110FB383&11&0000` on the 2026-08-27 machine.
+            #
+            # That last one is why the parent widening is UNCONDITIONAL rather
+            # than a fallback for a failed removal. Removing an ID that is not
+            # in the list is a verifiable success by every test this module can
+            # make -- the entry really is gone -- while the entry that is
+            # actually hiding the pad, its churned sibling, sits there
+            # untouched and the record is deleted on the strength of it. The
+            # parent is readable even for a phantom child, so it is the only
+            # thing that still identifies the pad in that state.
+            targets = list(ids)
+            for extra in entries_under_parent(hh.hidden_raw(), parent):
+                if not any(norm_instance_id(extra) == norm_instance_id(i)
+                           for i in targets):
+                    targets.append(extra)
+            if not hh.unhide(targets):
+                # Only now is a device enumeration worth its cost -- and only
+                # while HidHide is still answering, because an unreadable
+                # blacklist is not something a second resolve can fix.
+                widened = list(targets)
+                if hh.hidden_raw():
+                    for extra in resolve_serial(serial, cli=hh.cli):
+                        if not any(norm_instance_id(extra) == norm_instance_id(i)
+                                   for i in widened):
+                            widened.append(extra)
+                if len(widened) == len(targets) or not hh.unhide(widened):
+                    say(f"could not unhide {serial}; the record is kept. Run "
+                        f"`ds5bridge unhide`")
+                    return False
+                targets = widened
+            ids = targets
+
+        # AFTER the verified removal, never before: the record is the only
+        # thing that will bring anybody back here if this went wrong.
+        remove_record(rec.get("_path") or serial)
+        if rec.get("cloak_enabled_by_us") and hh is not None and not read_records():
+            hh.set_active(False)
+        if ids and revive:
+            # An empty blacklist is NOT a visible controller. Measured on the
+            # reporting user's machine: `--dev-list` empty, cloak harmless, and
+            # `hid_enumerate` still showing nothing, because the HID child under
+            # the pad's Bluetooth node had gone phantom and only a
+            # re-enumeration brings it back.
+            revive_serial(serial, parent_id=parent, log_fn=say)
+        elif ids:
             say("Bluetooth pad is visible again")
         return True
     except Exception:  # noqa: BLE001
         log.exception("unhiding %s failed", serial)
         return False
+
+
+def _unhide_unrecorded(hh: "HidHide | None", serial: str, say,
+                       revive: bool = True) -> bool:
+    """No journal record -- so check HidHide itself before claiming success.
+
+    This is the tray's "hide toggle off" for a controller whose record was
+    already consumed by a lying unhide, and it is the difference between the
+    tray believing it unhid the pad and the pad actually being usable.
+
+    Deliberately narrow. It removes only entries that belong to THIS serial --
+    either resolving to its live HID instances, or hanging off its Bluetooth
+    parent devnode. A stranger's DS4Windows entry satisfies neither test.
+
+    The parent half is not redundant: `resolve_serial()` goes through hidapi,
+    and a pad whose HID child has gone phantom is invisible to hidapi by
+    definition, so on the machine that needs this most the address route
+    returns nothing at all.
+    """
+    if hh is None:
+        return True
+    current = hh.hidden_raw()
+    if not current:
+        # [] is "nothing is hidden, by us or anyone". None is "unreadable", and
+        # with no record there is no debt to keep alive over it -- `sweep()` and
+        # `doctor` are the places that report an unreachable HidHide.
+        return True
+    parent = bt_parent_for_serial(serial)
+    ids = resolve_serial(serial, cli=hh.cli)
+    stale = list(hh.still_hidden(ids) or [])
+    for entry in entries_under_parent(current, parent):
+        if not any(norm_instance_id(entry) == norm_instance_id(s) for s in stale):
+            stale.append(entry)
+    if not stale:
+        if revive:
+            revive_serial(serial, parent_id=parent, log_fn=say)
+        return True
+    say(f"{serial} is in HidHide's blacklist with no record of ours -- "
+        f"removing {len(stale)} leftover entr(y/ies)")
+    if not hh.unhide(stale):
+        say(f"could not unhide {serial}; run `ds5bridge unhide --all-hidhide`")
+        return False
+    if revive:
+        revive_serial(serial, parent_id=parent, log_fn=say)
+    else:
+        say("Bluetooth pad is visible again")
+    return True
 
 
 def hidden_serials() -> list[str]:

@@ -237,6 +237,18 @@ class Config:
         """
         return bool(self.get(serial).hide_bluetooth)
 
+    def set_hide_bluetooth_default(self, hide: bool) -> None:
+        """The seed `get()` stamps on a controller this machine has never seen.
+
+        Every other field the UI can change is per controller, so this one was
+        read-only for a long time: it existed to be hand-edited. Once the tray
+        grew a single switch for "hide all of them", that stopped being
+        defensible -- a user who hides both pads and then plugs in a third
+        means the third one too, and without writing the seed the answer would
+        silently be "no" for every controller bought after the click.
+        """
+        self.hide_bluetooth_default = bool(hide)
+
     def set_master_enabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
 

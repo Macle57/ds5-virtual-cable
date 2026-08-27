@@ -322,16 +322,46 @@ class FactoryTestFeatureTests(unittest.TestCase):
         self.assertEqual(self.be.stats["feature_test_forwarded"], 0)
         self.assertEqual(self.be.feature_writes[0][0], B.FEATURE_TEST_CMD)
 
-    def test_the_allowlist_holds_only_reads(self):
-        # Every entry names a READ_/GET_ action, and none of the ids that could
-        # write pairing, flash or calibration is present.
+    #: The one deliberate non-read pair: the tester's 1 kHz sine-wave button.
+    #: Nothing in it outlives a power cycle -- see the comment on the allowlist.
+    AUDIO_WAVEOUT = {(0x06, 0x02), (0x06, 0x04)}
+
+    def test_the_allowlist_holds_only_reads_and_the_wave_out_pair(self):
+        # Every entry names a READ_/GET_ action, except the two AUDIO entries
+        # that start and stop the built-in test tone, and none of the ids that
+        # could write pairing, flash or calibration is present.
         for (dev_id, action), why in B.TEST_COMMAND_ALLOWLIST.items():
+            if (dev_id, action) in self.AUDIO_WAVEOUT:
+                continue
             self.assertTrue(
                 why.startswith(("READ_", "GET_", "BATTERY", "SOLOMON_")),
                 f"{dev_id:#04x}/{action:#04x} -> {why}")
         for banned in ((0x01, 0x03), (0x01, 0x07), (0x09, 0x01), (0x01, 0x70),
-                       (0x03, 0x01), (0x06, 0x02)):
+                       (0x03, 0x01),
+                       # the writing halves of the BUILTIN_MIC_CALIB_DATA family
+                       # that the wave-out pair sits next to
+                       (0x06, 0x01), (0x06, 0x03)):
             self.assertNotIn(banned, B.TEST_COMMAND_ALLOWLIST)
+
+    def test_the_testers_play_sound_button_reaches_the_controller(self):
+        """The exact pair `controlWaveOut()` sends, and it must be forwarded.
+
+        dualsense-tester's speaker/headphone 1 kHz test is two fire-and-forget
+        SET_REPORT(Feature, 0x80)s -- `setTestCommandWithParams` never reads
+        0x81 back -- so whether the button does anything is decided entirely
+        here. Measured 2026-08-27: with these two off the allowlist the button
+        was silent through the emulator and worked on the same pad over plain
+        Bluetooth. See docs/wired-gap-findings.md.
+        """
+        params = bytearray(20)
+        params[2] = 8  # speaker
+        self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(0x06, 0x04, params))
+        self.be.set_feature_report(B.FEATURE_TEST_CMD,
+                                   self.cmd(0x06, 0x02, b"\x01\x01\x00"))
+        self.assertEqual([(w[1], w[2]) for w in self.dev.h.feature_writes],
+                         [(0x06, 0x04), (0x06, 0x02)])
+        self.assertEqual(self.be.stats["feature_test_blocked"], 0)
+        self.assertEqual(self.be.stats["feature_test_forwarded"], 2)
 
     def test_pairing_and_the_individual_data_channel_stay_blocked(self):
         for rid in (0x09, 0x84):
@@ -386,53 +416,119 @@ class FactoryTestFeatureTests(unittest.TestCase):
         self.assertEqual(seen, [0, 1, 2, 3])
         self.assertEqual(len(self.dev.h.feature_reads), 4)
 
-    def test_a_get_of_0x81_with_nothing_armed_stalls(self):
-        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+    # -- 0x81 answers idle; it never STALLs --------------------------------
+    #
+    # MEASURED on a physical wired DualSense 2026-08-27
+    # (emulator/tools/hid_diff_probe.py): a cold GET_REPORT(Feature, 0x81)
+    # returns 64 bytes of `81 00 00 ...`. It does not STALL, ever. That matters
+    # because dualsense-tester polls 0x81 in
+    # `while (report = await receiveFeatureReport(item, 0x81))` -- a STALL
+    # throws straight out of the loop.
+
+    def idle(self, got):
+        self.assertEqual(got, B.FEATURE_TEST_IDLE)
+        self.assertEqual(len(got), B.FEATURE_TEST_PAYLOAD_LEN + 1)
+        self.assertEqual(got[0], B.FEATURE_TEST_RESULT)
+        self.assertEqual(set(got[1:]), {0})
+
+    def test_a_get_of_0x81_with_nothing_armed_answers_idle(self):
+        self.idle(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        # ... without going near the controller for a host that is just probing
         self.assertEqual(self.dev.h.feature_reads, [])
-        self.assertEqual(self.be.feature_misses[B.FEATURE_TEST_RESULT], 1)
+        self.assertEqual(self.be.feature_misses.get(B.FEATURE_TEST_RESULT, 0), 0)
 
     def test_a_blocked_command_does_not_arm_the_result_read(self):
         self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(0x01, 0x03))
-        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        self.idle(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
         self.assertEqual(self.dev.h.feature_reads, [])
 
     def test_nothing_is_forwarded_while_the_link_is_down(self):
         self.be.connected.clear()
         self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(*self.TELEMETRY))
         self.assertEqual(self.dev.h.feature_writes, [])
-        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        self.idle(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
 
-    def test_a_slow_bluetooth_read_falls_back_to_a_stall(self):
+    def test_a_slow_bluetooth_read_falls_back_to_idle_not_a_stall(self):
         # Threads "running" but nothing draining the queue: the job is posted
         # and never runs, which is exactly what a wedged writer thread looks
-        # like. The USB request path must give up, not hang.
+        # like. The USB request path must give up, not hang -- and give up the
+        # way the hardware does, with an idle header rather than a STALL.
         self.be._threads = ["pretend the backend is started"]
         self.be._test_armed = self.TELEMETRY
         self.be.feature_timeout = 0.02
         started = time.perf_counter()
-        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        self.idle(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
         self.assertLess(time.perf_counter() - started, 1.0)
         self.assertEqual(self.be.stats["feature_bt_timeouts"], 1)
-        self.assertEqual(self.be.feature_misses[B.FEATURE_TEST_RESULT], 1)
 
-    def test_a_raising_bluetooth_read_falls_back_to_a_stall(self):
+    def test_a_raising_bluetooth_read_falls_back_to_idle(self):
         def boom(*_a, **_k):
             raise OSError("read error")
 
         self.dev.h.get_feature_report = boom
         self.be._test_armed = self.TELEMETRY
-        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        self.idle(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
         self.assertEqual(self.be.stats["feature_test_errors"], 1)
 
-    def test_an_empty_answer_stalls_rather_than_returning_junk(self):
+    def test_an_empty_answer_is_idle_rather_than_junk(self):
         self.be._test_armed = self.TELEMETRY
-        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        self.idle(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
 
     # -- the plain GET-only prefetch ----------------------------------------
 
     def test_bt_patch_info_0x22_is_on_the_prefetch_list(self):
         self.assertIn(0x22, B.PREFETCH_FEATURES)
         self.assertIn(0x20, B.PREFETCH_FEATURES)
+
+    def test_the_mac_report_0x09_is_prefetched(self):
+        """The one a libScePad title reads before it will accept the pad.
+
+        WujekFoliarz/duaLib, the open-source libScePad, puts the entire
+        registration of a controller inside `if (getMacAddress(...))`
+        (src/source/duaLib.cpp:145), and `getMacAddress` for a DualSense is one
+        `hid_get_feature_report` of 0x09 (src/source/duaLibUtils.cpp:182-199).
+        Measured 2026-08-27: a real wired unit answers 0x09 with 20 bytes; this
+        emulator used to STALL it, and a STALL means the pad is never
+        registered and the game sees no input at all.
+        """
+        self.assertIn(0x09, B.PREFETCH_FEATURES)
+        self.assertIn(0x0B, B.PREFETCH_FEATURES)
+
+    # -- making a Bluetooth-sourced feature report look like a wired one ----
+
+    def test_the_bluetooth_crc_trailer_is_zeroed(self):
+        # A wired DualSense ends 0x05/0x09/0x0b/0x20/0x22 in four zero bytes;
+        # the Bluetooth unit ends them in a CRC-32. Measured, both, 2026-08-27.
+        for rid in (0x05, 0x09, 0x20, 0x22):
+            raw = bytes([rid]) + b"\x5a" * 35 + b"\xde\xad\xbe\xef"
+            got = B.BridgeBackend._feature_bytes(rid, raw)
+            self.assertEqual(len(got), len(raw), f"0x{rid:02x} changed length")
+            self.assertEqual(got[-4:], b"\x00\x00\x00\x00")
+            self.assertEqual(got[:-4], raw[:-4])
+
+    def test_a_report_with_no_crc_trailer_is_left_alone(self):
+        raw = bytes([0x81]) + b"\x5a" * 63
+        self.assertEqual(B.BridgeBackend._feature_bytes(0x81, raw), raw)
+
+    def test_0x0b_keeps_the_two_macs_and_drops_the_link_key(self):
+        # Bluetooth 0x0b carries a pairing-slot count and link-key material
+        # after the host MAC, where a wired unit publishes zeros. Serving the
+        # Bluetooth bytes verbatim would differ from the ground truth AND hand
+        # the pairing material to anything that can open the HID device.
+        raw = (bytes([0x0B]) + b"\x11" * 6 + b"\x08\x25\x00\x00" + b"\x22" * 6
+               + b"\x99" * 25)
+        got = B.BridgeBackend._feature_bytes(0x0B, raw)
+        self.assertEqual(len(got), len(raw))
+        self.assertEqual(got[:B.FEATURE_0B_WIRED_PREFIX],
+                         raw[:B.FEATURE_0B_WIRED_PREFIX])
+        self.assertEqual(got[1:7], b"\x11" * 6)      # controller MAC kept
+        self.assertEqual(got[11:17], b"\x22" * 6)    # host MAC kept, in full
+        self.assertEqual(set(got[B.FEATURE_0B_WIRED_PREFIX:]), {0})
+
+    def test_the_report_id_is_prepended_when_hidapi_omits_it(self):
+        got = B.BridgeBackend._feature_bytes(0x81, b"\x00" * 63)
+        self.assertEqual(got[0], 0x81)
+        self.assertEqual(len(got), 64)
 
     def test_a_prefetched_report_is_served_from_the_cache(self):
         self.be._features[0x22] = bytes([0x22]) + b"\x5a" * 63
