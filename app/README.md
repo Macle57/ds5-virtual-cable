@@ -17,11 +17,29 @@ ds5app/
   cli.py        `ds5bridge` -- run / devices / cleanup / doctor / tray
   tray.py       pystray front end over the same BridgeService
 tests/          hardware-free (the `usbip port` parser)
-tools/          hardware tests -- launcher lifecycle, reconnect, long soak
+tools/          dev_tray.ps1 (run the tray from source), plus the hardware
+                tests -- launcher lifecycle, reconnect, long soak
 packaging/      PyInstaller spec + build.ps1
 ```
 
 ## Run it
+
+Nothing here is installed and nothing has to be built. The tray you get from
+`dev_tray.ps1` is the same tray the packaged exe shows -- same process, same
+icon, same menu -- so the edit/run loop never has to go through PyInstaller:
+
+```powershell
+powershell -File app\tools\dev_tray.ps1              # console window + live logs
+powershell -File app\tools\dev_tray.ps1 -Windowed    # no console, like ds5bridge-tray.exe
+powershell -File app\tools\dev_tray.ps1 -Isolated    # scratch DS5_CONFIG, not your real settings
+powershell -File app\tools\dev_tray.ps1 -Stop        # stop it, cleanly
+```
+
+Every start replaces the running one, and `-Stop` tears down through the
+service rather than killing it, which is what gives a hidden Bluetooth pad back.
+Do not stop it from Task Manager.
+
+The commands it wraps, and everything else:
 
 ```powershell
 cd D:\Codes\dualSense\ds5-virtual-usb\app
