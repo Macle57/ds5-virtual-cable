@@ -259,5 +259,105 @@ class NeutralizeTests(unittest.TestCase):
         self.assertEqual(P.decode_input(T.neutralize_usb01(zeros)[1:], usb=True).dpad, "-")
 
 
+class MergeSetStateTests(unittest.TestCase):
+    """Phase 4c: folding two unsent SetState bodies into one.
+
+    This is the fix for the dark player LEDs. A game sets them ONCE, in an early
+    output report, and then streams rumble reports that never carry the
+    player-indicator valid flag again -- so the coalescer only had to overwrite
+    that one report to lose the LEDs for the whole session.
+    """
+
+    def leds(self, mask=0x01, brightness=None):
+        return bytes(P.SetState().player_leds(mask, brightness).body)
+
+    def rumble(self, left=0x40, right=0x80):
+        return bytes(P.SetState().rumble(left, right).body)
+
+    def test_the_led_report_survives_a_rumble_only_report(self):
+        merged = T.merge_setstate(self.leds(0x04), self.rumble())
+        self.assertEqual(merged[P.PLAYER_INDICATOR], 0x04)
+        self.assertTrue(merged[P.VALID_FLAG1] & P.F1_PLAYER_INDICATOR)
+        self.assertEqual(merged[P.BC_VIBRATION_LEFT], 0x40)
+        self.assertEqual(merged[P.BC_VIBRATION_RIGHT], 0x80)
+        self.assertTrue(merged[P.VALID_FLAG0] & P.F0_COMPATIBLE_VIBRATION)
+
+    def test_the_newer_report_wins_a_field_both_of_them_claim(self):
+        merged = T.merge_setstate(self.leds(0x01), self.leds(0x1F))
+        self.assertEqual(merged[P.PLAYER_INDICATOR], 0x1F)
+
+    def test_an_older_field_is_carried_even_when_the_newer_byte_is_zero(self):
+        # The trap: a rumble-only report has playerIndicator = 0 in its bytes.
+        # Taking "the newest byte" unconditionally would turn the LEDs off.
+        merged = T.merge_setstate(self.leds(0x1F), self.rumble())
+        self.assertEqual(merged[P.PLAYER_INDICATOR], 0x1F)
+
+    def test_lightbar_and_triggers_merge_as_whole_field_groups(self):
+        older = bytes(P.SetState().lightbar(0x11, 0x22, 0x33).body)
+        newer = bytes(P.SetState().trigger_left(P.AT_WEAPON, b"\x01\x02\x03").body)
+        merged = T.merge_setstate(older, newer)
+        self.assertEqual(bytes(merged[P.LED_R:P.LED_B + 1]), b"\x11\x22\x33")
+        self.assertEqual(merged[P.AT_LEFT_MODE], P.AT_WEAPON)
+        self.assertEqual(bytes(merged[P.AT_LEFT_MODE + 1:P.AT_LEFT_MODE + 4]),
+                         b"\x01\x02\x03")
+        self.assertTrue(merged[P.VALID_FLAG1] & P.F1_LIGHTBAR_CONTROL)
+        self.assertTrue(merged[P.VALID_FLAG0] & P.F0_LEFT_TRIGGER_FFB)
+
+    def test_brightness_rides_validflag2_under_either_convention(self):
+        # The tester uses validFlag2 bit 0, hid-playstation bit 1; the merge
+        # accepts either as gating ledBrightness/lightbarSetup.
+        for bit in (0, 1):
+            older = bytearray(T.SETSTATE_BODY_LEN)
+            older[P.VALID_FLAG2] = 1 << bit
+            older[P.LED_BRIGHTNESS] = 2
+            merged = T.merge_setstate(bytes(older), self.rumble())
+            self.assertEqual(merged[P.LED_BRIGHTNESS], 2)
+            self.assertTrue(merged[P.VALID_FLAG2] & (1 << bit))
+
+    def test_release_leds_is_newest_wins_not_or(self):
+        older = bytearray(T.SETSTATE_BODY_LEN)
+        older[P.VALID_FLAG1] = P.F1_RELEASE_LEDS
+        merged = T.merge_setstate(bytes(older), self.leds(0x1F))
+        self.assertFalse(merged[P.VALID_FLAG1] & P.F1_RELEASE_LEDS)
+        self.assertTrue(merged[P.VALID_FLAG1] & P.F1_PLAYER_INDICATOR)
+
+    def test_a_newer_release_drops_the_older_led_control(self):
+        newer = bytearray(T.SETSTATE_BODY_LEN)
+        newer[P.VALID_FLAG1] = P.F1_RELEASE_LEDS
+        merged = T.merge_setstate(self.leds(0x1F), bytes(newer))
+        self.assertTrue(merged[P.VALID_FLAG1] & P.F1_RELEASE_LEDS)
+        self.assertFalse(merged[P.VALID_FLAG1] & P.F1_PLAYER_INDICATOR)
+        self.assertFalse(merged[P.VALID_FLAG1] & P.F1_LIGHTBAR_CONTROL)
+
+    def test_merging_is_associative_enough_to_fold_a_whole_burst(self):
+        # The backend folds N reports one at a time; every flag any of them set
+        # must survive to the end.
+        bodies = [self.leds(0x02), self.rumble(1, 2),
+                  bytes(P.SetState().lightbar(9, 9, 9).body), self.rumble(3, 4)]
+        acc = bodies[0]
+        for b in bodies[1:]:
+            acc = T.merge_setstate(acc, b)
+        self.assertEqual(acc[P.PLAYER_INDICATOR], 0x02)
+        self.assertEqual(bytes(acc[P.LED_R:P.LED_B + 1]), b"\x09\x09\x09")
+        self.assertEqual(acc[P.BC_VIBRATION_LEFT], 3)
+        self.assertEqual(acc[P.BC_VIBRATION_RIGHT], 4)
+
+    def test_merging_a_body_with_itself_changes_nothing(self):
+        body = self.leds(0x0A)
+        self.assertEqual(T.merge_setstate(body, body), body)
+
+    def test_short_and_oversized_input_is_normalised(self):
+        self.assertEqual(len(T.merge_setstate(b"", b"")), T.SETSTATE_BODY_LEN)
+        self.assertEqual(len(T.merge_setstate(b"\x01", b"\x02" * 90)),
+                         T.SETSTATE_BODY_LEN)
+
+    def test_every_gated_offset_is_inside_the_body(self):
+        for off in T.GATES_BY_OFFSET:
+            self.assertLess(off, T.SETSTATE_BODY_LEN)
+        # ...and the three flag bytes are never themselves gated
+        for flag in (P.VALID_FLAG0, P.VALID_FLAG1, P.VALID_FLAG2):
+            self.assertNotIn(flag, T.GATES_BY_OFFSET)
+
+
 if __name__ == "__main__":
     unittest.main()

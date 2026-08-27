@@ -12,6 +12,7 @@ suite still runs anywhere.
 
 from __future__ import annotations
 
+import time
 import unittest
 
 try:
@@ -214,6 +215,325 @@ class BackendWithoutHardwareTests(unittest.TestCase):
         self.assertLess(mid, loud)
         self.assertLessEqual(loud, 255)
         self.assertGreaterEqual(quiet, 0)
+
+
+class _FakeHid:
+    """The hidapi handle underneath `ds5bridge.device.DualSense`."""
+
+    def __init__(self):
+        self.feature_writes: list[bytes] = []
+        self.feature_reads: list[tuple[int, int]] = []
+        #: Queue of answers `get_feature_report` hands back, in order. The last
+        #: one repeats once the queue is empty, which is what a controller does
+        #: while the host keeps polling a finished command.
+        self.answers: list[bytes] = []
+
+    def send_feature_report(self, data):
+        self.feature_writes.append(bytes(data))
+        return len(data)
+
+    def get_feature_report(self, report_id, length):
+        self.feature_reads.append((report_id, length))
+        if not self.answers:
+            return []
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
+class _FakeDev:
+    """Stands in for `ds5bridge.device.DualSense` on the bridge's own seam."""
+
+    def __init__(self, is_bt=True):
+        self.h = _FakeHid()
+        self.is_bt = is_bt
+        self.seq = 0
+        self.writes: list[bytes] = []
+
+    def _next_seq(self):
+        s = self.seq
+        self.seq = (self.seq + 1) & 0x0F
+        return s
+
+    def write_raw(self, data):
+        self.writes.append(bytes(data))
+        return len(data)
+
+    def get_feature(self, report_id, length=64):
+        return bytes(self.h.get_feature_report(report_id, length))
+
+
+@unittest.skipUnless(HAVE_DEPS, "numpy / PyAV / hidapi not available")
+class FactoryTestFeatureTests(unittest.TestCase):
+    """Phase 4c: the 0x80 -> 0x81 factory-diagnostics channel.
+
+    `_defer` runs inline while no threads are started, so every allowlisted
+    command here really does reach the fake device on the calling thread -- the
+    same code path the writer thread takes in production.
+    """
+
+    #: TELEMETRY / GET_INFO -- the Diagnostics panel's only command.
+    TELEMETRY = (0x70, 0x01)
+    #: SYSTEM / READ_SERIAL_NUMBER -- a Factory Info read.
+    SERIAL = (0x01, 0x13)
+
+    def setUp(self):
+        self.be = B.BridgeBackend()
+        self.dev = _FakeDev()
+        self.be._dev = self.dev
+        self.be.connected.set()
+
+    def cmd(self, device_id, action_id, params=b"", with_report_id=False):
+        body = bytearray(B.FEATURE_TEST_PAYLOAD_LEN)
+        body[0] = device_id
+        body[1] = action_id
+        body[2:2 + len(params)] = params
+        return (bytes([B.FEATURE_TEST_CMD]) + bytes(body)) if with_report_id \
+            else bytes(body)
+
+    def answer(self, device_id, action_id, status, payload=b"\xab" * 56):
+        buf = bytearray(B.FEATURE_TEST_PAYLOAD_LEN + 1)
+        buf[0] = B.FEATURE_TEST_RESULT
+        buf[1] = device_id
+        buf[2] = action_id
+        buf[3] = status
+        buf[4:4 + len(payload)] = payload
+        return bytes(buf)
+
+    # -- the allowlist ------------------------------------------------------
+
+    def test_an_allowlisted_command_is_forwarded_crc_signed(self):
+        self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(*self.TELEMETRY))
+        self.assertEqual(len(self.dev.h.feature_writes), 1)
+        wire = self.dev.h.feature_writes[0]
+        self.assertEqual(wire[0], B.FEATURE_TEST_CMD)
+        self.assertEqual(len(wire), B.FEATURE_TEST_PAYLOAD_LEN + 1)
+        self.assertEqual((wire[1], wire[2]), self.TELEMETRY)
+        # 0x53-seeded CRC32 over the payload, inside the same 63 bytes
+        from ds5bridge.crc import SEED_SET_FEATURE, crc32_seeded
+        want = crc32_seeded(SEED_SET_FEATURE, B.FEATURE_TEST_CMD, wire[1:-4])
+        self.assertEqual(want.to_bytes(4, "little"), wire[-4:])
+        self.assertEqual(self.be.stats["feature_test_forwarded"], 1)
+        self.assertEqual(self.be.stats["feature_test_blocked"], 0)
+
+    def test_a_command_that_is_not_allowlisted_is_recorded_and_dropped(self):
+        # SYSTEM / WRITE_PCBAID. A write, and it must never reach the pad.
+        self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(0x01, 0x03))
+        self.assertEqual(self.dev.h.feature_writes, [])
+        self.assertEqual(self.be.stats["feature_test_blocked"], 1)
+        self.assertEqual(self.be.stats["feature_test_forwarded"], 0)
+        self.assertEqual(self.be.feature_writes[0][0], B.FEATURE_TEST_CMD)
+
+    def test_the_allowlist_holds_only_reads(self):
+        # Every entry names a READ_/GET_ action, and none of the ids that could
+        # write pairing, flash or calibration is present.
+        for (dev_id, action), why in B.TEST_COMMAND_ALLOWLIST.items():
+            self.assertTrue(
+                why.startswith(("READ_", "GET_", "BATTERY", "SOLOMON_")),
+                f"{dev_id:#04x}/{action:#04x} -> {why}")
+        for banned in ((0x01, 0x03), (0x01, 0x07), (0x09, 0x01), (0x01, 0x70),
+                       (0x03, 0x01), (0x06, 0x02)):
+            self.assertNotIn(banned, B.TEST_COMMAND_ALLOWLIST)
+
+    def test_pairing_and_the_individual_data_channel_stay_blocked(self):
+        for rid in (0x09, 0x84):
+            self.be.set_feature_report(rid, b"\xde\xad\xbe\xef")
+        self.assertEqual(self.dev.h.feature_writes, [])
+        self.assertEqual([r for r, _ in self.be.feature_writes], [0x09, 0x84])
+
+    def test_the_report_id_may_or_may_not_be_repeated_in_the_data_stage(self):
+        for with_id in (False, True):
+            be = B.BridgeBackend()
+            be._dev = _FakeDev()
+            be.connected.set()
+            be.set_feature_report(B.FEATURE_TEST_CMD,
+                                  self.cmd(*self.SERIAL, with_report_id=with_id))
+            self.assertEqual(be.stats["feature_test_forwarded"], 1)
+            self.assertEqual(be._dev.h.feature_writes[0][1:3],
+                             bytes(self.SERIAL))
+
+    def test_a_report_the_hid_stack_refuses_is_counted_not_ignored(self):
+        # hidapi returns -1 instead of raising when Windows rejects a feature
+        # write. Measured on hardware: that is exactly what an unsigned 0x80
+        # over Bluetooth does. A refused query that looked sent would leave the
+        # host polling 0x81 for a second and reading stale bytes.
+        self.dev.h.send_feature_report = lambda data: -1
+        self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(*self.SERIAL))
+        self.assertEqual(self.be.stats["feature_test_errors"], 1)
+
+    def test_a_report_the_hid_stack_accepts_counts_no_error(self):
+        self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(*self.SERIAL))
+        self.assertEqual(self.be.stats["feature_test_errors"], 0)
+
+    # -- the 0x80 -> 0x81 round trip ----------------------------------------
+
+    def test_the_round_trip_returns_the_controllers_answer(self):
+        self.dev.h.answers = [self.answer(*self.TELEMETRY, 3, b"\x11" * 56)]
+        self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(*self.TELEMETRY))
+        got = self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64)
+        self.assertEqual(got[0], B.FEATURE_TEST_RESULT)
+        self.assertEqual((got[1], got[2]), self.TELEMETRY)
+        self.assertEqual(got[3], 3)                      # COMPLETE_2
+        self.assertEqual(got[4:60], b"\x11" * 56)
+        self.assertEqual(self.dev.h.feature_reads, [(B.FEATURE_TEST_RESULT, 64)])
+
+    def test_every_get_of_0x81_is_a_fresh_bluetooth_read(self):
+        # Diagnostics is FOUR pages behind one 0x80: caching the first answer
+        # would truncate the block to a quarter of itself.
+        pages = [self.answer(*self.TELEMETRY, 3, bytes([i]) * 56) for i in range(4)]
+        self.dev.h.answers = list(pages)
+        self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(*self.TELEMETRY))
+        seen = [self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64)[4]
+                for _ in range(4)]
+        self.assertEqual(seen, [0, 1, 2, 3])
+        self.assertEqual(len(self.dev.h.feature_reads), 4)
+
+    def test_a_get_of_0x81_with_nothing_armed_stalls(self):
+        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        self.assertEqual(self.dev.h.feature_reads, [])
+        self.assertEqual(self.be.feature_misses[B.FEATURE_TEST_RESULT], 1)
+
+    def test_a_blocked_command_does_not_arm_the_result_read(self):
+        self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(0x01, 0x03))
+        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        self.assertEqual(self.dev.h.feature_reads, [])
+
+    def test_nothing_is_forwarded_while_the_link_is_down(self):
+        self.be.connected.clear()
+        self.be.set_feature_report(B.FEATURE_TEST_CMD, self.cmd(*self.TELEMETRY))
+        self.assertEqual(self.dev.h.feature_writes, [])
+        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+
+    def test_a_slow_bluetooth_read_falls_back_to_a_stall(self):
+        # Threads "running" but nothing draining the queue: the job is posted
+        # and never runs, which is exactly what a wedged writer thread looks
+        # like. The USB request path must give up, not hang.
+        self.be._threads = ["pretend the backend is started"]
+        self.be._test_armed = self.TELEMETRY
+        self.be.feature_timeout = 0.02
+        started = time.perf_counter()
+        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        self.assertLess(time.perf_counter() - started, 1.0)
+        self.assertEqual(self.be.stats["feature_bt_timeouts"], 1)
+        self.assertEqual(self.be.feature_misses[B.FEATURE_TEST_RESULT], 1)
+
+    def test_a_raising_bluetooth_read_falls_back_to_a_stall(self):
+        def boom(*_a, **_k):
+            raise OSError("read error")
+
+        self.dev.h.get_feature_report = boom
+        self.be._test_armed = self.TELEMETRY
+        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+        self.assertEqual(self.be.stats["feature_test_errors"], 1)
+
+    def test_an_empty_answer_stalls_rather_than_returning_junk(self):
+        self.be._test_armed = self.TELEMETRY
+        self.assertIsNone(self.be.get_feature_report(B.FEATURE_TEST_RESULT, 64))
+
+    # -- the plain GET-only prefetch ----------------------------------------
+
+    def test_bt_patch_info_0x22_is_on_the_prefetch_list(self):
+        self.assertIn(0x22, B.PREFETCH_FEATURES)
+        self.assertIn(0x20, B.PREFETCH_FEATURES)
+
+    def test_a_prefetched_report_is_served_from_the_cache(self):
+        self.be._features[0x22] = bytes([0x22]) + b"\x5a" * 63
+        got = self.be.get_feature_report(0x22, 64)
+        self.assertEqual(len(got), 64)
+        self.assertEqual(got[0], 0x22)
+        self.assertEqual(self.be.feature_misses.get(0x22, 0), 0)
+
+
+@unittest.skipUnless(HAVE_DEPS, "numpy / PyAV / hidapi not available")
+class SetStateCoalescingTests(unittest.TestCase):
+    """Phase 4c: why the player LEDs stayed dark.
+
+    `write_output_report` used to REPLACE an unsent SetState body. Games set the
+    player-LED bits once and then stream rumble reports without the
+    player-indicator valid flag, so that one report only had to lose one race
+    against `SETSTATE_MIN_INTERVAL` to be gone for the whole session.
+    """
+
+    def leds(self, mask=0x01):
+        from ds5bridge import protocol as P
+        return P.build_usb_setstate(bytes(P.SetState().player_leds(mask).body))
+
+    def rumble(self, left=0x40, right=0x80):
+        from ds5bridge import protocol as P
+        return P.build_usb_setstate(bytes(P.SetState().rumble(left, right).body))
+
+    def setUp(self):
+        self.be = B.BridgeBackend()
+
+    def test_a_pending_led_report_is_merged_not_overwritten(self):
+        from ds5bridge import protocol as P
+
+        self.be.write_output_report(self.leds(0x04))
+        self.be.write_output_report(self.rumble())
+        pending = self.be._setstate_pending
+        self.assertEqual(pending[P.PLAYER_INDICATOR], 0x04)
+        self.assertTrue(pending[P.VALID_FLAG1] & P.F1_PLAYER_INDICATOR)
+        self.assertEqual(pending[P.BC_VIBRATION_LEFT], 0x40)
+        self.assertEqual(self.be.stats["setstate_merged"], 1)
+        self.assertEqual(self.be.stats["setstate_in"], 2)
+
+    def test_a_whole_burst_of_rumble_never_erases_the_leds(self):
+        from ds5bridge import protocol as P
+
+        self.be.write_output_report(self.leds(0x1F))
+        for i in range(50):
+            self.be.write_output_report(self.rumble(i, i))
+        self.assertEqual(self.be._setstate_pending[P.PLAYER_INDICATOR], 0x1F)
+        self.assertEqual(self.be.stats["setstate_merged"], 50)
+
+    def test_the_first_report_is_still_stored_verbatim(self):
+        from ds5bridge import protocol as P
+
+        st = P.SetState().lightbar(1, 2, 3)
+        self.be.write_output_report(P.build_usb_setstate(bytes(st.body)))
+        self.assertEqual(self.be._setstate_pending, bytes(st.body))
+        self.assertEqual(self.be.stats["setstate_merged"], 0)
+
+    # -- pre-connect buffering and replay -----------------------------------
+
+    def test_the_host_state_accumulates_across_sends(self):
+        from ds5bridge import protocol as P
+
+        self.be.write_output_report(self.leds(0x02))
+        self.be._setstate_pending = None          # pretend the writer sent it
+        self.be.write_output_report(self.rumble())
+        host = self.be._setstate_host
+        self.assertEqual(host[P.PLAYER_INDICATOR], 0x02)
+        self.assertEqual(host[P.BC_VIBRATION_LEFT], 0x40)
+
+    def test_the_host_state_is_replayed_after_a_connect(self):
+        from ds5emu import translate as T
+        from ds5bridge import protocol as P
+
+        dev = _FakeDev()
+        self.be.write_output_report(self.leds(0x08))
+        self.be._dev = dev
+        self.be._prime_setstate()
+        # audio routing first, then the host's own state
+        self.assertEqual(len(dev.writes), 2)
+        primed = T.bt31_output_body(dev.writes[0])
+        self.assertFalse(primed[P.VALID_FLAG1] & P.F1_PLAYER_INDICATOR)
+        replayed = T.bt31_output_body(dev.writes[1])
+        self.assertEqual(replayed[P.PLAYER_INDICATOR], 0x08)
+        self.assertTrue(replayed[P.VALID_FLAG1] & P.F1_PLAYER_INDICATOR)
+        self.assertTrue(T.verify_bt_output_crc(dev.writes[1]))
+        self.assertEqual(self.be.stats["setstate_replayed"], 1)
+
+    def test_nothing_is_replayed_when_the_host_has_said_nothing(self):
+        dev = _FakeDev()
+        self.be._dev = dev
+        self.be._prime_setstate()
+        self.assertEqual(len(dev.writes), 1)
+        self.assertEqual(self.be.stats["setstate_replayed"], 0)
+
+    def test_the_lightbar_fade_out_prime_is_off_by_default(self):
+        # It is wired up as the last once-per-connect candidate if a real pad
+        # still refuses to light its player LEDs, but the lightbar demonstrably
+        # already obeys us, so it stays off.
+        self.assertFalse(B.PRIME_LIGHTBAR_FADE_OUT)
 
 
 @unittest.skipUnless(HAVE_DEPS, "numpy / PyAV / hidapi not available")

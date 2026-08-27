@@ -123,6 +123,7 @@ from av.audio.frame import AudioFrame  # noqa: E402
 from ds5bridge import audio as A  # noqa: E402
 from ds5bridge import device as DEV  # noqa: E402
 from ds5bridge import protocol as P  # noqa: E402
+from ds5bridge.crc import fill_feature_checksum  # noqa: E402
 from ds5bridge.pacing import Pacer, TimerResolution  # noqa: E402
 
 log = logging.getLogger("ds5emu.bridge")
@@ -196,6 +197,90 @@ AUDIO_IDLE_TIMEOUT = 0.5
 #: an unchanged body is refreshed (0 disables the refresh).
 SETSTATE_MIN_INTERVAL = 0.006
 SETSTATE_REFRESH = 0.0
+
+#: Send one lightbar "fade out" (validFlag2 lightbar-setup + lightbarSetup bit 1)
+#: at every connect, the way Linux `hid-playstation`'s `dualsense_reset_leds`
+#: does, to end the controller's own Bluetooth startup animation.
+#:
+#: OFF, on evidence: the lightbar already obeys us without it (Miles Morales set
+#: it fine), so the animation is demonstrably not holding the LEDs hostage, and
+#: turning it on costs a visibly dark lightbar until the game paints one. It is
+#: wired up rather than deleted because it is the only remaining once-per-connect
+#: candidate if a real pad still refuses to light its player LEDs -- flip it to
+#: True and re-test. See docs/FINDINGS.md "Output 0x31 ... MERGEABLE".
+PRIME_LIGHTBAR_FADE_OUT = False
+
+# --- factory-test feature reports 0x80 / 0x81 (Phase 4c) --------------------
+# The DualSense's whole factory-diagnostics channel is one request/response
+# pair: SET feature 0x80 carries [deviceId, actionId, params...], GET feature
+# 0x81 returns [deviceId, actionId, status, 56-byte page]. daidr/dualsense-tester
+# drives its "Factory Info" and "Diagnostics" panels entirely through it.
+# docs/FINDINGS.md "Factory-test feature reports 0x80 / 0x81" has the full
+# layout, the page protocol and the per-field command table.
+
+FEATURE_TEST_CMD = 0x80
+FEATURE_TEST_RESULT = 0x81
+
+#: Both are `95 3f` in the HID report descriptor: 63 data bytes after the id.
+#: On Bluetooth the 4-byte CRC lives in the LAST 4 of those 63 -- it does not
+#: make the report longer (STATUS.md section 5 gotcha 6, confirmed for feature 0x05).
+#:
+#: VERIFIED on hardware 2026-08-25: the *Bluetooth* report descriptor declares
+#: `0x80` and `0x81` as `count=63, size=8`, byte for byte the same as the wired
+#: one, and a signed 63-byte 0x80 is answered while an unsigned one is refused.
+#: See docs/FINDINGS.md "Measured on hardware".
+FEATURE_TEST_PAYLOAD_LEN = 63
+
+#: Extra plain GET-only feature reports to prefetch at open, beyond 0x05
+#: (calibration, read as part of the extended-mode flip) and 0x20 (firmware).
+#: 0x22 is the BT patch version, which Factory Info reads directly.
+#:
+#: VERIFIED on hardware 2026-08-25: over Bluetooth 0x22 answers 64 bytes (id +
+#: 63), no CRC needed for a GET, and its `u32` at offset 31 is the patch
+#: version Factory Info shows. Prefetching it is correct -- it is static.
+PREFETCH_FEATURES = (0x20, 0x22)
+
+#: How long a USB GET_REPORT(0x81) may wait for the writer thread to come back
+#: from Bluetooth. This is the ONE place the USB request path waits on hidapi,
+#: and it is a control transfer, never an isochronous deadline -- but it still
+#: runs on the asyncio server thread, so the budget is deliberately small. The
+#: tester allows itself 1000 ms per command and sleeps 10 ms between polls, so
+#: a stall here costs it one poll, not the command.
+FEATURE_BT_TIMEOUT = 0.06
+
+#: Read-only factory-test subcommands, `(deviceId, actionId): why it is safe`.
+#:
+#: THE RULE: a subcommand gets in only if the tester issues it as a pure read
+#: for Factory Info or Diagnostics AND its action id is a READ_*/GET_* in
+#: `DualSenseTestActionId`. Everything else -- every WRITE_*, ERASE_*, AGING_*,
+#: SET_*, NVS_*, TEST_ACTION_BOOTLOADER_*, the whole 0x84/0x85 individual-data
+#: channel and feature report 0x09 -- keeps the record-and-drop behaviour.
+#: Nothing here can re-pair the controller, touch its flash or change a setting.
+TEST_COMMAND_ALLOWLIST: dict[tuple[int, int], str] = {
+    # deviceId 1 = SYSTEM
+    (0x01, 0x04): "READ_PCBAID (legacy PCBA id, 6 bytes)",
+    (0x01, 0x09): "GET_MCU_UNIQUE_ID (9 bytes)",
+    (0x01, 0x11): "READ_PCBAID_FULL (24 bytes)",
+    (0x01, 0x13): "READ_SERIAL_NUMBER (32 bytes, Shift-JIS)",
+    (0x01, 0x15): "READ_ASSEMBLE_PARTS_INFO (32 bytes)",
+    (0x01, 0x18): "READ_BATTERY_BARCODE (32 bytes)",
+    (0x01, 0x1A): "READ_VCM_LEFT_BARCODE (32 bytes)",
+    (0x01, 0x1C): "READ_VCM_RIGHT_BARCODE (32 bytes)",
+    # deviceId 4 = ANALOG_DATA
+    (0x04, 0x03): "BATTERY (battery voltage in mV)",
+    # deviceId 5 = TOUCH -- read-only, but the controller does not answer these
+    # over Bluetooth, so expect a stall. Harmless either way.
+    (0x05, 0x02): "SOLOMON_UID (touchpad unique id)",
+    (0x05, 0x04): "SOLOMON_VERSION (touchpad firmware version)",
+    # deviceId 7 = ADAPTIVE_TRIGGER. Action 37 is named both
+    # CYPRESS_SIGNAL_STEP_2 and READ_TRACABILITY_INFO; 36 writes and 38 erases
+    # the same data, so 37 is the read. The one ambiguous entry -- see FINDINGS.
+    (0x07, 0x25): "READ_TRACABILITY_INFO (AT serial no + motor info)",
+    # deviceId 9 = BLUETOOTH
+    (0x09, 0x02): "READ_BDADR (BD MAC address, 6 bytes)",
+    # deviceId 0x70 = TELEMETRY (the Diagnostics panel's only command)
+    (0x70, 0x01): "GET_INFO (paged usage/connection/button counters)",
+}
 
 # --- link-loss handling (Phase 4a) ------------------------------------------
 # Two independent things have to happen when the controller goes away, and only
@@ -477,6 +562,12 @@ class BridgeBackend(Backend):
         self._setstate_lock = threading.Lock()
         self._setstate_pending: bytes | None = None
         self._setstate_last: bytes | None = None
+        #: Everything the host has ever asked for, folded into one body: the
+        #: newest value of every field whose valid-flag bit it has set. Replayed
+        #: once after each (re)connect, because a controller that was away
+        #: forgot its LEDs and trigger effects and the game will not resend
+        #: them -- it set them once, at startup.
+        self._setstate_host: bytes | None = None
         self._setstate_event = threading.Event()
 
         # --- deferred Bluetooth control work ------------------------------
@@ -501,6 +592,13 @@ class BridgeBackend(Backend):
         self._features: dict[int, bytes] = {}
         self.feature_misses: dict[int, int] = {}
         self.feature_writes: list[tuple[int, bytes]] = []
+        #: The (deviceId, actionId) of the last allowlisted 0x80 we forwarded.
+        #: A GET of 0x81 with nothing armed is answered with a STALL rather than
+        #: a Bluetooth round trip, so an idle host cannot make us poll the
+        #: controller 250 times a second.
+        self._test_armed: tuple[int, int] | None = None
+        #: Per-instance so a test can shrink it; see FEATURE_BT_TIMEOUT.
+        self.feature_timeout = FEATURE_BT_TIMEOUT
 
         # --- observability -------------------------------------------------
         self.stats = {
@@ -514,6 +612,19 @@ class BridgeBackend(Backend):
             "setstate_in": 0,
             "setstate_sent": 0,
             "setstate_coalesced": 0,
+            #: Output reports folded into an already-pending one instead of
+            #: replacing it. Before Phase 4c these were silently LOST, which is
+            #: what kept the player LEDs dark: a game sets them once and never
+            #: repeats the valid flag.
+            "setstate_merged": 0,
+            #: Times the host's accumulated state was replayed after a connect.
+            "setstate_replayed": 0,
+            #: Factory-test channel (feature 0x80 -> 0x81).
+            "feature_test_forwarded": 0,
+            "feature_test_blocked": 0,
+            "feature_test_errors": 0,
+            "feature_test_reads": 0,
+            "feature_bt_timeouts": 0,
             "audio_out_calls": 0,
             "audio_out_bytes": 0,
             "audio_in_bytes": 0,
@@ -628,11 +739,15 @@ class BridgeBackend(Backend):
             # minimal 0x01 report mode into extended 78-byte 0x31 reports.
             cal = dev.flip_to_extended()
             self._features[0x05] = self._feature_bytes(0x05, cal)
-        try:
-            fw = dev.firmware_info()
-            self._features[0x20] = self._feature_bytes(0x20, fw)
-        except Exception as e:  # noqa: BLE001
-            log.warning("feature 0x20 read failed: %s", e)
+        # Plain GET-only feature reports the host may ask for. Prefetched, never
+        # read lazily: a blocking feature read from the USB request path would
+        # stall the isochronous endpoints. `feature_misses` is what reveals any
+        # id that still belongs on this list.
+        for rid in PREFETCH_FEATURES:
+            try:
+                self._features[rid] = self._feature_bytes(rid, dev.get_feature(rid, 64))
+            except Exception as e:  # noqa: BLE001
+                log.warning("feature 0x%02x read failed: %s", rid, e)
         with self._dev_lock:
             self._dev = dev
         self.connected.set()
@@ -648,11 +763,19 @@ class BridgeBackend(Backend):
         return b
 
     def _prime_setstate(self) -> None:
-        """One SetState that routes audio and sets the volumes.
+        """One SetState that routes audio and sets the volumes, then a replay of
+        whatever the host has already commanded.
 
-        Only the audio valid-flag bits are set, so nothing the host later sends
-        (lightbar, rumble, triggers) is affected — the controller applies a
-        field only when its valid-flag bit is present.
+        Only the audio valid-flag bits are set in the priming report, so nothing
+        the host later sends (lightbar, rumble, triggers) is affected — the
+        controller applies a field only when its valid-flag bit is present.
+
+        The replay afterwards exists because a controller that has just come
+        back has forgotten its LEDs and trigger effects, and the game will not
+        say them again: it set them once, at startup, and has been streaming
+        rumble ever since. `_setstate_host` is the fold of everything it has
+        asked for, so one report restores the lot. It goes out *after* the audio
+        priming so the host's own audio fields, if it set any, win.
         """
         st = P.SetState()
         if self.target == "headphone":
@@ -660,7 +783,18 @@ class BridgeBackend(Backend):
         else:
             st.speaker_volume(self.speaker_volume)
         st.haptic_volume(self.haptic_volume)
+        if PRIME_LIGHTBAR_FADE_OUT:
+            st.flag2(P.F2_LIGHTBAR_SETUP | (1 << 1))
+            st.body[P.LIGHTBAR_SETUP] = 1 << 1     # hid-playstation: fade light out
         self._write_raw(P.build_bt_setstate(bytes(st.body), self._next_bt_seq()))
+
+        with self._setstate_lock:
+            host = self._setstate_host
+        if host is not None:
+            self.stats["setstate_replayed"] += 1
+            log.info("replaying the host's SetState state after connect (flags %s)",
+                     T.setstate_flags(host))
+            self._write_raw(T.usb02_to_bt31(host, self._next_bt_seq()))
 
     def _next_bt_seq(self) -> int:
         dev = self._dev
@@ -686,6 +820,9 @@ class BridgeBackend(Backend):
             log.warning("Bluetooth link lost; the virtual device stays attached "
                         "and will report a neutral controller until it returns")
         self.connected.clear()
+        # Whatever factory-test command was in flight died with the link; a new
+        # 0x80 has to arm the 0x81 read again.
+        self._test_armed = None
 
     def force_disconnect(self, hold_s: float = 0.0) -> None:
         """Simulate a link loss. TEST HOOK — closes the HID handle underneath
@@ -981,6 +1118,13 @@ class BridgeBackend(Backend):
             if self._stop.is_set():
                 return
             self._drain_control_q()
+            if not self.connected.is_set():
+                # Do NOT consume the pending body while the link is down: it
+                # would be dropped on the floor, and the pending body is exactly
+                # the once-per-session state (player LEDs, trigger effects) the
+                # game will never send again. Leave it to keep merging; the
+                # reconnect replays `_setstate_host` anyway.
+                continue
             with self._setstate_lock:
                 body = self._setstate_pending
                 self._setstate_pending = None
@@ -1006,6 +1150,15 @@ class BridgeBackend(Backend):
                 self.stats["setstate_sent"] += 1
                 self._setstate_last = body
                 last_sent_at = time.perf_counter()
+            else:
+                # The link died between the check above and the write. Put the
+                # body back rather than losing it, oldest-first so anything the
+                # host queued meanwhile still wins field by field.
+                with self._setstate_lock:
+                    self._setstate_pending = (
+                        body if self._setstate_pending is None
+                        else T.merge_setstate(body, self._setstate_pending)
+                    )
 
     # =====================================================================
     # Backend contract — HID
@@ -1063,31 +1216,190 @@ class BridgeBackend(Backend):
         return report[:max_len] if max_len < len(report) else report
 
     def write_output_report(self, data: bytes) -> None:
-        """USB output report 0x02 -> BT 0x31. Never blocks on Bluetooth."""
+        """USB output report 0x02 -> BT 0x31. Never blocks on Bluetooth.
+
+        Reports arrive faster than they are allowed onto the air
+        (`SETSTATE_MIN_INTERVAL`), so an unsent one is still pending when the
+        next arrives. It is **merged**, not replaced. Replacing it lost data for
+        real: a game sets the player-LED bits in one early report and then
+        streams rumble/trigger reports that never carry the player-indicator
+        valid flag again, so the LED report only had to lose one race to be gone
+        forever. The SetState body is valid-flag driven, which makes the merge
+        exact rather than a guess -- see `translate.merge_setstate`.
+        """
         self.stats["setstate_in"] += 1
         body = T.usb02_body(bytes(data))
         with self._setstate_lock:
-            self._setstate_pending = body
+            if self._setstate_pending is None:
+                self._setstate_pending = body
+            else:
+                self._setstate_pending = T.merge_setstate(self._setstate_pending, body)
+                self.stats["setstate_merged"] += 1
+            self._setstate_host = (
+                body if self._setstate_host is None
+                else T.merge_setstate(self._setstate_host, body)
+            )
         self._setstate_event.set()
 
     def get_feature_report(self, report_id: int, length: int) -> bytes | None:
-        body = self._features.get(report_id)
+        if report_id == FEATURE_TEST_RESULT:
+            body = self._read_test_result()
+        else:
+            body = self._features.get(report_id)
         if body is None:
             self.feature_misses[report_id] = self.feature_misses.get(report_id, 0) + 1
             return None
         return body[:length] if length < len(body) else body
 
     def set_feature_report(self, report_id: int, data: bytes) -> None:
-        """Recorded, never forwarded.
+        """Recorded, never forwarded -- except allowlisted factory-test reads.
 
         Feature *writes* are how a DualSense is re-paired (0x09) and how its
-        firmware is touched. Nothing in this project needs to write one, and a
-        stray host-issued write must not reach the physical controller, so they
-        are logged and dropped.
+        firmware is touched. A stray host-issued write must not reach the
+        physical controller, so by default they are logged and dropped.
+
+        Report 0x80 is the one exception, and only for the read-only
+        subcommands in `TEST_COMMAND_ALLOWLIST`: it is the query half of the
+        factory-diagnostics channel that Factory Info and Diagnostics are built
+        on, and there is no way to read those without writing the query. Every
+        other (deviceId, actionId) -- and every other report id, 0x09 and the
+        0x84/0x85 individual-data channel included -- keeps the old behaviour.
         """
-        self.feature_writes.append((report_id, bytes(data)))
+        data = bytes(data)
+        if report_id == FEATURE_TEST_CMD:
+            self._on_test_command(data)
+            return
+        self.feature_writes.append((report_id, data))
         log.info("set_feature_report 0x%02x (%d bytes) recorded, NOT forwarded",
                  report_id, len(data))
+
+    # -- the factory-test channel (feature 0x80 -> 0x81) ---------------------
+
+    @staticmethod
+    def _test_payload(data: bytes) -> bytes:
+        """The 63-byte 0x80 payload, whichever framing the host used.
+
+        A control SET_REPORT puts the report id in wValue and may or may not
+        repeat it in the data stage; the length is what disambiguates, exactly
+        as in `translate.usb02_body`.
+        """
+        if len(data) > FEATURE_TEST_PAYLOAD_LEN and data[0] == FEATURE_TEST_CMD:
+            data = data[1:]
+        buf = bytearray(FEATURE_TEST_PAYLOAD_LEN)
+        n = min(len(data), FEATURE_TEST_PAYLOAD_LEN)
+        buf[:n] = data[:n]
+        return bytes(buf)
+
+    def _on_test_command(self, data: bytes) -> None:
+        payload = self._test_payload(data)
+        key = (payload[0], payload[1])
+        self.feature_writes.append((FEATURE_TEST_CMD, payload))
+        why = TEST_COMMAND_ALLOWLIST.get(key)
+        if why is None:
+            self.stats["feature_test_blocked"] += 1
+            log.warning(
+                "BLOCKED factory-test command device=0x%02x action=0x%02x: not on "
+                "the read-only allowlist. Recorded, NOT forwarded to the controller.",
+                key[0], key[1])
+            return
+        if not self.connected.is_set():
+            log.info("factory-test command 0x%02x/0x%02x dropped: link is down",
+                     key[0], key[1])
+            return
+        self.stats["feature_test_forwarded"] += 1
+        self._test_armed = key
+        log.info("forwarding factory-test command device=0x%02x action=0x%02x (%s)",
+                 key[0], key[1], why)
+        self._defer(self._bt_send_test_command, payload)
+
+    def _bt_send_test_command(self, payload: bytes) -> None:
+        """Writer thread: the 0x80 query, CRC-signed for Bluetooth.
+
+        VERIFIED on hardware 2026-08-25 (`tools/factory_probe.py --framing`):
+        the same 63-byte body, signed, is accepted and answered; unsigned, the
+        identical report is rejected outright. The CRC is mandatory on
+        Bluetooth, and it does not make the report longer.
+        """
+        dev = self._dev
+        if dev is None:
+            return
+        buf = bytearray(payload)
+        if dev.is_bt:
+            # 0x53-seeded CRC32 in the last 4 of the SAME 63 payload bytes; a BT
+            # feature report is not longer than its USB twin (FINDINGS).
+            fill_feature_checksum(FEATURE_TEST_CMD, buf)
+        try:
+            rc = dev.h.send_feature_report(bytes([FEATURE_TEST_CMD]) + bytes(buf))
+        except Exception as e:  # noqa: BLE001
+            self.stats["feature_test_errors"] += 1
+            log.warning("factory-test command write failed: %s", e)
+            return
+        if rc is not None and rc < 0:
+            # hidapi does NOT raise when Windows refuses the report — it returns
+            # -1. Measured: that is exactly what an unsigned 0x80 over Bluetooth
+            # does. Without this check a malformed query looks sent, the host
+            # polls 0x81 for a second and gets stale bytes, and nothing counts.
+            self.stats["feature_test_errors"] += 1
+            log.warning("factory-test command rejected by the HID stack (rc=%d); "
+                        "the 0x80 body was not accepted", rc)
+
+    def _bt_read_test_result(self) -> bytes | None:
+        """Writer thread: one GET of feature 0x81.
+
+        Deliberately NOT cached. One 0x80 can be answered by several 56-byte
+        pages, each read with its own GET of 0x81, so replaying a stored answer
+        would truncate every multi-page result -- including the whole Diagnostics
+        block, which is four pages.
+        """
+        dev = self._dev
+        if dev is None:
+            return None
+        raw = dev.get_feature(FEATURE_TEST_RESULT, FEATURE_TEST_PAYLOAD_LEN + 1)
+        if not raw:
+            return None
+        return self._feature_bytes(FEATURE_TEST_RESULT, raw)
+
+    def _read_test_result(self) -> bytes | None:
+        if self._test_armed is None:
+            # Nobody has asked a question, so there is no answer to fetch. STALL
+            # rather than poll the controller for a host that is just probing.
+            return None
+        if not self.connected.is_set():
+            return None
+        self.stats["feature_test_reads"] += 1
+        return self._bt_call(self._bt_read_test_result)
+
+    def _bt_call(self, fn, *args):
+        """Run `fn` on the writer thread and wait a bounded time for its result.
+
+        The only place the USB request path waits on Bluetooth, and it is a
+        control transfer (GET_REPORT(0x81)), never an isochronous deadline. The
+        work itself still runs on the writer thread, so hidapi is never touched
+        from the asyncio server thread -- see the module docstring. On timeout
+        the caller STALLs, which the host retries.
+        """
+        done = threading.Event()
+        box: dict = {}
+
+        def job():
+            try:
+                box["value"] = fn(*args)
+            except Exception as e:  # noqa: BLE001
+                box["error"] = e
+            finally:
+                done.set()
+
+        self._defer(job)
+        if not done.wait(self.feature_timeout):
+            self.stats["feature_bt_timeouts"] += 1
+            log.debug("Bluetooth feature call timed out after %.0f ms",
+                      self.feature_timeout * 1000)
+            return None
+        if "error" in box:
+            self.stats["feature_test_errors"] += 1
+            log.debug("Bluetooth feature call failed: %s", box["error"])
+            return None
+        return box.get("value")
 
     # =====================================================================
     # Backend contract — audio
@@ -1315,8 +1627,12 @@ class BridgeBackend(Backend):
         return (
             f"bt={s['bt_reports']} (ctrl {s['bt_control']}, mic {s['bt_mic']}, "
             f"err {s['bt_read_errors']})  input_out={s['input_delivered']}  "
-            f"setstate in/sent/coalesced={s['setstate_in']}/{s['setstate_sent']}/"
-            f"{s['setstate_coalesced']}  0x39={s['reports_39']} "
+            f"setstate in/sent/coalesced/merged={s['setstate_in']}/{s['setstate_sent']}/"
+            f"{s['setstate_coalesced']}/{s['setstate_merged']}  "
+            f"feature0x80 fwd/blocked={s['feature_test_forwarded']}/"
+            f"{s['feature_test_blocked']} 0x81 reads/timeouts="
+            f"{s['feature_test_reads']}/{s['feature_bt_timeouts']}  "
+            f"0x39={s['reports_39']} "
             f"(err {s['report_39_errors']}, underrun frames "
             f"{s['audio_underrun_frames']}, q-drop {s['audio_q_drop_frames']})  "
             f"audio_out={s['audio_out_bytes']}B "
