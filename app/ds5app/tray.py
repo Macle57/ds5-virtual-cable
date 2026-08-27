@@ -25,14 +25,36 @@ Run key and the hotplug watcher bridges each enabled controller as it appears,
 so the honest answer to "do I have to do anything after setup?" is no: turn the
 controller on, and a wired DualSense shows up in Windows a few seconds later.
 
-**3. The menu must not move under the cursor.** The old version reassigned
-`icon.menu` whenever Start had to become Stop, and had to guard against doing
-it more often than that -- rebuilding a menu somebody has open is a genuinely
-unpleasant bug. pystray evaluates `text`, `checked`, `visible` and `enabled` as
-CALLABLES every time the menu is drawn, so the menu here is built exactly once,
-in `_menu()`, and every dynamic thing in it is a lambda reading the latest
-snapshot. Controllers come and go by flipping `visible` on a fixed set of
-slots, which is why `MAX_SLOTS` exists.
+**3. The menu must be current, and must not move under the cursor.** These
+pull in opposite directions, and the first version got the balance wrong in a
+way that is worth spelling out because the pystray documentation invites it.
+
+`text`, `checked`, `visible` and `enabled` may all be CALLABLES, so the menu is
+built exactly once in `_menu()` and every dynamic thing in it is a lambda over
+the latest snapshot; controllers come and go by flipping `visible` on a fixed
+bank of slots, which is why `MAX_SLOTS` exists. What is NOT true -- and what
+this file assumed for a while -- is that those callables are re-evaluated when
+the menu is opened. On Windows they are not. `pystray._win32` evaluates every
+one of them in `_update_menu()` and bakes the answers into a native HMENU;
+right-clicking the icon only calls `TrackPopupMenuEx` on that cached handle. So
+the menu froze at the moment `_mark_ready()` built it -- before any controller
+had been discovered -- and stayed frozen. The bug the user sees is: plug in a
+second controller, watch the console bridge it, open the menu, and be told
+there is one. Then click any row, and the menu is suddenly right -- because
+pystray wraps every item's action in `_handler`, which calls `update_menu()`
+afterwards. "Rescan for controllers" appeared to be what fixed it. It was not:
+the click was.
+
+So `_refresh_now()` fingerprints what the menu RENDERS (`_menu_key`) and calls
+`icon.update_menu()` when that changes -- which is the documented contract for
+dynamic menus, and rare, because the fingerprint deliberately ignores the
+report rate ticking between 249/s and 251/s. The other half is `_menu_open`:
+`update_menu()` destroys the HMENU it replaces, `TrackPopupMenuEx` is modal on
+the message-loop thread, and this refresh runs on another thread -- so a
+rebuild that lands while the menu is on screen would destroy the menu somebody
+is reading. `_watch_menu_visibility()` wraps pystray's own notify handler to
+know when that is, and a rebuild that arrives during it is deferred to the
+moment the menu closes.
 
 Why pystray and not tkinter: a tray icon is what a background utility should
 be, a tkinter window is one more thing to minimise, and pystray's Windows
@@ -47,6 +69,7 @@ single file.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -58,6 +81,8 @@ from . import config as K
 from . import controller as C
 from . import manager as M
 from . import service as S
+
+log = logging.getLogger("ds5app.tray")
 
 REFRESH_S = 2.0
 
@@ -152,6 +177,12 @@ class TrayApp:
         self._stop = threading.Event()
         self._busy: dict[str, bool] = {}
         self._lock = threading.Lock()
+        #: What the menu looked like the last time it was actually rebuilt, and
+        #: whether a rebuild is waiting for an open menu to close. See point 3
+        #: of the module docstring.
+        self._menu_key_built: tuple | None = None
+        self._menu_open = False
+        self._menu_dirty = False
 
         self.cfg = K.load()
         self._reconcile_autostart()
@@ -273,6 +304,22 @@ class TrayApp:
         self.cfg.set_hide_bluetooth(serial, value)
         self._save()
 
+    def _persist_hide_default(self, value: bool) -> None:
+        """Remember the hide choice for controllers this machine has not met yet.
+
+        Two halves, and forgetting either one makes the all-switch look like it
+        did not stick. `hide_bluetooth_default` seeds `hide_bluetooth` on a
+        first sighting, so it is what a pad plugged in tomorrow inherits; the
+        manager took a COPY of it at construction (`hide_default`), so it is
+        also what a pad plugged in five minutes from now inherits, without a
+        restart. The copy is assigned directly because the manager has no
+        setter for it, and one tray row is not a reason to grow one -- a bare
+        bool store is atomic, and the manager only ever reads it as a fallback.
+        """
+        self.cfg.set_hide_bluetooth_default(value)
+        self._save()
+        self.mgr.hide_default = bool(value)
+
     def _persist_port(self, serial: str, port: int) -> None:
         # Trap 5 from the manager's hardware testing: a controller that comes
         # back on a different port is a NEW devnode to Windows, so it loses its
@@ -357,23 +404,106 @@ class TrayApp:
             self._work("hide-" + serial, go)
         return act
 
+    def _toggle_hide_all(self, *_):
+        """One click for every controller, and for the ones not here yet.
+
+        Hiding two pads used to be two clicks in two different rows, and there
+        was no way at all to say "and anything else I plug in". This says both:
+        the per-controller flags are pushed through the manager (which applies
+        them to a running bridge immediately and calls back into
+        `_persist_hide`), and `hide_bluetooth_default` records the same answer
+        for a controller seen for the first time.
+
+        ONE notification, not N. The per-controller path has to name the pad it
+        is talking about; this one is about all of them, and N balloons for one
+        click is how a helpful message becomes something a user turns off.
+        """
+        want = not self._hide_all_checked()
+        serials = [c["serial"] for c in self._controllers()]
+
+        def go():
+            self._persist_hide_default(want)
+            for serial in serials:
+                self.mgr.set_hide_bluetooth(serial, want)
+            n = len(serials)
+            if not self._has_hidhide:
+                self._notify("Hide Bluetooth pads",
+                             "HidHide is not installed, so nothing is hidden. "
+                             "See the user guide.")
+            elif not n:
+                self._notify("Hide Bluetooth pads",
+                             "No controller is connected. Pads that show up "
+                             "from now on will be hidden while bridged."
+                             if want else
+                             "No controller is connected. Pads that show up "
+                             "from now on will stay visible.")
+            elif want:
+                # Same caveat as the single-controller path: HidHide gates
+                # IRP_MJ_CREATE, so a game that is running right now already
+                # holds its handles and keeps seeing the pads.
+                self._notify("Hide Bluetooth pads",
+                             f"{n} controller(s) hidden. Games started from "
+                             f"now on will not see the Bluetooth pads.")
+            else:
+                self._notify("Hide Bluetooth pads",
+                             f"{n} controller(s) visible to everything again.")
+        self._work("hide-all", go)
+
     def _unhide_all(self, *_):
         """The panic button. Stop everything first, then force the sweep.
 
         Stopping first is what makes the state coherent afterwards: every
         bridge's own `stop()` unhides its controller through the normal path, so
         the forced sweep only has to deal with what a crash left behind.
+
+        What it must never do is say "every pad is visible again" on the
+        strength of an empty journal. The journal is a list of debts we know
+        about, and the failure this button exists for -- 2026-08-27, "unhiding
+        does not unhide" -- produces a blacklist entry with no debt recorded
+        against it. On that machine, this notification was the all-clear that
+        sent the user away from the one control that could still have helped.
+        So the sweep's own count is reported, and then HidHide is asked.
         """
         def go():
             from . import hidhide as HH
 
             self.mgr.stop_all()
-            n = HH.sweep(force=True)
+            # Whose pads this is answerable for, taken BEFORE the sweep -- a
+            # cleared record is a deleted record, and the serials are what the
+            # visibility check below needs.
+            owed = [r.get("serial") for r in HH.read_records() if r.get("serial")]
+            n = HH.sweep(force=True, log_fn=lambda t: print("  " + t, flush=True))
             left = HH.journal_count()
+            stray = HH.unrecorded_hidden()
+            stuck = [s for s in owed if HH.pad_visible(s) is False]
             if left:
+                # A record that survives the sweep is the worse failure of the
+                # two and names the real culprit, so it is reported first even
+                # though its pad is necessarily in `stuck` as well.
                 self._notify("ds5bridge",
                              f"{left} controller(s) could not be unhidden. Use "
                              f"HidHideClient.exe, or run `ds5bridge unhide`.")
+            elif stuck:
+                # The blacklist can be empty and the controller still gone: the
+                # HID devnode under it goes phantom, and only a re-enumeration
+                # brings it back. `sweep()` has already tried, including the
+                # elevated route if this process happens to have it.
+                self._notify("ds5bridge", HH.power_cycle_hint(short(stuck[0]))
+                             if len(stuck) == 1 else
+                             f"{len(stuck)} controllers are unhidden but still "
+                             f"not showing up. Switch each one off and on "
+                             f"again.")
+            elif stray is None:
+                self._notify("ds5bridge",
+                             "HidHide would not say what it is hiding, so this "
+                             "cannot confirm your pads are visible. Check "
+                             "HidHideClient.exe.")
+            elif stray:
+                self._notify("ds5bridge",
+                             f"HidHide is still hiding {len(stray)} device(s) "
+                             f"that ds5bridge has no record of. Run `ds5bridge "
+                             f"unhide --all-hidhide`, or untick them in "
+                             f"HidHideClient.exe.")
             else:
                 self._notify("ds5bridge",
                              f"Unhid {n} controller(s). Every pad is visible "
@@ -499,8 +629,48 @@ class TrayApp:
 
         return visible, text, checked, action
 
+    def _hide_all_checked(self, _item=None) -> bool:
+        """Checked only when EVERY listed controller is hiding. Mixed reads off.
+
+        pystray has no third state, so a mixed selection has to render as one
+        of the two, and the choice is made by what the next click should do: an
+        unchecked box hides the remainder, which is the reason somebody opens
+        this menu with one pad already hidden. Checking it on a mixed state
+        would instead unhide the pad that is already hidden -- the opposite of
+        what the row is for, and destructive of a setting the user made
+        deliberately.
+
+        With nothing connected the row shows the SEED
+        (`hide_bluetooth_default`) rather than the vacuous `all([]) is True`.
+        A checkbox that is ticked when there is nothing to tick would claim a
+        state that does not exist, and clicking it would then unhide-by-default
+        every controller that ever appears.
+        """
+        cs = self._controllers()
+        if not cs:
+            return bool(self.cfg.hide_bluetooth_default)
+        return all(c.get("hide_bluetooth") for c in cs)
+
+    def _hide_all_row(self):
+        """(visible, checked, action) for the all-switch -- same shape as a slot.
+
+        Visible on exactly the rule the per-controller rows use, because a
+        master switch over rows that are not there explains nothing. Kept as a
+        factory so the menu can stay built-exactly-once and so this is testable
+        without pystray.
+        """
+        return (lambda _item=None: self._has_hidhide,
+                self._hide_all_checked,
+                self._toggle_hide_all)
+
     def _hide_menu(self):
         """The `Hide Bluetooth pad while bridged >` submenu. Built once.
+
+        The first row is the all-switch, then a separator, then the
+        per-controller rows. Leading the submenu with it costs nothing when it
+        is hidden: pystray drops invisible items first and only then strips
+        leading, trailing and repeated separators, so the machine without
+        HidHide gets the explanatory row and no stray line above it.
 
         Two visibility rules that are deliberate:
 
@@ -514,7 +684,12 @@ class TrayApp:
         """
         import pystray
 
-        items = []
+        all_visible, all_checked, all_action = self._hide_all_row()
+        items = [
+            pystray.MenuItem("Hide all Bluetooth pads", all_action,
+                             checked=all_checked, visible=all_visible),
+            pystray.Menu.SEPARATOR,
+        ]
         for i in range(MAX_SLOTS):
             visible, text, checked, action = self._hide_slot(i)
             items.append(pystray.MenuItem(text, action, checked=checked,
@@ -536,13 +711,27 @@ class TrayApp:
         return pystray.Menu(*items)
 
     def _title(self) -> str:
+        """The tooltip, and the first row of the menu.
+
+        An offline controller is counted apart from the bridged ones rather
+        than among them. Both numbers are true -- a bridge whose Bluetooth link
+        has dropped keeps its virtual device attached and feeds the game
+        neutral input on purpose, which is what `running` counts -- but "2 of 2
+        bridged" is not what a person wants to read about a controller they can
+        see is switched off, and it is the line that made the program look
+        wrong when it was merely being slow (`offline_grace`).
+        """
         agg = self._snap.get("aggregate", {})
         if not self._snap.get("master_enabled", True):
             return "ds5bridge -- off"
         running, present = agg.get("running", 0), agg.get("present", 0)
+        offline = agg.get("degraded", 0)
         if not present:
             return "ds5bridge -- no controller connected"
-        bits = [f"ds5bridge -- {running} of {present} bridged"]
+        head = f"ds5bridge -- {running - offline} of {present} bridged"
+        if offline:
+            head += f", {offline} offline"
+        bits = [head]
         for c in self._controllers():
             bits.append("  " + describe(c))
         return "\n".join(bits)[:127]      # Win32 tooltips are capped at 128
@@ -571,6 +760,98 @@ class TrayApp:
         return COLORS.get(state, (128, 128, 128)), (min(bats) if bats else None), \
             agg.get("running", 0)
 
+    def _menu_key(self) -> tuple:
+        """Everything the MENU shows, as one comparable value. In memory only.
+
+        The redraw key for the menu, exactly as `_art()` is the redraw key for
+        the icon, and bucketed for the same reason: the report rate moves every
+        single tick, and rebuilding a native menu twice a second forever to
+        keep "250/s" honest would be all cost and no benefit. Anything a person
+        would actually notice -- a controller appearing or going away, a state,
+        a checkbox, the battery, the count in the first row -- is in here.
+
+        Deliberately absent: `A.is_enabled()` and `_journal_count()`, which are
+        a registry read and a directory listing. Both are evaluated when the
+        menu is rebuilt, and neither may be put on a two-second timer just to
+        notice a change that only a click can cause -- and a click rebuilds the
+        menu anyway, through pystray's own `_handler`.
+        """
+        return (self._title().splitlines()[0],
+                bool(self._snap.get("master_enabled", True)),
+                self._hide_all_checked(),
+                tuple((c["serial"], (c.get("label") or ""), c.get("state"),
+                       bool(c.get("enabled")), bool(c.get("present")),
+                       bool(c.get("hide_bluetooth")), bool(c.get("error")),
+                       c.get("battery_percent"),
+                       round((c.get("reports_per_s") or 0.0) / 10.0))
+                      for c in self._controllers()))
+
+    def _sync_menu(self) -> None:
+        """Rebuild the native menu if what it renders has moved. Never mid-open.
+
+        `update_menu()` destroys the HMENU it replaces (`pystray._win32`), and
+        `TrackPopupMenuEx` is modal on the message-loop thread while this runs
+        on the poll thread -- so a rebuild landing while the menu is on screen
+        would pull it out from under the cursor, or worse. When that is the
+        case the rebuild is remembered instead, and `_watch_menu_visibility`
+        runs it the moment the menu closes.
+
+        `_menu_key_built` is only advanced by a rebuild that actually happened,
+        so a deferred one is still pending on the next tick if the menu is
+        somehow still open.
+        """
+        if self.icon is None:
+            return
+        key = self._menu_key()
+        if key == self._menu_key_built:
+            return
+        with self._lock:
+            if self._menu_open:
+                self._menu_dirty = True
+                return
+            self._menu_dirty = False
+        try:
+            self.icon.update_menu()
+        except Exception:  # noqa: BLE001  (a stale menu is not worth a crash)
+            return
+        self._menu_key_built = key
+
+    def _watch_menu_visibility(self) -> None:
+        """Know when the menu is on screen, by wrapping pystray's own handler.
+
+        There is no public way to ask. `_on_notify` is what displays the menu
+        and it does not return until the user has dismissed it, so wrapping it
+        brackets exactly the window in which a rebuild is unsafe -- and gives
+        the natural moment to run one that was deferred.
+
+        Reaching into `_message_handlers` is reaching into a private API, so it
+        is done by identity rather than by hardcoding `WM_NOTIFY`, and every
+        failure is survivable: without the wrapper the menu still refreshes,
+        it just refreshes without knowing whether anyone is looking at it.
+        """
+        handlers = getattr(self.icon, "_message_handlers", None)
+        inner = getattr(self.icon, "_on_notify", None)
+        if not isinstance(handlers, dict) or inner is None:
+            return
+        codes = [code for code, fn in handlers.items() if fn == inner]
+        if not codes:
+            return
+
+        def on_notify(wparam, lparam):
+            with self._lock:
+                self._menu_open = True
+            try:
+                return inner(wparam, lparam)
+            finally:
+                with self._lock:
+                    self._menu_open = False
+                    dirty = self._menu_dirty
+                if dirty:
+                    self._sync_menu()
+
+        for code in codes:
+            handlers[code] = on_notify
+
     def _refresh_now(self) -> None:
         if self.icon is None:
             return
@@ -584,9 +865,10 @@ class TrayApp:
         if key != getattr(self, "_last_art", None):
             self._last_art = key
             self.icon.icon = _icon_image(rgb, bat, count)
-        # The menu is NEVER reassigned. Everything in it is a callable that
-        # pystray re-evaluates when the menu is opened, so there is nothing to
-        # rebuild and nothing that can change under an open menu.
+        # The menu OBJECT is never reassigned -- every item in it is a lambda
+        # over `self._snap`. What has to be asked for is the native rebuild
+        # that re-evaluates those lambdas; see point 3 of the module docstring.
+        self._sync_menu()
 
     def _menu(self):
         """Built once. Every dynamic value below is a lambda -- see the docstring."""
@@ -638,28 +920,90 @@ class TrayApp:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _announce_switches(self) -> None:
+        """Say out loud when a switch, not a fault, is why nothing is bridging.
+
+        Measured 2026-08-27 on this project's own dev launcher: the master
+        switch was off in the settings, so `poll_once` returned at its first
+        line, so no controller was ever started -- and the console printed
+        NOTHING AT ALL. Every symptom of a switch being off is identical to the
+        program being broken: no bridge, no virtual pad, no error. The tray icon
+        does say "off", but a developer running the console form is reading the
+        console, and an empty one is indistinguishable from a hang.
+
+        A switch is a setting somebody chose; being quiet about a fault is a
+        bug, and being quiet about a choice that stops the entire program from
+        doing its job is the same bug wearing better clothes.
+        """
+        if not self.mgr.master_enabled:
+            print("  bridging is OFF -- the \"Bridging enabled\" switch in the "
+                  "tray menu is unticked,\n  so no controller will be bridged "
+                  "until it is turned back on.", flush=True)
+            return
+        off = sorted(s for s in self.mgr.known() if not self.mgr.is_enabled(s))
+        for serial in off:
+            print(f"  {short(serial)} is switched off in the tray menu and will "
+                  f"not be bridged.", flush=True)
+
+    # -- startup and shutdown ----------------------------------------------
+
+    def _install_teardown_hooks(self) -> None:
+        """Ctrl+Break, SIGTERM, logoff and shutdown all reach `_teardown_all`,
+        which stops every bridge -- but the `raise KeyboardInterrupt` that ends
+        the CLI does not escape pystray's Win32 `GetMessage` loop, so without
+        the second hook the tray tears down and then lives on as a process with
+        dead bridges and a stale icon. Measured 2026-08-25: CTRL_BREAK detached
+        the device and the process never exited.
+
+        THE ORDER IS LOAD-BEARING, and it is not the order these were first
+        written in. `_shutdown_icon` arms a three-second `os._exit(0)`
+        watchdog, so everything that must actually finish has to be registered
+        BEFORE it: `mgr.close()` stops every child, detaches every virtual
+        device and unhides every cloaked pad, which on a two-controller machine
+        is comfortably more than three seconds of work. The other way round, a
+        Ctrl+C exits the process mid-detach and leaves behind precisely the
+        zombie device and the invisible controller this path exists to prevent.
+        """
+        S.ON_TEARDOWN.append(self.mgr.close)
+        S.ON_TEARDOWN.append(self._shutdown_icon)
+
+    def _startup_reconcile(self) -> None:
+        """Clear what a previous run's death left on the machine.
+
+        An armed auto-re-attach and any virtual controller still attached with
+        no server behind it -- neither of which is visible in this program's own
+        memory, because both live in the usbip driver and outlive every process
+        on this side. Synchronous and before the hotplug watcher, deliberately:
+        it is two fast usbip calls, and a pass racing it would be starting
+        bridges into a machine still holding the last run's wreckage.
+
+        HidHide's half of the same job has already run, from
+        `install_crash_handlers()` -> `hidhide_sweep_once()`.
+        """
+        try:
+            self.mgr.reconcile_stale(log_fn=lambda t: print("  " + t, flush=True))
+        except Exception:  # noqa: BLE001  (housekeeping must not stop the tray)
+            log.exception("the startup reconciliation failed")
+
     # -- entry point -------------------------------------------------------
 
     def run(self) -> int:
         import pystray
 
         S.install_crash_handlers()
-        # Ctrl+Break, SIGTERM, logoff and shutdown all reach `_teardown_all`,
-        # which stops every bridge -- but the `raise KeyboardInterrupt` that
-        # ends the CLI does not escape pystray's Win32 GetMessage loop, so
-        # without this the tray tears down and then lives on as a process with
-        # dead bridges and a stale icon. Measured 2026-08-25: CTRL_BREAK
-        # detached the device and the process never exited.
-        S.ON_TEARDOWN.append(self._shutdown_icon)
-        S.ON_TEARDOWN.append(self.mgr.close)
+        self._install_teardown_hooks()
 
         self.icon = pystray.Icon("ds5bridge", _icon_image(COLORS[S.STOPPED], None),
                                  "ds5bridge -- starting", menu=self._menu())
+        self._watch_menu_visibility()
         threading.Thread(target=self._poll, name="tray-poll", daemon=True).start()
+
+        self._startup_reconcile()
 
         # This is the answer to "do I have to do anything after setup?".
         # Nothing is clicked: the watcher bridges every enabled controller that
         # is already on, and every one that appears later.
+        self._announce_switches()
         if not getattr(self.args, "no_hotplug", False):
             self.mgr.start_hotplug()
         else:

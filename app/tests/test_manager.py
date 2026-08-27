@@ -47,17 +47,25 @@ class FakeBridge:
     never_ready: set = set()
 
     def __init__(self, serial, port, command, job=None, on_event=None,
-                 usbip_exe=None, **kw):
+                 usbip_exe=None, on_change=None, **kw):
         self.serial = serial.lower()
         self.port = port
         self.command = list(command)
         self.job = job
         self.on_event = on_event or (lambda s, k, t: None)
+        self.on_change = on_change or (lambda s: None)
         self.error = None
         self.started = False
         self.stopped = False
+        #: Was the last stop the impolite one? A disconnect teardown must not
+        #: spend `stop_timeout` waiting for a graceful shutdown of a bridge
+        #: whose controller is already gone.
+        self.stopped_hard = None
         self._state = M.STOPPED
         self._rate = 0.0
+        #: Set when the child first says the link is down, exactly as the real
+        #: `ChildBridge._note_state` stamps it.
+        self._offline_since = None
 
     @property
     def alive(self) -> bool:
@@ -78,9 +86,11 @@ class FakeBridge:
         self._rate = 250.0
         return True
 
-    def stop(self) -> None:
+    def stop(self, hard: bool = False) -> None:
         self.stopped = True
+        self.stopped_hard = bool(hard)
         self._state = M.STOPPED
+        self._offline_since = None
         self._rate = 0.0
         FakeBridge.cleaned.append(self.port)
 
@@ -89,12 +99,34 @@ class FakeBridge:
         self.stopped = True
         self.error = "the bridge process exited"
         self._state = M.ERROR
+        self.on_change(self.serial)
+
+    def go_offline(self, at=None) -> None:
+        """The Bluetooth link dropped, and the child said so.
+
+        What a real child does across a dropout: `BridgeService.snapshot()`
+        turns `device_status()["connected"] is False` into DEGRADED, and the
+        virtual device stays attached, because most of these recover. The
+        timestamp is the child's own, as it is in `ChildBridge`.
+        """
+        self._state = M.DEGRADED
+        self._rate = 0.0
+        if self._offline_since is None:
+            self._offline_since = time.monotonic() if at is None else at
+        self.on_change(self.serial)
+
+    def come_back(self) -> None:
+        self._state = M.RUNNING
+        self._rate = 250.0
+        self._offline_since = None
+        self.on_change(self.serial)
 
     def snapshot(self) -> dict:
         return {"serial": self.serial, "port": self.port, "state": self._state,
                 "error": self.error, "pid": 4242, "battery_percent": 55,
                 "reports_per_s": self._rate, "uptime_s": 7,
-                "attached": self._state == M.RUNNING, "last_event": ""}
+                "attached": self._state in (M.RUNNING, M.DEGRADED),
+                "last_event": "", "offline_since": self._offline_since}
 
 
 A = "d42f4ba1485d"
@@ -110,6 +142,10 @@ class _Base(unittest.TestCase):
         self.present = [A, B]
         self.busy: set = set()
         self.events: list = []
+        #: Serials the manager asked to have unhidden, in order.
+        self.unhidden: list = []
+        #: One entry per exit sweep the manager ran.
+        self.swept: list = []
         self._before_hooks = list(S.ON_TEARDOWN)
         # Several tests provoke a start failure on purpose, and `manager.start`
         # logs those with a traceback. Unconfigured, logging prints them to
@@ -132,8 +168,15 @@ class _Base(unittest.TestCase):
         kw.setdefault("child_command", lambda s, p: ["fake", s, str(p)])
         # Never the real HidHide journal: a developer with something genuinely
         # hidden would otherwise see these tests behave differently on their
-        # machine than in CI.
+        # machine than in CI -- and, since every stop repays its hide debt,
+        # would have their own controller unhidden by a green test run.
         kw.setdefault("hidden_serials", lambda: [])
+        kw.setdefault("unhide_serial", lambda s: self.unhidden.append(s))
+        # Same reasoning for the exit sweep: it reads the real journal and
+        # unhides anything whose owner is gone, which on a developer's machine
+        # is their own controller.
+        kw.setdefault("sweep_fn", lambda: self.swept.append(True))
+        kw.setdefault("usbip_factory", lambda: None)
         kw.setdefault("on_event",
                       lambda s, k, t: self.events.append((s, k, t)))
         kw.setdefault("use_job", False)
@@ -549,6 +592,78 @@ class TestSnapshot(_Base):
 # ---------------------------------------------------------------------------
 
 
+class TestOfflineIsVisible(_Base):
+    """What the tray is told while a bridge's controller is offline."""
+
+    def test_the_aggregate_separates_offline_from_bridged(self):
+        m = self.make()
+        m.start_all()
+        m._bridges[A].go_offline()
+        agg = m.snapshot()["aggregate"]
+        # `running` keeps its meaning -- the device is still attached and the
+        # game is still being fed -- and `degraded` is what lets the tray say
+        # so without claiming the controller is there.
+        self.assertEqual(agg["running"], 2)
+        self.assertEqual(agg["degraded"], 1)
+
+    def test_a_healthy_pair_reports_none_offline(self):
+        m = self.make()
+        m.start_all()
+        self.assertEqual(m.snapshot()["aggregate"]["degraded"], 0)
+
+    def test_the_offline_grace_is_shorter_than_the_vanish_grace(self):
+        # The child has already spent bridge.LINK_DEAD_S deciding the link is
+        # dead before this clock starts, so waiting a full vanish_grace on top
+        # is waiting twice for the same answer.
+        m = self.make()
+        self.assertLess(m.offline_grace, m.vanish_grace)
+
+
+class TestHotplugStartup(_Base):
+    """When the first pass runs. See `start_hotplug`."""
+
+    def test_the_first_pass_does_not_wait_for_the_interval(self):
+        # Starting the program with a controller already switched on is the
+        # common case, and an interval's silence at that moment reads as "it
+        # did not see my controller" -- which is what sent a user looking for
+        # Rescan. The interval separates the passes AFTER the first one.
+        calls = []
+
+        def discover():
+            calls.append(time.monotonic())
+            return list(self.present)
+
+        m = self.make(discover=discover, hotplug_interval=30.0)
+        m.start_hotplug()
+        try:
+            deadline = time.monotonic() + 2.0
+            while not calls and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            m.stop_hotplug()
+        self.assertTrue(calls, "hotplug waited a full interval before looking")
+
+    def test_a_controller_already_connected_is_bridged_without_a_click(self):
+        m = self.make(hotplug_interval=30.0)
+        m.start_hotplug()
+        try:
+            deadline = time.monotonic() + 2.0
+            while len(m.snapshot()["controllers"]) < 2                     and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            m.stop_hotplug()
+        self.assertEqual(m.snapshot()["aggregate"]["running"], 2)
+
+    def test_stopping_the_watcher_still_ends_the_thread_promptly(self):
+        # The loop now polls before it waits, so the stop event has to be
+        # checked on the way round rather than only on the way in.
+        m = self.make(hotplug_interval=30.0)
+        m.start_hotplug()
+        t = m._watch
+        m.stop_hotplug()
+        self.assertFalse(t.is_alive())
+
+
 class TestChildPlumbing(_Base):
     def test_the_status_line_the_cli_prints_is_parsed(self):
         # Exactly what `cli.cmd_run` writes: two leading spaces, then
@@ -805,3 +920,682 @@ class TestHideToggle(_Base):
         snap = m.snapshot()["controllers"]
         self.assertTrue(snap[A]["hide_bluetooth"])
         self.assertFalse(snap[B]["hide_bluetooth"])
+
+
+# ---------------------------------------------------------------------------
+# the child's own verdict on the Bluetooth link -- what cloaking hides from us
+# ---------------------------------------------------------------------------
+
+
+class TestOfflineTeardown(_Base):
+    """Both halves of the bug a user reported with hiding switched on.
+
+    Presence used to be computed two different ways. `poll_once` unioned the
+    HidHide journal in, so a cloaked pad counted; `snapshot()` read the raw
+    enumeration, which structurally CANNOT list a cloaked pad, so the same pad
+    did not -- and the tray rendered "2 of 1 controllers bridged" and called a
+    perfectly healthy hidden controller "not connected".
+
+    Worse, the journal entry stands whether or not the controller is switched
+    on, so the absence clock never started for a hidden pad and switching one
+    off left its virtual device attached to Windows on the end of a dead radio
+    link, for ever. The child knows better: it reports DEGRADED straight from
+    `device_status()["connected"]`, which needs no enumeration and therefore
+    still works through the cloak.
+    """
+
+    def test_a_hidden_healthy_controller_counts_as_present(self):
+        m = self.make(hidden_serials=lambda: [A])
+        m.start(A)
+        self.present = []                      # cloaked: it cannot enumerate
+        m.poll_once()
+        snap = m.snapshot()
+        self.assertTrue(snap["controllers"][A]["present"],
+                        "a bridged pad we hid is not 'not connected'")
+        self.assertEqual(snap["aggregate"]["present"], 1)
+        self.assertEqual(snap["aggregate"]["running"], 1)
+
+    def test_the_tray_can_never_be_told_more_are_running_than_are_present(self):
+        m = self.make(hidden_serials=lambda: [A])
+        m.start(A)
+        m.start(B)
+        self.present = [B]                     # A is cloaked, B is not
+        m.poll_once()
+        agg = m.snapshot()["aggregate"]
+        self.assertEqual((agg["running"], agg["present"]), (2, 2),
+                         "2 of 1 controllers bridged is this assertion failing")
+        self.assertLessEqual(agg["running"], agg["present"])
+
+    def test_a_bridge_started_before_any_hotplug_pass_is_counted_too(self):
+        """`start()` on its own must not produce running > present either."""
+        m = self.make(discover=lambda: [], hidden_serials=lambda: [])
+        m.start(A)
+        agg = m.snapshot()["aggregate"]
+        self.assertLessEqual(agg["running"], agg["present"])
+
+    def test_a_hidden_controller_that_goes_offline_is_torn_down(self):
+        m = self.make(offline_grace=0.0, vanish_grace=999.0,
+                      hidden_serials=lambda: [A])
+        m.start(A)
+        self.present = []
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertNotIn(A, m._bridges,
+                         "a cloaked pad that was switched off kept its virtual "
+                         "device attached to Windows for ever")
+        self.assertEqual(FakeBridge.cleaned, [3241])
+        self.assertTrue(any(s == A and k == "warn" and "offline" in t
+                            for s, k, t in self.events), self.events)
+
+    def test_a_brief_dropout_inside_the_grace_does_not_tear_it_down(self):
+        # Measured 2026-08-25: a 4 s silence tripped the link watchdog on both
+        # controllers mid-soak and both recovered on their own. Tearing down
+        # here would turn that into a device removal the user sees.
+        m = self.make(offline_grace=60.0, vanish_grace=60.0,
+                      hidden_serials=lambda: [A])
+        m.start(A)
+        self.present = []
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertIn(A, m._bridges)
+        self.assertEqual(FakeBridge.cleaned, [])
+        m._bridges[A].come_back()
+        m.poll_once()
+        self.assertEqual(m.snapshot()["controllers"][A]["state"], M.RUNNING)
+
+    def test_the_offline_clock_restarts_after_a_recovery(self):
+        m = self.make(offline_grace=0.5)
+        m.start(A)
+        b = m._bridges[A]
+        b.go_offline()
+        m.poll_once()                          # first offline pass
+        b.come_back()
+        m.poll_once()                          # recovered -- the clock resets
+        b.go_offline()
+        m.poll_once()
+        self.assertEqual(FakeBridge.cleaned, [],
+                         "the offline clock must restart, not accumulate")
+
+    def test_the_journal_stops_vouching_for_a_pad_whose_link_is_down(self):
+        """The union must not mask a real disconnect.
+
+        A journal entry records that WE hid this serial. It says nothing about
+        whether the controller is switched on, and treating it as if it did is
+        what stopped the absence clock from ever starting.
+        """
+        m = self.make(offline_grace=999.0, vanish_grace=999.0,
+                      hidden_serials=lambda: [A])
+        m.start(A)
+        self.present = []
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertNotIn(A, m._present)
+        self.assertIn(A, m._missing_since,
+                      "the absence clock never started, so the bridge never fell")
+
+    def test_the_oscillation_guard_still_holds_for_a_healthy_hidden_pad(self):
+        """Hiding must still not be able to start the ~40 s flap.
+
+        Both graces at zero, so anything that can tear this bridge down will.
+        The child says RUNNING, so nothing may.
+        """
+        m = self.make(vanish_grace=0.0, offline_grace=0.0,
+                      hidden_serials=lambda: [A])
+        m.start(A)
+        self.present = []
+        for _ in range(5):
+            m.poll_once()
+        self.assertIn(A, m._bridges)
+        self.assertEqual(FakeBridge.cleaned, [])
+
+    def test_an_offline_teardown_settles_instead_of_looping(self):
+        # The pad is switched off but still enumerated -- a DualSense charging
+        # on a cable does exactly that. Without the retry window this is a
+        # start/tear-down loop that attaches a virtual device every pass.
+        built = []
+
+        def factory(*a, **kw):
+            b = FakeBridge(*a, **kw)
+            built.append(b)
+            return b
+
+        self.present = [A]
+        m = self.make(bridge_factory=factory, offline_grace=0.0,
+                      retry_after=999.0)
+        m.start(A)
+        built[0].go_offline()
+        m.poll_once()
+        for _ in range(5):
+            m.poll_once()
+        self.assertNotIn(A, m._bridges)
+        self.assertEqual(len(built), 1)
+
+    def test_a_controller_switched_back_on_is_bridged_again_by_itself(self):
+        """The teardown must not leave a hold behind.
+
+        A hold means "the user asked for this", and it only lifts when the
+        serial leaves the present set -- which a pad that keeps enumerating
+        never does. That would be a promise never to bridge this controller
+        again until somebody clicked Start.
+        """
+        m = self.make(offline_grace=0.0, retry_after=0.0)
+        m.start(A)
+        first = m._bridges[A]
+        first.go_offline()
+        m.poll_once()                          # torn down, and the radio is back
+        self.assertNotIn(A, m._held)
+        self.assertIsNot(m._bridges[A], first)
+        self.assertEqual(m.snapshot()["controllers"][A]["state"], M.RUNNING)
+
+    def test_every_stop_repays_the_hide_debt_the_child_may_not_have(self):
+        """A tray host has no console, so its children die without unhiding.
+
+        `ChildBridge.stop()` is then a `TerminateProcess`: no atexit, no
+        `BridgeService.stop()`, no unhide. A cloaked pad cannot be enumerated,
+        so it cannot be seen to come back -- the controller stays gone for the
+        rest of the session.
+        """
+        m = self.make(offline_grace=0.0)
+        m.start(A)
+        m.start(B)
+        m.stop(B)
+        self.assertEqual(self.unhidden, [B])
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertEqual(self.unhidden, [B, A])
+
+    def test_an_offline_bridge_is_still_counted_present_while_it_lives(self):
+        """Otherwise the tray's own arithmetic goes negative mid-dropout."""
+        m = self.make(offline_grace=999.0, vanish_grace=999.0,
+                      hidden_serials=lambda: [A])
+        m.start(A)
+        self.present = []
+        m._bridges[A].go_offline()
+        m.poll_once()
+        agg = m.snapshot()["aggregate"]
+        self.assertEqual(agg["running"], 1)
+        self.assertLessEqual(agg["running"], agg["present"])
+
+
+# ---------------------------------------------------------------------------
+# switching the controller off during a game
+# ---------------------------------------------------------------------------
+
+
+class TestPromptDisconnect(_Base):
+    """How long the game keeps seeing a controller that is not there.
+
+    The user-visible complaint this class exists for: switch the pad off
+    mid-game and the virtual wired DualSense stayed attached, feeding neutral
+    input, long enough to be indistinguishable from a hang. Three separate
+    delays were stacked on top of each other, and all three are app-layer:
+
+      * the child's status line only went out on its own timer;
+      * the offline clock started when a POLL noticed, not when the link died;
+      * the teardown then waited for the next poll, and asked the child nicely
+        first -- a graceful shutdown for a controller that is already gone.
+    """
+
+    def test_two_witnesses_tear_down_on_the_short_grace(self):
+        """Link dead AND not enumerated: the pad is off, not merely quiet."""
+        m = self.make(offline_grace=999.0, gone_grace=0.0, vanish_grace=999.0)
+        m.start(A)
+        self.present = [B]                       # A is switched off
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+        self.assertEqual(FakeBridge.cleaned, [3241],
+                         "only the gone controller's port may be cleaned up")
+
+    def test_one_witness_still_waits_out_the_long_grace(self):
+        """A pad that is quiet but still enumerated may only be dropping out.
+
+        Measured 2026-08-25: a 4 s silence tripped the link watchdog on both
+        controllers mid-soak and both recovered. Enumeration did not blink.
+        """
+        m = self.make(offline_grace=999.0, gone_grace=0.0, vanish_grace=999.0)
+        m.start(A)
+        m._bridges[A].go_offline()               # still in self.present
+        m.poll_once()
+        self.assertIn(A, m._bridges)
+        self.assertEqual(FakeBridge.cleaned, [])
+
+    def test_the_short_grace_can_never_be_the_longer_of_the_two(self):
+        """Two witnesses agreeing must shorten the wait, never lengthen it."""
+        m = self.make(offline_grace=0.0, gone_grace=999.0)
+        m.start(A)
+        self.present = []
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+
+    def test_the_clock_starts_when_the_link_died_not_when_a_poll_looked(self):
+        """The child stamps it; the poll only reads it.
+
+        Otherwise every disconnect costs a whole poll interval before anybody
+        even starts counting -- and the pad has already been silent for
+        `bridge.LINK_DEAD_S` by then.
+        """
+        m = self.make(offline_grace=5.0, gone_grace=5.0, vanish_grace=999.0)
+        m.start(A)
+        self.present = []
+        # The child noticed six seconds ago; this is the first pass to see it.
+        m._bridges[A].go_offline(at=time.monotonic() - 6.0)
+        m.poll_once()
+        self.assertNotIn(A, m._bridges,
+                         "the grace was measured from the poll, not from the "
+                         "moment the link died")
+
+    def test_a_disconnect_teardown_does_not_wait_for_a_polite_shutdown(self):
+        """There is nothing left for the child to shut down gracefully.
+
+        On a console host the polite route is a Ctrl+Break and up to
+        `stop_timeout` seconds of waiting -- seconds in which Windows still
+        shows a game a wired DualSense on the end of a dead radio link.
+        """
+        m = self.make(offline_grace=0.0, gone_grace=0.0)
+        m.start(A)
+        b = m._bridges[A]
+        self.present = []
+        b.go_offline()
+        m.poll_once()
+        self.assertTrue(b.stopped_hard)
+
+    def test_a_user_asking_for_stop_is_still_asked_politely(self):
+        """The controller is right there; let its child disarm the mic."""
+        m = self.make()
+        m.start(A)
+        b = m._bridges[A]
+        m.stop(A)
+        self.assertFalse(b.stopped_hard)
+
+    def test_a_child_going_offline_wakes_the_watcher(self):
+        """Without this the news waits out a whole poll interval, twice."""
+        m = self.make(hotplug_interval=999.0)
+        m.start(A)
+        m._wake.clear()
+        m._bridges[A].go_offline()
+        self.assertTrue(m._wake.is_set(),
+                        "a disconnect must not wait for the next tick")
+
+    def test_a_child_dying_wakes_the_watcher_too(self):
+        m = self.make(hotplug_interval=999.0)
+        m.start(A)
+        m._wake.clear()
+        m._bridges[A].die()
+        self.assertTrue(m._wake.is_set())
+
+    def test_the_watcher_sleeps_only_until_the_grace_expires(self):
+        """A 5 s interval must not add 5 s to a 3 s grace."""
+        m = self.make(hotplug_interval=5.0, gone_grace=1.0, offline_grace=999.0)
+        self.assertAlmostEqual(m._next_interval(), 5.0, places=2)
+        m.start(A)
+        self.present = []
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertLessEqual(m._next_interval(), 1.0)
+        self.assertGreater(m._next_interval(), 0.0)
+
+    def test_the_interval_is_never_zero(self):
+        """A grace of zero must not turn the watcher into a spin loop."""
+        m = self.make(hotplug_interval=5.0, gone_grace=0.0, offline_grace=0.0)
+        m.start(A)
+        with m._lock:
+            m._offline_since[A] = time.monotonic() - 100.0
+        self.assertGreaterEqual(m._next_interval(), 0.1)
+
+
+# ---------------------------------------------------------------------------
+# switching it back on again
+# ---------------------------------------------------------------------------
+
+
+class TestReconnect(_Base):
+    """Every transition has to converge, including the ones the user repeats.
+
+    A teardown leaves a retry window behind so that a pad which enumerates
+    while its radio is silent -- a DualSense charging on a cable does exactly
+    that -- cannot become a start/tear-down loop. Left unqualified, that window
+    is also a minute of nothing happening after somebody switches a controller
+    off and straight back on, which is the single most common thing a user does
+    when something looks wrong.
+    """
+
+    def test_a_power_cycle_clears_the_backoff(self):
+        m = self.make(offline_grace=0.0, gone_grace=0.0, retry_after=999.0)
+        m.start(A)
+        self.present = [B]                       # switched off
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+        m.poll_once()                            # still off: nothing happens
+        self.assertNotIn(A, m._bridges)
+
+        self.present = [A, B]                    # switched back on
+        m.poll_once()
+        self.assertIn(A, m._bridges,
+                      "a controller switched back on waited out the retry "
+                      "window it was given for being switched off")
+        self.assertEqual(m.snapshot()["controllers"][A]["state"], M.RUNNING)
+
+    def test_a_pad_that_never_left_enumeration_keeps_its_backoff(self):
+        """The case the backoff exists for: still listed, radio silent."""
+        m = self.make(offline_grace=0.0, gone_grace=0.0, retry_after=999.0)
+        m.start(A)
+        first = m._bridges[A]
+        first.go_offline()                       # A stays in self.present
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+        for _ in range(5):
+            m.poll_once()
+        self.assertNotIn(A, m._bridges, "a start/tear-down loop")
+
+    def test_a_reappearance_clears_the_recorded_error(self):
+        FakeBridge.fail_on_start = {A}
+        m = self.make(retry_after=999.0)
+        m.start_all()
+        self.assertIn(A, m._errors)
+        self.present = [B]
+        m.poll_once()
+        FakeBridge.fail_on_start = set()
+        self.present = [A, B]
+        m.poll_once()
+        self.assertNotIn(A, m._errors)
+        self.assertEqual(m.snapshot()["controllers"][A]["state"], M.RUNNING)
+
+    def test_off_on_off_on_settles_every_time(self):
+        """Ten cycles, one bridge at the end of each 'on'."""
+        m = self.make(offline_grace=0.0, gone_grace=0.0, retry_after=999.0)
+        for _ in range(10):
+            self.present = [A]
+            m.poll_once()
+            self.assertIn(A, m._bridges)
+            m._bridges[A].go_offline()
+            self.present = []
+            m.poll_once()
+            self.assertNotIn(A, m._bridges)
+        self.assertEqual(len(FakeBridge.cleaned), 10)
+
+
+# ---------------------------------------------------------------------------
+# the way out
+# ---------------------------------------------------------------------------
+
+
+class TestTeardownIsFinal(_Base):
+    """Closing has to mean closed, from any thread and at any moment.
+
+    The failure this guards is not a leak of memory, it is a leak of DEVICE
+    STATE: a bridge started while the manager is being torn down is a child
+    nobody will stop, an attached virtual controller nobody will detach and a
+    cloaked pad nobody will unhide.
+    """
+
+    def test_closing_stops_the_watcher_before_it_can_start_anything(self):
+        m = self.make()
+        m.close()
+        self.present = [A, B]
+        m.poll_once()
+        self.assertEqual(m._bridges, {})
+        self.assertFalse(m.start(A), "a closed manager must not start bridges")
+
+    def test_closing_sweeps_the_hide_journal_last(self):
+        """Whatever a hard-killed child never unhid for itself."""
+        m = self.make()
+        m.start(A)
+        m.close()
+        self.assertEqual(self.swept, [True])
+        self.assertEqual(FakeBridge.cleaned, [3241])
+
+    def test_the_teardown_hook_sweeps_too(self):
+        """Ctrl+C and a closed console reach the hook, not `close()`."""
+        m = self.make()
+        m.start(A)
+        m._teardown_hook()
+        self.assertEqual(self.swept, [True])
+        self.assertNotIn(A, m._bridges)
+
+    def test_a_start_that_lands_after_a_stop_is_torn_back_down(self):
+        """`start()` blocks for as long as the child takes to attach.
+
+        Quit, the master switch, a Stop click and a disconnect teardown can all
+        land inside that window, and none of them can stop a child that has not
+        attached yet. Without the arrival check, what is left is an attached
+        virtual controller with no owner.
+        """
+        gate = threading.Event()
+
+        class Slow(FakeBridge):
+            def wait_ready(self, timeout=60.0):
+                gate.wait(5.0)
+                return super().wait_ready(timeout)
+
+        m = self.make(bridge_factory=Slow)
+        t = threading.Thread(target=lambda: m.start(A))
+        t.start()
+        try:
+            for _ in range(200):                 # until it is registered
+                if A in m._bridges:
+                    break
+                time.sleep(0.01)
+            m.stop(A)                            # the user clicked Stop
+        finally:
+            gate.set()
+            t.join(timeout=5.0)
+        self.assertNotIn(A, m._bridges)
+        self.assertEqual(FakeBridge.cleaned, [3241, 3241],
+                         "the bridge that attached after the stop was left "
+                         "attached to Windows")
+        self.assertIn(A, self.unhidden)
+
+    def test_a_hotplug_pass_does_not_kill_a_start_in_flight(self):
+        """A bridge is registered BEFORE its child has a pid.
+
+        A pass that landed in that window used to read "not alive" as "the
+        bridge process exited", report an error and tear down a bridge that was
+        coming up perfectly well -- then back it off for a minute for good
+        measure.
+        """
+        gate = threading.Event()
+
+        class Slow(FakeBridge):
+            def start(self):
+                gate.wait(5.0)
+                super().start()
+
+        m = self.make(bridge_factory=Slow)
+        t = threading.Thread(target=lambda: m.start(A))
+        t.start()
+        try:
+            for _ in range(200):
+                if A in m._bridges:
+                    break
+                time.sleep(0.01)
+            m.poll_once()
+            self.assertIn(A, m._bridges)
+            self.assertEqual([e for e in self.events if e[1] == "error"], [])
+        finally:
+            gate.set()
+            t.join(timeout=5.0)
+        self.assertEqual(m.snapshot()["controllers"][A]["state"], M.RUNNING)
+
+
+# ---------------------------------------------------------------------------
+# what a previous run's death left behind
+# ---------------------------------------------------------------------------
+
+
+class _Res:
+    def __init__(self, code=0, out=""):
+        self.code, self.out = code, out
+
+    @property
+    def ok(self):
+        return self.code == 0
+
+
+class FakeUsbip:
+    """`usbip port` as a table, plus a record of what was done to it."""
+
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.calls: list = []
+
+    def parse_ports(self):
+        return list(self.rows)
+
+    def stop_auto_reattach(self):
+        self.calls.append("attach -X")
+        return _Res()
+
+    def detach(self, port_no):
+        self.calls.append(("detach", port_no))
+        return _Res()
+
+
+class TestReconcileStale(_Base):
+    """The startup sweep -- the only thing that can undo a `taskkill /F`.
+
+    usbip's port table and its armed auto-re-attach both live in the driver and
+    outlive every process on this side. Nothing in this program's own memory can
+    reveal them, so reconciliation has to ask.
+    """
+
+    def test_the_auto_reattach_is_disarmed_unconditionally(self):
+        """Nothing about a clean-looking machine reveals that it is armed."""
+        u = FakeUsbip([])
+        m = self.make(usbip_factory=lambda: u)
+        self.assertEqual(m.reconcile_stale(), 0)
+        self.assertEqual(u.calls, ["attach -X"])
+
+    def test_a_device_whose_server_is_gone_is_detached(self):
+        u = FakeUsbip([(1, "127.0.0.1:3241/1-1")])
+        m = self.make(usbip_factory=lambda: u, port_free=lambda p: True)
+        self.assertEqual(m.reconcile_stale(), 1)
+        self.assertIn(("detach", 1), u.calls)
+
+    def test_a_live_siblings_device_is_left_alone(self):
+        """Its port is bound, which is the whole distinction.
+
+        Detaching on "is anything attached?" is the regression that killed a
+        30-minute soak once (usbip.py `our_ports`), and a second instance of
+        this program is exactly the case that made it possible.
+        """
+        u = FakeUsbip([(1, "127.0.0.1:3241/1-1"), (2, "127.0.0.1:3242/1-1")])
+        self.busy = {3242}
+        m = self.make(usbip_factory=lambda: u,
+                      port_free=lambda p: p not in self.busy)
+        self.assertEqual(m.reconcile_stale(), 1)
+        self.assertIn(("detach", 1), u.calls)
+        self.assertNotIn(("detach", 2), u.calls)
+
+    def test_a_real_remote_server_is_never_touched(self):
+        u = FakeUsbip([(1, "192.168.1.50:3240/2-3")])
+        m = self.make(usbip_factory=lambda: u, port_free=lambda p: True)
+        self.assertEqual(m.reconcile_stale(), 0)
+        self.assertEqual(u.calls, ["attach -X"])
+
+    def test_an_unattributable_port_is_never_touched(self):
+        """`usbip port` prints a device with no URL line if it cannot resolve."""
+        u = FakeUsbip([(1, "")])
+        m = self.make(usbip_factory=lambda: u, port_free=lambda p: True)
+        self.assertEqual(m.reconcile_stale(), 0)
+
+    def test_no_usbip_is_not_an_error(self):
+        """A machine without usbip-win2 has nothing to reconcile."""
+        m = self.make(usbip_factory=lambda: None)
+        self.assertEqual(m.reconcile_stale(), 0)
+
+    def test_a_failure_to_read_the_table_detaches_nothing(self):
+        class Broken(FakeUsbip):
+            def parse_ports(self):
+                raise OSError("usbip.exe is not answering")
+
+        u = Broken()
+        m = self.make(usbip_factory=lambda: u)
+        self.assertEqual(m.reconcile_stale(), 0)
+        self.assertEqual(u.calls, ["attach -X"])
+
+
+# ---------------------------------------------------------------------------
+# service.py's teardown funnel -- reached from three different directions
+# ---------------------------------------------------------------------------
+
+
+class TestTeardownFunnel(unittest.TestCase):
+    """`_teardown_all` is what atexit, the signal handlers and the console
+    control handler all reach, and more than one of them fires per exit."""
+
+    def setUp(self):
+        self._hooks = list(S.ON_TEARDOWN)
+        self.addCleanup(lambda: S.ON_TEARDOWN.__setitem__(
+            slice(None), self._hooks))
+        S.ON_TEARDOWN[:] = []
+        # One test raises from a hook on purpose, and an unconfigured logger
+        # prints that traceback to stderr -- a green run that looks broken.
+        log = logging.getLogger("ds5app.service")
+        was = log.propagate, log.disabled
+        log.propagate, log.disabled = False, True
+        self.addCleanup(lambda: setattr(log, "disabled", was[1]))
+        self.addCleanup(lambda: setattr(log, "propagate", was[0]))
+
+    def test_a_second_ctrl_c_does_not_interleave_a_second_teardown(self):
+        """The second signal arrives on the SAME thread, mid-teardown.
+
+        Interleaving two sets of stops is how a bridge ends up half detached --
+        one pass issuing `attach -X` while the other issues the detach it was
+        protecting. A plain lock would deadlock here instead, which is worse:
+        the impatient second Ctrl+C would hang the program.
+        """
+        calls = []
+
+        def hook():
+            calls.append("in")
+            S._teardown_all()          # the second Ctrl+C, re-entering
+            calls.append("out")
+
+        S.ON_TEARDOWN.append(hook)
+        S._teardown_all()
+        self.assertEqual(calls, ["in", "out"], "re-entry must return, not "
+                                               "recurse and not deadlock")
+
+    def test_another_thread_waits_rather_than_running_in_parallel(self):
+        """A tray Quit on the message-loop thread, and SIGTERM on the main one.
+
+        `atexit` must not be allowed to return while another thread is still
+        detaching devices, so the second caller waits and then finds everything
+        already stopped.
+        """
+        started = threading.Event()
+        release = threading.Event()
+        order = []
+
+        def slow():
+            order.append("in")
+            started.set()
+            release.wait(5.0)
+            order.append("out")
+
+        S.ON_TEARDOWN.append(slow)
+        first = threading.Thread(target=S._teardown_all)
+        first.start()
+        try:
+            self.assertTrue(started.wait(5.0))
+            second = threading.Thread(target=S._teardown_all)
+            second.start()
+            second.join(0.3)
+            self.assertTrue(second.is_alive(),
+                            "two teardowns ran at once")
+        finally:
+            release.set()
+            first.join(5.0)
+            second.join(5.0)
+        self.assertEqual(order, ["in", "out", "in", "out"],
+                         "the two passes overlapped")
+
+    def test_one_failing_hook_does_not_stop_the_others(self):
+        ran = []
+        S.ON_TEARDOWN.append(lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        S.ON_TEARDOWN.append(lambda: ran.append(True))
+        S._teardown_all()
+        self.assertEqual(ran, [True])

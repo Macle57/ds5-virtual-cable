@@ -181,7 +181,14 @@ def make(ioctl=None, cli=None):
 
 
 class _Temp(unittest.TestCase):
-    """Its own directory, its own DS5_CONFIG, its own journal."""
+    """Its own directory, its own DS5_CONFIG, its own journal.
+
+    `revive_serial` is stubbed out here for everybody: the real one talks to
+    cfgmgr32 and, when elevated, to `pnputil`, neither of which belongs in a
+    test about journals and blacklists. What each unhide path ASKED it to do is
+    recorded in `self.revived`, and `TestRevive` exercises the real thing
+    against mocked CM and pnputil calls.
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -189,6 +196,17 @@ class _Temp(unittest.TestCase):
         self._saved = os.environ.get("DS5_CONFIG")
         os.environ["DS5_CONFIG"] = self.dir
         self.addCleanup(self._restore)
+
+        self.revived: list = []
+
+        def fake_revive(serial, parent_id="", log_fn=None, **kw):
+            self.revived.append((serial, parent_id))
+            return {"serial": serial, "visible": True, "action": "none",
+                    "parent": parent_id, "hint": ""}
+
+        p = mock.patch.object(HH, "revive_serial", fake_revive)
+        p.start()
+        self.addCleanup(p.stop)
 
     def _restore(self):
         if self._saved is None:
@@ -1160,12 +1178,20 @@ class TestDoctorRows(_Temp):
     deliberately fixed.
     """
 
-    def render(self, cfg, live=()):
+    def render(self, cfg, live=(), visible=None):
+        """`visible` is what hidapi says about every configured controller.
+
+        None by default -- "cannot tell", which is the honest answer with no
+        hidapi and the only one that keeps these rows hardware-free. The real
+        check enumerates HID devices and reads the Bluetooth devnode tree, and
+        on a developer's machine that finds their own controller.
+        """
         import io
         import contextlib
 
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        with mock.patch.object(HH, "pad_visible", lambda s: visible), \
+                contextlib.redirect_stdout(buf):
             problems = CLI._doctor_hidhide(cfg, list(live))
         return buf.getvalue(), problems
 
@@ -1267,6 +1293,44 @@ class TestDoctorRows(_Temp):
             out, _ = self.render(CFG.Config())
         self.assertIn("hidden by  us: nothing", out)
 
+    def test_a_connected_pad_nobody_can_enumerate_is_a_finding(self):
+        """Every other row can be green while the pad is unusable.
+
+        Blacklist empty, cloak off, no records -- and the HID child devnode is
+        a phantom, so no application on the machine can open the controller.
+        The 2026-08-27 report, in one command.
+        """
+        cfg = CFG.Config()
+        cfg.set_hide_bluetooth(SERIAL, True)
+        with mock.patch.object(HH.HidHide, "detect", return_value=make()), \
+                mock.patch.object(HH, "bt_parent_for_serial", lambda s: PARENT), \
+                mock.patch.object(HH, "devnode_present", lambda i: True):
+            out, problems = self.render(cfg, visible=False)
+        self.assertIn("cannot be enumerated", out)
+        self.assertIn(SERIAL, out)
+        self.assertGreaterEqual(problems, 1)
+
+    def test_a_controller_in_a_drawer_is_not_a_finding(self):
+        """It is switched off. A diagnostic that says so about every pad
+        anybody owns is a diagnostic people stop reading."""
+        cfg = CFG.Config()
+        cfg.set_hide_bluetooth(SERIAL, True)
+        with mock.patch.object(HH.HidHide, "detect", return_value=make()), \
+                mock.patch.object(HH, "bt_parent_for_serial", lambda s: PARENT), \
+                mock.patch.object(HH, "devnode_present", lambda i: False):
+            out, problems = self.render(cfg, visible=False)
+        self.assertNotIn("cannot be enumerated", out)
+        self.assertEqual(problems, 0)
+
+    def test_no_hidapi_means_no_verdict(self):
+        """`doctor` must work without the hardware stack; it must not guess."""
+        cfg = CFG.Config()
+        cfg.set_hide_bluetooth(SERIAL, True)
+        with mock.patch.object(HH.HidHide, "detect", return_value=make()):
+            out, problems = self.render(cfg, visible=None)
+        self.assertNotIn("cannot be enumerated", out)
+        self.assertEqual(problems, 0)
+
     def test_a_record_with_a_dead_owner_is_loud(self):
         """This is the signature of a crash that did not get to unhide."""
         HH.write_record(SERIAL, IDS)
@@ -1307,6 +1371,469 @@ class TestDoctorRows(_Temp):
         self.assertIn("[warn]", out)
         self.assertIn("could not be checked", out)
         self.assertEqual(problems, 1)
+
+
+# ---------------------------------------------------------------------------
+# what "unhiding does not unhide" turned out to be (2026-08-27)
+# ---------------------------------------------------------------------------
+
+
+class TestCliListingParsing(unittest.TestCase):
+    """`--dev-list` prints re-runnable commands, not bare instance paths.
+
+    Unparsed, every entry HidHide reported was a string beginning `--dev-hide "`
+    that no device instance ID could ever equal -- so `unhide()` found nothing
+    to remove and called that success.
+    """
+
+    def parse(self, out, verb):
+        return HH.CliBackend._parse_listing(out, verb)
+
+    def test_a_dev_list_line_yields_the_path_inside_the_quotes(self):
+        self.assertEqual(self.parse('--dev-hide "' + IDS[0] + '"\n', "--dev-hide"),
+                         [IDS[0]])
+
+    def test_the_app_list_shape_still_works(self):
+        exe = r"C:\Program Files\x\y.exe"
+        self.assertEqual(self.parse('--app-reg "' + exe + '"\n', "--app-reg"), [exe])
+
+    def test_several_entries_come_back_in_order(self):
+        out = '--dev-hide "' + IDS[0] + '"\n--dev-hide "' + STRANGER + '"\n'
+        self.assertEqual(self.parse(out, "--dev-hide"), [IDS[0], STRANGER])
+
+    def test_a_bare_value_is_still_accepted(self):
+        # Being wrong about which shape a HidHide release prints is how this
+        # bug happened; the tolerant branch is deliberate.
+        self.assertEqual(self.parse(IDS[0] + "\n", "--dev-hide"), [IDS[0]])
+
+    def test_blank_lines_and_banners_are_not_entries(self):
+        out = '\n   \n--dev-hide "' + IDS[0] + '"\n'
+        self.assertEqual(self.parse(out, "--dev-hide"), [IDS[0]])
+
+    def test_an_empty_listing_is_empty_not_a_ghost_entry(self):
+        self.assertEqual(self.parse("", "--dev-hide"), [])
+        self.assertEqual(self.parse("\n\n", "--dev-hide"), [])
+
+
+class TestCliStdin(unittest.TestCase):
+    """HidHideCLI keeps reading verbs from stdin until EOF -- see the docstring.
+
+    With the parent's console inherited it never exits, so every call died on
+    the 30 s timeout and looked exactly like "HidHide refused" -- disabling the
+    fallback precisely when the IOCTL surface was the thing that had failed.
+    """
+
+    def test_every_invocation_closes_stdin(self):
+        seen = {}
+
+        class R:
+            returncode, stdout, stderr = 0, "", ""
+
+        def fake_run(cmd, **kw):
+            seen.update(kw)
+            return R()
+
+        with mock.patch("subprocess.run", fake_run):
+            HH.CliBackend(r"C:\fake\HidHideCLI.exe")._run("--dev-list")
+        self.assertIs(seen.get("stdin"), HH.subprocess.DEVNULL)
+
+    def test_a_timeout_is_a_failure_not_a_silent_empty_list(self):
+        def fake_run(cmd, **kw):
+            raise HH.subprocess.TimeoutExpired(cmd, 30)
+
+        with mock.patch("subprocess.run", fake_run):
+            self.assertEqual(HH.CliBackend(r"C:\x.exe")._run("--dev-list"), (-1, ""))
+
+
+class TestInstanceIdsAreCaseInsensitive(unittest.TestCase):
+    """Windows device instance paths are case-insensitive; our sources disagree.
+
+    Measured on one boot: the interface property and `--dev-gaming` say
+    `_VID&0002054c_`, `Get-PnpDevice` says `_VID&0002054C_`. A case-sensitive
+    membership test against the blacklist is a coin flip, and the side it lands
+    on decides whether a user gets their controller back.
+    """
+
+    def test_the_normal_form_folds_case_and_strips_quotes(self):
+        self.assertEqual(HH.norm_instance_id('  "' + IDS[0].upper() + '" '),
+                         HH.norm_instance_id(IDS[0].lower()))
+
+    def test_unhide_matches_an_entry_that_differs_only_in_case(self):
+        f = FakeIoctl(blacklist=[IDS[0].lower()])
+        self.assertTrue(make(f).unhide([IDS[0].upper()]))
+        self.assertEqual(f.blacklist, [])
+
+    def test_hide_does_not_add_a_second_spelling_of_the_same_device(self):
+        f = FakeIoctl(blacklist=[IDS[0].lower()])
+        self.assertTrue(make(f).hide([IDS[0].upper()]))
+        self.assertEqual(f.blacklist, [IDS[0].lower()])
+
+    def test_a_strangers_entry_is_still_left_alone(self):
+        f = FakeIoctl(blacklist=[STRANGER, IDS[0].lower()])
+        make(f).unhide([IDS[0].upper()])
+        self.assertEqual(f.blacklist, [STRANGER])
+
+
+class _LyingIoctl(FakeIoctl):
+    """Accepts the write and changes nothing. What a stale handle looks like."""
+
+    def set_hidden(self, items):
+        self.sets += 1
+        return True
+
+
+class TestUnhideIsProven(unittest.TestCase):
+    """Success is a read-back, never a return code.
+
+    True is what deletes the journal record, and the record is the user's last
+    way back to a visible controller.
+    """
+
+    def test_a_write_that_silently_did_nothing_is_a_failure(self):
+        f = _LyingIoctl(blacklist=list(IDS))
+        self.assertFalse(make(f).unhide(IDS))
+        self.assertEqual(f.blacklist, IDS)
+
+    def test_an_unreadable_blacklist_is_a_failure_not_a_shrug(self):
+        # "Nobody can tell" must never round up to success.
+        self.assertFalse(make(FakeIoctl(available=False), None).unhide(IDS))
+
+    def test_the_cli_finishes_what_the_ioctl_could_not(self):
+        # The CLI is not an `else`: the two surfaces can disagree about what
+        # the driver is actually enforcing.
+        cli = FakeCli(blacklist=list(IDS))
+        hh = make(_LyingIoctl(blacklist=list(IDS)), cli)
+        hh.ioctl.hidden = lambda: list(cli.blacklist)
+        self.assertTrue(hh.unhide(IDS))
+        self.assertEqual(cli.blacklist, [])
+
+    def test_success_still_means_gone(self):
+        f = FakeIoctl(blacklist=[STRANGER] + IDS)
+        self.assertTrue(make(f).unhide(IDS))
+        self.assertEqual(f.blacklist, [STRANGER])
+
+
+class TestLeftoversWithNoRecord(_Temp):
+    """The state one lying unhide leaves behind: an entry nothing points at.
+
+    `journal_count()` reads zero, so every path that trusts the journal --
+    `sweep()`, `ds5bridge unhide`, the tray's own panic button -- reports
+    all-clear while the pad is invisible to every application on the machine.
+    """
+
+    def test_an_entry_of_ours_with_no_record_is_reported(self):
+        self.assertEqual(HH.unrecorded_hidden(make(FakeIoctl(blacklist=list(IDS)))),
+                         IDS)
+
+    def test_a_recorded_entry_is_not_reported(self):
+        HH.write_record("aabbccddeeff", IDS, cloak_enabled_by_us=False)
+        self.assertEqual(HH.unrecorded_hidden(make(FakeIoctl(blacklist=list(IDS)))),
+                         [])
+
+    def test_the_match_survives_a_different_spelling(self):
+        HH.write_record("aabbccddeeff", [IDS[0].lower()], cloak_enabled_by_us=False)
+        hh = make(FakeIoctl(blacklist=[IDS[0].upper()]))
+        self.assertEqual(HH.unrecorded_hidden(hh), [])
+
+    def test_an_unreadable_blacklist_is_none_not_empty(self):
+        # [] is "nothing is hidden"; None is "cannot tell". The tray says
+        # different things about them, and must.
+        self.assertIsNone(HH.unrecorded_hidden(make(FakeIoctl(available=False), None)))
+
+    def test_no_hidhide_at_all_is_nothing_hidden(self):
+        with mock.patch.object(HH.HidHide, "detect",
+                               staticmethod(lambda *a, **k: None)):
+            self.assertEqual(HH.unrecorded_hidden(), [])
+
+    def test_a_clean_machine_reports_nothing(self):
+        self.assertEqual(HH.unrecorded_hidden(make(FakeIoctl())), [])
+
+
+# ---------------------------------------------------------------------------
+# an empty blacklist is not a working controller
+# ---------------------------------------------------------------------------
+
+#: The same physical pad, before and after one hide/revive cycle. The `&11&` in
+#: the second is the re-enumeration counter -- measured on a user's machine,
+#: 2026-08-27, and the reason a recorded instance ID cannot be identity.
+OLD_CHILD = r"HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\8&2FDE51C0&0&0000"
+NEW_CHILD = r"HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\8&110FB383&11&0000"
+PARENT = (r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6"
+          r"\7&16440032&0&D42F4BA1485D_C00000000")
+
+
+class TestRevive(unittest.TestCase):
+    """`revive_serial`, with cfgmgr32 and pnputil mocked.
+
+    The failure it repairs, measured on a user's machine after a tray Quit:
+    HidHide's blacklist was verifiably EMPTY and the pad was still not there,
+    because its HID child devnode had gone phantom. Clearing a blacklist does
+    not re-create a devnode; only a re-enumeration does.
+
+    The properties worth breaking a build over:
+
+      * the non-admin route is tried FIRST and, when it works, `pnputil` is
+        never reached -- this program must never come to need elevation;
+      * nothing escalates past what it can verify;
+      * a failure says "power-cycle the controller" instead of nothing.
+    """
+
+    def _patch(self, *, visible, reenum=True, elevated=False, pnputil=(0, ""),
+               parent=PARENT, connected=True):
+        """Mock every seam. `visible` is a list of successive answers."""
+        self.seen = {"reenum": [], "pnputil": []}
+        answers = list(visible)
+
+        def pad_visible(_serial):
+            return answers.pop(0) if len(answers) > 1 else answers[0]
+
+        def _reenumerate(iid):
+            self.seen["reenum"].append(iid)
+            return reenum
+
+        def _pnputil_restart(iid):
+            self.seen["pnputil"].append(iid)
+            return pnputil
+
+        for name, fn in (("pad_visible", pad_visible),
+                         ("_reenumerate", _reenumerate),
+                         ("_pnputil_restart", _pnputil_restart),
+                         ("devnode_present", lambda i: connected),
+                         ("is_elevated", lambda: elevated),
+                         ("bt_parent_for_serial", lambda s: parent)):
+            p = mock.patch.object(HH, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_a_visible_pad_is_left_completely_alone(self):
+        """The normal case: one enumeration, no devnode touched."""
+        self._patch(visible=[True])
+        r = HH.revive_serial(SERIAL, settle=0.0)
+        self.assertEqual(r["action"], "none")
+        self.assertTrue(r["visible"])
+        self.assertEqual(self.seen["reenum"], [])
+        self.assertEqual(self.seen["pnputil"], [])
+
+    def test_a_controller_that_is_simply_switched_off_is_left_alone(self):
+        """The most ordinary event there is, and it is not a fault.
+
+        Most of this program's teardowns begin with somebody switching a
+        controller off. Re-enumerating a Bluetooth node for that, and then
+        advising a power-cycle of a pad they turned off deliberately, would
+        train the user to ignore the one message that matters.
+        """
+        said = []
+        self._patch(visible=[False], connected=False, elevated=True)
+        r = HH.revive_serial(SERIAL, settle=0.0, log_fn=said.append)
+        self.assertEqual(r["action"], "disconnected")
+        self.assertEqual(self.seen["reenum"], [])
+        self.assertEqual(self.seen["pnputil"], [])
+        self.assertEqual(said, [], "a switched-off pad must not be nagged about")
+
+    def test_a_blacklist_change_is_given_time_to_take_effect(self):
+        """The driver applies an unhide, not us.
+
+        Tearing a devnode down because we looked half a second too early would
+        be this feature causing the failure it exists to fix -- and with a
+        bridge still running, a devnode restart takes its HID handle with it.
+        """
+        self._patch(visible=[False, True])
+        r = HH.revive_serial(SERIAL, settle=1.0)
+        self.assertTrue(r["visible"])
+        self.assertEqual(r["action"], "none")
+        self.assertEqual(self.seen["reenum"], [],
+                         "it restarted a devnode that was about to be fine")
+
+    def test_the_non_admin_route_is_tried_first_and_is_enough(self):
+        self._patch(visible=[False, False, True])
+        r = HH.revive_serial(SERIAL, settle=0.0)
+        self.assertEqual(r["action"], "reenumerate")
+        self.assertTrue(r["visible"])
+        self.assertEqual(self.seen["reenum"], [PARENT],
+                         "the PARENT is what gets re-enumerated, not the child")
+        self.assertEqual(self.seen["pnputil"], [],
+                         "an elevated restart must never be needed when the "
+                         "user-mode call did the job")
+
+    def test_the_recorded_parent_beats_a_fresh_lookup(self):
+        """After the hide, nothing can resolve the address any more."""
+        self._patch(visible=[False, False, True], parent="")
+        r = HH.revive_serial(SERIAL, parent_id=PARENT, settle=0.0)
+        self.assertEqual(self.seen["reenum"], [PARENT])
+        self.assertTrue(r["visible"])
+
+    def test_unelevated_it_says_what_to_do_instead_of_failing_silently(self):
+        said = []
+        self._patch(visible=[False], elevated=False)
+        r = HH.revive_serial(SERIAL, settle=0.0, log_fn=said.append)
+        self.assertFalse(r["visible"])
+        self.assertEqual(r["action"], "failed")
+        self.assertEqual(self.seen["pnputil"], [],
+                         "pnputil unelevated fails with a message about "
+                         "administrator rights; predict it, do not provoke it")
+        self.assertTrue(any("OFF" in t and "on again" in t for t in said), said)
+
+    def test_elevated_it_escalates_to_pnputil(self):
+        self._patch(visible=[False, False, False, True], elevated=True)
+        r = HH.revive_serial(SERIAL, settle=0.0)
+        self.assertEqual(self.seen["pnputil"], [PARENT])
+        self.assertEqual(r["action"], "pnputil")
+        self.assertTrue(r["visible"])
+
+    def test_a_pnputil_that_fails_is_not_success(self):
+        said = []
+        self._patch(visible=[False], elevated=True, pnputil=(1, "denied"))
+        r = HH.revive_serial(SERIAL, settle=0.0, log_fn=said.append)
+        self.assertFalse(r["visible"])
+        self.assertTrue(said)
+
+    def test_no_bluetooth_parent_means_ask_the_user(self):
+        """Nothing to restart -- but the pad is still gone, so say so."""
+        said = []
+        self._patch(visible=[False], parent="")
+        r = HH.revive_serial(SERIAL, settle=0.0, log_fn=said.append)
+        self.assertEqual(r["action"], "unknown")
+        self.assertFalse(r["visible"])
+        self.assertEqual(self.seen["reenum"], [])
+        self.assertTrue(said)
+
+    def test_an_unverifiable_answer_never_escalates(self):
+        """No hidapi: the check cannot be made, so nothing may be restarted.
+
+        None is a third answer. Rounding it to "broken" would restart a devnode
+        on a suspicion that cannot be confirmed; rounding it to "fine" would be
+        the lie this whole section exists to stop telling.
+        """
+        self._patch(visible=[None], elevated=True)
+        r = HH.revive_serial(SERIAL, settle=0.0)
+        self.assertIsNone(r["visible"])
+        self.assertEqual(self.seen["reenum"], [])
+        self.assertEqual(self.seen["pnputil"], [])
+
+    def test_a_reenumeration_that_cannot_be_confirmed_stops_there(self):
+        self._patch(visible=[False, False, None], elevated=True)
+        r = HH.revive_serial(SERIAL, settle=0.0)
+        self.assertEqual(self.seen["reenum"], [PARENT])
+        self.assertEqual(self.seen["pnputil"], [],
+                         "an elevated devnode restart on an unverifiable "
+                         "suspicion is worse than leaving it")
+        self.assertIsNone(r["visible"])
+
+    def test_nothing_it_does_can_raise(self):
+        def boom(_s):
+            raise OSError("cfgmgr32 is having a day")
+
+        with mock.patch.object(HH, "pad_visible", boom):
+            self.assertEqual(HH.revive_serial(SERIAL, settle=0.0)["action"],
+                             "none")
+
+
+class TestParentMatching(unittest.TestCase):
+    """Instance IDs churn; the Bluetooth parent does not."""
+
+    def test_entries_are_matched_by_their_parent(self):
+        with mock.patch.object(HH, "parent_instance_id",
+                               lambda i: PARENT if "0CE6" in i.upper() else ""):
+            self.assertEqual(
+                HH.entries_under_parent([NEW_CHILD, STRANGER], PARENT),
+                [NEW_CHILD])
+
+    def test_a_strangers_pad_is_never_matched(self):
+        with mock.patch.object(HH, "parent_instance_id",
+                               lambda i: r"BTHENUM\somebody-elses-pad"):
+            self.assertEqual(HH.entries_under_parent([STRANGER], PARENT), [])
+
+    def test_no_parent_matches_nothing(self):
+        self.assertEqual(HH.entries_under_parent([NEW_CHILD], ""), [])
+
+    def test_the_comparison_is_case_insensitive(self):
+        with mock.patch.object(HH, "parent_instance_id",
+                               lambda i: PARENT.upper()):
+            self.assertEqual(HH.entries_under_parent([NEW_CHILD], PARENT.lower()),
+                             [NEW_CHILD])
+
+    def test_the_mac_is_read_out_of_the_parents_own_id(self):
+        with mock.patch.object(HH, "device_ids_for_enumerator",
+                               lambda *a: [r"BTHENUM\Dev_AABBCCDDEEFF", PARENT]):
+            self.assertEqual(HH.bt_parent_for_serial(SERIAL), PARENT)
+
+    def test_an_unknown_address_resolves_to_nothing(self):
+        with mock.patch.object(HH, "device_ids_for_enumerator",
+                               lambda *a: [r"BTHENUM\Dev_AABBCCDDEEFF"]):
+            self.assertEqual(HH.bt_parent_for_serial(SERIAL), "")
+
+
+class TestReviveIsWiredIn(_Temp):
+    """Every path that clears a blacklist entry has to finish the job."""
+
+    def test_the_hide_records_the_bluetooth_parent(self):
+        """While the pad is still visible -- afterwards nothing can look it up."""
+        hh = make(FakeIoctl())
+        with mock.patch.object(HH.HidHide, "detect", return_value=hh), \
+                mock.patch.object(HH, "resolve_serial", return_value=[OLD_CHILD]), \
+                mock.patch.object(HH, "parent_instance_id", lambda i: PARENT):
+            HH.hide_for_bridge(SERIAL)
+        self.assertEqual(HH.read_records()[0]["parent_id"], PARENT)
+
+    def test_an_unhide_revives_with_the_recorded_parent(self):
+        hh = make(FakeIoctl(blacklist=[OLD_CHILD]))
+        HH.write_record(SERIAL, [OLD_CHILD], parent_id=PARENT)
+        with mock.patch.object(HH.HidHide, "detect", return_value=hh):
+            self.assertTrue(HH.unhide_for_bridge(SERIAL))
+        self.assertEqual(self.revived, [(SERIAL, PARENT)])
+
+    def test_the_sweep_revives_what_a_dead_run_left(self):
+        HH.write_record(SERIAL, [OLD_CHILD], parent_id=PARENT)
+        hh = make(FakeIoctl(blacklist=[OLD_CHILD]))
+        with mock.patch.object(HH, "owner_alive", return_value=False):
+            self.assertEqual(HH.sweep(hh), 1)
+        self.assertEqual(self.revived, [(SERIAL, PARENT)])
+
+    def test_the_sweep_takes_out_the_churned_child_too(self):
+        """The record names a phantom; the blacklist holds its replacement."""
+        HH.write_record(SERIAL, [OLD_CHILD], parent_id=PARENT)
+        f = FakeIoctl(blacklist=[NEW_CHILD, STRANGER])
+        with mock.patch.object(HH, "owner_alive", return_value=False), \
+                mock.patch.object(
+                    HH, "parent_instance_id",
+                    lambda i: PARENT if "0CE6" in i.upper() else ""):
+            self.assertEqual(HH.sweep(make(f)), 1)
+        self.assertEqual(f.blacklist, [STRANGER],
+                         "the entry that was actually hiding the pad survived, "
+                         "and somebody else's did not")
+
+    def test_an_unhide_widens_to_the_parent_when_the_ids_no_longer_match(self):
+        HH.write_record(SERIAL, [OLD_CHILD], parent_id=PARENT)
+        f = FakeIoctl(blacklist=[NEW_CHILD])
+        with mock.patch.object(HH.HidHide, "detect", return_value=make(f)), \
+                mock.patch.object(HH, "resolve_serial", return_value=[]), \
+                mock.patch.object(
+                    HH, "parent_instance_id",
+                    lambda i: PARENT if "0CE6" in i.upper() else ""):
+            self.assertTrue(HH.unhide_for_bridge(SERIAL))
+        self.assertEqual(f.blacklist, [])
+        self.assertEqual(HH.read_records(), [])
+
+    def test_a_leftover_with_no_record_is_matched_by_parent(self):
+        """hidapi cannot see a phantom pad, so the address route finds nothing."""
+        f = FakeIoctl(blacklist=[NEW_CHILD])
+        with mock.patch.object(HH.HidHide, "detect", return_value=make(f)), \
+                mock.patch.object(HH, "resolve_serial", return_value=[]), \
+                mock.patch.object(HH, "bt_parent_for_serial", lambda s: PARENT), \
+                mock.patch.object(
+                    HH, "parent_instance_id",
+                    lambda i: PARENT if "0CE6" in i.upper() else ""):
+            self.assertTrue(HH.unhide_for_bridge(SERIAL))
+        self.assertEqual(f.blacklist, [])
+
+    def test_a_failed_unhide_does_not_pretend_to_revive(self):
+        HH.write_record(SERIAL, [OLD_CHILD], parent_id=PARENT)
+        with mock.patch.object(HH.HidHide, "detect",
+                               return_value=make(FakeIoctl(available=False), None)), \
+                mock.patch.object(HH, "resolve_serial", return_value=[]):
+            self.assertFalse(HH.unhide_for_bridge(SERIAL))
+        self.assertEqual(self.revived, [])
+        self.assertEqual(len(HH.read_records()), 1, "the record must be kept")
 
 
 if __name__ == "__main__":

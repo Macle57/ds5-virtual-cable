@@ -12,6 +12,9 @@ not run in CI.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import logging
 import sys
 import types
 import unittest
@@ -23,6 +26,7 @@ from ds5app import service as S    # noqa: E402
 from ds5app import tray as T       # noqa: E402
 
 A = "a0fa9c0dd8bb"
+STRAY_ID = r"HID\VID_054C&PID_0CE6\8&2fde51c0&0&0000"
 B = "d42f4ba1485d"
 
 
@@ -42,6 +46,8 @@ def snap(controllers, master=True):
         "controllers": {c["serial"]: c for c in controllers},
         "aggregate": {"present": sum(1 for c in controllers if c["present"]),
                       "bridges": len(controllers), "running": running,
+                      "degraded": sum(1 for c in controllers
+                                      if c["state"] == S.DEGRADED),
                       "attached": running,
                       "reports_per_s": sum(c["reports_per_s"] for c in controllers),
                       "errors": sum(1 for c in controllers if c["error"])},
@@ -102,6 +108,9 @@ class _FakeManager:
     def __init__(self, snapshot):
         self._snap = snapshot
         self.master_enabled = snapshot["master_enabled"]
+        # The tray assigns this directly: the manager exposes no setter for the
+        # seed it copied at construction.
+        self.hide_default = False
         self.calls = []
 
     def snapshot(self):
@@ -128,8 +137,32 @@ class _FakeManager:
     def close(self):
         self.calls.append(("close",))
 
+    def reconcile_stale(self, log_fn=None):
+        self.calls.append(("reconcile_stale",))
+        return 0
 
-def app_with(controllers, master=True, has_hidhide=True, journal=0):
+
+class _FakeConfig:
+    """The settings the tray reads and writes, and a count of the saves.
+
+    A real `Config` in a temporary directory would work too, but the tray's own
+    `_save` is stubbed out here anyway, and counting saves is how these tests
+    say "the choice was persisted" without going near the filesystem.
+    """
+
+    def __init__(self, hide_default=False):
+        self.hide_bluetooth_default = hide_default
+        self.saves = 0
+
+    def get(self, serial):
+        return types.SimpleNamespace(label="", port=None, enabled=True)
+
+    def set_hide_bluetooth_default(self, hide):
+        self.hide_bluetooth_default = bool(hide)
+
+
+def app_with(controllers, master=True, has_hidhide=True, journal=0,
+             hide_default=False):
     """A TrayApp with __init__ bypassed -- it would open the real config."""
     app = T.TrayApp.__new__(T.TrayApp)
     app.icon = None
@@ -139,10 +172,15 @@ def app_with(controllers, master=True, has_hidhide=True, journal=0):
     app._lock = threading.Lock()
     app._snap = snap(controllers, master)
     app.mgr = _FakeManager(app._snap)
-    app.cfg = types.SimpleNamespace(
-        get=lambda s: types.SimpleNamespace(label="", port=None, enabled=True))
+    app.cfg = _FakeConfig(hide_default)
+    app.notes = []
+    app._notify = lambda title, text: app.notes.append((title, text))
+    app._save = lambda: setattr(app.cfg, "saves", app.cfg.saves + 1)
     app.hidhide_cli = None
     app._has_hidhide = has_hidhide
+    app._menu_key_built = None
+    app._menu_open = False
+    app._menu_dirty = False
     # Never the real journal: these tests must behave the same on a machine
     # where the developer genuinely has a controller hidden.
     app._journal_count = staticmethod(lambda: journal)
@@ -257,6 +295,114 @@ class HideSubmenuTests(unittest.TestCase):
         self.assertIn("a0fa..d8bb", text)
 
 
+class HideAllSwitchTests(unittest.TestCase):
+    """The single row that hides or unhides every pad at once.
+
+    The interesting decision is the mixed state. pystray has no tri-state, so
+    "one of two pads is hidden" has to render as a plain checked or unchecked
+    box, and the rule here is UNCHECKED -- because the click that follows must
+    hide the remaining pad rather than unhide the one the user already chose to
+    hide.
+    """
+
+    def test_it_is_checked_only_when_every_controller_is_hiding(self):
+        self.assertTrue(app_with([controller(A, hide=True),
+                                  controller(B, hide=True)])._hide_all_checked())
+        self.assertFalse(app_with([controller(A, hide=False),
+                                   controller(B, hide=False)])._hide_all_checked())
+
+    def test_a_mixed_state_reads_as_unchecked(self):
+        app = app_with([controller(A, hide=True), controller(B, hide=False)])
+        self.assertFalse(app._hide_all_checked())
+
+    def test_clicking_a_mixed_state_hides_the_ones_that_are_not_hidden(self):
+        # The whole reason a mixed state renders unchecked: the next click has
+        # to finish the job rather than undo half of it.
+        app = app_with([controller(A, hide=True), controller(B, hide=False)])
+        app._toggle_hide_all()
+        settle()
+        self.assertIn(("set_hide_bluetooth", B, True), app.mgr.calls)
+        self.assertNotIn(("set_hide_bluetooth", A, False), app.mgr.calls)
+
+    def test_one_click_sets_every_controller(self):
+        app = app_with([controller(A), controller(B)])
+        app._toggle_hide_all()
+        settle()
+        self.assertEqual([c for c in app.mgr.calls if c[0] == "set_hide_bluetooth"],
+                         [("set_hide_bluetooth", A, True),
+                          ("set_hide_bluetooth", B, True)])
+
+    def test_clicking_when_everything_is_hidden_unhides_everything(self):
+        app = app_with([controller(A, hide=True), controller(B, hide=True)])
+        app._toggle_hide_all()
+        settle()
+        self.assertEqual([c for c in app.mgr.calls if c[0] == "set_hide_bluetooth"],
+                         [("set_hide_bluetooth", A, False),
+                          ("set_hide_bluetooth", B, False)])
+
+    def test_the_choice_is_seeded_for_controllers_not_seen_yet(self):
+        # Both halves: the file, so a pad plugged in tomorrow inherits it, and
+        # the live manager, so a pad plugged in a minute from now does too.
+        app = app_with([controller(A)])
+        app._toggle_hide_all()
+        settle()
+        self.assertTrue(app.cfg.hide_bluetooth_default)
+        self.assertTrue(app.mgr.hide_default)
+        self.assertEqual(app.cfg.saves, 1)
+
+    def test_unhiding_seeds_the_opposite_answer(self):
+        app = app_with([controller(A, hide=True)], hide_default=True)
+        app._toggle_hide_all()
+        settle()
+        self.assertFalse(app.cfg.hide_bluetooth_default)
+        self.assertFalse(app.mgr.hide_default)
+
+    def test_with_no_controllers_it_records_the_preference_without_throwing(self):
+        app = app_with([])
+        app._toggle_hide_all()
+        settle()
+        self.assertTrue(app.cfg.hide_bluetooth_default)
+        self.assertEqual([c for c in app.mgr.calls if c[0] == "set_hide_bluetooth"],
+                         [])
+
+    def test_with_no_controllers_the_box_shows_the_seed_not_a_vacuous_true(self):
+        # all([]) is True, which would tick the box for a state that does not
+        # exist -- and the click after that would unhide by default.
+        self.assertFalse(app_with([])._hide_all_checked())
+        self.assertTrue(app_with([], hide_default=True)._hide_all_checked())
+
+    def test_it_is_invisible_without_hidhide(self):
+        visible = app_with([controller(A)], has_hidhide=False)._hide_all_row()[0]
+        self.assertFalse(visible())
+        self.assertTrue(app_with([controller(A)])._hide_all_row()[0]())
+
+    def test_one_notification_for_the_click_not_one_per_controller(self):
+        # N balloons for one click is how a helpful message becomes something
+        # the user turns off in Windows settings.
+        app = app_with([controller(A), controller(B)])
+        app._toggle_hide_all()
+        settle()
+        self.assertEqual(len(app.notes), 1)
+        self.assertIn("from now on", app.notes[0][1])
+
+    def test_without_hidhide_the_notification_says_nothing_was_hidden(self):
+        app = app_with([controller(A)], has_hidhide=False)
+        app._toggle_hide_all()
+        settle()
+        self.assertEqual(len(app.notes), 1)
+        self.assertIn("HidHide", app.notes[0][1])
+
+    def test_the_row_is_callables_over_the_latest_snapshot(self):
+        # The menu is built exactly once, so the same callable has to answer
+        # for a snapshot that did not exist when the row was made.
+        app = app_with([controller(A, hide=False)])
+        visible, checked, action = app._hide_all_row()
+        self.assertTrue(all(callable(x) for x in (visible, checked, action)))
+        self.assertFalse(checked())
+        app._snap = snap([controller(A, hide=True)])
+        self.assertTrue(checked(), "the row must read the newest snapshot")
+
+
 class UnhideEverythingTests(unittest.TestCase):
     """The panic item. Its visibility rule is the whole point of it."""
 
@@ -269,37 +415,158 @@ class UnhideEverythingTests(unittest.TestCase):
         app = app_with([controller(A)], has_hidhide=False, journal=1)
         self.assertGreater(app._journal_count(), 0)
 
-    def test_it_stops_every_bridge_before_sweeping(self):
-        """So the state is coherent afterwards rather than half torn down."""
-        app = app_with([controller(A)], journal=1)
+    def _run_unhide_all(self, app, *, sweep_n=1, journal=0, stray=None,
+                        owed=(), visible=True):
+        """Drive the panic button with every HidHide call faked.
+
+        `unrecorded_hidden` is faked along with the rest deliberately: it is a
+        blacklist read, and a unit test that reaches the real driver would both
+        depend on the developer's machine and be answered differently in CI.
+        The same goes for `read_records` and `pad_visible` -- the second one
+        enumerates HID devices, which on a developer's machine finds their own
+        controller and in CI finds nothing.
+
+        `owed` is what the journal held BEFORE the sweep, and `visible` is what
+        `hid_enumerate` says about those serials afterwards: `visible=False` is
+        the 2026-08-27 machine, where the blacklist really was emptied and the
+        pad really was still gone.
+        """
         seen = {}
-
-        class FakeHH:
-            @staticmethod
-            def sweep(force=False):
-                seen["force"] = force
-                seen["stopped_first"] = ("stop_all",) in app.mgr.calls
-                return 1
-
-            @staticmethod
-            def journal_count():
-                return 0
-
-        app._notify = lambda *a: None
-        real_import = T.TrayApp.__dict__.get("_unhide_all")
-        self.assertIsNotNone(real_import)
         import ds5app.hidhide as HH_real
-        saved = (HH_real.sweep, HH_real.journal_count)
-        HH_real.sweep, HH_real.journal_count = FakeHH.sweep, FakeHH.journal_count
+        saved = (HH_real.sweep, HH_real.journal_count, HH_real.unrecorded_hidden,
+                 HH_real.read_records, HH_real.pad_visible)
+
+        def sweep(force=False, log_fn=None, **kw):
+            seen["force"] = force
+            seen["stopped_first"] = ("stop_all",) in app.mgr.calls
+            return sweep_n
+
+        HH_real.sweep = sweep
+        HH_real.journal_count = lambda: journal
+        HH_real.unrecorded_hidden = lambda *a, **k: stray
+        HH_real.read_records = lambda: [{"serial": s} for s in owed]
+        HH_real.pad_visible = lambda s: visible
         try:
             app._unhide_all()
             settle()
         finally:
-            HH_real.sweep, HH_real.journal_count = saved
+            (HH_real.sweep, HH_real.journal_count, HH_real.unrecorded_hidden,
+             HH_real.read_records, HH_real.pad_visible) = saved
+        return seen
+
+    def test_it_stops_every_bridge_before_sweeping(self):
+        """So the state is coherent afterwards rather than half torn down."""
+        app = app_with([controller(A)], journal=1)
+        app._notify = lambda *a: None
+        seen = self._run_unhide_all(app, stray=[])
         self.assertTrue(seen.get("stopped_first"),
                         "the sweep ran before the bridges were stopped")
         self.assertTrue(seen.get("force"),
                         "the panic path must ignore the liveness check")
+
+    def test_an_empty_journal_alone_is_not_an_all_clear(self):
+        # The 2026-08-27 failure: one lying unhide leaves a blacklist entry
+        # with no record against it, and this notification was what sent the
+        # user away from the only control that could still have helped.
+        app = app_with([controller(A)])
+        self._run_unhide_all(app, journal=0, stray=[STRAY_ID])
+        text = " ".join(t for _title, t in app.notes)
+        self.assertIn("still hiding", text)
+        self.assertIn("--all-hidhide", text)
+        self.assertNotIn("visible to Windows again", text)
+
+    def test_an_unreadable_blacklist_does_not_claim_success(self):
+        app = app_with([controller(A)])
+        self._run_unhide_all(app, journal=0, stray=None)
+        text = " ".join(t for _title, t in app.notes)
+        self.assertIn("cannot confirm", text)
+
+    def test_a_genuinely_clean_sweep_still_says_so(self):
+        app = app_with([controller(A)])
+        self._run_unhide_all(app, sweep_n=2, journal=0, stray=[])
+        text = " ".join(t for _title, t in app.notes)
+        self.assertIn("Unhid 2 controller(s)", text)
+        self.assertIn("visible to Windows again", text)
+
+    def test_an_empty_blacklist_is_not_a_working_controller(self):
+        """The 2026-08-27 machine after a tray Quit: list clear, pad gone.
+
+        The HID child devnode had gone phantom, and clearing a blacklist does
+        not re-create a devnode. `sweep()` has already tried the re-enumeration
+        by the time this runs, so what is left to give the user is the one
+        instruction that always works.
+        """
+        app = app_with([controller(A)])
+        self._run_unhide_all(app, sweep_n=1, journal=0, stray=[], owed=[A],
+                             visible=False)
+        text = " ".join(t for _title, t in app.notes)
+        self.assertIn("OFF", text)
+        self.assertIn("on again", text)
+        self.assertNotIn("Every pad is visible", text)
+
+    def test_a_pad_that_really_did_come_back_is_not_nagged_about(self):
+        app = app_with([controller(A)])
+        self._run_unhide_all(app, sweep_n=1, journal=0, stray=[], owed=[A],
+                             visible=True)
+        text = " ".join(t for _title, t in app.notes)
+        self.assertIn("visible to Windows again", text)
+        self.assertNotIn("on again", text)
+
+    def test_a_record_that_survived_names_the_real_culprit(self):
+        """It is the worse failure of the two, so it is the one reported."""
+        app = app_with([controller(A)])
+        self._run_unhide_all(app, journal=1, stray=[], owed=[A], visible=False)
+        text = " ".join(t for _title, t in app.notes)
+        self.assertIn("could not be unhidden", text)
+
+
+class StartupAndShutdownTests(unittest.TestCase):
+    """The two orderings that decide whether Quit and Ctrl+C leave a mess."""
+
+    def setUp(self):
+        self._hooks = list(S.ON_TEARDOWN)
+        self.addCleanup(lambda: S.ON_TEARDOWN.__setitem__(slice(None),
+                                                          self._hooks))
+        S.ON_TEARDOWN[:] = []
+
+    def test_the_manager_is_closed_before_the_exit_watchdog_is_armed(self):
+        """`_shutdown_icon` arms a three-second `os._exit(0)`.
+
+        Stopping two children, detaching their devices and unhiding their pads
+        is comfortably more than three seconds of work, so a hook order that
+        arms the watchdog first can exit the process mid-detach -- leaving the
+        zombie virtual device and the invisible controller this path exists to
+        prevent.
+        """
+        app = app_with([controller(A)])
+        order = []
+        app._shutdown_icon = lambda: order.append("icon")
+        app.mgr.close = lambda: order.append("close")
+        app._install_teardown_hooks()
+        for hook in S.ON_TEARDOWN:
+            hook()
+        self.assertEqual(order, ["close", "icon"])
+
+    def test_the_startup_reconciliation_runs(self):
+        app = app_with([controller(A)])
+        app._startup_reconcile()
+        self.assertIn(("reconcile_stale",), app.mgr.calls)
+
+    def test_a_reconciliation_failure_does_not_stop_the_tray(self):
+        """usbip.exe missing, a driver fault -- housekeeping, not the product."""
+        app = app_with([controller(A)])
+
+        def boom(log_fn=None):
+            raise RuntimeError("usbip is not answering")
+
+        app.mgr.reconcile_stale = boom
+        log = logging.getLogger("ds5app.tray")
+        was = log.propagate, log.disabled
+        log.propagate, log.disabled = False, True
+        try:
+            app._startup_reconcile()      # must not raise
+        finally:
+            log.propagate, log.disabled = was
 
 
 class ReconcileAutostartTests(unittest.TestCase):
@@ -358,6 +625,19 @@ class TitleTests(unittest.TestCase):
         app = app_with([controller(A), controller(B, state=S.STOPPED, rate=0.0)])
         self.assertIn("1 of 2 bridged", app._title())
 
+    def test_an_offline_controller_is_not_counted_as_bridged(self):
+        # The line that made the program look wrong while it was being slow:
+        # the pad is switched off on the desk and the tray said "2 of 2".
+        app = app_with([controller(A), controller(B, state=S.DEGRADED)])
+        head = app._title().splitlines()[0]
+        self.assertIn("1 of 2 bridged", head)
+        self.assertIn("1 offline", head)
+
+    def test_nothing_offline_says_nothing_about_it(self):
+        app = app_with([controller(A), controller(B)])
+        self.assertEqual(app._title().splitlines()[0],
+                         "ds5bridge -- 2 of 2 bridged")
+
     def test_master_off_is_stated_plainly(self):
         app = app_with([controller(A)], master=False)
         self.assertEqual(app._title(), "ds5bridge -- off")
@@ -401,6 +681,196 @@ class ArtTests(unittest.TestCase):
         for count in (0, 1, 2):
             img = T._icon_image((60, 170, 90), 50, count, size=16)
             self.assertEqual(img.size, (16, 16))
+
+
+#: What pystray's win32 backend actually registers its tray callback under --
+#: `WM_USER + 11`, not `WM_NOTIFY`. The value is here only so the fake is
+#: honest: `_watch_menu_visibility` finds the handler by IDENTITY precisely so
+#: that this private constant is not something this project has to know.
+_NOTIFY_CODE = 0x040B
+
+
+class _FakeIcon:
+    """The parts of pystray's win32 `Icon` the refresh path actually touches.
+
+    `_message_handlers` and `_on_notify` are private, which is exactly why they
+    are modelled here: the tray wraps them, and a test is the only thing that
+    will notice if a future pystray renames them.
+    """
+
+    def __init__(self, on_notify=None, fail=False):
+        self.updates = 0
+        self.title = ""
+        self.icon = None
+        self.fail = fail
+        self.notified = []
+        self._on_notify = on_notify or (lambda w, l: self.notified.append(l))
+        self._message_handlers = {_NOTIFY_CODE: self._on_notify}
+
+    def update_menu(self):
+        if self.fail:
+            raise RuntimeError("the menu handle is gone")
+        self.updates += 1
+
+
+class MenuRefreshTests(unittest.TestCase):
+    """The native menu is a SNAPSHOT on Windows -- see the module docstring.
+
+    pystray bakes every `text`/`checked`/`visible` callable into an HMENU in
+    `_update_menu()` and reuses it for every right-click, so without an explicit
+    `update_menu()` the menu shows whatever was true when the icon was created.
+    """
+
+    def app(self, controllers, **kw):
+        app = app_with(controllers, **kw)
+        app.icon = _FakeIcon()
+        return app
+
+    def test_a_controller_appearing_changes_the_key(self):
+        one = self.app([controller(A)])
+        two = self.app([controller(A), controller(B)])
+        self.assertNotEqual(one._menu_key(), two._menu_key())
+
+    def test_a_jittering_report_rate_does_not(self):
+        # Rebuilding a native menu twice a second forever to keep "250/s"
+        # honest would be all cost and no benefit.
+        a = self.app([controller(A, rate=249.0)])
+        b = self.app([controller(A, rate=251.0)])
+        self.assertEqual(a._menu_key(), b._menu_key())
+
+    def test_a_controller_going_offline_does(self):
+        up = self.app([controller(A)])
+        down = self.app([controller(A, state=S.DEGRADED)])
+        self.assertNotEqual(up._menu_key(), down._menu_key())
+
+    def test_a_toggled_checkbox_does(self):
+        on = self.app([controller(A, hide=False)])
+        off = self.app([controller(A, hide=True)])
+        self.assertNotEqual(on._menu_key(), off._menu_key())
+
+    def test_the_first_sync_rebuilds_the_menu(self):
+        app = self.app([controller(A)])
+        app._sync_menu()
+        self.assertEqual(app.icon.updates, 1)
+
+    def test_a_menu_that_has_not_moved_is_not_rebuilt(self):
+        app = self.app([controller(A)])
+        app._sync_menu()
+        for _ in range(5):
+            app._sync_menu()
+        self.assertEqual(app.icon.updates, 1)
+
+    def test_a_new_controller_rebuilds_it(self):
+        app = self.app([controller(A)])
+        app._sync_menu()
+        app._snap = snap([controller(A), controller(B)])
+        app._sync_menu()
+        self.assertEqual(app.icon.updates, 2)
+
+    def test_a_rebuild_is_deferred_while_the_menu_is_open(self):
+        # update_menu() destroys the handle TrackPopupMenuEx is displaying.
+        app = self.app([controller(A)])
+        app._sync_menu()
+        app._menu_open = True
+        app._snap = snap([controller(A), controller(B)])
+        app._sync_menu()
+        self.assertEqual(app.icon.updates, 1)
+        self.assertTrue(app._menu_dirty)
+
+    def test_the_deferred_rebuild_runs_when_the_menu_closes(self):
+        app = self.app([controller(A)])
+        app._sync_menu()
+
+        def on_notify(_w, _l):
+            # The poll thread ticking while the user has the menu open.
+            app._snap = snap([controller(A), controller(B)])
+            app._sync_menu()
+            self.assertEqual(app.icon.updates, 1)
+
+        app.icon = _FakeIcon(on_notify=on_notify)
+        app.icon.updates = 1
+        app._watch_menu_visibility()
+        app.icon._message_handlers[_NOTIFY_CODE](0, 0x0205)
+        self.assertEqual(app.icon.updates, 2)
+        self.assertFalse(app._menu_open)
+
+    def test_the_wrapper_leaves_the_handler_working(self):
+        seen = []
+        app = self.app([controller(A)])
+        app.icon = _FakeIcon(on_notify=lambda w, l: seen.append(l))
+        app._watch_menu_visibility()
+        app.icon._message_handlers[_NOTIFY_CODE](0, 0x0205)
+        self.assertEqual(seen, [0x0205])
+
+    def test_a_pystray_without_the_private_handler_is_survived(self):
+        # A stale menu is a bad day; an exception in the message loop takes the
+        # icon with it.
+        app = self.app([controller(A)])
+        app.icon = types.SimpleNamespace(update_menu=lambda: None)
+        app._watch_menu_visibility()          # must not raise
+
+    def test_a_failed_rebuild_is_retried_rather_than_remembered(self):
+        app = self.app([controller(A)])
+        app.icon = _FakeIcon(fail=True)
+        app._sync_menu()
+        self.assertIsNone(app._menu_key_built)
+        app.icon.fail = False
+        app._sync_menu()
+        self.assertEqual(app.icon.updates, 1)
+
+    def test_the_refresh_tick_syncs_the_menu(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        app = self.app([controller(A)])
+        app._refresh_now()
+        self.assertEqual(app.icon.updates, 1)
+
+
+class AnnounceSwitchesTests(unittest.TestCase):
+    """A switch being off must never look like the program being broken.
+
+    Measured 2026-08-27: the master switch was off in the settings, `poll_once`
+    returned at its first line, nothing was bridged, and the console printed
+    nothing whatsoever -- which is indistinguishable from a hang.
+    """
+
+    def app(self, controllers, master=True, enabled=True):
+        app = app_with(controllers, master=master)
+        app.mgr.master_enabled = master
+        app.mgr.known = lambda: [c["serial"] for c in controllers]
+        app.mgr.is_enabled = lambda s: enabled
+        return app
+
+    def say(self, app):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            app._announce_switches()
+        return out.getvalue()
+
+    def test_the_master_switch_being_off_is_stated(self):
+        said = self.say(self.app([controller(A)], master=False))
+        self.assertIn("bridging is OFF", said)
+        self.assertIn("Bridging enabled", said)
+
+    def test_a_working_setup_says_nothing(self):
+        # Silence is correct when there is nothing to explain; the event lines
+        # from the bridges themselves are the output that matters.
+        self.assertEqual(self.say(self.app([controller(A)])), "")
+
+    def test_one_disabled_controller_is_named(self):
+        said = self.say(self.app([controller(A)], enabled=False))
+        self.assertIn(T.short(A), said)
+        self.assertIn("switched off", said)
+
+    def test_the_master_switch_wins_over_the_per_controller_ones(self):
+        # One line about the switch that stops everything, not N about the
+        # switches underneath it that no longer matter.
+        said = self.say(self.app([controller(A), controller(B)],
+                                 master=False, enabled=False))
+        self.assertEqual(said.count("switched off"), 0)
+        self.assertIn("bridging is OFF", said)
 
 
 if __name__ == "__main__":

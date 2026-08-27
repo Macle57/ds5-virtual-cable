@@ -266,17 +266,53 @@ _console_handler = None  # keep a reference or ctypes garbage-collects it
 ON_TEARDOWN: list = []
 
 
+#: Serialises teardown, and remembers WHICH thread is doing it. See below.
+_teardown_lock = threading.Lock()
+_teardown_thread: int | None = None
+
+
 def _teardown_all() -> None:
-    for svc in list(_ACTIVE):
+    """The single funnel every exit path reaches. Safe to arrive at twice.
+
+    Twice is not hypothetical. A Ctrl+C runs the signal handler and then unwinds
+    into `atexit`; closing the console window fires the console handler while
+    the main thread may already be in `atexit`; and an impatient second Ctrl+C
+    arrives in the MIDDLE of the first teardown, on the same thread, because
+    that is where Python runs signal handlers.
+
+    Two different answers, because those are two different situations:
+
+    * **The same thread, re-entering.** Return at once. The work is in progress
+      further up this very stack, and interleaving a second set of `stop()`
+      calls into it is how a bridge gets half detached -- `attach -X` issued by
+      one, the detach it was protecting issued by the other. A plain lock would
+      deadlock here instead, which is worse: the user's second Ctrl+C would hang
+      the program it was meant to hurry.
+    * **A different thread.** Wait for the one in progress, then run. Everything
+      below is idempotent, so the second pass finds nothing to do and returns --
+      which is the right shape for `atexit` in particular, because it must not
+      return while another thread is still tearing down.
+    """
+    global _teardown_thread
+    if _teardown_thread == threading.get_ident():
+        log.debug("re-entered teardown on the same thread; letting the first "
+                  "one finish")
+        return
+    with _teardown_lock:
+        _teardown_thread = threading.get_ident()
         try:
-            svc.stop()
-        except Exception:  # noqa: BLE001
-            log.exception("teardown failed")
-    for fn in list(ON_TEARDOWN):
-        try:
-            fn()
-        except Exception:  # noqa: BLE001
-            log.exception("teardown hook failed")
+            for svc in list(_ACTIVE):
+                try:
+                    svc.stop()
+                except Exception:  # noqa: BLE001
+                    log.exception("teardown failed")
+            for fn in list(ON_TEARDOWN):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001
+                    log.exception("teardown hook failed")
+        finally:
+            _teardown_thread = None
 
 
 _swept = False
@@ -712,12 +748,25 @@ class BridgeService:
                                   log_fn=lambda t: self._emit("info", t))
 
     def _unhide(self, quiet: bool = False) -> bool:
+        """`quiet` silences the running commentary. It does NOT silence failure.
+
+        A quiet stop is the tray stopping a bridge nobody is watching, and the
+        old code routed its log_fn to `lambda t: None` -- so the one line that
+        says "your controller is still hidden and here is how to get it back"
+        went to the same place as "shutting down ...". An unhide that did not
+        happen is the failure this whole feature exists to prevent; it is loud
+        on every path.
+        """
         from . import hidhide as HH
 
         ok = HH.unhide_for_bridge(
             self.serial, cli_override=self.hidhide_cli,
             log_fn=(lambda t: None) if quiet else (lambda t: self._emit("info", t)))
         self._hidden_ids = []
+        if not ok:
+            self._emit("warn",
+                       f"the Bluetooth pad for {self.serial} is STILL HIDDEN -- "
+                       f"HidHide would not release it. Run `ds5bridge unhide`.")
         return ok
 
     @staticmethod
@@ -781,8 +830,18 @@ class BridgeService:
             log.exception("snapshot failed")
         return snap
 
-    def status_line(self) -> str:
-        s = self.snapshot()
+    def status_line(self, snap: dict | None = None) -> str:
+        """One line of status. Pass a `snapshot()` you already have.
+
+        Not a convenience: `snapshot()` differences the input counter against
+        the last call to work out the report rate, so calling it twice in the
+        same instant makes the second one see a dt of nearly zero and hold the
+        previous number. A caller that has just looked at the state -- which is
+        how the child tells its parent about a disconnect the moment it happens
+        rather than at the next status tick -- must be able to format THAT
+        snapshot rather than provoke another.
+        """
+        s = self.snapshot() if snap is None else snap
         if s["state"] == STOPPED:
             return "stopped"
         bat = ("battery ?" if s["battery_percent"] is None

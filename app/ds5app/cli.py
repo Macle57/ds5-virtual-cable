@@ -100,11 +100,24 @@ def cmd_unhide(args) -> int:
     if not records and not args.all_hidhide:
         print("Nothing is hidden by ds5bridge.")
         print(f"(checked {HH.journal_dir()})")
-        return 0
+        # An empty journal is not the same claim as "your pad is visible", and
+        # the 2026-08-27 report is what that difference costs: a lying unhide
+        # deletes the record and leaves the blacklist entry, after which this
+        # command used to print the line above and stop -- the escape hatch
+        # reporting all-clear on the exact machine that needed it. So say what
+        # HidHide itself is holding, and name the verb that clears it.
+        #
+        # And then the other half of "give me my controller back", which has
+        # nothing to do with HidHide's lists at all: a HID child devnode that
+        # has gone phantom. Nothing above this line can see that, and nothing
+        # else in this program will look until the next hide.
+        rc = _report_foreign_entries(HH, args)
+        return _revive_known(HH) or rc
 
     if args.all_hidhide:
         return _unhide_everything(HH, args)
 
+    owed = [r.get("serial") for r in records if r.get("serial")]
     n = HH.sweep(force=True, log_fn=lambda t: print("  " + t))
     left = HH.read_records()
     if left:
@@ -115,6 +128,70 @@ def cmd_unhide(args) -> int:
               "--cloak-off, or untick the device in HidHideClient.exe.")
         return 1
     print(f"unhid {n} controller(s); nothing is hidden by ds5bridge any more")
+    # An empty blacklist is not the same claim as a working controller: on the
+    # 2026-08-27 machine the list was clear and the pad's HID devnode was still
+    # a phantom. `sweep()` has already tried to bring each one back; this says
+    # what to do about the ones it could not.
+    stuck = [s for s in owed if HH.pad_visible(s) is False]
+    for serial in stuck:
+        print(f"\n  {HH.power_cycle_hint(serial)}")
+    return 1 if stuck else 0
+
+
+def _revive_known(HH) -> int:
+    """Restart the devnode of any known controller that is connected but gone.
+
+    -> 1 if one of them is still not visible afterwards, else 0.
+
+    The escape hatch for the failure that has nothing to do with a blacklist:
+    HidHide is holding nothing, the journal is empty, and the pad is still
+    invisible because its HID child devnode is a phantom. `revive_serial` does
+    the work, decides for itself whether there is anything to do, and says
+    "power-cycle the controller" when there is nothing left to try.
+
+    Run as an administrator, this can also reach `pnputil /restart-device`,
+    which is what fixed the machine this was written for.
+    """
+    from . import config as K
+
+    stuck = 0
+    for serial in sorted(K.load().controllers):
+        r = HH.revive_serial(serial, log_fn=lambda t: print(f"  {t}"))
+        if r.get("visible") is False and r.get("action") not in ("disconnected",):
+            stuck += 1
+    return 1 if stuck else 0
+
+
+def _report_foreign_entries(HH, args) -> int:
+    """Print what HidHide is hiding that we have no record of. Never removes it.
+
+    Read-only on purpose. Some of these entries legitimately belong to somebody
+    else -- DS4Windows hides pads through the same driver -- and this module's
+    standing rule is that we never take out an entry we did not put in without
+    being asked in words. `--all-hidhide` is that asking.
+    """
+    try:
+        hh = HH.HidHide.detect(getattr(args, "hidhide_cli", None))
+    except Exception:  # noqa: BLE001
+        return 0
+    if hh is None:
+        return 0
+    entries = hh.hidden_raw()
+    if entries is None:
+        print("\nHidHide is installed but would not tell us what it is hiding, "
+              "so this cannot confirm your controller is visible.")
+        print("Check it in HidHideClient.exe.")
+        return 0
+    if not entries:
+        return 0
+    print(f"\nHidHide itself is still hiding {len(entries)} device(s), none of "
+          f"which ds5bridge has a record of:\n")
+    for e in entries:
+        print(f"    {e}")
+    print("\nIf one of those is your controller, `ds5bridge unhide "
+          "--all-hidhide` clears them all\n(it also clears any that another "
+          "program such as DS4Windows put there), or untick\nthe device in "
+          "HidHideClient.exe to remove just the one.")
     return 0
 
 
@@ -350,7 +427,42 @@ def _doctor_hidhide_inner(cfg, live) -> int:
             print(f"{'[warn]':7}           run `ds5bridge unhide` to get "
                   f"{'them' if len(stale) > 1 else 'it'} back")
             problems += 1
-    return problems
+
+    return problems + _doctor_visibility(HH, cfg)
+
+
+def _doctor_visibility(HH, cfg) -> int:
+    """Is every controller this machine knows about actually VISIBLE?
+
+    The check that would have answered the 2026-08-27 report in one command.
+    Everything above this line can be green -- blacklist empty, cloak off, no
+    records -- while a pad's HID child devnode sits there as a phantom and no
+    application on the machine can open it. Only an enumeration can tell.
+
+    Silent about controllers that are simply switched off: `revive_serial`
+    makes that distinction from the Bluetooth parent devnode, and a diagnostic
+    that reported every pad in a drawer as a fault would be worth nothing.
+    """
+    stuck = []
+    for serial in sorted(cfg.controllers):
+        if HH.pad_visible(serial) is not False:
+            continue                       # visible, or hidapi cannot say
+        parent = HH.bt_parent_for_serial(serial)
+        if parent and HH.devnode_present(parent):
+            stuck.append(serial)
+    if not stuck:
+        return 0
+    print(f"{'[warn]':7}visible    {len(stuck)} connected controller(s) cannot "
+          f"be enumerated:")
+    for serial in stuck:
+        print(f"{'':7}           {serial}")
+    print(f"{'':7}           HidHide is not hiding {'them' if len(stuck) > 1 else 'it'}"
+          f" -- the HID device itself is missing.")
+    print(f"{'':7}           Switch the controller off (hold PS ~10 s) and on "
+          f"again, or run")
+    print(f"{'':7}           `ds5bridge unhide` from an ADMINISTRATOR prompt to "
+          f"restart the device.")
+    return len(stuck)
 
 
 def cmd_run_all(args) -> int:
@@ -381,6 +493,10 @@ def cmd_run_all(args) -> int:
                            on_event=ev)
     S.install_crash_handlers()
     S.ON_TEARDOWN.append(mgr.close)
+    # Before anything of ours goes near a port: disarm any auto-re-attach a
+    # previous run left armed, and detach virtual devices whose server is gone.
+    # `install_crash_handlers()` has already done the same for HidHide.
+    mgr.reconcile_stale(log_fn=lambda t: _log("info", t))
     try:
         started = mgr.start_all()
     except C.NoControllerError as e:
@@ -467,19 +583,48 @@ def cmd_run(args) -> int:
     print("  Press Ctrl+C here to stop and put everything back.\n")
 
     try:
-        last = 0.0
-        while True:
-            time.sleep(0.5)
-            if args.status_every and time.time() - last >= args.status_every:
-                last = time.time()
-                print("  " + svc.status_line(), flush=True)
-            if svc.state == S.ERROR:
-                break
+        run_loop(svc, args.status_every)
     except KeyboardInterrupt:
         print()
     finally:
         svc.stop()
     return 0
+
+
+def run_loop(svc, status_every: float, tick: float = 0.5) -> None:
+    """Report status until the bridge fails. Returns on ERROR, raises on Ctrl+C.
+
+    A STATE CHANGE IS PRINTED THE MOMENT IT HAPPENS, not at the next tick.
+
+    This loop is also the status channel of every child `BridgeManager` spawns
+    (`manager.default_child_command`), and the state in these lines is the ONLY
+    way a parent learns that a controller's Bluetooth link has dropped -- it is
+    the one signal that still works while the pad is cloaked and therefore
+    cannot be enumerated at all. On a status timer alone, a disconnect waited
+    out most of `--status-every` before the parent even heard about it, and
+    every one of those seconds is a second in which a game holds a wired
+    DualSense that is switched off.
+
+    Half a second of polling costs nothing: `BridgeService.snapshot()` is O(1)
+    counters by construction (it says so, and why), and a line is only printed
+    when it says something new.
+    """
+    last = 0.0
+    last_state = svc.state
+    while True:
+        time.sleep(tick)
+        snap = svc.snapshot()
+        state = snap["state"]
+        due = status_every and time.time() - last >= status_every
+        if state != last_state or due:
+            last_state = state
+            last = time.time()
+            # The snapshot we already took: `snapshot()` differences the input
+            # counter against the previous call to get the report rate, so
+            # taking a second one in the same instant reports a stale number.
+            print("  " + svc.status_line(snap), flush=True)
+        if svc.state == S.ERROR:
+            return
 
 
 def cmd_tray(args) -> int:

@@ -97,6 +97,13 @@ DEGRADED = S.DEGRADED
 STOPPING = S.STOPPING
 ERROR = S.ERROR
 
+#: Child states that mean this process is HOLDING the controller: a bridge
+#: exists and owns an open HID handle to it. That is first-hand evidence the
+#: pad is there, and it is better evidence than enumeration -- HidHide can stop
+#: `hid_enumerate` from listing a device, it cannot stop a handle somebody
+#: already has from working. `snapshot()` counts these as present.
+_HOLDING = (STARTING, RUNNING, DEGRADED)
+
 _CREATE_NO_WINDOW = 0x08000000
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CTRL_BREAK_EVENT = 1
@@ -266,6 +273,82 @@ def _hidden_serials() -> list[str]:
         return []
 
 
+def _unhide_serial(serial: str, cli_override: str | None = None,
+                   log_fn=None) -> bool:
+    """Repay one controller's hide debt from THIS process. Never raises.
+
+    `BridgeService.stop()` already unhides, and on a machine with a console it
+    gets to: `ChildBridge.stop()` sends Ctrl+Break and the child tears itself
+    down properly. A tray host has no console (`_have_console()`), so the same
+    stop is a `TerminateProcess`, the child runs no teardown, and the journal
+    entry -- and the cloak -- outlive the bridge that owned them.
+
+    That leftover is not cosmetic. A cloaked pad cannot be enumerated, so it
+    cannot be seen to come back: the user powers the controller on again and
+    nothing happens, for the rest of the session, because `hidhide.sweep()`
+    only runs once per process start. So the parent repays the debt itself
+    after every stop. Idempotent and cheap -- no record means no work, which is
+    the normal case on the Ctrl+Break path.
+    """
+    try:
+        from . import hidhide as HH
+
+        return HH.unhide_for_bridge(serial, cli_override=cli_override,
+                                    log_fn=log_fn)
+    except Exception:  # noqa: BLE001
+        log.debug("could not unhide %s", serial, exc_info=True)
+        return False
+
+
+def _sweep_hidhide(log_fn=None) -> int:
+    """Unhide anything whose owning process is gone. Never raises. -> how many.
+
+    The last thing that happens on the way out, and it is not the same promise
+    as `stop()`'s unhide. A child that was hard-killed never ran its own
+    teardown; a bridge whose manager entry had already been dropped (a crash the
+    poll noticed, a start abandoned mid-flight) has nobody left to speak for it.
+    `sweep()` is keyed on the journal on disk rather than on what this object
+    remembers, so it catches both.
+
+    NOT forced: `owner_alive()` is respected, so a `ds5bridge run` bridging in
+    another terminal keeps its own cloak. This process quitting is not a reason
+    to unhide somebody else's controller.
+    """
+    try:
+        from . import hidhide as HH
+
+        n = HH.sweep(log_fn=log_fn)
+        if n:
+            log.info("unhid %d controller(s) on the way out", n)
+        return n
+    except Exception:  # noqa: BLE001
+        log.debug("the exit sweep failed", exc_info=True)
+        return 0
+
+
+def _open_usbip(exe: str | None = None):
+    """A `Usbip` for the reconciliation, or None when usbip-win2 is not there.
+
+    None rather than an exception: startup reconciliation is best-effort by
+    definition, and a machine without usbip-win2 has no attached devices to
+    reconcile. The user-facing "install usbip-win2" message belongs to a bridge
+    that is trying to start, not to a housekeeping pass.
+    """
+    try:
+        from .usbip import Usbip
+
+        return Usbip(exe)
+    except Exception:  # noqa: BLE001
+        log.debug("usbip.exe is not available for the reconciliation",
+                  exc_info=True)
+        return None
+
+
+#: Hosts a usbip URL may name for a device THIS machine is serving. Anything
+#: else is a real remote server and none of our business.
+_LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
 def default_child_command(serial: str, port: int, usbip_exe: str | None = None,
                           audio_target: str = "speaker",
                           status_every: float = 2.0,
@@ -329,13 +412,20 @@ class ChildBridge:
 
     def __init__(self, serial: str, port: int, command: list[str],
                  job=None, on_event=None, stop_timeout: float = 15.0,
-                 usbip_exe: str | None = None, cleanup_fn=None):
+                 usbip_exe: str | None = None, cleanup_fn=None,
+                 on_change=None):
         self.serial = serial.lower()
         self.port = port
         self.command = list(command)
         self.job = job
         self.usbip_exe = usbip_exe
         self.on_event = on_event or (lambda serial, kind, text: None)
+        #: Called whenever the child reports a DIFFERENT state, and when it
+        #: exits. The manager uses it to wake its watcher: a controller that was
+        #: switched off should not wait out a poll interval before anybody
+        #: starts counting, and the interval is time a game spends being fed
+        #: neutral input by a pad that is not there.
+        self.on_change = on_change or (lambda serial: None)
         self.stop_timeout = stop_timeout
         #: Injected so tests can watch that teardown cleans only THIS port.
         self.cleanup_fn = cleanup_fn or S.cleanup
@@ -349,7 +439,37 @@ class ChildBridge:
         return {"serial": self.serial, "port": self.port, "state": STOPPED,
                 "error": None, "pid": None, "battery_percent": None,
                 "reports_per_s": 0.0, "uptime_s": 0, "attached": False,
-                "last_event": ""}
+                "last_event": "", "offline_since": None}
+
+    # -- state, and who is told about it -----------------------------------
+
+    def _note_state(self, state: str) -> bool:
+        """Record a state the child just reported. -> did it CHANGE.
+
+        Call with `self._lock` held.
+
+        `offline_since` is stamped the moment the child FIRST says the
+        Bluetooth link is down, and cleared by anything else it says. That
+        timestamp -- not the poll that happens to notice it -- is what the
+        manager's offline grace is measured from. Measuring from the poll adds a
+        whole hotplug interval to every disconnect, on top of the interval the
+        child's own status tick already costs, and all of it is time in which
+        Windows still shows a game a controller that is switched off.
+        """
+        prev = self._snap["state"]
+        self._snap["state"] = state
+        if state == DEGRADED:
+            if self._snap.get("offline_since") is None:
+                self._snap["offline_since"] = time.monotonic()
+        else:
+            self._snap["offline_since"] = None
+        return state != prev
+
+    def _changed(self) -> None:
+        try:
+            self.on_change(self.serial)
+        except Exception:  # noqa: BLE001
+            log.exception("state-change handler failed")
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -402,8 +522,16 @@ class ChildBridge:
         self._fail(self.error)
         return False
 
-    def stop(self) -> None:
+    def stop(self, hard: bool = False) -> None:
         """Ask, kill, then clean up THIS port -- in that order, always.
+
+        `hard=True` skips the asking. It is for the one case where the polite
+        path buys nothing and costs everything: the controller is GONE, so the
+        graceful shutdown the child would run has no controller to disarm, no
+        microphone to quieten and nothing to unhide that this process is not
+        about to repay anyway -- while `stop_timeout` seconds of waiting for it
+        are seconds in which a game still sees a wired DualSense that cannot
+        answer. Disconnect teardown passes it; a user asking for Stop does not.
 
         Step three is not a fallback, it runs every time. There is no reliable
         polite kill on Windows: `Popen.terminate()` is `TerminateProcess`,
@@ -428,7 +556,7 @@ class ChildBridge:
             if p is not None:
                 self._snap["state"] = STOPPING
         if p is not None and p.poll() is None:
-            if not self._ctrl_break(p):
+            if hard or not self._ctrl_break(p):
                 self._kill(p)
             else:
                 try:
@@ -474,8 +602,10 @@ class ChildBridge:
     def _fail(self, text: str) -> None:
         with self._lock:
             self.error = text
-            self._snap["state"] = ERROR
+            changed = self._note_state(ERROR)
             self._snap["error"] = text
+        if changed:
+            self._changed()
 
     def _read_stdout(self, p: subprocess.Popen) -> None:
         """Blocking readline on its own thread -- the child's only status channel.
@@ -498,12 +628,14 @@ class ChildBridge:
                 if m:
                     bat = m.group("bat")
                     with self._lock:
+                        changed = self._note_state(m.group("state").strip())
                         self._snap.update(
-                            state=m.group("state").strip(),
                             battery_percent=None if bat == "?" else int(bat),
                             reports_per_s=float(m.group("rps")),
                             uptime_s=int(m.group("up")),
                             attached=True)
+                    if changed:
+                        self._changed()
                     continue
                 kind = _EVENT_PREFIX.get(raw[:5], None)
                 if kind is None:
@@ -514,8 +646,10 @@ class ChildBridge:
                     self._snap["last_event"] = text
                 if kind == "ready":
                     with self._lock:
-                        self._snap.update(state=RUNNING, attached=True,
-                                          error=None)
+                        changed = self._note_state(RUNNING)
+                        self._snap.update(attached=True, error=None)
+                    if changed:
+                        self._changed()
                 elif kind == "error":
                     self._fail(text)
                 self._emit(kind, text)
@@ -530,15 +664,19 @@ class ChildBridge:
             with self._lock:
                 if self._snap["state"] not in (STOPPING, STOPPED):
                     if code:
-                        self._snap["state"] = ERROR
+                        self._note_state(ERROR)
                         self._snap["error"] = (
                             self._snap["error"]
                             or (f"the bridge exited with code {code}"
                                 + (f": {last}" if last else "")))
                     else:
-                        self._snap["state"] = STOPPED
+                        self._note_state(STOPPED)
                     self._snap["attached"] = False
                     self._snap["reports_per_s"] = 0.0
+            # Unconditionally, not only on a change: a child that has EXITED is
+            # news the manager must act on within a tick, and it is the one
+            # transition that can arrive with the state already looking right.
+            self._changed()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -567,6 +705,8 @@ class BridgeManager:
                  default_enabled: bool = True,
                  hotplug_interval: float = 5.0,
                  vanish_grace: float = 30.0,
+                 offline_grace: float = 12.0,
+                 gone_grace: float = 3.0,
                  retry_after: float = 60.0,
                  usbip_exe: str | None = None,
                  audio_target: str = "speaker",
@@ -578,6 +718,9 @@ class BridgeManager:
                  bridge_factory=None,
                  port_free=None,
                  hidden_serials=None,
+                 unhide_serial=None,
+                 sweep_fn=None,
+                 usbip_factory=None,
                  on_event=None,
                  on_enabled_changed=None,
                  on_master_changed=None,
@@ -593,6 +736,41 @@ class BridgeManager:
         self.default_enabled = bool(default_enabled)
         self.hotplug_interval = hotplug_interval
         self.vanish_grace = vanish_grace
+        #: How long a child may keep saying "controller offline" before its
+        #: bridge is torn down.
+        #:
+        #: Shorter than `vanish_grace` on purpose, because by the time this
+        #: clock starts the child has ALREADY waited. `bridge.LINK_DEAD_S` is
+        #: 4 s of silence before `connected` is cleared at all, and the reader
+        #: then retries `_open_device()` every 2 s for as long as it takes. So
+        #: this grace is not "how long might a healthy pad be quiet" -- the
+        #: watchdog has answered that -- it is "how many reconnect attempts
+        #: deserve to be waited out", and twelve seconds is about six of them.
+        #:
+        #: The cost of being generous here is not neutral, which is what the
+        #: first version of this got wrong at 30 s: for all of it, the tray says
+        #: the controller is bridged, a virtual pad Windows can see stays
+        #: attached to a radio link that is gone, and the user -- who switched
+        #: the controller off themselves and knows perfectly well what happened
+        #: -- is left clicking things to make the program agree with them.
+        self.offline_grace = offline_grace
+        #: The same clock, for when TWO independent witnesses agree the pad is
+        #: gone: the child says the Bluetooth link is dead AND the controller is
+        #: no longer enumerated at all.
+        #:
+        #: `offline_grace` is generous because one witness can be wrong -- a
+        #: healthy pad goes quiet for four seconds and comes back (measured
+        #: 2026-08-25, mid-soak, both controllers), and tearing down on that
+        #: turns a recoverable dropout into a device removal Windows shows the
+        #: user. Two witnesses being wrong at once is a different proposition:
+        #: a dropout does not remove a device from the HID device set, and a
+        #: pad that is neither answering nor enumerated has been switched off.
+        #:
+        #: So this is a settling time, not a wait-and-see: long enough that the
+        #: two observations are not read from different instants, short enough
+        #: that switching a controller off during a game does what the user
+        #: expects it to do -- the controller disconnects.
+        self.gone_grace = gone_grace
         self.retry_after = retry_after
         self.usbip_exe = usbip_exe
         self.audio_target = audio_target
@@ -616,6 +794,20 @@ class BridgeManager:
         #: Injected so the oscillation guard in `poll_once` is testable without
         #: a driver. Returns the serials WE currently have hidden.
         self._hidden_serials = hidden_serials or _hidden_serials
+        #: The other half of that seam: a test must never unhide a controller
+        #: its developer genuinely had hidden.
+        self._unhide_serial = unhide_serial or (
+            lambda serial: _unhide_serial(
+                serial, cli_override=self.hidhide_cli,
+                log_fn=lambda t: self._emit(serial, "info", t)))
+        #: The last-resort unhide, run once on the way out with everything
+        #: already stopped. Injected for the same reason as the two above: a
+        #: green test run must never unhide the developer's own controller.
+        self._sweep = sweep_fn or _sweep_hidhide
+        #: How `reconcile_stale()` reaches usbip. Injected so the startup
+        #: reconciliation can be tested with no driver installed.
+        self._usbip_factory = usbip_factory or (
+            lambda: _open_usbip(self.usbip_exe))
 
         self._lock = threading.RLock()
         self._enabled: dict[str, bool] = {k.lower(): bool(v)
@@ -638,6 +830,16 @@ class BridgeManager:
         self._retry_at: dict[str, float] = {}
         #: When a serial was first seen missing. See `poll_once`.
         self._missing_since: dict[str, float] = {}
+        #: When a bridge's child first said "controller offline", cleared the
+        #: moment it says anything else. This is the only disconnect signal that
+        #: survives cloaking, because it needs no enumeration -- see `poll_once`.
+        #: Normally a copy of the child's own `offline_since`, which is stamped
+        #: when the child says it rather than when a poll notices.
+        self._offline_since: dict[str, float] = {}
+        #: What the last pass ENUMERATED (not the vouched-for union). Its only
+        #: job is to spot the absent -> present edge, which is the moment a
+        #: retry backoff stops being justified: see `poll_once`.
+        self._seen_last: set = set()
         #: Serials the CALLER stopped. Found on hardware: `stop(serial)` used to
         #: be undone by the very next hotplug pass five seconds later, because
         #: the controller was obviously still enumerated -- so "Stop" in a tray
@@ -650,10 +852,19 @@ class BridgeManager:
         #: controller and the second dies on the port's named mutex.
         self._inflight: set = set()
         self._present: list[str] = []
+        #: Set once teardown has begun. Nothing may start a bridge after this,
+        #: including the watcher thread, which is otherwise perfectly capable of
+        #: spawning a child while `close()` is stopping its siblings -- and a
+        #: child spawned during teardown is a child nobody will ever stop.
+        self._closing = False
 
         self._job = create_kill_on_close_job() if use_job else None
         self._watch: threading.Thread | None = None
         self._watch_stop = threading.Event()
+        #: "Look now." Set by a child changing state or exiting, so a disconnect
+        #: is acted on when it happens rather than at the next tick of a
+        #: five-second timer.
+        self._wake = threading.Event()
 
         S.install_crash_handlers()
         # `service._ACTIVE` holds BridgeService objects and this manager holds
@@ -784,7 +995,7 @@ class BridgeManager:
         """
         serial = serial.lower()
         with self._lock:
-            if not self.master_enabled:
+            if not self.master_enabled or self._closing:
                 return False
             b = self._bridges.get(serial)
             if b is not None and b.alive:
@@ -800,7 +1011,8 @@ class BridgeManager:
                                      self._child_command(serial, port),
                                      job=self._job,
                                      usbip_exe=self.usbip_exe,
-                                     on_event=self._emit)
+                                     on_event=self._emit,
+                                     on_change=self._child_changed)
             with self._lock:
                 self._bridges[serial] = b
             b.start()
@@ -816,8 +1028,36 @@ class BridgeManager:
             self._record_failure(serial, (b.snapshot().get("error")
                                           or b.error or "the bridge did not start"))
             return False
+        # DID ANYBODY STILL WANT THIS? `start()` blocks for as long as the child
+        # takes to attach -- up to a minute for a frozen build -- and Quit, the
+        # master switch, a per-controller Stop and a disconnect teardown can all
+        # land inside that window. Every one of them looked at `self._bridges`,
+        # found this serial (it is registered before the wait) and stopped it;
+        # what they could not do is stop a child that had not attached yet. So
+        # the arrival check is here, at the one point where both facts are
+        # known, and a bridge nobody wants is torn straight back down instead of
+        # being left attached to Windows with no owner.
         with self._lock:
-            self._retry_at.pop(serial, None)
+            abandoned = (self._closing or serial in self._held
+                         or self._bridges.get(serial) is not b)
+            if not abandoned:
+                self._retry_at.pop(serial, None)
+        if abandoned:
+            with self._lock:
+                if self._bridges.get(serial) is b:
+                    del self._bridges[serial]
+            self._emit(serial, "info",
+                       "the bridge attached after it had been stopped -- "
+                       "tearing it down again")
+            try:
+                b.stop(hard=True)
+            except Exception:  # noqa: BLE001
+                log.exception("tearing down an abandoned start of %s", serial)
+            try:
+                self._unhide_serial(serial)
+            except Exception:  # noqa: BLE001
+                log.exception("unhiding %s after an abandoned start", serial)
+            return False
         return True
 
     def _record_failure(self, serial: str, text: str) -> None:
@@ -831,12 +1071,27 @@ class BridgeManager:
                 b.stop()          # tears down only this serial's port
             except Exception:  # noqa: BLE001
                 log.exception("cleaning up a failed start of %s", serial)
+        # Every path that drops a bridge repays the hide debt, without deciding
+        # for itself whether there is one -- the journal on disk knows, and no
+        # record means no work. A start that got far enough to hide and then
+        # failed is rare; a controller nobody can open afterwards is not a rare
+        # enough consequence to leave to a rule of thumb.
+        try:
+            self._unhide_serial(serial)
+        except Exception:  # noqa: BLE001
+            log.exception("unhiding %s after a failed start", serial)
 
-    def stop(self, serial: str) -> None:
+    def stop(self, serial: str, hard: bool = False) -> None:
+        """Stop one bridge and put its controller back. Idempotent.
+
+        `hard` goes straight through to `ChildBridge.stop()`: skip the polite
+        Ctrl+Break for a controller that is already gone. See there.
+        """
         serial = serial.lower()
         with self._lock:
             b = self._bridges.pop(serial, None)
             self._missing_since.pop(serial, None)
+            self._offline_since.pop(serial, None)
             # Under the SAME lock as the pop. A hotplug pass that saw the bridge
             # gone but not the hold would spawn a replacement while this one was
             # still tearing down, and the replacement dies on the port's named
@@ -845,9 +1100,47 @@ class BridgeManager:
         if b is None:
             return                                    # idempotent by design
         try:
-            b.stop()
+            b.stop(hard=hard)
         except Exception:  # noqa: BLE001
             log.exception("stopping %s failed", serial)
+        # Belt and braces for the child's own unhide, which a hard kill never
+        # gets to run. `_unhide_serial` says why leaving that debt unpaid costs
+        # the user their controller for the rest of the session.
+        try:
+            self._unhide_serial(serial)
+        except Exception:  # noqa: BLE001
+            log.exception("unhiding %s after its stop failed", serial)
+
+    def _stop_offline(self, serial: str, now: float) -> None:
+        """Stop a bridge whose controller stopped answering, without holding it.
+
+        `stop()` records a hold, and a hold means "the user asked for this, so
+        hotplug must not undo it" -- it is what makes Stop in the tray menu
+        stick. This stop is hotplug's own decision, and a hold here would be a
+        promise never to bridge that controller again until somebody clicked
+        Start: the hold only lifts when the serial leaves the present set, and a
+        pad that is switched off but still enumerated (a DualSense charging on a
+        cable does exactly that -- `enumerate_serials()`) never leaves it.
+
+        So the hold comes straight back off and the retry window takes its
+        place. A controller that is genuinely off has by now been unhidden and
+        is not enumerated either, so nothing tries to start it at all; one that
+        merely enumerates while its radio is silent is retried once per
+        `retry_after` rather than on every five-second pass, which is the same
+        bargain `_record_failure` already strikes for a start that fails.
+
+        Hard, and that is the point of the whole path: the reason this bridge is
+        coming down is that its controller is not there, so there is nothing
+        left for a graceful child shutdown to do gracefully -- and on a console
+        host the polite route waits up to `stop_timeout` seconds for a teardown
+        whose only remaining work is the teardown we are doing anyway. Those
+        seconds are seconds in which a game still sees a wired DualSense on the
+        end of a dead radio link.
+        """
+        self.stop(serial, hard=True)
+        with self._lock:
+            self._held.discard(serial)
+            self._retry_at[serial] = now + self.retry_after
 
     def start_all(self) -> list[str]:
         """Start every enabled controller that is present. -> the ones that came up.
@@ -881,13 +1174,34 @@ class BridgeManager:
     # -- hotplug -----------------------------------------------------------
 
     def _refresh_present(self) -> list[str]:
+        """Enumerate, and notice anything that has just COME BACK.
+
+        The reappearance half lives here rather than in `poll_once` because it
+        is a property of observing enumeration, and `start_all()` observes it
+        too. It is rule 6 in `poll_once`: a serial that left the enumeration and
+        returned has been switched off and on again, which is the most explicit
+        "try this one again" a user can give without opening a menu -- so the
+        retry backoff a teardown or a failed start left behind is dropped, along
+        with the error it was recorded with.
+
+        A backoff must survive the case it exists for, which is a pad that is
+        switched off but STILL enumerated -- a DualSense charging on a cable
+        does exactly that. Such a serial never leaves the set, so it never
+        returns to it, so nothing here touches its backoff.
+        """
         try:
             present = [s.lower() for s in self._discover()]
         except Exception:  # noqa: BLE001
             log.exception("controller discovery failed")
             return list(self._present)
+        seen = set(present)
         with self._lock:
             self._present = present
+            returned = seen - self._seen_last
+            self._seen_last = seen
+            for serial in returned:
+                self._retry_at.pop(serial, None)
+                self._errors.pop(serial, None)
         return present
 
     def poll_once(self) -> None:
@@ -929,17 +1243,112 @@ class BridgeManager:
            this module's docstring rejects. That rejection is about not PROBING
            a bridged controller; this adds no HID call at all, it reads a
            directory listing.
+        4. **The journal says we hid it, not that it is switched on.** Point 3
+           on its own is how a hidden controller became impossible to unplug:
+           the journal entry stands whether or not the pad is powered, so a
+           cloaked pad that was switched off stayed in the present set forever,
+           the absence clock in point 2 never started, and the virtual device
+           sat attached to Windows on the end of a dead Bluetooth link while the
+           tray cheerfully reported it running.
+
+           The child knows better than either the journal or enumeration.
+           `BridgeService.snapshot()` turns the backend's own
+           `device_status()["connected"]` into `DEGRADED`, that reaches us in
+           the status line, and it needs no enumeration at all -- which is
+           exactly why it still works while the pad is cloaked. So a child
+           saying DEGRADED withdraws the journal's vouching for its own serial,
+           and after `offline_grace` seconds of it the bridge comes down.
+
+           Both halves of point 3 survive: a hidden pad whose child says RUNNING
+           is still present, so hiding one still cannot start the ~40 s flap.
+        5. **Two witnesses beat one.** A child saying DEGRADED is one witness
+           and it is treated cautiously (point 4) because a healthy pad really
+           does go quiet for a few seconds. Enumeration is another, and a
+           dropout does NOT remove a device from the HID device set. When both
+           agree -- the link is dead AND the controller is not listed -- the pad
+           has been switched off, and the wait drops from `offline_grace` to
+           `gone_grace`. That is the difference between a game seeing the
+           controller disconnect when the user switches it off and a game seeing
+           it twenty seconds later.
+        6. **A controller that comes BACK is new information.** A teardown
+           leaves a retry window behind so a pad that enumerates while its radio
+           is silent (a DualSense charging on a cable) cannot become a
+           start/tear-down loop. That reasoning stops applying the instant the
+           serial leaves enumeration and returns: somebody switched the
+           controller off and on again, which is the most explicit "try again"
+           a user can give without opening a menu. So the absent -> present edge
+           clears the backoff and the error with it.
         """
-        present = set(self._refresh_present())
+        now = time.monotonic()
+        with self._lock:
+            if self._closing:
+                return
+            running = list(self._bridges.items())
+            # In-flight starts are NOT part of this pass. Their bridge object is
+            # registered before `wait_ready()` returns, so a pass that landed in
+            # the middle of one used to find a child with no pid yet, read that
+            # as "the bridge process exited" and tear down a bridge that was
+            # coming up perfectly well.
+            inflight = set(self._inflight)
+        # One snapshot per child per pass, reused below: it is a dict copy under
+        # the child's lock, and taking it twice is two chances to see the state
+        # change halfway through a decision.
+        snaps = {serial: b.snapshot() for serial, b in running}
+
+        enumerated = self._refresh_present()
+        seen = set(enumerated)
         try:
-            present |= {s.lower() for s in self._hidden_serials()}
+            hidden = list(dict.fromkeys(s.lower()
+                                        for s in self._hidden_serials()))
         except Exception:  # noqa: BLE001
             log.debug("hidden-serial union failed", exc_info=True)
-        now = time.monotonic()
-
+            hidden = []
+        vouched = [s for s in hidden
+                   if s not in seen and snaps.get(s, {}).get("state") != DEGRADED]
+        # What the tray counts. Written back so `snapshot()` -- which must not
+        # do any work of its own -- reads a present list that a cloaked pad is
+        # in, rather than the enumeration that structurally cannot list it.
+        present_list = enumerated + vouched
+        present = set(present_list)
         with self._lock:
-            running = list(self._bridges.items())
+            # Rule 6's edge was computed inside `_refresh_present`, on the RAW
+            # enumeration -- deliberately before the vouched-for union is added
+            # here, or a pad we cloaked would look like it had just been plugged
+            # in every time the journal spoke up for it.
+            self._present = present_list
+
         for serial, b in running:
+            if serial in inflight:
+                continue
+            if snaps[serial].get("state") == DEGRADED:
+                # The child's own timestamp when it has one: it was stamped when
+                # the link died, not when this pass happened to look.
+                stamped = snaps[serial].get("offline_since")
+                with self._lock:
+                    if stamped is None:
+                        first = self._offline_since.setdefault(serial, now)
+                    else:
+                        first = self._offline_since[serial] = stamped
+                gone = serial not in seen
+                # `min`, not just `gone_grace`: two witnesses agreeing may
+                # shorten the wait and must never lengthen it, whatever a
+                # caller has set the two graces to.
+                grace = (min(self.gone_grace, self.offline_grace) if gone
+                         else self.offline_grace)
+                if now - first >= grace:
+                    self._emit(serial, "warn",
+                               ("the controller is offline and no longer "
+                                "connected -- switched off, or out of range"
+                                if gone else
+                                f"the controller has been offline for "
+                                f"{grace:.0f}s")
+                               + " -- stopping its bridge")
+                    self._stop_offline(serial, now)
+                    continue
+            else:
+                with self._lock:
+                    self._offline_since.pop(serial, None)
+
             if serial in present:
                 with self._lock:
                     self._missing_since.pop(serial, None)
@@ -955,6 +1364,8 @@ class BridgeManager:
             # A child that died on its own -- crash, or the user killed it.
             # Its siblings are untouched; only this serial is cleaned up.
             if not b.alive:
+                # Freshly, not from `snaps`: the child may have died since, and
+                # the error it wrote on its way out is the one worth reporting.
                 snap = b.snapshot()
                 self._emit(serial, "error",
                            snap.get("error") or "the bridge process exited")
@@ -969,10 +1380,12 @@ class BridgeManager:
             # by the user", it is unplugged -- so plugging it back in starts it.
             self._held &= present
 
-        if not self.master_enabled:
+        if not self.master_enabled or self._closing:
             return
         for serial in present:
             with self._lock:
+                if self._closing:
+                    return
                 if serial in self._bridges or serial in self._inflight:
                     continue
                 if serial in self._held:
@@ -990,24 +1403,75 @@ class BridgeManager:
         `enumerate_devices()` still walks the HID device set, and this thread
         shares an interpreter with nothing that must not be delayed only
         because every bridge lives in its own process.
+
+        The FIRST pass runs immediately, and the interval only separates the
+        passes after it. Waiting first is the obvious way to write this loop and
+        it is wrong in the one case that matters most: starting the program with
+        a controller already switched on. Nothing happens for five seconds, the
+        reasonable conclusion is that it did not see the controller, and the
+        user goes looking for the button that makes it look -- which teaches
+        them that hotplug needs a click.
+
+        The interval is a CEILING, not a metronome. Two things shorten it:
+        `_child_changed` sets `_wake` the moment a child reports a different
+        state or exits, and `_next_interval()` shortens the sleep to whatever is
+        left on a running offline clock. Together they take the app-layer cost
+        of noticing a disconnect from "up to one interval, plus up to another
+        one before the grace is judged" down to about a tenth of a second --
+        which matters because every one of those seconds is a game holding a
+        controller that is not there.
         """
         if self._watch is not None:
             return
         self._watch_stop.clear()
 
         def loop() -> None:
-            while not self._watch_stop.wait(self.hotplug_interval):
+            while True:
+                # Cleared BEFORE the pass, never after: a child that changes
+                # state while the pass is running has news this pass may
+                # already have missed, and clearing afterwards would throw it
+                # away for a whole interval.
+                self._wake.clear()
                 try:
                     self.poll_once()
                 except Exception:  # noqa: BLE001
                     log.exception("hotplug pass failed")
+                if self._watch_stop.is_set():
+                    return
+                self._wake.wait(self._next_interval())
+                if self._watch_stop.is_set():
+                    return
 
         self._watch = threading.Thread(target=loop, name="ds5-hotplug",
                                        daemon=True)
         self._watch.start()
 
+    def _child_changed(self, serial: str) -> None:
+        """A child said something new. Look now rather than at the next tick."""
+        self._wake.set()
+
+    def _next_interval(self) -> float:
+        """How long the watcher may sleep before it MUST look again.
+
+        The poll interval, unless a bridge is sitting on an offline clock -- in
+        which case it is whatever is left of the shortest grace, so the teardown
+        lands within a tenth of a second of the grace expiring instead of up to
+        a full interval later. `gone_grace` is used as the deadline even for a
+        controller that is still enumerated: waking early costs one enumeration
+        and the pass simply decides not to act yet.
+        """
+        now = time.monotonic()
+        with self._lock:
+            starts = list(self._offline_since.values())
+        soonest = self.hotplug_interval
+        for first in starts:
+            soonest = min(soonest, first + self.gone_grace - now)
+        # Never a hot loop, and never longer than asked for.
+        return max(0.1, min(self.hotplug_interval, soonest))
+
     def stop_hotplug(self) -> None:
         self._watch_stop.set()
+        self._wake.set()
         t, self._watch = self._watch, None
         if t is not None:
             t.join(timeout=self.hotplug_interval + 2.0)
@@ -1023,6 +1487,17 @@ class BridgeManager:
         this architecture those endpoints are in OTHER processes whose stdout
         this process must keep draining. A snapshot that blocks is a snapshot
         that stalls every child's status channel at once.
+
+        Which is why presence is decided here from what is already in memory,
+        and never by asking anything. `self._present` is what the last hotplug
+        pass worked out (enumeration plus the cloaked pads it vouched for), and
+        a bridge in one of the `_HOLDING` states adds its own serial regardless:
+        it has the controller open, so the controller is there. Before that, a
+        cloaked pad counted as present inside `poll_once` and as absent in the
+        tray, which is where "2 of 1 controllers bridged" came from -- and the
+        same arithmetic rendered a perfectly healthy hidden controller as "not
+        connected" in the menu. Counting the holders makes `running` a subset of
+        `present` by construction rather than by luck.
         """
         with self._lock:
             bridges = list(self._bridges.items())
@@ -1036,16 +1511,20 @@ class BridgeManager:
             hide_default = self.hide_default
 
         controllers = {}
-        running = attached = 0
+        running = degraded = attached = 0
         total_rate = 0.0
+        present_set = set(present)
         for serial, b in bridges:
             snap = b.snapshot()
             snap["enabled"] = enabled.get(serial, default_enabled)
             snap["hide_bluetooth"] = hide.get(serial, hide_default)
-            snap["present"] = serial in present
+            snap["present"] = (serial in present_set
+                               or snap["state"] in _HOLDING)
             controllers[serial] = snap
             if snap["state"] in (RUNNING, DEGRADED):
                 running += 1
+            if snap["state"] == DEGRADED:
+                degraded += 1
             if snap.get("attached"):
                 attached += 1
             total_rate += snap.get("reports_per_s") or 0.0
@@ -1064,9 +1543,18 @@ class BridgeManager:
             "master_enabled": master,
             "controllers": controllers,
             "aggregate": {
-                "present": len(present),
+                "present": sum(1 for c in controllers.values()
+                               if c.get("present")),
                 "bridges": len(bridges),
                 "running": running,
+                # A subset of `running`, not a rival to it: the virtual device
+                # really is still attached and a game really is still being fed
+                # (neutralised) input, which is what `running` claims. What it
+                # cannot say on its own is that the Bluetooth link behind one of
+                # them is gone -- and a count of "2 of 2 bridged" while a
+                # controller sits switched off on the desk is how a user learns
+                # not to believe the tray.
+                "degraded": degraded,
                 "attached": attached,
                 "reports_per_s": round(total_rate, 1),
                 "errors": sum(1 for c in controllers.values() if c.get("error")),
@@ -1101,10 +1589,48 @@ class BridgeManager:
     # -- teardown ----------------------------------------------------------
 
     def _teardown_hook(self) -> None:
+        """What Ctrl+C, a closed console, a logoff and `atexit` all reach.
+
+        Identical to `close()` except that it keeps the job object: the hook can
+        run while the process is on its way out through a path that will not
+        come back here, and the job is the last-resort kill for any child that
+        outlived its stop. Closing it early would only remove that safety net a
+        few milliseconds sooner.
+        """
         try:
+            self._begin_close()
             self.stop_all()
+            self._final_sweep()
         except Exception:  # noqa: BLE001
             log.exception("manager teardown failed")
+
+    def _begin_close(self) -> None:
+        """Shut the door before emptying the room. Idempotent.
+
+        The flag goes up FIRST and the watcher is stopped SECOND, in that order
+        and never the other way round: between the two, the watcher may be
+        halfway through a pass, and `_closing` is what stops that pass from
+        starting a bridge nobody will ever be around to stop. A `stop_hotplug()`
+        on its own cannot -- it can only wait for a pass that may currently be
+        blocked in `start()` waiting up to a minute for a child to attach.
+        """
+        with self._lock:
+            self._closing = True
+        self._wake.set()
+        self.stop_hotplug()
+
+    def _final_sweep(self) -> None:
+        """Repay any hide debt nothing else did, once everything is stopped.
+
+        Deliberately last. Every bridge has been stopped by now, so every record
+        that still exists belongs to a child that died without unhiding -- which
+        is exactly the set `sweep()`'s liveness check will clear and the set a
+        `stop()` could not know about.
+        """
+        try:
+            self._sweep()
+        except Exception:  # noqa: BLE001
+            log.exception("the exit sweep failed")
 
     def close(self) -> None:
         """Stop everything and let go of the job object. Safe twice.
@@ -1113,7 +1639,7 @@ class BridgeManager:
         list, so a manager that is closed and replaced would otherwise leave a
         dead one behind to be called at exit.
         """
-        self.stop_hotplug()
+        self._begin_close()
         self.stop_all()
         try:
             S.ON_TEARDOWN.remove(self._hook)
@@ -1121,3 +1647,74 @@ class BridgeManager:
             pass
         close_job(self._job)
         self._job = None
+        self._final_sweep()
+
+    # -- startup reconciliation --------------------------------------------
+
+    def reconcile_stale(self, log_fn=None) -> int:
+        """Undo what a previous run's death left on this machine. -> ports freed.
+
+        Called once, at startup, BEFORE anything of ours goes near a port. It
+        exists because two pieces of state outlive the process that created them
+        and neither can be discovered by looking at this program's own memory:
+
+        * **An armed auto-re-attach.** `usbip attach` arms a background
+          re-attach that survives the death of everything on both sides of it,
+          and it fires the instant ANY server listens on that port again.
+          `attach -X` is the only thing that disarms it, and nothing about the
+          state of the machine reveals that it is armed -- measured 2026-08-25
+          (`BridgeService._start_inner` step 2): hard-kill a bridge and both
+          `usbip port` and the TCP port come back clean while the re-attach is
+          still waiting. So it is issued unconditionally.
+        * **Attached virtual devices with nobody behind them.** A hard-killed
+          bridge leaves Windows holding a wired DualSense whose server is gone.
+          Games see a controller that answers nothing, and the user sees a
+          device that no amount of restarting this program removes, because
+          every start only ever cleaned up the ONE port it was about to use.
+
+        What may be detached is deliberately narrow, and it is the same rule
+        `usbip.our_ports()` exists for: a port whose URL says loopback AND whose
+        TCP port has no listener. A live sibling -- another instance, a
+        `ds5bridge run` in a terminal, this program's own child from a moment
+        ago -- is holding its port bound, so it is never a candidate. A genuine
+        remote USB/IP server is not loopback, so it is never a candidate either.
+        """
+        say = log_fn or (lambda t: log.info("%s", t))
+        u = self._usbip_factory()
+        if u is None:
+            return 0
+        try:
+            u.stop_auto_reattach()
+        except Exception:  # noqa: BLE001
+            log.exception("attach -X during the startup reconciliation failed")
+        freed = 0
+        for port_no, tcp in self._zombie_ports(u):
+            say(f"detaching a leftover virtual controller on usbip port "
+                f"{port_no} -- nothing is serving TCP {tcp} any more")
+            try:
+                if u.detach(port_no).ok:
+                    freed += 1
+            except Exception:  # noqa: BLE001
+                log.exception("detach -p %s failed", port_no)
+        return freed
+
+    def _zombie_ports(self, u) -> list[tuple[int, int]]:
+        """[(usbip port, TCP port)] for attached devices with no live server."""
+        out: list[tuple[int, int]] = []
+        try:
+            rows = u.parse_ports()
+        except Exception:  # noqa: BLE001
+            log.exception("could not read `usbip port`")
+            return out
+        for port_no, url in rows:
+            host = (url or "").partition("/")[0]
+            addr, _, tcp = host.rpartition(":")
+            if not tcp.isdigit() or addr.lower() not in _LOOPBACK:
+                continue
+            try:
+                if not self._port_free(int(tcp)):
+                    continue          # somebody is still serving it
+            except Exception:  # noqa: BLE001
+                continue              # cannot tell -> leave it alone
+            out.append((int(port_no), int(tcp)))
+        return out

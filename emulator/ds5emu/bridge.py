@@ -231,6 +231,12 @@ FEATURE_TEST_RESULT = 0x81
 #: See docs/FINDINGS.md "Measured on hardware".
 FEATURE_TEST_PAYLOAD_LEN = 63
 
+#: What a real wired DualSense returns from GET_REPORT(Feature, 0x81) when no
+#: factory-test command is outstanding: the report id and 63 zero bytes.
+#: MEASURED on the physical wired unit 2026-08-27 -- it answers, it never
+#: STALLs. See `_read_test_result`.
+FEATURE_TEST_IDLE = bytes([FEATURE_TEST_RESULT]) + bytes(FEATURE_TEST_PAYLOAD_LEN)
+
 #: Extra plain GET-only feature reports to prefetch at open, beyond 0x05
 #: (calibration, read as part of the extended-mode flip) and 0x20 (firmware).
 #: 0x22 is the BT patch version, which Factory Info reads directly.
@@ -238,7 +244,49 @@ FEATURE_TEST_PAYLOAD_LEN = 63
 #: VERIFIED on hardware 2026-08-25: over Bluetooth 0x22 answers 64 bytes (id +
 #: 63), no CRC needed for a GET, and its `u32` at offset 31 is the patch
 #: version Factory Info shows. Prefetching it is correct -- it is static.
-PREFETCH_FEATURES = (0x20, 0x22)
+#:
+#: 0x09 AND 0x0b ADDED 2026-08-27, and 0x09 is the important one.
+#: `emulator/tools/hid_diff_probe.py` was run against a real *wired* DualSense
+#: and against this emulator on the same machine, through the same HidUsb stack,
+#: on the same day. A real wired unit answers feature 0x09 with 20 bytes and
+#: 0x0b with 42; this emulator STALLed both. libScePad -- the Sony controller
+#: library every Sony PC port links -- reads 0x09 as the FIRST thing it does to
+#: a DualSense and uses the MAC in it as the device's identity. In the
+#: open-source reimplementation (WujekFoliarz/duaLib, src/source/duaLib.cpp:145)
+#: the whole registration is inside `if (getMacAddress(...))`, and
+#: `getMacAddress` for a DualSense is one `hid_get_feature_report` of 0x09
+#: (src/source/duaLibUtils.cpp:182-199). A STALL there means the pad is never
+#: registered at all, which is exactly the "The Last of Us Part 1 sees no input"
+#: report -- see docs/wired-gap-findings.md.
+PREFETCH_FEATURES = (0x09, 0x0B, 0x20, 0x22)
+
+#: Feature reports whose LAST FOUR BYTES are a Bluetooth CRC-32 that a wired
+#: DualSense leaves as zero.
+#:
+#: MEASURED, both transports, 2026-08-27: for 0x05, 0x09, 0x0b, 0x20 and 0x22
+#: the wired unit ends every one of them in `00 00 00 00` while the Bluetooth
+#: unit ends them in a CRC. Forwarding the Bluetooth bytes verbatim therefore
+#: put four bytes of Bluetooth-only checksum into a report that is supposed to
+#: be a USB report. Nothing observed reads them, but "byte-identical to a real
+#: wired DualSense" is the whole claim of this project, so they are zeroed.
+FEATURE_CRC_TRAILER = frozenset({0x05, 0x09, 0x0B, 0x20, 0x22})
+
+#: Bytes of feature 0x0b that a *wired* DualSense actually publishes.
+#:
+#: MEASURED 2026-08-27: over Bluetooth 0x0b carries, after the host MAC, a
+#: pairing-slot count and a link-key blob. The wired unit publishes zeros there.
+#: Serving the Bluetooth bytes verbatim would both differ from the ground truth
+#: and export the controller's pairing material to anything that can open the
+#: HID device.
+#:
+#: The wired layout, from the physical unit:
+#:     [0]      report id 0x0b
+#:     [1..6]   client (controller) MAC, little-endian
+#:     [7..10]  08 25 00 00
+#:     [11..16] host MAC, little-endian
+#:     [17..]   zero
+#: so keep 17 bytes and zero the rest.
+FEATURE_0B_WIRED_PREFIX = 17
 
 #: How long a USB GET_REPORT(0x81) may wait for the writer thread to come back
 #: from Bluetooth. This is the ONE place the USB request path waits on hidapi,
@@ -252,10 +300,12 @@ FEATURE_BT_TIMEOUT = 0.06
 #:
 #: THE RULE: a subcommand gets in only if the tester issues it as a pure read
 #: for Factory Info or Diagnostics AND its action id is a READ_*/GET_* in
-#: `DualSenseTestActionId`. Everything else -- every WRITE_*, ERASE_*, AGING_*,
-#: SET_*, NVS_*, TEST_ACTION_BOOTLOADER_*, the whole 0x84/0x85 individual-data
-#: channel and feature report 0x09 -- keeps the record-and-drop behaviour.
-#: Nothing here can re-pair the controller, touch its flash or change a setting.
+#: `DualSenseTestActionId`, or (the AUDIO pair below, and only that pair) it
+#: drives a transient output that touches no persistent state. Everything else
+#: -- every WRITE_*, ERASE_*, AGING_*, SET_*, NVS_*, TEST_ACTION_BOOTLOADER_*,
+#: the whole 0x84/0x85 individual-data channel and feature report 0x09 as a
+#: *write* -- keeps the record-and-drop behaviour. Nothing here can re-pair the
+#: controller, touch its flash or change a setting that outlives a power cycle.
 TEST_COMMAND_ALLOWLIST: dict[tuple[int, int], str] = {
     # deviceId 1 = SYSTEM
     (0x01, 0x04): "READ_PCBAID (legacy PCBA id, 6 bytes)",
@@ -268,6 +318,25 @@ TEST_COMMAND_ALLOWLIST: dict[tuple[int, int], str] = {
     (0x01, 0x1C): "READ_VCM_RIGHT_BARCODE (32 bytes)",
     # deviceId 4 = ANALOG_DATA
     (0x04, 0x03): "BATTERY (battery voltage in mV)",
+    # deviceId 6 = AUDIO. THE ONE PAIR THAT IS NOT A READ, and it is here on
+    # purpose -- see docs/wired-gap-findings.md symptom 2.
+    #
+    # These two are the entire "Speaker / Headphone 1 kHz sine wave" button in
+    # dualsense-tester (`controlWaveOut`, src/utils/dualsense/ds.util.ts:673).
+    # Action 2 (WAVEOUT_CTRL) starts and stops the controller's own built-in
+    # tone generator; action 4 selects which output it comes out of. Blocking
+    # them was measured, 2026-08-27, to be exactly why that button does nothing
+    # through the emulator while it works on the same pad over plain Bluetooth.
+    #
+    # WHY THIS DOES NOT BREAK THE RULE THE REST OF THIS TABLE FOLLOWS.
+    # The rule protects the controller's persistent state: pairing, flash,
+    # calibration, settings. Neither of these touches any of it. WAVEOUT_CTRL
+    # toggles a tone that stops the moment it is sent [0,1,0] and in any case
+    # does not survive a power cycle; action 4 is the VERIFY of the
+    # BUILTIN_MIC_CALIB_DATA family, not its _SEND (2) or _STORE (3), which are
+    # the ones that would write, and which stay blocked.
+    (0x06, 0x02): "WAVEOUT_CTRL (start/stop the built-in 1 kHz test tone)",
+    (0x06, 0x04): "BUILTIN_MIC_CALIB_DATA_VERIFY (wave-out path select)",
     # deviceId 5 = TOUCH -- read-only, but the controller does not answer these
     # over Bluetooth, so expect a stall. Harmless either way.
     (0x05, 0x02): "SOLOMON_UID (touchpad unique id)",
@@ -756,10 +825,20 @@ class BridgeBackend(Backend):
 
     @staticmethod
     def _feature_bytes(report_id: int, raw: bytes) -> bytes:
-        """hidapi returns the feature body with the report id already at [0]."""
+        """hidapi returns the feature body with the report id already at [0].
+
+        Then it is made to look like it came off a cable rather than off a
+        Bluetooth link: the trailing CRC-32 is zeroed on the reports where a
+        wired unit publishes zeros, and 0x0b's link-key tail is dropped. See
+        FEATURE_CRC_TRAILER and FEATURE_0B_WIRED_PREFIX.
+        """
         b = bytes(raw)
         if not b or b[0] != report_id:
             b = bytes([report_id]) + b
+        if report_id == 0x0B and len(b) > FEATURE_0B_WIRED_PREFIX:
+            b = b[:FEATURE_0B_WIRED_PREFIX] + bytes(len(b) - FEATURE_0B_WIRED_PREFIX)
+        elif report_id in FEATURE_CRC_TRAILER and len(b) >= 5:
+            b = b[:-4] + b"\0\0\0\0"
         return b
 
     def _prime_setstate(self) -> None:
@@ -1258,8 +1337,10 @@ class BridgeBackend(Backend):
         firmware is touched. A stray host-issued write must not reach the
         physical controller, so by default they are logged and dropped.
 
-        Report 0x80 is the one exception, and only for the read-only
-        subcommands in `TEST_COMMAND_ALLOWLIST`: it is the query half of the
+        Report 0x80 is the one exception, and only for the subcommands in
+        `TEST_COMMAND_ALLOWLIST` -- read-only but for the AUDIO wave-out pair,
+        which starts and stops a test tone and nothing else. It is the query
+        half of the
         factory-diagnostics channel that Factory Info and Diagnostics are built
         on, and there is no way to read those without writing the query. Every
         other (deviceId, actionId) -- and every other report id, 0x09 and the
@@ -1360,14 +1441,22 @@ class BridgeBackend(Backend):
         return self._feature_bytes(FEATURE_TEST_RESULT, raw)
 
     def _read_test_result(self) -> bytes | None:
-        if self._test_armed is None:
-            # Nobody has asked a question, so there is no answer to fetch. STALL
-            # rather than poll the controller for a host that is just probing.
-            return None
-        if not self.connected.is_set():
-            return None
+        if self._test_armed is None or not self.connected.is_set():
+            # Nobody has asked a question, so there is no answer to fetch --
+            # but a real device still ANSWERS. Measured on a physical wired
+            # DualSense 2026-08-27 (emulator/tools/hid_diff_probe.py): a cold
+            # GET_REPORT(Feature, 0x81) returns 64 bytes of `81 00 00 ...`, it
+            # does not STALL. Stalling here was visible behaviour, not a detail:
+            # dualsense-tester's getTestResult() is
+            # `while (report = await receiveFeatureReport(item, 0x81))`, so a
+            # STALL throws out of the loop and fails the command outright,
+            # where a real pad just returns an idle header and lets the caller
+            # poll out its own 1000 ms budget.
+            return FEATURE_TEST_IDLE
         self.stats["feature_test_reads"] += 1
-        return self._bt_call(self._bt_read_test_result)
+        # A timeout or a link hiccup must not turn into a STALL either: answer
+        # idle, the way the physical device does when it has nothing to say.
+        return self._bt_call(self._bt_read_test_result) or FEATURE_TEST_IDLE
 
     def _bt_call(self, fn, *args):
         """Run `fn` on the writer thread and wait a bounded time for its result.
