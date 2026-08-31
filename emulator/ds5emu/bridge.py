@@ -288,6 +288,49 @@ FEATURE_CRC_TRAILER = frozenset({0x05, 0x09, 0x0B, 0x20, 0x22})
 #: so keep 17 bytes and zero the rest.
 FEATURE_0B_WIRED_PREFIX = 17
 
+#: Feature reports that carry the CONTROLLER'S OWN Bluetooth MAC in bytes
+#: [1..6] (little-endian, so the first textual octet of the address is at
+#: byte [6]).
+FEATURE_CLIENT_MAC = frozenset({0x09, 0x0B})
+
+#: The locally-administered bit of the first MAC octet, i.e. of report
+#: byte [6] of the reports above.
+#:
+#: WHY THE SERVED MAC IS ALTERED AT ALL (2026-08-31, the "TLOU powers the
+#: pad off" bug). libScePad -- the Sony pad library every Sony PC port
+#: links -- de-duplicates controllers by the MAC in feature 0x09. When it
+#: sees a *wired* DualSense whose 0x09 MAC equals that of a *Bluetooth*
+#: DualSense it also has open, it treats them as one pad on two transports
+#: and does what a PS5 does when the cable is plugged in: it tells the
+#: Bluetooth twin to drop its link -- a feature 0x08 write, action 0x02
+#: (0x08 is DS_FEATURE_REPORT_BLUETOOTH_CONTROL in the public research,
+#: nondebug/dualsense) -- and a DualSense told to drop its link with no
+#: console to fall back to simply powers off.
+#:
+#: That is fatal here, because our "wired" pad IS the Bluetooth pad. The
+#: captured sequence (emulator/ds5emu/capture.py dump, 2026-08-31, The Last
+#: of Us Part I running with an open handle to the raw Bluetooth pad while
+#: the virtual pad attached):
+#:
+#:     +15.7232  usb.get_feature  id=0x09 -> 20B     (TLOU learns our MAC)
+#:     +15.7496  bt.read.error #1                    (the pad's link is dying,
+#:                                                    26 ms later)
+#:     +15.7503  usb.set_feature  id=0x08  08 02 00... (the same kill command,
+#:                                                    aimed at the virtual pad;
+#:                                                    recorded, never forwarded)
+#:     +15.7532  link.death                          (pad off until PS press)
+#:
+#: We wrote nothing to the controller in that window -- the power-off went
+#: down TLOU's own pre-existing handle to the Bluetooth device. HidHide does
+#: not sever handles a game already holds, so hiding cannot prevent it; the
+#: only robust fix is for the virtual pad to never claim the same identity.
+#: Flipping the locally-administered bit keeps the MAC stable and unique per
+#: controller (it is derived from the real address) while guaranteeing it
+#: never collides with the real address on the air. Verified: with the bit
+#: flipped the same TLOU scenario leaves the pad on; with it unflipped the
+#: pad dies within seconds, 100% reproducible.
+WIRED_MAC_LA_BIT = 0x02
+
 #: How long a USB GET_REPORT(0x81) may wait for the writer thread to come back
 #: from Bluetooth. This is the ONE place the USB request path waits on hidapi,
 #: and it is a control transfer, never an isochronous deadline -- but it still
@@ -572,6 +615,7 @@ class BridgeBackend(Backend):
         report_id: int = 0x39,
         reconnect: bool = True,
         keep_raw: bool = False,
+        distinct_wired_mac: bool = True,
     ):
         self.transport = transport
         self.device_index = device_index
@@ -602,6 +646,12 @@ class BridgeBackend(Backend):
         #: soak run can re-decode both with the Phase-1 decoder and prove the
         #: translation on real traffic. Off by default: it doubles the copy.
         self.keep_raw = keep_raw
+        #: Serve a MAC in features 0x09/0x0b that is derived from -- but not
+        #: equal to -- the controller's real Bluetooth address. ON by default,
+        #: and turning it off re-enables a proven kill: libScePad titles that
+        #: can still reach the raw Bluetooth pad will power it off the moment
+        #: they see a wired pad with the identical MAC. See WIRED_MAC_LA_BIT.
+        self.distinct_wired_mac = distinct_wired_mac
 
         if report_id != 0x39:
             raise ValueError("only report 0x39 (two frames per report) is implemented")
@@ -720,6 +770,13 @@ class BridgeBackend(Backend):
             #: Disconnect events seen from any cause.
             "disconnects": 0,
         }
+        #: Optional flight recorder (`ds5emu.capture.BlackBox`). When set,
+        #: every host->device request and every post-translation Bluetooth
+        #: write is recorded into its bounded ring, and the ring is dumped to
+        #: a file automatically when the Bluetooth link dies -- so one
+        #: reproduction of a disconnect preserves the ~10 s that caused it.
+        #: `python -m ds5emu serve --capture PATH` turns it on.
+        self.blackbox = None
         #: Sampled mic-ring depth in bytes, for the drift report. Cheap: three
         #: integers updated per `read_audio_in`.
         self._mic_depth_n = 0
@@ -729,12 +786,38 @@ class BridgeBackend(Backend):
         self.connected = threading.Event()
 
     # =====================================================================
+    # flight recorder
+    # =====================================================================
+
+    def _bb(self, kind: str, data: bytes | None = None, note: str = "") -> None:
+        """Record one event into the black box, when one is attached.
+
+        Kept to a None-check plus one method call so it is free to sprinkle
+        on the hot paths when no capture is running.
+        """
+        bb = self.blackbox
+        if bb is not None:
+            bb.record(kind, data, note)
+
+    def _bb_context(self) -> list:
+        """Header lines for a dump: the stats and the last-known pad state."""
+        lines = [f"stats: {self.stats}", f"feature_misses: {self.feature_misses}"]
+        try:
+            lines.append(f"device_status: {self.device_status()}")
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"device_status failed: {e!r}")
+        return lines
+
+    # =====================================================================
     # lifecycle
     # =====================================================================
 
     def start(self) -> None:
         if self._threads:
             return
+        if self.blackbox is not None:
+            self.blackbox.context_fn = self._bb_context
+            self._bb("lifecycle", note="start()")
         self._stop.clear()
         self._open_device()
         for name, fn in (
@@ -770,6 +853,9 @@ class BridgeBackend(Backend):
                 finally:
                     self._dev = None
         self.connected.clear()
+        if self.blackbox is not None:
+            self._bb("lifecycle", note="stop()")
+            self.blackbox.dump("shutdown")
         log.info("BridgeBackend stopped: %s", self.stats)
 
     def __enter__(self) -> "BridgeBackend":
@@ -821,16 +907,24 @@ class BridgeBackend(Backend):
             self._dev = dev
         self.connected.set()
         log.info("opened %s", DEV.describe(info))
+        self._bb("link.open", note=DEV.describe(info))
         self._prime_setstate()
 
-    @staticmethod
-    def _feature_bytes(report_id: int, raw: bytes) -> bytes:
+    def _feature_bytes(self, report_id: int, raw: bytes) -> bytes:
         """hidapi returns the feature body with the report id already at [0].
 
         Then it is made to look like it came off a cable rather than off a
         Bluetooth link: the trailing CRC-32 is zeroed on the reports where a
         wired unit publishes zeros, and 0x0b's link-key tail is dropped. See
         FEATURE_CRC_TRAILER and FEATURE_0B_WIRED_PREFIX.
+
+        Finally, the controller MAC in 0x09/0x0b gets its locally-administered
+        bit set, so this virtual *wired* pad never claims the exact identity of
+        the Bluetooth pad behind it. Identical MACs are how libScePad decides
+        "same pad, two transports" -- and its response is to power the
+        Bluetooth one off. Full story and the capture proving it at
+        WIRED_MAC_LA_BIT. Still stable and per-controller: derived from the
+        real address by one deterministic bit.
         """
         b = bytes(raw)
         if not b or b[0] != report_id:
@@ -839,6 +933,13 @@ class BridgeBackend(Backend):
             b = b[:FEATURE_0B_WIRED_PREFIX] + bytes(len(b) - FEATURE_0B_WIRED_PREFIX)
         elif report_id in FEATURE_CRC_TRAILER and len(b) >= 5:
             b = b[:-4] + b"\0\0\0\0"
+        if (self.distinct_wired_mac and report_id in FEATURE_CLIENT_MAC
+                and len(b) >= 7):
+            # MAC is little-endian at [1..6]; the first textual octet -- the
+            # one that carries the locally-administered bit -- is byte [6].
+            mb = bytearray(b)
+            mb[6] |= WIRED_MAC_LA_BIT
+            b = bytes(mb)
         return b
 
     def _prime_setstate(self) -> None:
@@ -884,12 +985,22 @@ class BridgeBackend(Backend):
     def _write_raw(self, data: bytes) -> bool:
         dev = self._dev
         if dev is None:
+            self._bb("bt.write.skip", data[:8], note="no device")
             return False
+        if self.blackbox is not None:
+            # seq nibble sits at payload[0] for every BT output report; the
+            # CRC check proves at dump time that the killer was not a
+            # malformed frame the controller would have discarded anyway.
+            note = f"id=0x{data[0]:02x} seq={data[1] >> 4}" if len(data) > 1 else ""
+            if len(data) >= 6:
+                note += f" crc={'ok' if T.verify_bt_output_crc(data) else 'BAD'}"
+            self._bb("bt.write", data, note=note)
         try:
             dev.write_raw(data)  # return value is meaningless on Windows
             return True
         except Exception as e:  # noqa: BLE001
             log.debug("hid write failed: %s", e)
+            self._bb("bt.write.error", note=repr(e))
             self._on_io_error()
             return False
 
@@ -898,6 +1009,11 @@ class BridgeBackend(Backend):
             self.stats["disconnects"] += 1
             log.warning("Bluetooth link lost; the virtual device stays attached "
                         "and will report a neutral controller until it returns")
+            self._bb("link.death")
+            if self.blackbox is not None:
+                path = self.blackbox.dump("link-death")
+                if path:
+                    log.warning("black-box dump written: %s", path)
         self.connected.clear()
         # Whatever factory-test command was in flight died with the link; a new
         # 0x80 has to arm the 0x81 read again.
@@ -976,6 +1092,8 @@ class BridgeBackend(Backend):
                 self.stats["bt_read_errors"] += 1
                 consecutive_errors += 1
                 log.debug("hid read failed: %s", e)
+                self._bb("bt.read.error",
+                         note=f"#{consecutive_errors} {e!r}")
                 if consecutive_errors > 5:
                     self._on_io_error()
                 continue
@@ -987,6 +1105,7 @@ class BridgeBackend(Backend):
                     self.stats["link_watchdog_trips"] += 1
                     log.warning("no Bluetooth report for %.1fs -- treating the link "
                                 "as dead", LINK_DEAD_S)
+                    self._bb("link.watchdog", note=f"silent for {LINK_DEAD_S}s")
                     self._on_io_error()
                 continue
             consecutive_errors = 0
@@ -998,6 +1117,12 @@ class BridgeBackend(Backend):
 
             if ptype == P.PAYLOAD_TYPE_CONTROL:
                 self.stats["bt_control"] += 1
+                if self.blackbox is not None and self.stats["bt_control"] % 100 == 1:
+                    # A ~5/s heartbeat with the raw payload: it timestamps the
+                    # last input before a link death to ~0.2 s and preserves
+                    # the status/battery bytes of the pad's dying seconds.
+                    self._bb("bt.input.hb", payload,
+                             note=f"#{self.stats['bt_control']}")
                 usb = T.bt31_payload_to_usb01(payload)
                 if usb is not None:
                     with self._input_lock:
@@ -1146,6 +1271,12 @@ class BridgeBackend(Backend):
         if dev is None:
             return
         mic = self.mic_always_on or self._mic_armed.is_set()
+        if self.blackbox is not None:
+            self._bb("bt.39",
+                     note=f"seq={dev.seq} pc={packet_counter} mic={int(mic)} "
+                          f"target={self.target} "
+                          f"op={len(opus2[0])}/{len(opus2[1])}B "
+                          f"hap={len(hap2[0])}/{len(hap2[1])}B")
         try:
             dev.send_report_39(
                 opus2, hap2, packet_counter,
@@ -1158,6 +1289,7 @@ class BridgeBackend(Backend):
         except Exception as e:  # noqa: BLE001
             self.stats["report_39_errors"] += 1
             log.debug("0x39 write failed: %s", e)
+            self._bb("bt.39.error", note=repr(e))
             if self.stats["report_39_errors"] > 20:
                 self._on_io_error()
 
@@ -1308,6 +1440,10 @@ class BridgeBackend(Backend):
         """
         self.stats["setstate_in"] += 1
         body = T.usb02_body(bytes(data))
+        if self.blackbox is not None:
+            f0, f1, f2 = T.setstate_flags(body)
+            self._bb("usb.out02", bytes(data),
+                     note=f"flags={f0:02x}/{f1:02x}/{f2:02x}")
         with self._setstate_lock:
             if self._setstate_pending is None:
                 self._setstate_pending = body
@@ -1327,7 +1463,11 @@ class BridgeBackend(Backend):
             body = self._features.get(report_id)
         if body is None:
             self.feature_misses[report_id] = self.feature_misses.get(report_id, 0) + 1
+            self._bb("usb.get_feature",
+                     note=f"id=0x{report_id:02x} len={length} -> MISS (STALL)")
             return None
+        self._bb("usb.get_feature",
+                 note=f"id=0x{report_id:02x} len={length} -> {len(body)}B")
         return body[:length] if length < len(body) else body
 
     def set_feature_report(self, report_id: int, data: bytes) -> None:
@@ -1347,6 +1487,7 @@ class BridgeBackend(Backend):
         0x84/0x85 individual-data channel included -- keeps the old behaviour.
         """
         data = bytes(data)
+        self._bb("usb.set_feature", data, note=f"id=0x{report_id:02x}")
         if report_id == FEATURE_TEST_CMD:
             self._on_test_command(data)
             return
@@ -1376,6 +1517,9 @@ class BridgeBackend(Backend):
         key = (payload[0], payload[1])
         self.feature_writes.append((FEATURE_TEST_CMD, payload))
         why = TEST_COMMAND_ALLOWLIST.get(key)
+        self._bb("usb.test_cmd",
+                 note=f"dev=0x{key[0]:02x} act=0x{key[1]:02x} "
+                      f"{'ALLOWED' if why else 'BLOCKED'}")
         if why is None:
             self.stats["feature_test_blocked"] += 1
             log.warning(
@@ -1409,6 +1553,7 @@ class BridgeBackend(Backend):
             # 0x53-seeded CRC32 in the last 4 of the SAME 63 payload bytes; a BT
             # feature report is not longer than its USB twin (FINDINGS).
             fill_feature_checksum(FEATURE_TEST_CMD, buf)
+        self._bb("bt.feature_write", bytes([FEATURE_TEST_CMD]) + bytes(buf))
         try:
             rc = dev.h.send_feature_report(bytes([FEATURE_TEST_CMD]) + bytes(buf))
         except Exception as e:  # noqa: BLE001
@@ -1498,6 +1643,12 @@ class BridgeBackend(Backend):
         """4-channel interleaved s16le @48 kHz from the host's speaker stream."""
         self.stats["audio_out_calls"] += 1
         self.stats["audio_out_bytes"] += len(pcm)
+        if self.blackbox is not None:
+            # ~1000/s: a summary line, never the PCM itself. "silent" tells a
+            # dump reader whether the host was actually driving the speaker.
+            self._bb("usb.audio_out",
+                     note=f"{len(pcm)}B"
+                          f"{' silent' if pcm.count(0) == len(pcm) else ''}")
         self._last_audio_out = time.perf_counter()
         if self.auto_arm and not self._audio_armed.is_set():
             self._audio_armed.set()
@@ -1576,6 +1727,7 @@ class BridgeBackend(Backend):
         — blocking here would stall every endpoint, isochronous included, at
         exactly the moment the host opens the stream.
         """
+        self._bb("usb.set_interface", note=f"iface={interface} alt={alt}")
         if interface == D.IFACE_AUDIO_OUT:
             if alt:
                 self._audio_armed.set()
@@ -1599,6 +1751,8 @@ class BridgeBackend(Backend):
         """
         from .uac import FU_MUTE_CONTROL, FU_VOLUME_CONTROL
 
+        self._bb("usb.uac_control",
+                 note=f"unit={unit} selector={selector} value={value}")
         st = P.SetState()
         if unit == D.UNIT_FU_SPEAKER:
             vol = 0 if (selector == FU_MUTE_CONTROL and value) else (
@@ -1657,6 +1811,8 @@ class BridgeBackend(Backend):
         dev = self._dev
         if dev is None:
             return
+        self._bb("bt.mic_arm", note=f"on={int(on)} muted={int(muted)} "
+                                    f"(0x31 mic-state + 0x32 mic-control pair)")
         try:
             if on:
                 dev.send_mic_state(True, muted=muted, headset_plugged=False)
@@ -1669,6 +1825,7 @@ class BridgeBackend(Backend):
             log.info("microphone %s", "armed" if on else "disarmed")
         except Exception as e:  # noqa: BLE001
             log.warning("mic arming failed: %s", e)
+            self._bb("bt.mic_arm.error", note=repr(e))
 
     def _disarm_mic_best_effort(self) -> None:
         if self._mic_armed.is_set():

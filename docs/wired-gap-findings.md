@@ -1,5 +1,20 @@
 # The wired gap: what the emulated DualSense still did differently
 
+> **2026-08-31 follow-up:** the fix below for symptom 1 created a new,
+> worse failure — libScePad titles powered the physical controller OFF when
+> the virtual pad appeared — because the served `0x09` MAC was the real
+> pad's own address. Root cause, capture evidence and the fix are in
+> **"Symptom 3 — TLOU powers the controller off"** at the end of this file.
+> The served MAC is now *derived from* rather than *equal to* the real one.
+>
+> **2026-09-01 follow-up:** with symptom 3 fixed, a mid-game pad
+> power-cycle surfaced the next layer: the re-bridged pad came back a
+> player slot later with rumble gone, because the app's disconnect
+> teardown unhid the raw pad and the running game grabbed it — a ghost
+> handle HidHide cannot sever. See **"Symptom 4 — after a mid-game
+> reconnect: player 3, and rumble is gone"**. The app now keeps the cloak
+> across a disconnect and hides before it attaches.
+
 **Date:** 2026-08-27
 **Method:** a real wired DualSense and this emulator, attached to the same
 machine at the same time, probed through the same `HidUsb` + `hidclass` stack,
@@ -235,6 +250,11 @@ from the same cache. The MAC in the served `0x09` is the bridged controller's
 own Bluetooth address, so a game that keys on it gets a genuine, stable,
 per-controller identity.
 
+> **Superseded 2026-08-31:** serving the *identical* address made libScePad
+> power the physical pad off (symptom 3, below). The served MAC is now the
+> controller's address with the locally-administered bit set — still stable
+> and per-controller, no longer a perfect twin.
+
 ### Making a Bluetooth report look like a wired one
 
 Forwarding the Bluetooth bytes verbatim would have been wrong in two ways, both
@@ -351,3 +371,291 @@ prototype\.venv\Scripts\python.exe emulator\tools\waveout_probe.py --match ... -
 
 Test suite: `226 tests, OK`
 (`cd emulator && ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t .`).
+
+---
+
+## Symptom 3 — TLOU powers the controller off when the virtual pad appears
+
+**Date:** 2026-08-31. **Status: root-caused with a byte-level capture, fixed,
+and verified on hardware in the same session.**
+
+### The report
+
+With The Last of Us Part I running and the bridge starting up (or a pad
+reconnecting mid-game), the physical controller **switched itself off**
+seconds after the virtual pad attached. 100 % reproducible with TLOU; never
+with Miles Morales or Genshin bridged; TLOU itself is fine on plain
+Bluetooth and on a real cable. The pad stayed off until the PS button was
+pressed — a genuine power-off, not a link hiccup.
+
+### What it was NOT (all chased first, all wrong)
+
+- not anything the bridge writes: the capture below shows **zero writes from
+  us** in the fatal window, and every write we did send was CRC-correct;
+- not the 0x39 audio stream, the sequence tags, the mic arming, or any
+  first-seconds translation issue;
+- not HidHide or the app layer's devnode logic: the kill reproduces with the
+  raw emulator, no tray, no HidHide, nothing hidden;
+- not a battery or radio problem: 80 % charge, same chair, same pad that
+  survives an hour of bridged Miles Morales.
+
+### The capture that settled it
+
+The emulator now carries a black-box flight recorder
+(`emulator/ds5emu/capture.py`, `--capture PREFIX` on `serve`): every
+host->device request and every post-translation Bluetooth write goes into a
+bounded ring that is dumped automatically the moment the Bluetooth link
+dies. One reproduction therefore preserves its own cause.
+
+The reproduction that mattered: **TLOU already running with the Bluetooth
+pad visible** (so the game holds an open handle to the raw BT device), then
+the emulator starts and the virtual pad attaches. The dump reads, in full
+(audio/heartbeat lines elided):
+
+```
++ 0.0989  bt.write         id=0x31 seq=0 crc=ok   (our audio-routing prime; pad fine for 15 s)
++15.4091  usb.set_interface iface=1 alt=0          (Windows enumerates the virtual pad)
++15.7232  usb.get_feature  id=0x09 len=20 -> 20B   (TLOU reads the MAC off the virtual pad)
++15.7496  bt.read.error    #1 OSError('read error')  <-- the PHYSICAL pad's link is
+                                                        already dying, 26 ms later
++15.7503  usb.set_feature  id=0x08  08 02 00 ... (48B)  (recorded, NOT forwarded)
++15.7532  link.death                                (pad off until the PS button)
+```
+
+Between the `0x09` read and the first read error the bridge wrote **nothing**
+to the controller. The kill went down **TLOU's own open handle to the raw
+Bluetooth pad**, which it had from before the virtual pad existed.
+
+### The mechanism
+
+libScePad de-duplicates controllers by the MAC address in feature `0x09` —
+the same read its whole registration hangs on (symptom 1). When it sees a
+*wired* DualSense whose MAC equals that of a *Bluetooth* DualSense it also
+has open, it concludes "one pad, two transports" and does exactly what a PS5
+does when the cable is plugged in: it tells the Bluetooth twin to drop its
+link. The command is feature report `0x08` — `DS_FEATURE_REPORT_BLUETOOTH_
+CONTROL` in the public research (nondebug/dualsense) — with action byte
+`0x02`; TLOU writes the identical `08 02 00...` to the virtual pad too,
+where the record-and-drop policy eats it. A DualSense told to drop its
+Bluetooth link with no console to fall back to simply powers off.
+
+Because the fix for symptom 1 served **the bridged controller's own
+Bluetooth address** in `0x09`, the virtual pad advertised itself as the
+physical pad's perfect twin. The de-duplication fired, and the "redundant"
+transport it killed was the only real link the bridge has.
+
+This also explains every boundary of the original report:
+
+- **why only libScePad titles**: Nixxes ports do their own HID handling and
+  no MAC de-duplication;
+- **why only when TLOU was already running** (or a pad reconnected
+  mid-game): the game needs a live handle to the *raw* Bluetooth device.
+  HidHide hides the device from new opens but does not sever handles a game
+  already holds — and on a reconnect there is a window before the tray
+  re-hides the returning pad in which the game can grab it;
+- **why plain Bluetooth and a real cable are fine**: no second pad with the
+  same MAC ever appears;
+- **why the first repro attempt failed**: TLOU was launched *after* the pad
+  was hidden, so it never held the raw handle.
+
+### The fix
+
+`emulator/ds5emu/bridge.py`: the MAC served in features `0x09` and `0x0b`
+now has the **locally-administered bit** of its first octet set
+(`WIRED_MAC_LA_BIT`; the MAC is little-endian at bytes [1..6], so the first
+textual octet is byte [6]). The identity stays stable and per-controller —
+it is derived from the real address by one deterministic bit — but can never
+collide with the address on the air, so the twin-match can never fire. Real
+Sony addresses are universally administered, so the bit is always a change.
+`distinct_wired_mac=False` on `BridgeBackend` restores the old behaviour for
+A/B-ing; it re-enables a proven kill and exists only for that.
+
+Defence in depth, already present and kept: a feature `0x08` write from the
+host is recorded and never forwarded, so even a title that aims the
+Bluetooth-control command at the virtual pad cannot reach the physical one.
+
+Measured, same session, same pad, same running TLOU:
+
+| served MAC | outcome |
+|---|---|
+| real address (old) | link dead **26 ms** after the game's `0x09` read; pad off until PS press; 2/2 runs |
+| derived address (new) | pad alive after 120 s+, game inputs flowing; TLOU's `08 02` still arrives at the virtual pad and is dropped |
+
+### Cosmetic residue, accepted
+
+- The factory-test channel's `READ_BDADR` (0x80, device 9 action 2) and the
+  BD address embedded deep in `0x20`/`0x22` still report the *real* address,
+  so a tool that cross-checks them against `0x09` can notice the one-bit
+  difference. Nothing observed does; the reports that matter for identity
+  are `0x09`/`0x0b` and they are consistent with each other.
+- `docs/identity-comparison.md`'s "byte-identical" claim now has a
+  deliberate, documented exception: one bit of the MAC, without which
+  libScePad titles power the controller off.
+
+### Files touched (2026-08-31)
+
+| file | change |
+|---|---|
+| `emulator/ds5emu/bridge.py` | derive the served MAC (`WIRED_MAC_LA_BIT`, `distinct_wired_mac`); black-box recording hooks on every host->device seam and Bluetooth write; auto-dump on link death |
+| `emulator/ds5emu/capture.py` | new — the black-box flight recorder (`--capture` on `serve`) |
+| `emulator/ds5emu/__main__.py` | the `--capture PREFIX` flag |
+| `emulator/tests/test_capture.py` | new — recorder contract + bridge wiring tests |
+| `emulator/tests/test_bridge.py` | MAC-derivation tests; the two `_feature_bytes` tests that asserted the identity MAC updated |
+
+Test suite: `243 tests, OK`.
+
+---
+
+## Symptom 4 — after a mid-game reconnect: player 3, and rumble is gone
+
+**Date:** 2026-09-01. **Status: mechanism identified (capture + source-level
+corroboration + a live counter-experiment), fixed structurally in the app
+layer, key property user-verified on hardware. Two nice-to-have
+verifications remain open — listed at the end.**
+
+### The report
+
+With TLOU running and a bridged pad working perfectly — full DualSense,
+rumble included — switching the pad off and on again mid-game brought it
+back *without rumble*. Haptics and adaptive triggers survived; classic
+rumble did not. The player LEDs told the story: first bridge = player 2,
+and after every reconnect cycle the re-bridged virtual pad advanced a slot
+(player 3), while the raw Bluetooth pad flashed player LEDs of its own in
+the seconds before the tray re-hid it. Same with either pad; a real wired
+pad never does any of this.
+
+### The mechanism: the ghost controller slot
+
+The app's disconnect teardown UNHID the pad. So the power-cycle went:
+
+1. pad off → child says offline → teardown (kill child → detach → **unhide**);
+2. pad on → it re-enumerates **visible** — and TLOU is still running;
+3. libScePad's watcher (1 s cadence) opens every visible pad immediately;
+   the raw Bluetooth pad gets a handle and a controller slot;
+4. the tray notices the pad, starts a new bridge, hides the raw pad again —
+   but HidHide only fails *new* opens (`IRP_MJ_CREATE`); **the handle the
+   game already holds keeps working**, so the slot stays occupied;
+5. the new virtual pad attaches and is assigned the *next* slot: player 3.
+
+Why that kills rumble: vibration in libScePad is routed **per handle/slot**
+(`scePadSetVibration(handle, …)`), and per-slot vibration-mode state
+(`scePadSetVibrationMode`: `EnableRumbleEmulation` /
+`EnableImprovedRumbleEmulation`) is what arms the compatible-vibration
+flags in the output reports. The game's rumble no longer reaches the slot
+the working virtual pad actually sits in. Haptics survive because they ride
+the *audio* path (Windows' default render endpoint follows the virtual
+audio device), and the triggers survive because trigger FFB is set on the
+handle the game reads input from.
+
+This is corroborated at source level by WujekFoliarz/duaLib (the public
+libScePad reimplementation): `watchFunc` assigns each newly seen device —
+deduplicated by the feature-0x09 MAC among entries whose *hid handle still
+answers* — to the FIRST slot whose handle is invalid; a slot whose open
+handle keeps answering `hid_read` is never freed, and a re-cloaked pad's
+ghost handle *keeps answering* precisely because HidHide cannot sever it
+(there is even a "restore half-valid controllers" pass that re-validates
+any entry whose handle still reads). Vibration and vibration mode are
+routed strictly by `sceHandle`.
+
+### The evidence
+
+Everything below is from black-box captures (`--capture`) on the raw
+emulator with TLOU live, 2026-08-31/09-01, pad `d42f4ba1485d`:
+
+- **Working state** (pad hidden BEFORE the game ever saw it): TLOU streams
+  output reports to the virtual pad with `validFlag0 = 0x0d` —
+  `COMPATIBLE_VIBRATION | RIGHT/LEFT_TRIGGER_FFB` — i.e. rumble armed on
+  our handle (2085 reports in one 25 s window; motor bytes zero because no
+  combat fell inside the ring's window).
+- **Player LEDs are being sent to the virtual pad**: on a mid-game BT
+  reconnect the bridge replayed the host's accumulated SetState with flags
+  `(0xff, 0xf7, 0x00)` — `validFlag1` bit `0x10` (PLAYER_INDICATOR) set.
+  The player-LED merge from the "stop losing player-LED writes" fix is
+  doing its job on this path.
+- **The live counter-experiment (the important one).** With the cloak KEPT
+  across a mid-game power-cycle — the pad re-enumerated *hidden*, the game
+  never saw the raw device — the pad came back with **everything working,
+  rumble included** (user-verified, the exact scenario that used to fail).
+  No ghost, no slot advance, no rumble loss.
+- **Instance-path stability**: across three off/on cycles in one session
+  the pad re-enumerated at the SAME instance path
+  (`…\8&2fde51c0&0&0000`), so a kept HidHide blacklist entry keeps
+  matching. (Churn — `&11&` re-enumeration suffixes — was only ever
+  observed after devnode *restarts*, i.e. revive's `pnputil` path, which
+  the kept cloak never triggers. The detection-time re-hide below covers
+  the churn case anyway.)
+- **Game exit powers off raw-held pads — expected, not ours.** When TLOU
+  exits it sends the feature-0x08 power-off down its own handles: a raw
+  Bluetooth pad it holds switches off (console behavior), and the same
+  command aimed at the *virtual* pad is recorded and dropped by the bridge
+  (`set_feature_report 0x08 … NOT forwarded`, present in the captures).
+  In both captured link deaths of this session, zero writes from the game
+  crossed the bridge to the physical pad in the fatal window.
+
+### The fix (app layer, `app/ds5app`)
+
+The raw pad must never be visible while a game might open it. Three
+structural changes, all in the working tree:
+
+1. **A disconnect teardown keeps the cloak** (`manager.stop(…,
+   keep_cloak=True)`, used by the offline and vanish teardowns, both now
+   hard). The pad re-enumerates already hidden and goes straight to
+   re-bridging — the race of step 2 above no longer exists. The journal
+   record is re-owned by the manager (`hidhide.adopt_record`) so no startup
+   sweep — the next child's included — reads the dead child's pid as an
+   abandoned hide. The debt is still repaid on every deliberate path:
+   - user Stop / per-controller disable / master switch off / hide toggle
+     off → unhide immediately (`_release_kept_cloak` covers the new
+     "cloak with no bridge" state the old switches would have missed);
+   - failed start (retry path) → unhide, as before;
+   - app exit → the final sweep clears manager-owned records
+     (`owner_alive` refuses the caller's own pid, by design);
+   - a crashed run → the next start's sweep unhides and revives, verified
+     live this session after an interrupted run.
+   The revive "power-cycle your pad" nag cannot fire for a kept cloak —
+   revive only runs on the unhide paths.
+2. **Hide before attach** (`service.BridgeService._start_inner`): the hide
+   moved from the last start step (after attach) to immediately after the
+   controller is selected — before the server even starts. The old "hidden
+   window == attached window" argument lost to measurement: the bring-up
+   takes seconds and libScePad opens a visible pad in under one.
+3. **Hide at detection time** (`manager.start()` pre-hides via
+   `hide_for_bridge` before the child process is even spawned): closes the
+   several-second child spawn/import window, and — because
+   `hide_for_bridge` resolves the serial fresh — re-applies the cloak to a
+   churned instance path on the spot. Auto-start now also only considers
+   serials the raw enumeration can see (the journal-vouched union stays,
+   but only for presence accounting), so a kept cloak can never be undone
+   by a doomed retry against a switched-off pad.
+
+### Verified, and what remains open
+
+Verified on hardware this session: mid-game power-cycle with the cloak kept
+→ **full DualSense including rumble after reconnect** (the exact failing
+case), instance-path reuse ×3, player-LED forwarding, 0x08 containment.
+
+Open, nice-to-have (the session was interrupted by a machine sleep before
+these could run):
+
+- a deliberate re-reproduction of the *broken* state under capture, to
+  diff the exact flag/motor bytes TLOU stops sending the player-3 pad
+  (the mechanism is established by the counter-experiment and the duaLib
+  source, but the byte-level "after" picture was not captured);
+- the clean-baseline LED count (with every raw pad cloaked before launch
+  the virtual pad should be player 1 — a single center LED, easy to miss;
+  the capture proves the LED bits reach the pad);
+- the end-to-end dev-tray run with two consecutive mid-game power-cycles
+  (the raw-emulator equivalent passed; the tray flow now shares the same
+  code path via `keep_cloak`).
+
+### Files touched (2026-09-01, symptom 4)
+
+| file | change |
+|---|---|
+| `app/ds5app/manager.py` | `stop(keep_cloak=)`, `_would_rebridge`, `_release_kept_cloak`, kept-cloak registry, pre-hide at detection, enumerated-only auto-start, hard vanish teardown |
+| `app/ds5app/service.py` | hide moved before server start/attach |
+| `app/ds5app/hidhide.py` | `adopt_record()` — re-own a journal record to keep a cloak alive |
+| `app/tests/test_manager.py` | `TestDisconnectKeepsTheCloak`, `TestKeptCloakRelease`, `TestPrehide`; the old "every stop unhides" test narrowed to deliberate stops |
+| `app/tests/test_hidhide.py` | `TestAdoptRecord`, `TestServiceStartOrdering` (hide before server before attach) |
+
+Test suites: emulator `243 tests, OK`; app `485 tests, OK`.

@@ -144,6 +144,11 @@ class _Base(unittest.TestCase):
         self.events: list = []
         #: Serials the manager asked to have unhidden, in order.
         self.unhidden: list = []
+        #: Serials whose cloak the manager chose to KEEP across a disconnect
+        #: (journal record adopted rather than unhidden), in order.
+        self.adopted: list = []
+        #: Serials the manager pre-hid before spawning their child, in order.
+        self.prehidden: list = []
         #: One entry per exit sweep the manager ran.
         self.swept: list = []
         self._before_hooks = list(S.ON_TEARDOWN)
@@ -172,6 +177,10 @@ class _Base(unittest.TestCase):
         # would have their own controller unhidden by a green test run.
         kw.setdefault("hidden_serials", lambda: [])
         kw.setdefault("unhide_serial", lambda s: self.unhidden.append(s))
+        # Same reasoning: a disconnect teardown re-owns the real journal
+        # record, and a pre-hide would cloak the developer's own controller.
+        kw.setdefault("adopt_record", lambda s: self.adopted.append(s))
+        kw.setdefault("prehide_serial", lambda s: self.prehidden.append(s))
         # Same reasoning for the exit sweep: it reads the real journal and
         # unhides anything whose owner is gone, which on a developer's machine
         # is their own controller.
@@ -1087,7 +1096,7 @@ class TestOfflineTeardown(_Base):
         self.assertIsNot(m._bridges[A], first)
         self.assertEqual(m.snapshot()["controllers"][A]["state"], M.RUNNING)
 
-    def test_every_stop_repays_the_hide_debt_the_child_may_not_have(self):
+    def test_a_deliberate_stop_repays_the_hide_debt_the_child_may_not_have(self):
         """A tray host has no console, so its children die without unhiding.
 
         `ChildBridge.stop()` is then a `TerminateProcess`: no atexit, no
@@ -1100,9 +1109,216 @@ class TestOfflineTeardown(_Base):
         m.start(B)
         m.stop(B)
         self.assertEqual(self.unhidden, [B])
+
+
+class TestDisconnectKeepsTheCloak(_Base):
+    """Symptom 4 (docs/wired-gap-findings.md): a disconnect must NOT unhide.
+
+    Unhiding on a disconnect teardown is what handed a running libScePad game
+    the raw Bluetooth pad for the seconds between power-on and the next
+    bridge's hide. The game opens it instantly, HidHide cannot sever a handle
+    already held, and the ghost keeps a controller slot forever -- the
+    re-bridged pad came back as player 3 with its rumble aimed at the ghost.
+    So a teardown whose cause is "the controller went away" keeps the cloak
+    (adopting the journal record so no sweep reads it as abandoned), and only
+    the deliberate paths -- user Stop, hide toggle, Quit, exit sweep -- unhide.
+    """
+
+    def test_an_offline_teardown_keeps_the_cloak(self):
+        m = self.make(offline_grace=0.0)
+        m.start(A)
         m._bridges[A].go_offline()
         m.poll_once()
-        self.assertEqual(self.unhidden, [B, A])
+        self.assertNotIn(A, m._bridges)
+        self.assertEqual(self.unhidden, [],
+                         "a disconnect teardown unhid the pad -- the ghost-slot "
+                         "race is back")
+        self.assertEqual(self.adopted, [A])
+
+    def test_a_vanish_teardown_keeps_the_cloak_and_is_hard(self):
+        m = self.make(vanish_grace=0.0)
+        m.start(A)
+        b = m._bridges[A]
+        self.present = []
+        m.poll_once()
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+        self.assertEqual(self.unhidden, [])
+        self.assertEqual(self.adopted, [A])
+        self.assertTrue(b.stopped_hard,
+                        "a polite stop would let the child run its own "
+                        "unconditional unhide")
+
+    def test_a_user_stop_still_unhides(self):
+        m = self.make()
+        m.start(A)
+        m.stop(A)
+        self.assertEqual(self.unhidden, [A])
+        self.assertEqual(self.adopted, [])
+
+    def test_disabling_a_controller_still_unhides(self):
+        m = self.make()
+        m.start(A)
+        m.set_enabled(A, False)
+        self.assertEqual(self.unhidden, [A])
+        self.assertEqual(self.adopted, [])
+
+    def test_the_master_switch_still_unhides(self):
+        m = self.make()
+        m.start(A)
+        m.set_master_enabled(False)
+        self.assertEqual(self.unhidden, [A])
+        self.assertEqual(self.adopted, [])
+
+    def test_no_rebridge_means_no_kept_cloak(self):
+        """A cloak is only kept for a pad something will re-hide later.
+
+        A disabled controller would never be re-bridged, so keeping its cloak
+        would strand the user with an invisible pad until the app exits.
+        """
+        m = self.make(offline_grace=0.0)
+        m.start(A)
+        m._bridges[A].go_offline()
+        with m._lock:
+            m._enabled[A] = False
+        m.poll_once()
+        self.assertEqual(self.unhidden, [A])
+        self.assertEqual(self.adopted, [])
+
+    def test_a_kept_cloak_does_not_retry_a_pad_that_is_not_enumerable(self):
+        """The journal vouches for presence, not for bridgeability.
+
+        After a keep-cloak teardown the serial stays in the vouched-for union
+        (rule 3 needs that), but a start attempt against a pad that is not
+        enumerable fails -- and `_record_failure` unhides, which would hand the
+        game the raw device the kept cloak exists to withhold. So the start
+        loop only ever starts serials the raw enumeration can see.
+        """
+        m = self.make(offline_grace=0.0, retry_after=0.0,
+                      hidden_serials=lambda: [A])
+        m.start(A)
+        m._bridges[A].go_offline()
+        self.present = []                      # switched off: not enumerable
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+        for _ in range(3):
+            m.poll_once()
+        self.assertNotIn(A, m._bridges,
+                         "a vouched-only serial was auto-started")
+        self.assertEqual(self.unhidden, [])
+
+    def test_the_returning_pad_is_bridged_and_rehidden_at_detection(self):
+        """Power the pad back on: it must be re-bridged, hidden first.
+
+        The pre-hide at detection time is also what re-applies the cloak when
+        the instance path churned across the reconnect -- `hide_for_bridge`
+        resolves the serial fresh, so a stale blacklist entry cannot leave the
+        new devnode visible for the life of the child spawn.
+        """
+        self.present = [A]
+        m = self.make(offline_grace=0.0, retry_after=999.0,
+                      hide_bluetooth={A: True})
+        m.start(A)
+        self.assertEqual(self.prehidden, [A])
+        m._bridges[A].go_offline()
+        self.present = []                      # pad off, not enumerable
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+        self.assertEqual(self.adopted, [A])
+        self.present = [A]                     # pad back on
+        m.poll_once()                          # the absent->present edge clears
+        self.assertIn(A, m._bridges, "the retry backoff outlived the return")
+        self.assertEqual(self.prehidden, [A, A])
+        self.assertEqual(self.unhidden, [])
+
+
+class TestKeptCloakRelease(_Base):
+    """A kept cloak has no bridge, so `stop()` alone can never repay it.
+
+    Every deliberate off switch must release it anyway -- otherwise "stop
+    bridging/hiding this pad" quietly leaves the pad invisible until app exit.
+    """
+
+    def keep_one(self, m):
+        """Drive A into the kept-cloak state: offline teardown, cloak kept."""
+        self.present = [A]                     # keep hotplug's hands off B
+        m.start(A)
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertEqual(self.adopted, [A])
+        self.assertEqual(self.unhidden, [])
+
+    def test_disabling_the_controller_releases_a_kept_cloak(self):
+        m = self.make(offline_grace=0.0)
+        self.keep_one(m)
+        m.set_enabled(A, False)
+        self.assertEqual(self.unhidden, [A])
+
+    def test_the_master_switch_releases_kept_cloaks(self):
+        m = self.make(offline_grace=0.0)
+        self.keep_one(m)
+        m.set_master_enabled(False)
+        self.assertEqual(self.unhidden, [A])
+
+    def test_the_hide_toggle_releases_a_kept_cloak_with_nothing_running(self):
+        m = self.make(offline_grace=0.0, hide_bluetooth={A: True})
+        self.keep_one(m)
+        m.set_hide_bluetooth(A, False)
+        self.assertEqual(self.unhidden, [A])
+
+    def test_toggling_hide_on_while_kept_does_not_unhide(self):
+        m = self.make(offline_grace=0.0, hide_bluetooth={A: True})
+        self.keep_one(m)
+        m.set_hide_bluetooth(A, True)
+        self.assertEqual(self.unhidden, [])
+
+    def test_a_restart_takes_the_cloak_back_without_unhiding(self):
+        """The pad returns: the new child owns the cloak, nothing unhides,
+        and a LATER disable releases through the normal stop path only."""
+        m = self.make(offline_grace=0.0, retry_after=0.0)
+        self.keep_one(m)
+        m.poll_once()                           # pad still enumerated: restart
+        self.assertIn(A, m._bridges)
+        self.assertEqual(self.unhidden, [])
+        m.set_enabled(A, False)                 # stop unhides; release is a no-op
+        self.assertEqual(self.unhidden, [A])
+
+    def test_release_is_scoped_to_what_this_manager_kept(self):
+        """A sibling process's journal entry must never be released by us."""
+        m = self.make(offline_grace=0.0, hidden_serials=lambda: [A, B])
+        self.keep_one(m)
+        m.set_master_enabled(False)
+        self.assertEqual(self.unhidden, [A],
+                         "B's cloak belongs to another process and was "
+                         "unhidden anyway")
+
+
+class TestPrehide(_Base):
+    def test_start_prehides_only_when_hiding_is_on(self):
+        m = self.make(hide_bluetooth={A: True, B: False})
+        m.start(A)
+        m.start(B)
+        self.assertEqual(self.prehidden, [A])
+
+    def test_a_prehide_failure_does_not_stop_the_start(self):
+        def boom(serial):
+            raise RuntimeError("HidHide exploded")
+
+        m = self.make(hide_bluetooth={A: True}, prehide_serial=boom)
+        self.assertTrue(m.start(A))
+        self.assertIn(A, m._bridges)
+
+    def test_the_prehide_happens_before_the_child_spawns(self):
+        order = []
+
+        def factory(*a, **kw):
+            order.append("spawn")
+            return FakeBridge(*a, **kw)
+
+        m = self.make(hide_bluetooth={A: True}, bridge_factory=factory,
+                      prehide_serial=lambda s: order.append("hide"))
+        m.start(A)
+        self.assertEqual(order, ["hide", "spawn"])
 
     def test_an_offline_bridge_is_still_counted_present_while_it_lives(self):
         """Otherwise the tray's own arithmetic goes negative mid-dropout."""

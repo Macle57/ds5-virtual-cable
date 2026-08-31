@@ -499,16 +499,19 @@ class FactoryTestFeatureTests(unittest.TestCase):
     def test_the_bluetooth_crc_trailer_is_zeroed(self):
         # A wired DualSense ends 0x05/0x09/0x0b/0x20/0x22 in four zero bytes;
         # the Bluetooth unit ends them in a CRC-32. Measured, both, 2026-08-27.
-        for rid in (0x05, 0x09, 0x20, 0x22):
+        # 0x09 also carries the controller MAC, which is separately derived --
+        # see test_the_served_mac_is_never_the_real_mac -- so it is exercised
+        # there, not here.
+        for rid in (0x05, 0x20, 0x22):
             raw = bytes([rid]) + b"\x5a" * 35 + b"\xde\xad\xbe\xef"
-            got = B.BridgeBackend._feature_bytes(rid, raw)
+            got = self.be._feature_bytes(rid, raw)
             self.assertEqual(len(got), len(raw), f"0x{rid:02x} changed length")
             self.assertEqual(got[-4:], b"\x00\x00\x00\x00")
             self.assertEqual(got[:-4], raw[:-4])
 
     def test_a_report_with_no_crc_trailer_is_left_alone(self):
         raw = bytes([0x81]) + b"\x5a" * 63
-        self.assertEqual(B.BridgeBackend._feature_bytes(0x81, raw), raw)
+        self.assertEqual(self.be._feature_bytes(0x81, raw), raw)
 
     def test_0x0b_keeps_the_two_macs_and_drops_the_link_key(self):
         # Bluetooth 0x0b carries a pairing-slot count and link-key material
@@ -517,16 +520,51 @@ class FactoryTestFeatureTests(unittest.TestCase):
         # the pairing material to anything that can open the HID device.
         raw = (bytes([0x0B]) + b"\x11" * 6 + b"\x08\x25\x00\x00" + b"\x22" * 6
                + b"\x99" * 25)
-        got = B.BridgeBackend._feature_bytes(0x0B, raw)
+        got = self.be._feature_bytes(0x0B, raw)
         self.assertEqual(len(got), len(raw))
-        self.assertEqual(got[:B.FEATURE_0B_WIRED_PREFIX],
-                         raw[:B.FEATURE_0B_WIRED_PREFIX])
-        self.assertEqual(got[1:7], b"\x11" * 6)      # controller MAC kept
+        self.assertEqual(got[1:6], b"\x11" * 5)      # controller MAC kept ...
+        self.assertEqual(got[6], 0x11 | B.WIRED_MAC_LA_BIT)  # ... but derived
+        self.assertEqual(got[7:11], b"\x08\x25\x00\x00")
         self.assertEqual(got[11:17], b"\x22" * 6)    # host MAC kept, in full
         self.assertEqual(set(got[B.FEATURE_0B_WIRED_PREFIX:]), {0})
 
+    def test_the_served_mac_is_never_the_real_mac(self):
+        """The fix for the TLOU power-off (2026-08-31, see WIRED_MAC_LA_BIT).
+
+        libScePad de-duplicates pads by the MAC in feature 0x09, and its
+        response to "this wired pad IS that Bluetooth pad" is to power the
+        Bluetooth one off, exactly as a PS5 does when the cable goes in.
+        Captured live: TLOU reads 0x09 off the virtual pad and 26 ms later the
+        physical pad's link is dead, killed through the game's own handle --
+        no write of ours in between. So the identity served over the virtual
+        cable must differ from the identity on the air, while remaining stable
+        and per-controller: the locally-administered bit of the first MAC
+        octet (byte [6]; the MAC is little-endian at [1..6]).
+        """
+        for rid in (0x09, 0x0B):
+            raw = bytes([rid]) + b"\x11" * 6 + b"\x5a" * 30 + bytes(4)
+            got = self.be._feature_bytes(rid, raw)
+            self.assertNotEqual(got[1:7], raw[1:7],
+                                f"0x{rid:02x} served the real MAC")
+            self.assertEqual(got[6], 0x11 | B.WIRED_MAC_LA_BIT)
+            self.assertEqual(got[1:6], raw[1:6])   # only the one bit differs
+
+    def test_distinct_wired_mac_false_serves_the_real_mac(self):
+        # The opt-out exists for A/B-ing the bug; it re-enables a proven kill
+        # and must stay off in production.
+        be = B.BridgeBackend(distinct_wired_mac=False)
+        raw = bytes([0x09]) + b"\x11" * 6 + b"\x5a" * 9 + bytes(4)
+        self.assertEqual(be._feature_bytes(0x09, raw)[1:7], raw[1:7])
+
+    def test_the_mac_bit_is_only_applied_to_the_mac_reports(self):
+        # 0x20/0x22 also contain the BD address (deeper in), but nothing
+        # observed de-duplicates on them; they stay byte-faithful.
+        raw = bytes([0x20]) + b"\x11" * 35 + bytes(4)
+        got = self.be._feature_bytes(0x20, raw)
+        self.assertEqual(got[1:7], raw[1:7])
+
     def test_the_report_id_is_prepended_when_hidapi_omits_it(self):
-        got = B.BridgeBackend._feature_bytes(0x81, b"\x00" * 63)
+        got = self.be._feature_bytes(0x81, b"\x00" * 63)
         self.assertEqual(got[0], 0x81)
         self.assertEqual(len(got), 64)
 
