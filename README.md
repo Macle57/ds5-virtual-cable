@@ -110,13 +110,33 @@ hub on the machine while it does.
 
 Two ways.
 
-**The easy way** — the packaged app, if a release is available for your
-platform: download it, install usbip-win2, run the tray. It bridges every
-controller that is switched on, picks up ones you turn on later, and can start
-itself when you log in — so after setup the routine is "turn the controller on,
-start the game". A tray menu switches any controller (or all of them) back to
-plain Bluetooth when you would rather a game used the native stack.
-Step-by-step instructions with screenshots live in the user guide
+**The easy way** — one line, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1 | iex
+```
+
+That does the whole list above in one pass: creates the restore point, installs
+the pinned usbip-win2 **0.9.7.7** silently (SHA-256-verified, never 0.9.7.8),
+installs HidHide (optional — it only powers "hide the Bluetooth pad while
+bridged", and a failure there is a warning, not a stop), then puts the latest
+ds5bridge release in `%LOCALAPPDATA%\ds5bridge`, checksum-verified, with a
+Start Menu shortcut and the tray running at the end. Re-running it is safe —
+every step checks whether its work is already done. To see the full plan
+without changing anything:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1))) -DryRun
+```
+
+The tray bridges every controller that is switched on, picks up ones you turn
+on later, and can start itself when you log in — so after setup the routine is
+"turn the controller on, start the game". A tray menu switches any controller
+(or all of them) back to plain Bluetooth when you would rather a game used the
+native stack. It also checks GitHub once a day for a newer release and offers
+it as a menu item — one click updates in place, checksum-verified again
+(`update_check: false` in the config turns the check off). Step-by-step
+instructions, options and the uninstaller live in the user guide
 (`docs/USER-GUIDE.md`).
 
 **From source:**
