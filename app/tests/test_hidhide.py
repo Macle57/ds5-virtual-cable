@@ -549,6 +549,59 @@ class TestJournal(_Temp):
         self.assertEqual(sorted(HH.hidden_serials()), sorted([SERIAL, OTHER]))
 
 
+class TestAdoptRecord(_Temp):
+    """Keeping a cloak across a disconnect must not look like abandonment.
+
+    The manager keeps the HidHide cloak when a bridged pad is switched off
+    (symptom 4), but the journal record was written by the now-dead child --
+    and `sweep()`, which every process start runs, unhides anything whose
+    owner is gone. Adoption rewrites the record with the caller's own pid so
+    the kept cloak survives exactly as long as the process that decided to
+    keep it.
+    """
+
+    def test_adoption_takes_over_the_pid_and_keeps_everything_else(self):
+        # A record as a dead child would leave it: someone else's pid.
+        HH.write_record(SERIAL, IDS, cloak_enabled_by_us=True,
+                        parent_id="BTHENUM\\X\\Y")
+        path = os.path.join(self.journal(), f"{SERIAL}.json")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["pid"] = 99999999
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        self.assertTrue(HH.adopt_record(SERIAL))
+        rec = HH.read_records()[0]
+        self.assertEqual(rec["pid"], os.getpid())
+        self.assertEqual(rec["instance_ids"], IDS)
+        self.assertEqual(rec["parent_id"], "BTHENUM\\X\\Y")
+        self.assertTrue(rec["cloak_enabled_by_us"])
+
+    def test_no_record_is_a_harmless_no(self):
+        """Hiding was off for this pad: nothing to keep, nothing to create."""
+        self.assertFalse(HH.adopt_record(SERIAL))
+        self.assertEqual(HH.read_records(), [])
+
+    def test_only_the_named_serial_is_adopted(self):
+        HH.write_record(OTHER, IDS)
+        self.assertFalse(HH.adopt_record(SERIAL))
+        self.assertEqual([r["serial"] for r in HH.read_records()], [OTHER])
+
+    def test_an_adopted_record_still_falls_to_the_owner_exit_sweep(self):
+        """`owner_alive` refuses our own pid, so the adopter's exit sweep --
+        and the next run's startup sweep after a crash -- both still clear it.
+        That is the property that makes keeping a cloak safe at all."""
+        HH.write_record(SERIAL, IDS)
+        HH.adopt_record(SERIAL)
+        self.assertFalse(HH.owner_alive(HH.read_records()[0]))
+
+    def test_never_raises(self):
+        with mock.patch.object(HH, "read_records",
+                               side_effect=RuntimeError("boom")):
+            self.assertFalse(HH.adopt_record(SERIAL))
+
+
 class TestRecordBeforeHide(_Temp):
     """The single most important ordering in this feature."""
 
@@ -1134,6 +1187,75 @@ class TestServiceStopPaths(_Temp):
                               hidhide_cli=r"C:\x\HidHideCLI.exe")
         self.assertTrue(s.hide_bluetooth)
         self.assertEqual(s.hidhide_cli, r"C:\x\HidHideCLI.exe")
+
+
+@unittest.skipIf(SVC is None, "the hardware stack is not importable here")
+class TestServiceStartOrdering(_Temp):
+    """The hide precedes the server start, which precedes the attach.
+
+    Symptom 4 (docs/wired-gap-findings.md): hiding used to be the LAST start
+    step, after the attach, which left the raw Bluetooth pad visible to a
+    running game for the whole bring-up -- seconds, and a libScePad title
+    opens a visible pad in far less. HidHide cannot sever the handle the game
+    then holds, and the ghost burns a controller slot for the life of the
+    game. The pad's identity is known the moment the controller is selected,
+    so that is when it disappears.
+    """
+
+    def test_hide_runs_before_the_server_and_the_attach(self):
+        order = []
+
+        class Pad:
+            serial = SERIAL
+            battery_percent = None
+            battery_state = ""
+
+            def describe(self):
+                return SERIAL
+
+        class FakeU:
+            exe = "usbip.exe"
+
+            def __init__(self, *a, **kw):
+                self.attached = False
+
+            def version(self):
+                return "test"
+
+            def stop_auto_reattach(self):
+                pass
+
+            def our_ports(self):
+                return [1] if self.attached else []
+
+            def attach(self):
+                self.attached = True
+                order.append("attach")
+
+                class R:
+                    ok = True
+                    code = 0
+                    out = ""
+                return R()
+
+        class Backend:
+            stats = {"input_delivered": 0}
+
+        s = SVC.BridgeService(serial=SERIAL, port=39997, hide_bluetooth=True)
+        self.addCleanup(s._lock_file.release)
+        s._hide = lambda: (order.append("hide") or list(IDS))
+
+        def fake_server():
+            order.append("server")
+            s._backend = Backend()
+
+        s._start_server = fake_server
+        with mock.patch.object(SVC, "Usbip", FakeU), \
+                mock.patch.object(SVC.C, "select", lambda serial: Pad()), \
+                mock.patch.object(SVC.C, "BatteryWatcher"):
+            s._start_inner()
+        self.assertEqual(order, ["hide", "server", "attach"])
+        self.assertEqual(s._hidden_ids, IDS)
 
 
 @unittest.skipIf(SVC is None, "the hardware stack is not importable here")

@@ -1825,6 +1825,52 @@ def remove_record(serial_or_path: str) -> None:
         pass
 
 
+def adopt_record(serial: str) -> bool:
+    """Re-own an existing hide record from THIS process, keeping the cloak.
+
+    The disconnect half of the 2026-08-31 "player 3, no rumble" bug
+    (`docs/wired-gap-findings.md`, symptom 4). When a bridged controller is
+    switched off mid-game, tearing the bridge down used to unhide it -- so the
+    pad re-enumerated *visible*, the game grabbed the raw Bluetooth device in
+    the seconds before the next bridge re-hid it, and from then on the game
+    held a ghost controller slot. The structural fix is to keep the cloak
+    across the disconnect, so a returning pad re-enumerates already hidden and
+    goes straight to bridging.
+
+    But a kept cloak must not look abandoned. The journal record was written
+    by the (now dead) bridge child, and `sweep()` -- which every process start
+    runs, including the NEXT bridge child's -- unhides anything whose owner is
+    gone. So the manager that decided to keep the cloak rewrites the record
+    with its own pid. `owner_alive()` then vouches for it exactly as long as
+    the manager lives:
+
+    * a sibling child starting meanwhile leaves it alone (owner alive);
+    * the manager's own exit sweep clears it (`owner_alive` refuses
+      `os.getpid()`, deliberately -- our own records are our own debt);
+    * a crashed manager leaves a dead pid, and the next start's sweep
+      unhides and revives as it always did.
+
+    Everything else in the record -- the instance IDs, the Bluetooth parent,
+    `cloak_enabled_by_us` -- is preserved verbatim. Returns False (harmless)
+    when there is no record: hiding was off, so there is no cloak to keep.
+    Never raises.
+    """
+    serial = (serial or "").strip().lower()
+    if not serial:
+        return False
+    try:
+        for rec in read_records():
+            if (rec.get("serial") or "").lower() == serial:
+                return write_record(
+                    serial,
+                    [i for i in (rec.get("instance_ids") or []) if i],
+                    cloak_enabled_by_us=bool(rec.get("cloak_enabled_by_us")),
+                    parent_id=(rec.get("parent_id") or "").strip())
+    except Exception:  # noqa: BLE001
+        log.exception("adopting the hide record for %s failed", serial)
+    return False
+
+
 def journal_count() -> int:
     return len(read_records())
 

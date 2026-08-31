@@ -535,17 +535,41 @@ class BridgeService:
         else:
             self._emit("info", note)
 
-        # 4-5. the server, on its own thread, and wait for it to listen
+        # 4. hide the real Bluetooth pad, if asked -- BEFORE the server opens
+        # and long before the attach. This used to be the last step, after the
+        # attach, on the argument that the hidden window should be exactly the
+        # window the virtual replacement exists. That ordering is what handed a
+        # running game the raw Bluetooth pad for the several seconds of server
+        # start + attach + enumeration: libScePad titles open every pad the
+        # moment it is visible, HidHide cannot sever a handle already held, and
+        # the ghost handle keeps a controller slot for the rest of the game's
+        # life (docs/wired-gap-findings.md, symptom 4 -- the re-bridged pad
+        # came back as player 3 with no rumble). So the pad is now hidden the
+        # moment its identity is known, and the "window" argument yields: if
+        # anything below fails, `start()` runs `stop(quiet=True)` and stop's
+        # unconditional unhide repays this immediately.
+        #
+        # Wrapped: `hide_for_bridge` already returns [] rather than raising for
+        # every failure, and this is belt and braces on top of that, because
+        # bridging is the product and hiding is not.
+        if self.hide_bluetooth:
+            try:
+                self._hidden_ids = self._hide()
+            except Exception:  # noqa: BLE001
+                log.exception("hiding the Bluetooth pad failed")
+                self._hidden_ids = []
+
+        # 5-6. the server, on its own thread, and wait for it to listen
         self._start_server()
 
-        # 6. attach
+        # 7. attach
         self._emit("info", "attaching the virtual controller ...")
         res = self.usbip.attach()
         if not res.ok:
             raise RuntimeError(
                 f"usbip attach failed (exit {res.code}): {res.out.strip()}")
 
-        # 7. verify -- `usbip port` prints nothing at all when nothing is attached
+        # 8. verify -- `usbip port` prints nothing at all when nothing is attached
         ports: list[int] = []
         for _ in range(20):
             ports = self.usbip.our_ports()
@@ -576,19 +600,6 @@ class BridgeService:
         self.state = RUNNING
         self._emit("ready",
                    f"virtual wired DualSense attached (controller {self.serial})")
-
-        # 8. hide the real Bluetooth pad, if asked. AFTER the attach succeeded,
-        # so a hide can never be the reason a bridge did not come up, and so the
-        # window in which something is hidden is exactly the window in which the
-        # virtual replacement exists. Wrapped: `hide_for_bridge` already returns
-        # [] rather than raising for every failure, and this is belt and braces
-        # on top of that, because bridging is the product and hiding is not.
-        if self.hide_bluetooth:
-            try:
-                self._hidden_ids = self._hide()
-            except Exception:  # noqa: BLE001
-                log.exception("hiding the Bluetooth pad failed")
-                self._hidden_ids = []
 
         self._battery = C.BatteryWatcher(
             self._backend,
@@ -737,9 +748,9 @@ class BridgeService:
 
     # -- HidHide -----------------------------------------------------------
     #
-    # Two thin seams rather than direct calls, so `test_service.py` can watch
-    # the ORDERING (hide only after attach; unhide before detach; unhide on
-    # every stop path) with no driver and no hardware.
+    # Two thin seams rather than direct calls, so the tests can watch the
+    # ORDERING (hide before the server starts, let alone attaches; unhide
+    # before detach; unhide on every stop path) with no driver and no hardware.
 
     def _hide(self) -> list[str]:
         from . import hidhide as HH

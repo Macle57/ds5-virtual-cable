@@ -300,6 +300,57 @@ def _unhide_serial(serial: str, cli_override: str | None = None,
         return False
 
 
+def _adopt_record(serial: str) -> bool:
+    """Keep one controller's cloak alive across a disconnect. Never raises.
+
+    The other verb a stopping bridge can apply to its hide debt. A DISCONNECT
+    teardown -- the pad was switched off, and this manager will re-bridge it
+    the moment it returns -- must NOT unhide: the pad would re-enumerate
+    visible, and a game that is already running grabs the raw Bluetooth device
+    in the seconds before the next bridge re-hides it. That ghost handle is a
+    controller slot the game never gives back (docs/wired-gap-findings.md,
+    symptom 4: the re-bridged pad came back as player 3 with no rumble).
+
+    So the cloak is kept, and the journal record is re-owned by THIS process
+    (`hidhide.adopt_record`) so that no sweep -- not the next child's startup
+    sweep, not a sibling's -- reads the dead child's pid as an abandoned hide.
+    The debt is still repaid on every deliberate path: a user Stop, the hide
+    toggle, Quit and the exit sweep all unhide exactly as before.
+    """
+    try:
+        from . import hidhide as HH
+
+        return HH.adopt_record(serial)
+    except Exception:  # noqa: BLE001
+        log.debug("could not adopt the hide record for %s", serial,
+                  exc_info=True)
+        return False
+
+
+def _prehide_serial(serial: str, cli_override: str | None = None,
+                    log_fn=None) -> list[str]:
+    """Hide one controller from THIS process, before its child even spawns.
+
+    `BridgeService` hides too (it must -- a bare `ds5bridge run` has no
+    manager), but a child process takes seconds to spawn, import and attach,
+    and for all of them a freshly appeared pad used to sit visible next to a
+    running game. Hiding at DETECTION time -- the moment the hotplug pass
+    decides to start a bridge -- closes most of that window, and it also
+    re-applies the cloak to a devnode whose instance path churned across the
+    reconnect (HidHide matches by instance path; `hide_for_bridge` resolves
+    fresh every time). Idempotent: the child's own hide then finds everything
+    already in the blacklist and merely re-owns the journal record.
+    """
+    try:
+        from . import hidhide as HH
+
+        return HH.hide_for_bridge(serial, cli_override=cli_override,
+                                  log_fn=log_fn)
+    except Exception:  # noqa: BLE001
+        log.debug("could not pre-hide %s", serial, exc_info=True)
+        return []
+
+
 def _sweep_hidhide(log_fn=None) -> int:
     """Unhide anything whose owning process is gone. Never raises. -> how many.
 
@@ -719,6 +770,8 @@ class BridgeManager:
                  port_free=None,
                  hidden_serials=None,
                  unhide_serial=None,
+                 adopt_record=None,
+                 prehide_serial=None,
                  sweep_fn=None,
                  usbip_factory=None,
                  on_event=None,
@@ -800,6 +853,17 @@ class BridgeManager:
             lambda serial: _unhide_serial(
                 serial, cli_override=self.hidhide_cli,
                 log_fn=lambda t: self._emit(serial, "info", t)))
+        #: What a DISCONNECT teardown does instead of unhiding: keep the cloak
+        #: and re-own its journal record, so the pad comes back already hidden
+        #: and a running game never sees the raw Bluetooth device. Injected for
+        #: the same reason as `unhide_serial`.
+        self._adopt_record = adopt_record or _adopt_record
+        #: Hiding at detection time, before the child spawns. Injected so a
+        #: test run never cloaks the developer's own controller.
+        self._prehide_serial = prehide_serial or (
+            lambda serial: _prehide_serial(
+                serial, cli_override=self.hidhide_cli,
+                log_fn=lambda t: self._emit(serial, "info", t)))
         #: The last-resort unhide, run once on the way out with everything
         #: already stopped. Injected for the same reason as the two above: a
         #: green test run must never unhide the developer's own controller.
@@ -840,6 +904,15 @@ class BridgeManager:
         #: job is to spot the absent -> present edge, which is the moment a
         #: retry backoff stops being justified: see `poll_once`.
         self._seen_last: set = set()
+        #: Serials whose HidHide cloak THIS manager kept across a disconnect
+        #: (`stop(keep_cloak=True)`). A kept cloak has no bridge and no child,
+        #: so nothing else will repay it if the user then turns bridging or
+        #: hiding OFF for that pad -- the deliberate-release paths all used to
+        #: stop at "nothing is running". Tracked in memory, deliberately NOT
+        #: read from the journal: the journal also lists cloaks owned by OTHER
+        #: live processes (a `ds5bridge run` in a terminal), which this
+        #: manager must never unhide.
+        self._kept_cloaks: set = set()
         #: Serials the CALLER stopped. Found on hardware: `stop(serial)` used to
         #: be undone by the very next hotplug pass five seconds later, because
         #: the controller was obviously still enumerated -- so "Stop" in a tray
@@ -931,6 +1004,11 @@ class BridgeManager:
                 self.start(serial)
         else:
             self.stop(serial)
+            # The stop above unhides only what it stopped. A cloak KEPT across
+            # a disconnect has no bridge, and disabling the controller is the
+            # user saying it will not be re-bridged -- the one promise the
+            # kept cloak was resting on.
+            self._release_kept_cloak(serial)
 
     def is_hiding(self, serial: str) -> bool:
         with self._lock:
@@ -956,6 +1034,12 @@ class BridgeManager:
             running = serial in self._bridges
         self.on_hide_changed(serial, bool(hide))
         if not running:
+            if not hide:
+                # A cloak can outlive its bridge now (kept across a
+                # disconnect). Turning the hide toggle OFF must release it
+                # even with nothing running, or the user's "stop hiding this
+                # pad" quietly waits for the next app exit.
+                self._release_kept_cloak(serial)
             return
         try:
             from . import hidhide as HH
@@ -982,6 +1066,13 @@ class BridgeManager:
             self.start_all()
         else:
             self.stop_all()
+            # Kept cloaks belong to pads with no bridge, which `stop_all()`
+            # therefore never visits. The master switch is "stop bridging,
+            # full stop", so they are released too.
+            with self._lock:
+                kept = list(self._kept_cloaks)
+            for serial in kept:
+                self._release_kept_cloak(serial)
 
     # -- start / stop ------------------------------------------------------
 
@@ -1006,6 +1097,17 @@ class BridgeManager:
             self._held.discard(serial)
             self._errors.pop(serial, None)
         try:
+            # Hide FIRST, before the child process even exists. The child hides
+            # too (a bare `ds5bridge run` has no manager), but it takes seconds
+            # to spawn and attach, and a game that is already running grabs a
+            # visible pad in far less -- the ghost-slot bug of symptom 4. This
+            # is also what re-applies the cloak when the instance path churned
+            # across a reconnect: `hide_for_bridge` resolves the serial fresh.
+            if self.is_hiding(serial):
+                try:
+                    self._prehide_serial(serial)
+                except Exception:  # noqa: BLE001
+                    log.exception("pre-hiding %s failed", serial)
             port = self.port_for(serial)
             b = self._bridge_factory(serial, port,
                                      self._child_command(serial, port),
@@ -1015,6 +1117,9 @@ class BridgeManager:
                                      on_change=self._child_changed)
             with self._lock:
                 self._bridges[serial] = b
+                # The new child re-hides and re-owns the journal record; the
+                # cloak is no longer this manager's to keep or release.
+                self._kept_cloaks.discard(serial)
             b.start()
             ok = b.wait_ready()
         except Exception as e:  # noqa: BLE001
@@ -1065,6 +1170,8 @@ class BridgeManager:
             self._errors[serial] = text
             self._retry_at[serial] = time.monotonic() + self.retry_after
             b = self._bridges.pop(serial, None)
+            # The unhide below repays everything, kept cloaks included.
+            self._kept_cloaks.discard(serial)
         self._emit(serial, "error", text)
         if b is not None:
             try:
@@ -1081,11 +1188,23 @@ class BridgeManager:
         except Exception:  # noqa: BLE001
             log.exception("unhiding %s after a failed start", serial)
 
-    def stop(self, serial: str, hard: bool = False) -> None:
+    def stop(self, serial: str, hard: bool = False,
+             keep_cloak: bool = False) -> None:
         """Stop one bridge and put its controller back. Idempotent.
 
         `hard` goes straight through to `ChildBridge.stop()`: skip the polite
         Ctrl+Break for a controller that is already gone. See there.
+
+        `keep_cloak=True` is the disconnect variant (symptom 4): the pad was
+        switched off and this manager will re-bridge it when it returns, so the
+        HidHide cloak is KEPT -- the pad re-enumerates hidden, a running game
+        never sees the raw Bluetooth device, and no ghost controller slot is
+        created. The journal record is re-owned by this process so no startup
+        sweep mistakes the kept cloak for an abandoned one; every deliberate
+        stop (tray Stop, hide toggle, master switch, Quit) still unhides, and
+        the exit sweep repays whatever is left. Callers passing it should pass
+        `hard=True` too: a kept cloak only stays kept if the child never runs
+        its own graceful teardown, whose unhide is unconditional.
         """
         serial = serial.lower()
         with self._lock:
@@ -1103,6 +1222,16 @@ class BridgeManager:
             b.stop(hard=hard)
         except Exception:  # noqa: BLE001
             log.exception("stopping %s failed", serial)
+        if keep_cloak:
+            with self._lock:
+                self._kept_cloaks.add(serial)
+            try:
+                self._adopt_record(serial)
+            except Exception:  # noqa: BLE001
+                log.exception("keeping the cloak of %s failed", serial)
+            return
+        with self._lock:
+            self._kept_cloaks.discard(serial)
         # Belt and braces for the child's own unhide, which a hard kill never
         # gets to run. `_unhide_serial` says why leaving that debt unpaid costs
         # the user their controller for the rest of the session.
@@ -1110,6 +1239,28 @@ class BridgeManager:
             self._unhide_serial(serial)
         except Exception:  # noqa: BLE001
             log.exception("unhiding %s after its stop failed", serial)
+
+    def _release_kept_cloak(self, serial: str) -> None:
+        """Unhide a cloak this manager kept across a disconnect, if it did.
+
+        The deliberate-release half of `keep_cloak`. A kept cloak belongs to a
+        pad with NO running bridge, so `stop()` -- which every user-facing off
+        switch goes through -- finds nothing to stop and used to return before
+        its unhide. This is called by exactly those switches (per-controller
+        disable, the master switch, the hide toggle) so that "stop bridging
+        this pad" gives the pad back immediately rather than at app exit. A
+        serial never kept is a no-op, which is the common case.
+        """
+        serial = serial.lower()
+        with self._lock:
+            kept = serial in self._kept_cloaks
+            self._kept_cloaks.discard(serial)
+        if not kept:
+            return
+        try:
+            self._unhide_serial(serial)
+        except Exception:  # noqa: BLE001
+            log.exception("releasing the kept cloak of %s failed", serial)
 
     def _stop_offline(self, serial: str, now: float) -> None:
         """Stop a bridge whose controller stopped answering, without holding it.
@@ -1136,11 +1287,35 @@ class BridgeManager:
         whose only remaining work is the teardown we are doing anyway. Those
         seconds are seconds in which a game still sees a wired DualSense on the
         end of a dead radio link.
+
+        And it KEEPS THE CLOAK whenever this manager would re-bridge the pad on
+        its return (symptom 4). Unhiding here is what handed a running game the
+        raw Bluetooth device for the few seconds between the pad powering back
+        on and the new bridge's hide -- a ghost handle HidHide cannot sever,
+        a controller slot the game never gives back, and a re-bridged pad that
+        came back as player 3 with its rumble routed at a ghost. `hard=True`
+        is part of the same promise: the child is terminated, never asked, so
+        its own unconditional unhide cannot run either.
         """
-        self.stop(serial, hard=True)
+        keep = self._would_rebridge(serial)
+        self.stop(serial, hard=True, keep_cloak=keep)
         with self._lock:
             self._held.discard(serial)
             self._retry_at[serial] = now + self.retry_after
+
+    def _would_rebridge(self, serial: str) -> bool:
+        """Would a returning `serial` be bridged again without user action?
+
+        The condition under which a disconnect teardown keeps the HidHide cloak
+        rather than unhiding. If any part of it is false -- the app is closing,
+        the master switch is off, the controller is disabled -- nothing would
+        re-hide the pad later, so keeping the cloak would strand it and the
+        stop unhides exactly as it always did.
+        """
+        with self._lock:
+            if self._closing or not self.master_enabled:
+                return False
+        return self.is_enabled(serial)
 
     def start_all(self) -> list[str]:
         """Start every enabled controller that is present. -> the ones that came up.
@@ -1359,7 +1534,14 @@ class BridgeManager:
                     self._emit(serial, "warn",
                                f"controller gone for {self.vanish_grace:.0f}s "
                                f"-- stopping its bridge")
-                    self.stop(serial)
+                    # A disconnect-shaped teardown, same as `_stop_offline`:
+                    # the pad is gone, so the stop is hard (nothing graceful
+                    # left to do, and the child's own unhide must not run) and
+                    # the cloak is kept for the pad's return. The hold `stop()`
+                    # records is cleared by `_held &= present` below, exactly
+                    # as before.
+                    self.stop(serial, hard=True,
+                              keep_cloak=self._would_rebridge(serial))
                     continue
             # A child that died on its own -- crash, or the user killed it.
             # Its siblings are untouched; only this serial is cleaned up.
@@ -1382,7 +1564,15 @@ class BridgeManager:
 
         if not self.master_enabled or self._closing:
             return
-        for serial in present:
+        # ENUMERATED serials only, never the vouched-for union. The union
+        # exists so a cloaked pad is not declared gone (rule 3); it must not
+        # also mean "try to bridge it". With the cloak now KEPT across a
+        # disconnect (symptom 4), a powered-off pad keeps a journal record and
+        # would otherwise be retried every `retry_after` -- and every failed
+        # start unhides, handing a running game the raw device the kept cloak
+        # exists to withhold. A pad that can actually be bridged is one the
+        # (whitelisted) enumeration can see, cloaked or not.
+        for serial in enumerated:
             with self._lock:
                 if self._closing:
                     return

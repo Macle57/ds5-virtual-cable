@@ -199,7 +199,7 @@ hardware. Full evidence, including the failures, is in `docs/e2e-results.md`.
 | speaker output, heard back through the controller's own mic | **+64.4 dB** at the commanded frequency | detectable |
 | haptic output, same method, audio stream silent | **+27.8 dB** at the commanded frequency | detectable |
 | Bluetooth link rate, steady state | ~480 Hz | — |
-| unit tests | **688** — 226 for the protocol and the emulator, 462 for the settings, the multi-controller manager and the tray. None needs hardware or a driver; a stdlib-only subset runs on bare Python (enforced in CI) | — |
+| unit tests | **728** — 243 for the protocol and the emulator, 485 for the settings, the multi-controller manager and the tray. None needs hardware or a driver; a stdlib-only subset runs on bare Python (enforced in CI) | — |
 | two controllers at once | **250 reports/s each**, one process per controller | 250 |
 
 The audio tests are deliberately *frequency-selective* — they only pass if
