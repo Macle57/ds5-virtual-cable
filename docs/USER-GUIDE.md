@@ -29,32 +29,52 @@ You do **not** need to turn on test signing, disable Secure Boot, or reboot.
 
 ---
 
-## Install — two steps, once
+## Install — one line
 
-### Step 1: install usbip-win2 (the driver)
+Open **PowerShell** (Start menu, type "powershell", Enter) and paste:
 
-This is the piece that lets a program present a virtual USB device. It is not
-part of `ds5bridge` and `ds5bridge` will not install it for you — a driver is
-not something a game utility should push onto your machine behind your back.
+```powershell
+irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1 | iex
+```
 
-1. Go to **https://github.com/vadimgrn/usbip-win2/releases/tag/v0.9.7.7**
-2. Download **`USBip-0.9.7.7-x64.exe`**.
-3. Run it and click through. It installs two Microsoft-signed drivers.
+It will ask for administrator rights once (the driver needs them; the app never
+does), and then does, in order, telling you as it goes:
 
-> **Use 0.9.7.7. Do not use 0.9.7.8** — its own maintainer warns that release
-> can corrupt memory and crash Windows.
+1. **Creates a System Restore point.** usbip-win2's own README asks for one
+   before installing, because the next step installs two kernel drivers.
+2. **Installs usbip-win2 0.9.7.7** — exactly that version, verified by
+   checksum. (Its maintainer warns 0.9.7.8 can corrupt memory, so the
+   installer will never "helpfully" take the latest.) **All your USB 3.0 hubs
+   restart during this** — devices blink out and come back; do not run it
+   while something is writing to a USB drive.
+3. **Installs HidHide** — optional; it only powers the "hide the Bluetooth pad
+   while bridged" feature. If this step fails you get a warning and everything
+   else still works. HidHide's driver activates after the next reboot.
+4. **Installs ds5bridge** itself to `%LOCALAPPDATA%\ds5bridge`, verified
+   against the release's published checksums, adds a Start Menu shortcut, and
+   starts the tray.
 
-Two things to know about the install:
+Safe to re-run any time — each step notices when its work is already done and
+skips itself. If you want to see the plan first without changing anything:
 
-* **All your USB 3.0 hubs restart during it.** USB devices will blink out and
-  come back. Do not do this while something is writing to a USB drive.
-* It may say a reboot is required. On the development machine it worked
-  immediately without one. If something behaves strangely later, reboot before
-  assuming it is broken.
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1))) -DryRun
+```
 
-### Step 2: get ds5bridge
+Other switches, same pattern: `-NoHidHide` (skip step 3), `-Autostart` (also
+register start-at-login — the tray menu has the same switch), `-NoLaunch`.
 
-Unzip the `ds5bridge` folder anywhere — Desktop is fine. Inside:
+If you have `usbipd` installed for WSL, the installer will mention it and move
+on: it owns port 3240, ds5bridge deliberately uses 3241, and nothing conflicts.
+
+**Prefer to do it by hand?** The steps above are exactly the manual procedure:
+usbip-win2 0.9.7.7 from
+https://github.com/vadimgrn/usbip-win2/releases/tag/v.0.9.7.7 (create a
+restore point first; do **not** use 0.9.7.8), optionally HidHide
+(`winget install Nefarius.HidHide`), then unzip the
+`ds5bridge-*-win-x64.zip` from this project's releases page anywhere you like.
+
+### What is in the ds5bridge folder
 
 | file | what it is |
 |---|---|
@@ -289,7 +309,7 @@ treating it as the same device rather than a new one each time.
   and no setting on the controller is changed. The program deliberately refuses
   to forward the kinds of commands that could do any of that.
 * **Nothing is installed** by `ds5bridge` itself. It uses the usbip-win2 driver
-  you installed in step 1 and one local network port (3241, loopback only —
+  the installer set up and one local network port (3241, loopback only —
   nothing leaves your PC).
 * The `usbipd` service some people have for WSL is **never touched**. It owns a
   different port.
@@ -312,7 +332,7 @@ drain faster than a cable ever would. Charge between sessions.
 | **"More than one Bluetooth DualSense is connected"** | two live controllers, and guessing would be wrong | `ds5bridge --all` bridges both. To pick one, run `ds5bridge devices` then `ds5bridge --serial <address>`. The tray does all of them without asking. |
 | **A controller is connected but never gets bridged** | it is switched off in the tray menu, or the master switch is | `ds5bridge doctor` prints both, and the tray menu turns them back on. |
 | **Random dropouts, timeouts, weird stutters** | **check the battery first.** Below ~15 % a DualSense produces failures that look exactly like software bugs | `ds5bridge devices` shows the level. Charge it. This has fooled every phase of this project at least once. |
-| **"usbip-win2 is not installed"** | step 1 was skipped, or it went somewhere unusual | Install 0.9.7.7 from the link above. If it is installed somewhere odd, `ds5bridge --usbip "D:\path\to\usbip.exe"`. |
+| **"usbip-win2 is not installed"** | the driver install was skipped, or it went somewhere unusual | Re-run the install line (it only does what is missing), or install 0.9.7.7 from the link above. If it is installed somewhere odd, `ds5bridge --usbip "D:\path\to\usbip.exe"`. |
 | **"TCP 3241 held by PID..."** | a previous run crashed and its server is still alive | `ds5bridge cleanup`. It kills the leftover and detaches anything stale. |
 | **"left over from a previous run ... cleaning up"** | same thing, and it already fixed itself | Nothing. It is telling you, not asking. |
 | **"ds5bridge is already running"** | you launched it twice | Use the one that is already running. Two would fight over one controller. |
@@ -360,6 +380,50 @@ Useful extras: `--status-every 5` (more frequent status lines), `--port 3242`
 controller's 3.5 mm jack instead of its speaker — untested),
 `--hide-bluetooth` (hide the Bluetooth pad for this run; needs HidHide), `-v`
 (verbose logs when reporting a problem).
+
+---
+
+## Updates
+
+The tray checks GitHub for a newer release **when it starts and once a day
+after that**. The check is one small request for public release information —
+nothing about you or your machine is sent, and nothing is downloaded or
+installed by the check itself.
+
+When a newer version exists you get a balloon notification, and the tray's
+right-click menu grows one row: **Install update x.y.z**. Clicking it downloads
+the new version, verifies it against the release's published SHA-256 checksums,
+and restarts the tray on the new version — bridging stops for the few seconds
+that takes and comes back on its own. If a download ever fails its checksum it
+is deleted and nothing changes.
+
+Not interested? Put `"update_check": false` in
+`%APPDATA%\ds5bridge\config.json` and the tray never asks GitHub anything.
+You can always update by re-running the install line — it is the same
+download, and it leaves your settings alone.
+
+(If you run from source instead of the installed app, the menu item opens the
+release page rather than swapping files under your git checkout — `git pull`
+is your update path.)
+
+---
+
+## Uninstall
+
+```powershell
+irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/uninstall.ps1 | iex
+```
+
+It quits the tray, detaches the virtual pad, un-hides anything HidHide was
+hiding, and removes the app, its shortcut and its start-at-login entry. Your
+settings in `%APPDATA%\ds5bridge` are kept (add `-PurgeSettings` via the
+scriptblock form above to remove them too).
+
+The two drivers are **left installed, on purpose** — other software may use
+them (DS4Windows also uses HidHide, and `usbipd` for WSL is a different product
+entirely). The script prints exactly how to remove each one if you decide to:
+usbip-win2 via Settings → Apps → **USBip**, HidHide via
+`winget uninstall Nefarius.HidHide` (it asks for a reboot).
 
 ---
 
