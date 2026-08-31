@@ -151,6 +151,34 @@ class DefaultsTests(_Temp):
                 self.assertEqual(CFG.load().port_base, 3241)
 
 
+class DashboardPortTests(_Temp):
+    """The port the tray's `Open dashboard` row points a browser at."""
+
+    def test_the_default_is_8765(self):
+        self.assertEqual(CFG.load().dashboard_port, 8765)
+        self.assertEqual(CFG.DEFAULT_DASHBOARD_PORT, 8765)
+
+    def test_a_chosen_port_round_trips(self):
+        cfg = CFG.load()
+        cfg.dashboard_port = 9001
+        cfg.save()
+        self.assertEqual(CFG.load().dashboard_port, 9001)
+
+    def test_junk_falls_back_to_the_default(self):
+        # Same contract as every other field: a hand-edited value can never
+        # stop the app, it can only be replaced by something usable.
+        for junk in ("banana", None, -1, 0, 65536, [8765], True):
+            with self.subTest(junk=junk):
+                self.write(json.dumps({"dashboard_port": junk}))
+                self.assertEqual(CFG.load().dashboard_port, 8765)
+
+    def test_3240_is_allowed_here(self):
+        # The usbipd-win exclusion is about USB/IP ports; an HTTP dashboard on
+        # 3240 is a strange choice, not a conflict this module can foresee.
+        self.write(json.dumps({"dashboard_port": 3240}))
+        self.assertEqual(CFG.load().dashboard_port, 3240)
+
+
 class RoundTripTests(_Temp):
     def test_save_then_load_returns_the_same_settings(self):
         cfg = CFG.load()

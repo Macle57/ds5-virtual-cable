@@ -56,6 +56,27 @@ is reading. `_watch_menu_visibility()` wraps pystray's own notify handler to
 know when that is, and a rebuild that arrives during it is deferred to the
 moment the menu closes.
 
+**4. A click is an intent, not an order to move hardware right now.** Starting
+a bridge takes seconds and cloaking a pad talks to a kernel driver, and a user
+working a menu of checkboxes will click three of them in four seconds. So every
+toggle updates the config file and the checkbox INSTANTLY, but the side effects
+are debounced: each click (re)arms one `APPLY_DELAY_S` timer, and when it
+expires the DIFF between what the user asked for (`_pending`) and what the
+manager is actually doing is applied -- so a box ticked and unticked inside the
+window is a no-op, and three clicks cost one apply pass. See `_poke_apply` /
+`_apply_now` for the mechanics and `_quit` for why quitting CANCELS rather than
+flushes.
+
+A note on the menu's shape, because it was tried the other way first: pystray
+cannot make one item both a checkbox you can click and a submenu you can open.
+`MenuItem` takes a single `action` that is either a callable or a `Menu`, and
+`MenuItem.__call__` refuses to invoke a `Menu` action; on Windows the backend
+would even RENDER `checked` on a submenu item (`_win32._create_menu_item` sets
+MFS_CHECKED and hSubMenu independently), but an MF_POPUP item never sends
+WM_COMMAND, so the checkmark would be a picture of a control rather than a
+control. Hence the fallback shape: a checkable "Bridging enabled" row with a
+"Controllers" submenu next to it, and the same pair for hiding.
+
 Why pystray and not tkinter: a tray icon is what a background utility should
 be, a tkinter window is one more thing to minimise, and pystray's Windows
 backend already exposes native balloon notifications through `icon.notify()` --
@@ -85,6 +106,13 @@ from . import service as S
 log = logging.getLogger("ds5app.tray")
 
 REFRESH_S = 2.0
+
+#: How long a toggled checkbox waits for the user's next click before its side
+#: effects run. Two seconds is long enough to tick three boxes in one visit to
+#: the menu and short enough that "I clicked it and nothing happened" never has
+#: time to form as a thought. Config and checkbox state change at click time;
+#: only the bridge starts/stops and HidHide cloaks wait for this.
+APPLY_DELAY_S = 2.0
 
 #: Fixed per-controller menu slots. A slot is a menu item whose `visible` is a
 #: lambda, so the menu object never has to be rebuilt (see the module docstring).
@@ -183,6 +211,18 @@ class TrayApp:
         self._menu_key_built: tuple | None = None
         self._menu_open = False
         self._menu_dirty = False
+        #: The debounced-intent ledger -- see point 4 of the module docstring.
+        #: Keys are "master", ("enabled", serial) and ("hide", serial); the
+        #: value is what the user last asked for. An entry exists only between
+        #: a click and the apply pass that honoured (or no-op'd) it, so the
+        #: rule for reading state anywhere in this file is: pending first,
+        #: then the snapshot. Guarded by `_lock`, like everything else the
+        #: menu handlers and the worker threads both touch.
+        self._pending: dict = {}
+        self._apply_timer = None
+        #: `threading.Timer` in production; tests inject a hand-fired fake so
+        #: that "wait two seconds" never appears in a test run.
+        self._timer_factory = threading.Timer
 
         self.cfg = K.load()
         self._reconcile_autostart()
@@ -304,22 +344,6 @@ class TrayApp:
         self.cfg.set_hide_bluetooth(serial, value)
         self._save()
 
-    def _persist_hide_default(self, value: bool) -> None:
-        """Remember the hide choice for controllers this machine has not met yet.
-
-        Two halves, and forgetting either one makes the all-switch look like it
-        did not stick. `hide_bluetooth_default` seeds `hide_bluetooth` on a
-        first sighting, so it is what a pad plugged in tomorrow inherits; the
-        manager took a COPY of it at construction (`hide_default`), so it is
-        also what a pad plugged in five minutes from now inherits, without a
-        restart. The copy is assigned directly because the manager has no
-        setter for it, and one tray row is not a reason to grow one -- a bare
-        bool store is atomic, and the manager only ever reads it as a fallback.
-        """
-        self.cfg.set_hide_bluetooth_default(value)
-        self._save()
-        self.mgr.hide_default = bool(value)
-
     def _persist_port(self, serial: str, port: int) -> None:
         # Trap 5 from the manager's hardware testing: a controller that comes
         # back on a different port is a NEW devnode to Windows, so it loses its
@@ -343,7 +367,7 @@ class TrayApp:
 
     # -- menu actions ------------------------------------------------------
 
-    def _work(self, key: str, fn) -> None:
+    def _work(self, key: str, fn) -> bool:
         """Run a menu action off the UI thread, once at a time per key.
 
         `start()` takes seconds -- it spawns a child, waits for a socket and
@@ -352,10 +376,14 @@ class TrayApp:
         the icon; doing it without the guard lets an impatient double-click
         start two bridges for one controller, which the manager's own in-flight
         guard would then have to refuse.
+
+        Returns whether the work was actually started: False means an earlier
+        run under the same key is still going, which `_apply_pending` uses to
+        try again later rather than silently dropping the user's intent.
         """
         with self._lock:
             if self._busy.get(key):
-                return
+                return False
             self._busy[key] = True
 
         def run():
@@ -368,40 +396,191 @@ class TrayApp:
                     self._busy[key] = False
                 self._refresh_now()
         threading.Thread(target=run, name=f"tray-{key}", daemon=True).start()
+        return True
+
+    # -- desired state: what the user has asked for, applied or not ---------
+
+    def _desired_master(self) -> bool:
+        with self._lock:
+            want = self._pending.get("master")
+        if want is not None:
+            return bool(want)
+        return bool(self._snap.get("master_enabled", True))
+
+    def _desired_enabled(self, serial: str) -> bool:
+        with self._lock:
+            want = self._pending.get(("enabled", serial))
+        if want is not None:
+            return bool(want)
+        c = self._snap.get("controllers", {}).get(serial) or {}
+        return bool(c.get("enabled"))
+
+    def _desired_hide(self, serial: str) -> bool:
+        with self._lock:
+            want = self._pending.get(("hide", serial))
+        if want is not None:
+            return bool(want)
+        c = self._snap.get("controllers", {}).get(serial) or {}
+        return bool(c.get("hide_bluetooth"))
+
+    # -- the debounce: click now, move hardware in APPLY_DELAY_S ------------
+
+    def _poke_apply(self) -> None:
+        """(Re)arm the one apply timer. Called at the end of every toggle.
+
+        One timer for the whole menu, not one per switch: the point is that a
+        burst of clicks -- master off, two pads re-enabled, one hide flipped --
+        settles into a single apply pass over the net difference, and separate
+        timers would turn that back into four staggered ones.
+        """
+        with self._lock:
+            if self._apply_timer is not None:
+                self._apply_timer.cancel()
+            t = self._timer_factory(APPLY_DELAY_S, self._apply_pending)
+            t.daemon = True
+            self._apply_timer = t
+        t.start()
+
+    def _apply_pending(self) -> None:
+        """The timer expired with no further clicks -- run the apply pass.
+
+        Runs on the timer thread, so it goes through `_work` like every other
+        slow action. A refusal means the PREVIOUS apply pass is still running
+        (a bridge start mid-flight); re-arming the timer instead of dropping is
+        what keeps a click made during that window from being lost -- the diff
+        is computed at execution time, so the retry always applies the newest
+        intent.
+        """
+        if not self._work("apply", self._apply_now):
+            self._poke_apply()
+
+    def _apply_now(self) -> None:
+        """Diff the intent ledger against the manager and apply the NET change.
+
+        A switch that was flipped on and back off inside the window compares
+        equal to what the manager is already doing and costs nothing -- that is
+        the entire contract of the debounce, and it falls out of diffing here
+        rather than remembering what each click said.
+
+        The order is deliberate: master-off first, so the per-controller flags
+        that follow are bookkeeping against an already-stopped fleet instead of
+        a stop apiece; then the per-controller switches; then master-on, whose
+        `start_all()` starts exactly the set the flags now describe; then the
+        hides, which want the bridges in their final state so a cloak lands on
+        a pad that is actually being bridged.
+
+        Entries are cleared only if the user has not touched them again while
+        this ran -- a click mid-apply re-armed the timer, and its entry stays
+        pending for that next pass.
+        """
+        with self._lock:
+            todo = dict(self._pending)
+        if not todo:
+            return
+        want_master = todo.get("master")
+        if want_master is not None and not want_master \
+                and self.mgr.master_enabled:
+            self.mgr.set_master_enabled(False)
+        for key, want in todo.items():
+            if isinstance(key, tuple) and key[0] == "enabled" \
+                    and bool(want) != self.mgr.is_enabled(key[1]):
+                self.mgr.set_enabled(key[1], bool(want))
+        if want_master is not None and want_master \
+                and not self.mgr.master_enabled:
+            self.mgr.set_master_enabled(True)
+        hid, shown = [], []
+        for key, want in todo.items():
+            if isinstance(key, tuple) and key[0] == "hide" \
+                    and bool(want) != self.mgr.is_hiding(key[1]):
+                self.mgr.set_hide_bluetooth(key[1], bool(want))
+                (hid if want else shown).append(key[1])
+        with self._lock:
+            for key, want in todo.items():
+                if self._pending.get(key) == want:
+                    del self._pending[key]
+        self._notify_hide_applied(hid, shown)
+
+    def _notify_hide_applied(self, hid: list, shown: list) -> None:
+        """ONE balloon for what an apply pass hid or unhid, however it got here.
+
+        The per-controller path has to name the pad it is talking about; a
+        coalesced click on the all-switch is about all of them, and N balloons
+        for one gesture is how a helpful message becomes something a user turns
+        off. Without HidHide nothing was cloaked and the CLICK already said so,
+        so this stays quiet rather than repeating it two seconds later.
+        """
+        if not self._has_hidhide or not (hid or shown):
+            return
+        if len(hid) == 1 and not shown:
+            # HidHide gates IRP_MJ_CREATE, so an already-open handle is
+            # untouched: a game that is running right now keeps seeing the
+            # pad. Saying so here is the difference between a feature that
+            # looks broken and one that looks honest.
+            self._notify("Hide Bluetooth pad",
+                         f"{short(hid[0])} is hidden. Games started "
+                         f"from now on will not see the Bluetooth pad.")
+        elif len(shown) == 1 and not hid:
+            self._notify("Hide Bluetooth pad",
+                         f"{short(shown[0])} is visible to everything again.")
+        else:
+            bits = []
+            if hid:
+                bits.append(f"{len(hid)} controller(s) hidden. Games started "
+                            f"from now on will not see the Bluetooth pads.")
+            if shown:
+                bits.append(f"{len(shown)} controller(s) visible to "
+                            f"everything again.")
+            self._notify("Hide Bluetooth pads", " ".join(bits))
+
+    def _cancel_pending(self) -> None:
+        """Drop every unapplied intent and disarm the timer. Used at teardown.
+
+        Cancelling is safe precisely because the config was written at click
+        time: nothing the user chose is lost, the next launch reads the file
+        and converges on it.
+        """
+        with self._lock:
+            t, self._apply_timer = self._apply_timer, None
+            self._pending.clear()
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -- menu toggles: instant config + checkbox, debounced hardware --------
 
     def _toggle_master(self, *_):
-        want = not self.mgr.master_enabled
-        self._work("master", lambda: self.mgr.set_master_enabled(want))
+        want = not self._desired_master()
+        with self._lock:
+            self._pending["master"] = want
+        self.cfg.set_master_enabled(want)
+        self._save()
+        self._poke_apply()
 
     def _toggle_controller(self, serial: str):
         def act(*_):
-            want = not self.mgr.is_enabled(serial)
-            self._work(serial, lambda: self.mgr.set_enabled(serial, want))
+            want = not self._desired_enabled(serial)
+            with self._lock:
+                self._pending[("enabled", serial)] = want
+            self._persist_enabled(serial, want)
+            self._poke_apply()
         return act
 
     def _toggle_hide(self, serial: str):
         def act(*_):
-            want = not self.mgr.is_hiding(serial)
-
-            def go():
-                self.mgr.set_hide_bluetooth(serial, want)
-                if not self._has_hidhide:
-                    self._notify("Hide Bluetooth pad",
-                                 "HidHide is not installed, so nothing is "
-                                 "hidden. See the user guide.")
-                elif want:
-                    # HidHide gates IRP_MJ_CREATE, so an already-open handle is
-                    # untouched: a game that is running right now keeps seeing
-                    # the pad. Saying so here is the difference between a
-                    # feature that looks broken and one that looks honest.
-                    self._notify("Hide Bluetooth pad",
-                                 f"{short(serial)} is hidden. Games started "
-                                 f"from now on will not see the Bluetooth pad.")
-                else:
-                    self._notify("Hide Bluetooth pad",
-                                 f"{short(serial)} is visible to everything "
-                                 f"again.")
-            self._work("hide-" + serial, go)
+            want = not self._desired_hide(serial)
+            with self._lock:
+                self._pending[("hide", serial)] = want
+            self._persist_hide(serial, want)
+            if not self._has_hidhide:
+                # Said at click time, not two seconds later: with HidHide
+                # absent there is no hardware side to wait for, and delaying
+                # "this will do nothing" makes it read like it did something.
+                self._notify("Hide Bluetooth pad",
+                             "HidHide is not installed, so nothing is "
+                             "hidden. See the user guide.")
+            self._poke_apply()
         return act
 
     def _toggle_hide_all(self, *_):
@@ -409,45 +588,64 @@ class TrayApp:
 
         Hiding two pads used to be two clicks in two different rows, and there
         was no way at all to say "and anything else I plug in". This says both:
-        the per-controller flags are pushed through the manager (which applies
-        them to a running bridge immediately and calls back into
-        `_persist_hide`), and `hide_bluetooth_default` records the same answer
+        every present controller's flag goes into the intent ledger (the
+        debounced apply pushes them through the manager, which applies each to
+        a running bridge), and `hide_bluetooth_default` records the same answer
         for a controller seen for the first time.
 
-        ONE notification, not N. The per-controller path has to name the pad it
-        is talking about; this one is about all of them, and N balloons for one
-        click is how a helpful message becomes something a user turns off.
+        The seed is written to BOTH halves immediately, and forgetting either
+        one makes the all-switch look like it did not stick:
+        `hide_bluetooth_default` seeds `hide_bluetooth` on a first sighting, so
+        it is what a pad plugged in tomorrow inherits; the manager took a COPY
+        of it at construction (`hide_default`), so it is also what a pad
+        plugged in five minutes from now inherits, without a restart. The copy
+        is assigned directly because the manager has no setter for it -- a bare
+        bool store is atomic, and the manager only ever reads it as a fallback.
+        It is not debounced: seeding is a pure settings write with no hardware
+        behind it, exactly like the per-controller config flags.
         """
         want = not self._hide_all_checked()
         serials = [c["serial"] for c in self._controllers()]
+        with self._lock:
+            for serial in serials:
+                self._pending[("hide", serial)] = want
+        self.cfg.set_hide_bluetooth_default(want)
+        for serial in serials:
+            self.cfg.set_hide_bluetooth(serial, want)
+        self._save()
+        self.mgr.hide_default = bool(want)
+        if not self._has_hidhide:
+            self._notify("Hide Bluetooth pads",
+                         "HidHide is not installed, so nothing is hidden. "
+                         "See the user guide.")
+        elif not serials:
+            self._notify("Hide Bluetooth pads",
+                         "No controller is connected. Pads that show up "
+                         "from now on will be hidden while bridged."
+                         if want else
+                         "No controller is connected. Pads that show up "
+                         "from now on will stay visible.")
+        self._poke_apply()
+
+    def _open_dashboard(self, *_):
+        """Open the local status dashboard in whatever browser is the default.
+
+        `webbrowser.open` can block for however long the OS takes to find and
+        launch a browser, and this is a pystray menu handler, so it goes
+        through `_work` like everything else slow. The port comes from the
+        config so the menu item and the server (which lives elsewhere) can
+        never disagree about the address.
+        """
+        url = f"http://127.0.0.1:{getattr(self.cfg, 'dashboard_port', K.DEFAULT_DASHBOARD_PORT)}"
 
         def go():
-            self._persist_hide_default(want)
-            for serial in serials:
-                self.mgr.set_hide_bluetooth(serial, want)
-            n = len(serials)
-            if not self._has_hidhide:
-                self._notify("Hide Bluetooth pads",
-                             "HidHide is not installed, so nothing is hidden. "
-                             "See the user guide.")
-            elif not n:
-                self._notify("Hide Bluetooth pads",
-                             "No controller is connected. Pads that show up "
-                             "from now on will be hidden while bridged."
-                             if want else
-                             "No controller is connected. Pads that show up "
-                             "from now on will stay visible.")
-            elif want:
-                # Same caveat as the single-controller path: HidHide gates
-                # IRP_MJ_CREATE, so a game that is running right now already
-                # holds its handles and keeps seeing the pads.
-                self._notify("Hide Bluetooth pads",
-                             f"{n} controller(s) hidden. Games started from "
-                             f"now on will not see the Bluetooth pads.")
-            else:
-                self._notify("Hide Bluetooth pads",
-                             f"{n} controller(s) visible to everything again.")
-        self._work("hide-all", go)
+            import webbrowser
+
+            if not webbrowser.open(url):
+                self._notify("Open dashboard",
+                             f"Could not open a browser. The dashboard is at "
+                             f"{url}.")
+        self._work("dashboard", go)
 
     def _unhide_all(self, *_):
         """The panic button. Stop everything first, then force the sweep.
@@ -561,6 +759,22 @@ class TrayApp:
         threading.Thread(target=_hard_exit, name="tray-exit", daemon=True).start()
 
     def _quit(self, *_):
+        """Cancel unapplied intents, then tear down. CANCEL, not flush.
+
+        The choice matters and was made on one question: which behaviour can
+        strand a pad hidden? Cancelling cannot. A pending "hide" was never
+        applied, so there is no cloak to strand; a pending "unhide" names a pad
+        that IS cloaked, and `mgr.close()` unhides everything this process hid
+        regardless of any intent -- each bridge's stop path uncloaks its own
+        pad and the final sweep clears the journal. Flushing, by contrast, is
+        the dangerous one: it could start a bridge or lay a fresh cloak
+        milliseconds before `close()` tears it down, racing the three-second
+        `os._exit` watchdog that `_shutdown_icon` arms -- and a cloak applied
+        just before a hard exit is exactly how a pad gets stranded invisible.
+        Nothing the user chose is lost either way, because every click already
+        wrote the config; the next launch converges on it.
+        """
+        self._cancel_pending()
         try:
             self.mgr.close()
         finally:
@@ -589,8 +803,12 @@ class TrayApp:
             return describe(cs[i]) if i < len(cs) else ""
 
         def checked(_item=None) -> bool:
+            # Desired, not actual: the checkbox must move at click time, two
+            # seconds before the bridge does. The row TEXT stays actual
+            # (`describe`), so a glance still says what is really running.
             cs = self._controllers()
-            return bool(cs[i].get("enabled")) if i < len(cs) else False
+            return self._desired_enabled(cs[i]["serial"]) if i < len(cs) \
+                else False
 
         def action(*_):
             cs = self._controllers()
@@ -602,10 +820,10 @@ class TrayApp:
     def _hide_slot(self, i: int):
         """One row of the hide submenu -- the same fixed-slot trick as `_slot`.
 
-        A second bank of slots rather than turning each controller row into a
-        submenu: the controller rows are click-to-toggle-bridging, which is the
-        common case, and making that two clicks to gain a rarely used checkbox
-        is a bad trade.
+        A second bank of slots rather than reusing the bridging rows: the
+        bridging rows are click-to-toggle-bridging, which is the common case,
+        and overloading them with a second meaning would make the frequent
+        action pay for the rare one.
         """
         def visible(_item=None) -> bool:
             return self._has_hidhide and i < len(self._controllers())
@@ -619,8 +837,10 @@ class TrayApp:
                 else short(cs[i]["serial"])
 
         def checked(_item=None) -> bool:
+            # Desired, like the bridging rows: the box moves at click time.
             cs = self._controllers()
-            return bool(cs[i].get("hide_bluetooth")) if i < len(cs) else False
+            return self._desired_hide(cs[i]["serial"]) if i < len(cs) \
+                else False
 
         def action(*_):
             cs = self._controllers()
@@ -630,15 +850,21 @@ class TrayApp:
         return visible, text, checked, action
 
     def _hide_all_checked(self, _item=None) -> bool:
-        """Checked only when EVERY listed controller is hiding. Mixed reads off.
+        """Checked only when EVERY listed controller is set to hide. Mixed
+        reads off.
 
-        pystray has no third state, so a mixed selection has to render as one
-        of the two, and the choice is made by what the next click should do: an
-        unchecked box hides the remainder, which is the reason somebody opens
-        this menu with one pad already hidden. Checking it on a mixed state
-        would instead unhide the pad that is already hidden -- the opposite of
-        what the row is for, and destructive of a setting the user made
-        deliberately.
+        This is the tri-state rule flattened for a control with two states:
+        all-on renders checked, all-off and PARTIAL both render unchecked --
+        pystray has no third state, so a mixed selection has to pick one, and
+        the choice is made by what the next click should do. An unchecked box
+        hides the remainder, which is the reason somebody opens this menu with
+        one pad already hidden. Checking it on a mixed state would instead
+        unhide the pad that is already hidden -- the opposite of what the row
+        is for, and destructive of a setting the user made deliberately.
+
+        Reads DESIRED state (`_desired_hide`), so the box answers for the
+        click the user just made rather than the cloak that lands two seconds
+        later.
 
         With nothing connected the row shows the SEED
         (`hide_bluetooth_default`) rather than the vacuous `all([]) is True`.
@@ -649,28 +875,30 @@ class TrayApp:
         cs = self._controllers()
         if not cs:
             return bool(self.cfg.hide_bluetooth_default)
-        return all(c.get("hide_bluetooth") for c in cs)
+        return all(self._desired_hide(c["serial"]) for c in cs)
 
     def _hide_all_row(self):
-        """(visible, checked, action) for the all-switch -- same shape as a slot.
+        """(visible, checked, action) for the top-level hide switch.
 
-        Visible on exactly the rule the per-controller rows use, because a
-        master switch over rows that are not there explains nothing. Kept as a
-        factory so the menu can stay built-exactly-once and so this is testable
-        without pystray.
+        This is the OUTER checkbox now -- "Hide Bluetooth pads while bridged"
+        in the main menu, next to the per-controller submenu -- but the shape
+        is unchanged: visible on exactly the rule the per-controller rows use,
+        because a switch over rows that are not there explains nothing. Kept as
+        a factory so the menu can stay built-exactly-once and so this is
+        testable without pystray.
         """
         return (lambda _item=None: self._has_hidhide,
                 self._hide_all_checked,
                 self._toggle_hide_all)
 
     def _hide_menu(self):
-        """The `Hide Bluetooth pad while bridged >` submenu. Built once.
+        """The per-controller half of hiding -- the submenu. Built once.
 
-        The first row is the all-switch, then a separator, then the
-        per-controller rows. Leading the submenu with it costs nothing when it
-        is hidden: pystray drops invisible items first and only then strips
-        leading, trailing and repeated separators, so the machine without
-        HidHide gets the explanatory row and no stray line above it.
+        The all-switch is NOT in here any more: it is the checkable
+        "Hide Bluetooth pads while bridged" row in the main menu, one level up
+        (see the module docstring for why pystray cannot put the checkbox and
+        the submenu on one item). This menu is only the per-pad checkboxes and
+        the escape hatch.
 
         Two visibility rules that are deliberate:
 
@@ -684,12 +912,7 @@ class TrayApp:
         """
         import pystray
 
-        all_visible, all_checked, all_action = self._hide_all_row()
-        items = [
-            pystray.MenuItem("Hide all Bluetooth pads", all_action,
-                             checked=all_checked, visible=all_visible),
-            pystray.Menu.SEPARATOR,
-        ]
+        items = []
         for i in range(MAX_SLOTS):
             visible, text, checked, action = self._hide_slot(i)
             items.append(pystray.MenuItem(text, action, checked=checked,
@@ -777,11 +1000,16 @@ class TrayApp:
         menu anyway, through pystray's own `_handler`.
         """
         return (self._title().splitlines()[0],
-                bool(self._snap.get("master_enabled", True)),
+                # DESIRED values for everything a checkbox renders, so the
+                # menu that pystray rebuilds right after a click (its own
+                # `_handler` calls `update_menu`) is recognised here as the
+                # current one rather than rebuilt again two seconds later.
+                self._desired_master(),
                 self._hide_all_checked(),
                 tuple((c["serial"], (c.get("label") or ""), c.get("state"),
-                       bool(c.get("enabled")), bool(c.get("present")),
-                       bool(c.get("hide_bluetooth")), bool(c.get("error")),
+                       self._desired_enabled(c["serial"]),
+                       bool(c.get("present")),
+                       self._desired_hide(c["serial"]), bool(c.get("error")),
                        c.get("battery_percent"),
                        round((c.get("reports_per_s") or 0.0) / 10.0))
                       for c in self._controllers()))
@@ -870,18 +1098,20 @@ class TrayApp:
         # that re-evaluates those lambdas; see point 3 of the module docstring.
         self._sync_menu()
 
-    def _menu(self):
-        """Built once. Every dynamic value below is a lambda -- see the docstring."""
+    def _controllers_menu(self):
+        """The per-controller bridging rows -- the `Controllers >` submenu.
+
+        These used to sit at the top level; a machine with two pads made the
+        main menu mostly serials, and the switch a user actually reaches for
+        nine times out of ten is the master one. The rows themselves are
+        unchanged -- `describe()` text, checkbox is the enable switch -- and
+        the explanatory row keeps the submenu non-empty (pystray hides a
+        submenu item whose menu has no visible rows), so "Controllers" never
+        blinks out of existence just because the last pad powered off.
+        """
         import pystray
 
-        items = [pystray.MenuItem(lambda _i: self._title().splitlines()[0],
-                                  self._copy_status, default=True),
-                 pystray.Menu.SEPARATOR,
-                 pystray.MenuItem(
-                     "Bridging enabled", self._toggle_master,
-                     checked=lambda _i: self._snap.get("master_enabled", True)),
-                 pystray.Menu.SEPARATOR]
-
+        items = []
         for i in range(MAX_SLOTS):
             visible, text, checked, action = self._slot(i)
             items.append(pystray.MenuItem(text, action, checked=checked,
@@ -889,28 +1119,57 @@ class TrayApp:
                                           # Greyed out, not hidden, when the
                                           # master switch is off: the row still
                                           # says what it would do.
-                                          enabled=lambda _i: self._snap.get(
-                                              "master_enabled", True)))
-        items += [
-            pystray.MenuItem(
-                lambda _i: ("No controller connected"
-                            if not self._controllers() else ""),
-                lambda *_: None, enabled=lambda _i: False,
-                visible=lambda _i: not self._controllers()),
-            pystray.Menu.SEPARATOR,
-            # Visible when HidHide is installed, OR when we have something
-            # hidden and it is not -- the second case is the escape hatch.
-            pystray.MenuItem("Hide Bluetooth pad while bridged",
-                             self._hide_menu(),
-                             visible=lambda _i: (self._has_hidhide
-                                                 or self._journal_count() > 0)),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Rescan for controllers", self._rescan),
-            pystray.MenuItem("Start at login", self._toggle_autostart,
-                             checked=lambda _i: A.is_enabled(),
-                             visible=lambda _i: A.available()),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", self._quit)]
+                                          enabled=lambda _i:
+                                              self._desired_master()))
+        items.append(pystray.MenuItem(
+            "No controller connected", lambda *_: None,
+            enabled=lambda _i: False,
+            visible=lambda _i: not self._controllers()))
+        return pystray.Menu(*items)
+
+    def _menu(self):
+        """Built once. Every dynamic value below is a lambda -- see the docstring.
+
+        The shape is pairs: a checkable row that answers for ALL controllers,
+        with the per-controller submenu directly under it. One item doing both
+        jobs was the first design and pystray cannot express it -- see the
+        module docstring -- so the checkbox and the submenu are adjacent rows
+        instead.
+        """
+        import pystray
+
+        all_visible, all_checked, all_action = self._hide_all_row()
+        items = [pystray.MenuItem(lambda _i: self._title().splitlines()[0],
+                                  self._copy_status, default=True),
+                 pystray.Menu.SEPARATOR,
+                 pystray.MenuItem("Open dashboard", self._open_dashboard),
+                 pystray.Menu.SEPARATOR,
+                 pystray.MenuItem(
+                     "Bridging enabled", self._toggle_master,
+                     checked=lambda _i: self._desired_master()),
+                 pystray.MenuItem("Controllers", self._controllers_menu()),
+                 pystray.Menu.SEPARATOR,
+                 # The pair for hiding: the checkbox is the all-switch (checked
+                 # only when EVERY pad is set to hide -- `_hide_all_checked`),
+                 # the submenu is the per-pad boxes. The submenu stays visible
+                 # on the wider rule: when HidHide is gone but the journal says
+                 # we still owe a pad its visibility, the escape hatch in there
+                 # is exactly what the user needs.
+                 pystray.MenuItem("Hide Bluetooth pads while bridged",
+                                  all_action, checked=all_checked,
+                                  visible=all_visible),
+                 pystray.MenuItem("Hide per controller",
+                                  self._hide_menu(),
+                                  visible=lambda _i: (self._has_hidhide
+                                                      or self._journal_count()
+                                                      > 0)),
+                 pystray.Menu.SEPARATOR,
+                 pystray.MenuItem("Rescan for controllers", self._rescan),
+                 pystray.MenuItem("Start at login", self._toggle_autostart,
+                                  checked=lambda _i: A.is_enabled(),
+                                  visible=lambda _i: A.available()),
+                 pystray.Menu.SEPARATOR,
+                 pystray.MenuItem("Quit", self._quit)]
         return pystray.Menu(*items)
 
     def _poll(self) -> None:
@@ -963,7 +1222,13 @@ class TrayApp:
         is comfortably more than three seconds of work. The other way round, a
         Ctrl+C exits the process mid-detach and leaves behind precisely the
         zombie device and the invisible controller this path exists to prevent.
+
+        `_cancel_pending` goes first for the same reason `_quit` cancels
+        rather than flushes: a debounce timer that fires mid-close would be
+        applying toggles to a manager that is tearing the bridges down under
+        it, and the one thing it could add is a cloak for `close()` to miss.
         """
+        S.ON_TEARDOWN.append(self._cancel_pending)
         S.ON_TEARDOWN.append(self.mgr.close)
         S.ON_TEARDOWN.append(self._shutdown_icon)
 
@@ -1013,6 +1278,7 @@ class TrayApp:
             self.icon.run()
         finally:
             self._stop.set()
+            self._cancel_pending()
             self.mgr.close()
         return 0
 
