@@ -147,18 +147,61 @@ class _FakeConfig:
 
     A real `Config` in a temporary directory would work too, but the tray's own
     `_save` is stubbed out here anyway, and counting saves is how these tests
-    say "the choice was persisted" without going near the filesystem.
+    say "the choice was persisted" without going near the filesystem. `calls`
+    records the setters, because the debounce contract is that CONFIG moves at
+    click time while the manager moves at apply time -- so which fake got
+    written, and when, is exactly what several tests assert.
     """
 
     def __init__(self, hide_default=False):
         self.hide_bluetooth_default = hide_default
+        self.dashboard_port = 8765
         self.saves = 0
+        self.calls = []
 
     def get(self, serial):
         return types.SimpleNamespace(label="", port=None, enabled=True)
 
     def set_hide_bluetooth_default(self, hide):
         self.hide_bluetooth_default = bool(hide)
+
+    def set_enabled(self, serial, enabled):
+        self.calls.append(("set_enabled", serial, bool(enabled)))
+
+    def set_hide_bluetooth(self, serial, hide):
+        self.calls.append(("set_hide_bluetooth", serial, bool(hide)))
+
+    def set_master_enabled(self, enabled):
+        self.calls.append(("set_master_enabled", bool(enabled)))
+
+
+class _FakeTimer:
+    """A `threading.Timer` that fires when the TEST says so.
+
+    The debounce window is real time in production and poison in a test suite:
+    a test that sleeps `APPLY_DELAY_S` to see the apply happen is slow, and a
+    test that sleeps slightly less to see it NOT happen is flaky. The tray
+    takes its timer as `_timer_factory` precisely so this stand-in can be
+    injected and the clock can be a method call.
+    """
+
+    def __init__(self, delay, fn):
+        self.delay = delay
+        self.fn = fn
+        self.started = False
+        self.cancelled = False
+        self.daemon = False
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        """What the real timer does at expiry -- unless it was cancelled."""
+        if self.started and not self.cancelled:
+            self.fn()
 
 
 def app_with(controllers, master=True, has_hidhide=True, journal=0,
@@ -181,10 +224,34 @@ def app_with(controllers, master=True, has_hidhide=True, journal=0,
     app._menu_key_built = None
     app._menu_open = False
     app._menu_dirty = False
+    app._pending = {}
+    app._apply_timer = None
+    # Fake timers, recorded in order: `flush(app)` is these tests' "two
+    # seconds pass with no further clicks".
+    app.timers = []
+
+    def factory(delay, fn):
+        t = _FakeTimer(delay, fn)
+        app.timers.append(t)
+        return t
+    app._timer_factory = factory
     # Never the real journal: these tests must behave the same on a machine
     # where the developer genuinely has a controller hidden.
     app._journal_count = staticmethod(lambda: journal)
     return app
+
+
+def flush(app):
+    """Let the debounce window expire: fire the newest armed timer, settle.
+
+    Only the newest, because that is what real time does -- every poke
+    cancelled the timer before it, and `_FakeTimer.fire` honours `cancel()`
+    the way `threading.Timer` does.
+    """
+    live = [t for t in app.timers if t.started and not t.cancelled]
+    if live:
+        live[-1].fire()
+    settle()
 
 
 class SlotTests(unittest.TestCase):
@@ -224,8 +291,7 @@ class SlotTests(unittest.TestCase):
         app = app_with([controller(A, enabled=True), controller(B)])
         i = [c["serial"] for c in app._controllers()].index(A)
         app._slot(i)[3]()
-        for t in list(threadlist()):
-            t.join(timeout=5)
+        flush(app)                     # the manager moves at apply time
         self.assertIn(("set_enabled", A, False), app.mgr.calls)
 
 
@@ -241,7 +307,7 @@ def settle():
 
 
 class HideSubmenuTests(unittest.TestCase):
-    """The `Hide Bluetooth pad while bridged >` bank of slots.
+    """The `Hide per controller >` bank of slots.
 
     Same fixed-slot discipline as the bridging rows: the menu object is built
     once and every dynamic value is a lambda, so an invisible slot still has to
@@ -279,13 +345,13 @@ class HideSubmenuTests(unittest.TestCase):
         app = app_with([controller(A, hide=False), controller(B)])
         i = [c["serial"] for c in app._controllers()].index(A)
         app._hide_slot(i)[3]()
-        settle()
+        flush(app)
         self.assertIn(("set_hide_bluetooth", A, True), app.mgr.calls)
 
     def test_clicking_again_turns_it_off(self):
         app = app_with([controller(A, hide=True)])
         app._hide_slot(0)[3]()
-        settle()
+        flush(app)
         self.assertIn(("set_hide_bluetooth", A, False), app.mgr.calls)
 
     def test_a_label_is_shown_with_the_serial(self):
@@ -296,13 +362,14 @@ class HideSubmenuTests(unittest.TestCase):
 
 
 class HideAllSwitchTests(unittest.TestCase):
-    """The single row that hides or unhides every pad at once.
+    """The top-level checkbox that hides or unhides every pad at once.
 
-    The interesting decision is the mixed state. pystray has no tri-state, so
-    "one of two pads is hidden" has to render as a plain checked or unchecked
-    box, and the rule here is UNCHECKED -- because the click that follows must
-    hide the remaining pad rather than unhide the one the user already chose to
-    hide.
+    It lives in the MAIN menu now, next to the per-controller submenu, but the
+    interesting decision is unchanged: the mixed state. pystray has no
+    tri-state, so "one of two pads is hidden" has to render as a plain checked
+    or unchecked box, and the rule here is UNCHECKED -- checked means ALL, and
+    the click that follows a mixed state must hide the remaining pad rather
+    than unhide the one the user already chose to hide.
     """
 
     def test_it_is_checked_only_when_every_controller_is_hiding(self):
@@ -315,37 +382,61 @@ class HideAllSwitchTests(unittest.TestCase):
         app = app_with([controller(A, hide=True), controller(B, hide=False)])
         self.assertFalse(app._hide_all_checked())
 
+    def test_it_reads_intent_so_the_tick_appears_at_click_time(self):
+        # Tri-state over DESIRED state: the user un-mixes the selection by
+        # ticking the last pad's box, and the outer box must agree
+        # immediately -- two seconds before the manager is told anything.
+        app = app_with([controller(A, hide=True), controller(B, hide=False)])
+        app._toggle_hide(B)()
+        self.assertTrue(app._hide_all_checked())
+        self.assertEqual([c for c in app.mgr.calls
+                          if c[0] == "set_hide_bluetooth"], [])
+
     def test_clicking_a_mixed_state_hides_the_ones_that_are_not_hidden(self):
         # The whole reason a mixed state renders unchecked: the next click has
         # to finish the job rather than undo half of it.
         app = app_with([controller(A, hide=True), controller(B, hide=False)])
         app._toggle_hide_all()
-        settle()
+        flush(app)
         self.assertIn(("set_hide_bluetooth", B, True), app.mgr.calls)
         self.assertNotIn(("set_hide_bluetooth", A, False), app.mgr.calls)
 
     def test_one_click_sets_every_controller(self):
         app = app_with([controller(A), controller(B)])
         app._toggle_hide_all()
-        settle()
+        flush(app)
         self.assertEqual([c for c in app.mgr.calls if c[0] == "set_hide_bluetooth"],
                          [("set_hide_bluetooth", A, True),
                           ("set_hide_bluetooth", B, True)])
 
+    def test_one_click_writes_every_controllers_config_immediately(self):
+        # The manager waits for the debounce; the FILE must not. A crash
+        # inside the window still remembers what the user chose.
+        app = app_with([controller(A), controller(B)])
+        app._toggle_hide_all()
+        self.assertEqual([c for c in app.cfg.calls
+                          if c[0] == "set_hide_bluetooth"],
+                         [("set_hide_bluetooth", A, True),
+                          ("set_hide_bluetooth", B, True)])
+        self.assertEqual(app.cfg.saves, 1)
+        self.assertEqual([c for c in app.mgr.calls
+                          if c[0] == "set_hide_bluetooth"], [])
+
     def test_clicking_when_everything_is_hidden_unhides_everything(self):
         app = app_with([controller(A, hide=True), controller(B, hide=True)])
         app._toggle_hide_all()
-        settle()
+        flush(app)
         self.assertEqual([c for c in app.mgr.calls if c[0] == "set_hide_bluetooth"],
                          [("set_hide_bluetooth", A, False),
                           ("set_hide_bluetooth", B, False)])
 
     def test_the_choice_is_seeded_for_controllers_not_seen_yet(self):
-        # Both halves: the file, so a pad plugged in tomorrow inherits it, and
-        # the live manager, so a pad plugged in a minute from now does too.
+        # Both halves, and both at CLICK time: the file, so a pad plugged in
+        # tomorrow inherits it, and the live manager's seed, so a pad plugged
+        # in a minute from now does too. Seeding is a pure settings write, so
+        # it does not wait for the debounce.
         app = app_with([controller(A)])
         app._toggle_hide_all()
-        settle()
         self.assertTrue(app.cfg.hide_bluetooth_default)
         self.assertTrue(app.mgr.hide_default)
         self.assertEqual(app.cfg.saves, 1)
@@ -353,14 +444,13 @@ class HideAllSwitchTests(unittest.TestCase):
     def test_unhiding_seeds_the_opposite_answer(self):
         app = app_with([controller(A, hide=True)], hide_default=True)
         app._toggle_hide_all()
-        settle()
         self.assertFalse(app.cfg.hide_bluetooth_default)
         self.assertFalse(app.mgr.hide_default)
 
     def test_with_no_controllers_it_records_the_preference_without_throwing(self):
         app = app_with([])
         app._toggle_hide_all()
-        settle()
+        flush(app)
         self.assertTrue(app.cfg.hide_bluetooth_default)
         self.assertEqual([c for c in app.mgr.calls if c[0] == "set_hide_bluetooth"],
                          [])
@@ -381,16 +471,20 @@ class HideAllSwitchTests(unittest.TestCase):
         # the user turns off in Windows settings.
         app = app_with([controller(A), controller(B)])
         app._toggle_hide_all()
-        settle()
+        flush(app)
         self.assertEqual(len(app.notes), 1)
         self.assertIn("from now on", app.notes[0][1])
 
     def test_without_hidhide_the_notification_says_nothing_was_hidden(self):
+        # And it says so at CLICK time -- with HidHide absent there is no
+        # hardware to wait for, and a delayed "this did nothing" reads like it
+        # did something. The apply pass must then stay quiet.
         app = app_with([controller(A)], has_hidhide=False)
         app._toggle_hide_all()
-        settle()
         self.assertEqual(len(app.notes), 1)
         self.assertIn("HidHide", app.notes[0][1])
+        flush(app)
+        self.assertEqual(len(app.notes), 1)
 
     def test_the_row_is_callables_over_the_latest_snapshot(self):
         # The menu is built exactly once, so the same callable has to answer
@@ -401,6 +495,179 @@ class HideAllSwitchTests(unittest.TestCase):
         self.assertFalse(checked())
         app._snap = snap([controller(A, hide=True)])
         self.assertTrue(checked(), "the row must read the newest snapshot")
+
+
+class DebounceTests(unittest.TestCase):
+    """A click is an intent; the hardware moves `APPLY_DELAY_S` later, once.
+
+    The contract under test: config and checkbox state change at click time,
+    the manager is only touched when the timer expires with no further input,
+    and the apply pass moves the NET difference -- so on-then-off is a no-op
+    and three clicks cost one pass. Timers are `_FakeTimer`s throughout;
+    nothing here sleeps.
+    """
+
+    def toggle(self, app, serial):
+        i = [c["serial"] for c in app._controllers()].index(serial)
+        app._slot(i)[3]()
+
+    def test_a_click_arms_the_timer_and_touches_nothing_else(self):
+        app = app_with([controller(A, enabled=True)])
+        self.toggle(app, A)
+        settle()
+        self.assertEqual(app.mgr.calls, [])
+        self.assertEqual(len(app.timers), 1)
+        self.assertTrue(app.timers[0].started)
+
+    def test_the_delay_is_the_module_constant(self):
+        app = app_with([controller(A)])
+        self.toggle(app, A)
+        self.assertEqual(app.timers[0].delay, T.APPLY_DELAY_S)
+
+    def test_the_checkbox_and_config_move_at_click_time(self):
+        app = app_with([controller(A, enabled=True)])
+        i = [c["serial"] for c in app._controllers()].index(A)
+        self.toggle(app, A)
+        self.assertFalse(app._slot(i)[2](), "the box must move with the click")
+        self.assertIn(("set_enabled", A, False), app.cfg.calls)
+        self.assertEqual(app.cfg.saves, 1)
+        self.assertEqual(app.mgr.calls, [], "the bridge must NOT move yet")
+
+    def test_each_click_rearms_the_one_timer(self):
+        app = app_with([controller(A), controller(B)])
+        self.toggle(app, A)
+        self.toggle(app, B)
+        self.assertEqual(len(app.timers), 2)
+        self.assertTrue(app.timers[0].cancelled)
+        self.assertFalse(app.timers[1].cancelled)
+
+    def test_on_then_off_inside_the_window_is_a_no_op(self):
+        app = app_with([controller(A, enabled=True)])
+        self.toggle(app, A)
+        self.toggle(app, A)
+        flush(app)
+        self.assertEqual(app.mgr.calls, [])
+        self.assertEqual(app._pending, {}, "the settled intent must be cleared")
+
+    def test_only_the_net_change_is_applied(self):
+        # Three clicks -- A off, B off, B back on -- coalesce into one call.
+        app = app_with([controller(A, enabled=True), controller(B, enabled=True)])
+        self.toggle(app, A)
+        self.toggle(app, B)
+        self.toggle(app, B)
+        flush(app)
+        self.assertEqual(app.mgr.calls, [("set_enabled", A, False)])
+
+    def test_the_master_toggle_coalesces_too(self):
+        app = app_with([controller(A)], master=True)
+        app._toggle_master()
+        app._toggle_master()
+        flush(app)
+        self.assertEqual([c for c in app.mgr.calls
+                          if c[0] == "set_master_enabled"], [])
+
+    def test_master_off_lands_before_the_per_controller_flags(self):
+        # So the flags that follow are bookkeeping against a stopped fleet
+        # rather than one stop apiece.
+        app = app_with([controller(A, enabled=True)], master=True)
+        app._toggle_master()
+        self.toggle(app, A)
+        flush(app)
+        self.assertEqual(app.mgr.calls, [("set_master_enabled", False),
+                                         ("set_enabled", A, False)])
+
+    def test_a_busy_apply_rearms_rather_than_dropping_the_intent(self):
+        # The previous apply pass can still be mid-bridge-start when the timer
+        # fires again. `_work` refuses re-entry; the intent must survive it.
+        app = app_with([controller(A, enabled=True)])
+        self.toggle(app, A)
+        app._busy["apply"] = True
+        flush(app)
+        self.assertEqual(app.mgr.calls, [])
+        app._busy["apply"] = False
+        flush(app)                      # the re-armed timer
+        self.assertEqual(app.mgr.calls, [("set_enabled", A, False)])
+
+    def test_quit_cancels_pending_intents_rather_than_flushing(self):
+        """The teardown decision, pinned down. See `_quit` for the full why:
+        `mgr.close()` unhides everything this process hid no matter what is
+        pending, so cancelling cannot strand a pad -- while flushing could lay
+        a fresh cloak seconds before the `os._exit` watchdog fires."""
+        app = app_with([controller(A, enabled=True)])
+        app._shutdown_icon = lambda: None    # never arm the real watchdog here
+        self.toggle(app, A)
+        app._quit()
+        settle()
+        self.assertIn(("close",), app.mgr.calls)
+        self.assertNotIn(("set_enabled", A, False), app.mgr.calls)
+        self.assertEqual(app._pending, {})
+        self.assertTrue(app.timers[0].cancelled)
+        # The choice itself was not lost: it went to the config at click time.
+        self.assertIn(("set_enabled", A, False), app.cfg.calls)
+
+    def test_cancel_pending_runs_before_the_manager_at_teardown(self):
+        app = app_with([controller(A)])
+        order = []
+        app._cancel_pending = lambda: order.append("cancel")
+        app.mgr.close = lambda: order.append("close")
+        app._shutdown_icon = lambda: order.append("icon")
+        hooks = list(S.ON_TEARDOWN)
+        try:
+            S.ON_TEARDOWN[:] = []
+            app._install_teardown_hooks()
+            for hook in S.ON_TEARDOWN:
+                hook()
+        finally:
+            S.ON_TEARDOWN[:] = hooks
+        self.assertEqual(order, ["cancel", "close", "icon"])
+
+    def test_a_pending_toggle_changes_the_menu_key(self):
+        # The click must repaint the checkbox: pystray rebuilds the menu after
+        # a click through its own `_handler`, and `_menu_key` has to recognise
+        # the pending state as a change or `_sync_menu` would fight it.
+        app = app_with([controller(A, hide=False)])
+        before = app._menu_key()
+        app._toggle_hide(A)()
+        self.assertNotEqual(app._menu_key(), before)
+
+
+class DashboardTests(unittest.TestCase):
+    """The `Open dashboard` row: one URL, from the config, in the default
+    browser."""
+
+    def open_with(self, app, result=True):
+        import webbrowser
+        opened = []
+        saved = webbrowser.open
+        webbrowser.open = lambda url: opened.append(url) or result
+        try:
+            app._open_dashboard()
+            settle()
+        finally:
+            webbrowser.open = saved
+        return opened
+
+    def test_it_opens_the_configured_port_on_loopback(self):
+        app = app_with([controller(A)])
+        app.cfg.dashboard_port = 9001
+        self.assertEqual(self.open_with(app), ["http://127.0.0.1:9001"])
+
+    def test_the_default_port_is_8765(self):
+        app = app_with([controller(A)])
+        self.assertEqual(self.open_with(app), ["http://127.0.0.1:8765"])
+
+    def test_a_browser_that_would_not_open_is_reported_with_the_url(self):
+        # webbrowser.open returning False is a headless or misconfigured
+        # machine; the balloon has to hand over the address it could not open.
+        app = app_with([controller(A)])
+        self.open_with(app, result=False)
+        self.assertEqual(len(app.notes), 1)
+        self.assertIn("http://127.0.0.1:8765", app.notes[0][1])
+
+    def test_a_working_browser_is_not_narrated(self):
+        app = app_with([controller(A)])
+        self.open_with(app, result=True)
+        self.assertEqual(app.notes, [])
 
 
 class UnhideEverythingTests(unittest.TestCase):

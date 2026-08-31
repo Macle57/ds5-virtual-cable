@@ -149,9 +149,11 @@ Right-click for the menu:
 
 | item | what it does |
 |---|---|
+| **Open dashboard** | opens the status dashboard in your browser |
 | **Bridging enabled** | the master switch. Unticking it stops every bridge |
-| one row per controller | tick to bridge it, untick to leave it alone |
-| **Hide Bluetooth pad while bridged** | optional, off by default — see below |
+| **Controllers >** | one row per controller — tick to bridge it, untick to leave it alone |
+| **Hide Bluetooth pads while bridged** | optional, off by default — sets *every* controller at once; see below |
+| **Hide per controller >** | the same choice, one pad at a time |
 | **Rescan for controllers** | look again now instead of waiting for the next sweep |
 | **Start at login** | run the tray when you log in |
 | **Quit** | stop everything and put it all back |
@@ -210,8 +212,9 @@ proves both halves on your real controller -- that other programs stop seeing th
 pad, *and* that ds5bridge can still open it. It puts everything back when it is
 done.
 
-Then tick the controller under **Hide Bluetooth pad while bridged**. From that
-moment:
+Then tick **Hide Bluetooth pads while bridged** for all of them at once (the
+box is ticked only when *every* pad is set to hide), or the one controller
+under **Hide per controller**. From that moment:
 
 * only ds5bridge can see the Bluetooth pad; games, Steam and tools such as
   `dualsense-tester` see only the virtual wired one;
@@ -232,7 +235,7 @@ back. If it happens, the fix is one of these, in order of convenience:
 | | |
 |---|---|
 | **Just start ds5bridge again** | any part of it -- the tray, `ds5bridge run`, `ds5bridge cleanup` -- checks on startup and puts back anything a dead run left hidden. This is usually all you need. |
-| **Tray -> Hide Bluetooth pad while bridged -> Unhide everything now** | stops every bridge and returns every pad. Visible whenever something is hidden, even if HidHide has been uninstalled. |
+| **Tray -> Hide per controller -> Unhide everything now** | stops every bridge and returns every pad. Visible whenever something is hidden, even if HidHide has been uninstalled. |
 | `ds5bridge unhide` | the same, from a terminal, for when the tray will not start. |
 | `ds5bridge doctor` | says whether HidHide is installed, whether it answers, and lists anything still hidden along with whether the process that hid it is still alive. |
 
@@ -317,7 +320,7 @@ drain faster than a cable ever would. Charge between sessions.
 | **"left over from a previous run ... cleaning up"** | same thing, and it already fixed itself | Nothing. It is telling you, not asking. |
 | **"ds5bridge is already running"** | you launched it twice | Use the one that is already running. Two would fight over one controller. |
 | **The game does not see a controller** | usually the game was started first, or it is using a different input backend | Stop the game, make sure the status line says `running`, start the game again. Also check Windows **Settings → Bluetooth & devices → Devices** shows "Wireless Controller". |
-| **The game sees TWO controllers** | the real Bluetooth one *and* the virtual wired one | Expected — Windows sees both. Most games take the wired one. If yours does not, unpair the Bluetooth controller from the *game's* settings, not from Windows. Or install HidHide and tick **Hide Bluetooth pad while bridged** (see "Using it"), which removes the Bluetooth one for everything but ds5bridge. |
+| **The game sees TWO controllers** | the real Bluetooth one *and* the virtual wired one | Expected — Windows sees both. Most games take the wired one. If yours does not, unpair the Bluetooth controller from the *game's* settings, not from Windows. Or install HidHide and tick **Hide Bluetooth pads while bridged** (see "Using it"), which removes the Bluetooth one for everything but ds5bridge. |
 | **My controller has vanished from Windows entirely** | a run was hard-killed while it had the Bluetooth pad hidden | Start ds5bridge again — it puts it back on startup. Or `ds5bridge unhide`. Or the tray's **Unhide everything now**. `ds5bridge doctor` shows what is still hidden. |
 | **I ticked "Hide Bluetooth pad" and nothing happened** | either HidHide is not installed, or the game was already running | `ds5bridge doctor` says which. HidHide cannot hide a device from a program that already has it open — close the game, then start it again. |
 | **"NOT hiding: this program is not on HidHide's whitelist"** | ds5bridge refused to hide, because it could not confirm it would still be able to read the controller itself | Deliberate, and the safe outcome: hiding a pad it cannot open would leave you with no working controller at all. Run `ds5bridge doctor` and read the `granting` row; `python app\tools\hidhide_verify.py` gives the full diagnosis. |

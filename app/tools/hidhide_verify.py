@@ -167,7 +167,7 @@ def main() -> int:
     print("\n" + "=" * 68)
     if blocking and granting:
         print("BOTH HALVES PASS -- the feature is safe to switch on.")
-        print("Tray -> Hide Bluetooth pad while bridged -> tick your controller.")
+        print("Tray -> Hide per controller -> tick your controller.")
         return 0
 
     if blocking and not granting:
