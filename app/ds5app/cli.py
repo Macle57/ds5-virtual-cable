@@ -34,7 +34,12 @@ from . import controller as C
 from . import service as S
 from .usbip import DEFAULT_PORT, REQUIRED_RELEASE, Usbip, UsbipNotFound
 
-VERSION = "0.4.0"
+# The one version number lives in ds5app/__init__.py; everything else -- this
+# banner, --version, the release workflow's tag check and the update checker's
+# "is that newer than me?" -- reads it from there. Two copies of a version
+# string always drift, and a drifted one here would make a build report itself
+# as the release it is not.
+from . import __version__ as VERSION
 
 BANNER = r"""
   ds5bridge -- a Bluetooth DualSense, presented to Windows as a wired one

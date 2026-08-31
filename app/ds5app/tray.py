@@ -81,6 +81,7 @@ from . import config as K
 from . import controller as C
 from . import manager as M
 from . import service as S
+from . import update as U
 
 log = logging.getLogger("ds5app.tray")
 
@@ -171,6 +172,11 @@ def describe(c: dict) -> str:
 
 
 class TrayApp:
+    #: Class-level default so an instance whose __init__ was bypassed (the
+    #: test rig builds them with __new__) still renders a menu: every menu
+    #: lambda goes through U.* helpers that accept None.
+    updater = None
+
     def __init__(self, args):
         self.args = args
         self.icon = None
@@ -197,6 +203,12 @@ class TrayApp:
         #: notice mid-session.
         self.hidhide_cli = getattr(args, "hidhide_cli", None) or self.cfg.hidhide_cli
         self._has_hidhide = self._detect_hidhide()
+
+        #: Background update check (None when `update_check: false`). The whole
+        #: integration is four U.* calls -- this one, two lambdas in `_menu()`,
+        #: one entry in `_menu_key()` -- and everything else lives in update.py,
+        #: deliberately: see its module docstring, "The tray touchpoint".
+        self.updater = U.start_if_enabled(self.cfg, notify=self._notify)
 
         self.mgr = M.BridgeManager(
             base_port=self.cfg.port_base,
@@ -525,6 +537,13 @@ class TrayApp:
                          if want else "ds5bridge will no longer start at login.")
         self._work("autostart", act)
 
+    def _install_update(self, *_):
+        """The "Install update" row. All of it happens in update.py; the tray
+        only supplies its own notifier and the clean way to exit -- the swap
+        helper is waiting on this PID, so `_quit` (teardown, then exit) is
+        exactly the right hand-off."""
+        U.install(self.updater, notify=self._notify, quit_cb=self._quit)
+
     def _rescan(self, *_):
         self._work("rescan", self.mgr.poll_once)
 
@@ -779,6 +798,9 @@ class TrayApp:
         return (self._title().splitlines()[0],
                 bool(self._snap.get("master_enabled", True)),
                 self._hide_all_checked(),
+                # In-memory read; this is how the "Install update" row appears
+                # when the daily background check lands mid-session.
+                U.menu_visible(self.updater),
                 tuple((c["serial"], (c.get("label") or ""), c.get("state"),
                        bool(c.get("enabled")), bool(c.get("present")),
                        bool(c.get("hide_bluetooth")), bool(c.get("error")),
@@ -909,6 +931,12 @@ class TrayApp:
             pystray.MenuItem("Start at login", self._toggle_autostart,
                              checked=lambda _i: A.is_enabled(),
                              visible=lambda _i: A.available()),
+            # Hidden until the background check finds a newer release; the
+            # action stages the download, hands off to the swap helper and
+            # quits so the helper can replace the locked exe. See update.py.
+            pystray.MenuItem(lambda _i: U.menu_text(self.updater),
+                             self._install_update,
+                             visible=lambda _i: U.menu_visible(self.updater)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._quit)]
         return pystray.Menu(*items)

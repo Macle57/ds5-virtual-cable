@@ -174,7 +174,8 @@ class ControllerConfig:
 
 
 _CFG_KNOWN = ("enabled", "autostart_on_login", "auto_bridge_new", "port_base",
-              "controllers", "hide_bluetooth_default", "hidhide_cli")
+              "controllers", "hide_bluetooth_default", "hidhide_cli",
+              "update_check")
 
 
 @dataclass
@@ -195,6 +196,12 @@ class Config:
     #: escape hatch mirroring the existing `--usbip` flag -- and a necessary one,
     #: because HidHide 1.5.230 records its install path nowhere in the registry.
     hidhide_cli: str | None = None
+    #: Ask the GitHub releases API (twice a day, ETag-cached, unauthenticated)
+    #: whether a newer ds5bridge exists, and say so in the tray. The check is
+    #: the ONLY thing this gates -- nothing downloads and nothing installs
+    #: without a click. See `update.py` for what a check actually sends
+    #: (nothing about you; a conditional GET of public release metadata).
+    update_check: bool = True
     #: Keyed by LOWERCASED bdaddr, e.g. "d42f4ba1485d".
     controllers: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
@@ -316,6 +323,7 @@ class Config:
             hide_bluetooth_default=_as_bool(data.get("hide_bluetooth_default"),
                                             False),
             hidhide_cli=_as_str(data.get("hidhide_cli"), "") or None,
+            update_check=_as_bool(data.get("update_check"), True),
         )
         raw = data.get("controllers")
         if raw is not None and not isinstance(raw, dict):
@@ -344,6 +352,7 @@ class Config:
                    port_base=int(self.port_base),
                    hide_bluetooth_default=bool(self.hide_bluetooth_default),
                    hidhide_cli=self.hidhide_cli,
+                   update_check=bool(self.update_check),
                    controllers={s: cc.to_dict()
                                 for s, cc in sorted(self.controllers.items())})
         return out
