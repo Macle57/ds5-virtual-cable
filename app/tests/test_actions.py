@@ -81,6 +81,31 @@ class VolumeAndMedia(RecorderCase):
                              name)
 
 
+class DefaultChordsResolve(RecorderCase):
+    """Every action a DEFAULT chord names must exist -- otherwise a factory
+    install prints `chord names unknown action ... -- ignored` and that chord
+    silently does nothing. This is the guard that keeps `config.DEFAULT_CHORDS`
+    and `OsActions.registry()` from drifting apart: a rename on one side that is
+    not mirrored on the other fails here rather than on a user's pad."""
+
+    def test_every_default_chord_action_resolves(self):
+        from ds5app import config as K
+
+        reg = self.a.registry()
+        unresolved = {}
+        for key, name in K.DEFAULT_CHORDS.items():
+            # `pad_power_off` is the engine's own callback, deliberately not an
+            # OsAction (see registry() docstring); everything else is a name in
+            # the registry.
+            if name == "pad_power_off":
+                continue
+            if name not in reg:
+                unresolved[key] = name
+        self.assertEqual(unresolved, {},
+                         f"DEFAULT_CHORDS names not in the action registry: "
+                         f"{unresolved}")
+
+
 class Brightness(RecorderCase):
     def test_brightness_goes_through_wmi_with_a_signed_step(self):
         reg = self.a.registry()
