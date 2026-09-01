@@ -111,11 +111,10 @@ on exit. Chords stay active in remote mode.
 |---|---|
 | touchpad 1-finger drag | move the pointer (`remote.mouse_speed`) |
 | touchpad 1-finger tap | left click |
-| touchpad 2-finger drag | scroll, vertical + horizontal (`remote.scroll_speed`) |
-| touchpad 2-finger horizontal slide | alt-tab hold, same semantics as the chord-held gesture — a decisive ≥150 px horizontal travel (before any vertical wheel has been emitted) opens the switcher; further travel steps it; lifting commits |
+| touchpad 2-finger horizontal slide | alt-tab hold, same semantics as the chord-held gesture — a decisive ≥150 px horizontal travel opens the switcher; further travel steps it; lifting commits |
 | touchpad 2-finger tap | right click |
 | left stick | move the pointer (rate) |
-| right stick (vertical) | scroll (rate) |
+| right stick (vertical) | scroll (rate — the touchpad deliberately does not scroll; sticks and triggers own it) |
 | L2 / R2 | scroll up / down (analog rate) |
 | Cross (hold to drag) | left mouse button down/up |
 | Circle | Esc |
