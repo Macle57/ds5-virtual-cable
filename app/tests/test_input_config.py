@@ -44,6 +44,8 @@ class Defaults(unittest.TestCase):
         self.assertEqual(ic.off_timer_minutes, 15.0)
         self.assertEqual(ic.double_press_ms, 400)
         self.assertTrue(ic.haptic_ack)
+        self.assertEqual(ic.haptic_strength, 25)
+        self.assertTrue(ic.stick_mouse_in_chord)
 
     def test_the_advertised_default_bindings(self):
         # The keymap docs/input-shortcuts.md promises. A change here is a
@@ -69,7 +71,15 @@ class Defaults(unittest.TestCase):
         self.assertEqual(ic.battery.low_percent, 20)
         self.assertEqual(ic.battery.critical_percent, 10)
         self.assertEqual(ic.lightbar.dim_after_minutes, 0.0)   # ships OFF
-        self.assertTrue(ic.remote.enabled)
+        self.assertFalse(ic.remote.enabled)                    # ships OFF too
+
+    def test_remote_mode_ships_off_from_dict_as_well(self):
+        # Both construction paths must agree, or a saved default config would
+        # flip the mode on at the next load.
+        self.assertFalse(CFG.RemoteMode.from_dict({}).enabled)
+        self.assertFalse(CFG.InputConfig.from_dict({}).remote.enabled)
+        self.assertTrue(
+            CFG.RemoteMode.from_dict({"enabled": True}).enabled)
 
 
 class Merging(unittest.TestCase):
@@ -116,6 +126,26 @@ class Coercion(unittest.TestCase):
     def test_off_timer_zero_is_a_valid_choice_not_garbage(self):
         ic = CFG.InputConfig.from_dict({"off_timer_minutes": 0})
         self.assertEqual(ic.off_timer_minutes, 0.0)
+
+    def test_haptic_strength_out_of_range_falls_back(self):
+        for bad in (-1, 101, 400, "loud", None, [50]):
+            ic = CFG.InputConfig.from_dict({"haptic_strength": bad})
+            self.assertEqual(ic.haptic_strength, 25, f"{bad!r}")
+
+    def test_haptic_strength_bounds_are_valid_choices(self):
+        # 0 (haptics effectively silent) and 100 (motor flat out) are choices,
+        # not garbage.
+        self.assertEqual(
+            CFG.InputConfig.from_dict({"haptic_strength": 0}).haptic_strength, 0)
+        self.assertEqual(
+            CFG.InputConfig.from_dict({"haptic_strength": 100}).haptic_strength,
+            100)
+
+    def test_stick_mouse_in_chord_coerces_like_every_bool(self):
+        self.assertFalse(CFG.InputConfig.from_dict(
+            {"stick_mouse_in_chord": "off"}).stick_mouse_in_chord)
+        self.assertTrue(CFG.InputConfig.from_dict(
+            {"stick_mouse_in_chord": "banana"}).stick_mouse_in_chord)
 
     def test_battery_coercion(self):
         b = CFG.BatteryAlerts.from_dict({
