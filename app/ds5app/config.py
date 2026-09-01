@@ -56,6 +56,11 @@ log = logging.getLogger("ds5app.config")
 DEFAULT_PORT_BASE = 3241
 USBIPD_WIN_PORT = 3240
 
+#: Where the local dashboard serves (127.0.0.1 only). One fixed default port,
+#: because the tray's "Open dashboard" item and the user's bookmark both need
+#: a URL that stays true across restarts.
+DEFAULT_DASHBOARD_PORT = 8765
+
 CONFIG_NAME = "config.json"
 #: A parse failure is quarantined here rather than overwritten. It is the only
 #: copy of the labels the user typed, and it is also the only evidence of what
@@ -174,7 +179,8 @@ class ControllerConfig:
 
 
 _CFG_KNOWN = ("enabled", "autostart_on_login", "auto_bridge_new", "port_base",
-              "controllers", "hide_bluetooth_default", "hidhide_cli")
+              "controllers", "hide_bluetooth_default", "hidhide_cli",
+              "dashboard_port")
 
 
 @dataclass
@@ -195,6 +201,10 @@ class Config:
     #: escape hatch mirroring the existing `--usbip` flag -- and a necessary one,
     #: because HidHide 1.5.230 records its install path nowhere in the registry.
     hidhide_cli: str | None = None
+    #: TCP port for the local web dashboard (dashboard.py). Loopback only, so
+    #: a port here is a URL, never an exposure. Validated like `port_base`:
+    #: nonsense falls back to the default rather than failing the load.
+    dashboard_port: int = DEFAULT_DASHBOARD_PORT
     #: Keyed by LOWERCASED bdaddr, e.g. "d42f4ba1485d".
     controllers: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
@@ -316,6 +326,8 @@ class Config:
             hide_bluetooth_default=_as_bool(data.get("hide_bluetooth_default"),
                                             False),
             hidhide_cli=_as_str(data.get("hidhide_cli"), "") or None,
+            dashboard_port=_as_service_port(data.get("dashboard_port"),
+                                            DEFAULT_DASHBOARD_PORT),
         )
         raw = data.get("controllers")
         if raw is not None and not isinstance(raw, dict):
@@ -344,6 +356,7 @@ class Config:
                    port_base=int(self.port_base),
                    hide_bluetooth_default=bool(self.hide_bluetooth_default),
                    hidhide_cli=self.hidhide_cli,
+                   dashboard_port=int(self.dashboard_port),
                    controllers={s: cc.to_dict()
                                 for s, cc in sorted(self.controllers.items())})
         return out
@@ -398,6 +411,25 @@ def _as_port(value: object) -> int | None:
         # and break whichever of the two started second.
         log.warning("ignoring port %r in the config", value)
         return None
+    return port
+
+
+def _as_service_port(value: object, default: int) -> int:
+    """A TCP port one of OUR servers will bind, with a default to fall back on.
+
+    Same shape as `_as_port_base`: nonsense, out-of-range values and 3240
+    (usbipd-win's) all become the default rather than an error, because a
+    hand-edited config must never stop the app from starting.
+    """
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return default
+    if not (1 <= port <= 65535) or port == USBIPD_WIN_PORT:
+        log.warning("port %r is not usable -- using %d", value, default)
+        return default
     return port
 
 

@@ -482,6 +482,19 @@ def cmd_run_all(args) -> int:
     from . import config as K
 
     cfg = K.load()
+    # The dashboard's telemetry hub binds an ephemeral UDP port; every child
+    # is told where it is via `--telemetry-port`. Best-effort throughout: a
+    # dashboard problem must never cost anybody their controllers.
+    hub = dash = None
+    try:
+        from . import dashboard as DB
+        from . import telemetry as TM
+
+        hub = TM.TelemetryHub()
+        hub.start()
+    except Exception:  # noqa: BLE001
+        logging.getLogger("ds5app.cli").exception(
+            "could not start the telemetry hub")
     mgr = MG.BridgeManager(base_port=args.port, usbip_exe=args.usbip,
                            audio_target=args.audio_target,
                            hide_bluetooth={s: cc.hide_bluetooth
@@ -490,7 +503,18 @@ def cmd_run_all(args) -> int:
                                          or cfg.hide_bluetooth_default),
                            hidhide_cli=(getattr(args, "hidhide_cli", None)
                                         or cfg.hidhide_cli),
+                           telemetry_port=(hub.port if hub else None),
                            on_event=ev)
+    if hub is not None:
+        try:
+            dash = DB.DashboardServer(hub=hub, snapshot_fn=mgr.snapshot,
+                                      port=cfg.dashboard_port)
+            dash.start()
+            _log("info", f"dashboard at {dash.url}")
+        except Exception as e:  # noqa: BLE001
+            dash = None
+            _log("warn", f"the dashboard could not start ({e}); bridging "
+                         f"continues without it")
     S.install_crash_handlers()
     S.ON_TEARDOWN.append(mgr.close)
     # Before anything of ours goes near a port: disarm any auto-re-attach a
@@ -501,11 +525,13 @@ def cmd_run_all(args) -> int:
         started = mgr.start_all()
     except C.NoControllerError as e:
         print(f"\n  {e}")
+        _close_quietly(dash, hub)
         return 4
     if not started:
         print("\n  No controller could be bridged. `ds5bridge doctor` checks "
               "the whole setup.")
         mgr.close()
+        _close_quietly(dash, hub)
         return 4
 
     print(f"\n  Windows now sees {len(started)} wired DualSense(s). Start your game.")
@@ -524,7 +550,18 @@ def cmd_run_all(args) -> int:
         print()
     finally:
         mgr.close()
+        _close_quietly(dash, hub)
     return 0
+
+
+def _close_quietly(*closers) -> None:
+    """Stop dashboard pieces without letting them complicate a teardown."""
+    for closer in closers:
+        if closer is not None:
+            try:
+                closer.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def cmd_run(args) -> int:
@@ -555,6 +592,7 @@ def cmd_run(args) -> int:
                           hide_bluetooth=hide,
                           hidhide_cli=(getattr(args, "hidhide_cli", None)
                                        or cfg.hidhide_cli),
+                          telemetry_port=getattr(args, "telemetry_port", None),
                           on_event=_log)
     try:
         svc.start()
@@ -673,6 +711,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "leaves it hidden, `ds5bridge unhide` gets it back")
     r.add_argument("--hidhide-cli", default=None, metavar="PATH",
                    help="path to HidHideCLI.exe, if it is somewhere unusual")
+    r.add_argument("--telemetry-port", type=int, default=None, metavar="PORT",
+                   help="publish live input state (buttons, sticks, touch) as "
+                        "UDP datagrams to 127.0.0.1:PORT at up to 60 Hz, for "
+                        "the web dashboard. The tray passes this to every "
+                        "bridge it spawns; a bare run rarely needs it")
     r.add_argument("-v", "--verbose", action="store_true")
     r.set_defaults(func=cmd_run)
 

@@ -405,7 +405,8 @@ class BridgeService:
                  host: str = "127.0.0.1", busid: str = "1-1",
                  usbip_exe: str | None = None, audio_target: str = "speaker",
                  auto_cleanup: bool = True, on_event=None,
-                 hide_bluetooth: bool = False, hidhide_cli: str | None = None):
+                 hide_bluetooth: bool = False, hidhide_cli: str | None = None,
+                 telemetry_port: int | None = None):
         self.serial = serial
         self.port = port
         self.host = host
@@ -425,6 +426,12 @@ class BridgeService:
         self.hide_bluetooth = bool(hide_bluetooth)
         self.hidhide_cli = hidhide_cli
         self._hidden_ids: list[str] = []
+        #: Where to publish live input telemetry (UDP to 127.0.0.1:port), for
+        #: the dashboard. None -- the default, and the only value a bare
+        #: `ds5bridge run` gets without the flag -- publishes nothing at all.
+        #: See `telemetry.py` for why UDP and why it cannot slow the bridge.
+        self.telemetry_port = telemetry_port
+        self._telemetry = None
 
         self.state = STOPPED
         self.error: str | None = None
@@ -608,6 +615,20 @@ class BridgeService:
             interval=60.0)
         self._battery.start()
 
+        if self.telemetry_port:
+            # Telemetry is a passenger: it starts last, after the bridge is
+            # verifiably up, and a failure to start it is a log line, never a
+            # failed bridge.
+            try:
+                from . import telemetry as TM
+
+                self._telemetry = TM.TelemetryPublisher(
+                    self._backend, self.telemetry_port, serial=self.serial or "")
+                self._telemetry.start()
+            except Exception:  # noqa: BLE001
+                log.exception("could not start the telemetry publisher")
+                self._telemetry = None
+
     def _start_server(self) -> None:
         from ds5emu.bridge import BridgeBackend
         from ds5emu.server import UsbIpServer
@@ -679,6 +700,13 @@ class BridgeService:
         if self._battery is not None:
             self._battery.stop()
             self._battery = None
+
+        if self._telemetry is not None:
+            try:
+                self._telemetry.stop()
+            except Exception:  # noqa: BLE001
+                log.exception("stopping the telemetry publisher failed")
+            self._telemetry = None
 
         # Unhide BEFORE the detach, not after. If the unhide fails we have not
         # yet begun tearing the virtual device down, so the failure is
