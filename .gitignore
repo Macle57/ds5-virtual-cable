@@ -11,6 +11,9 @@ prototype/.venv/
 # Claude Code agent worktrees
 .claude/worktrees/
 
+# Diagnostic one-offs (mouse_probe.py and friends)
+scratchpad/
+
 # Build output
 build/
 dist/
