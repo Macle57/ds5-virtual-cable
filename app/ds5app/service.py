@@ -37,7 +37,9 @@ from __future__ import annotations
 import asyncio
 import atexit
 import ctypes
+import json
 import logging
+import os
 import re
 import signal
 import socket
@@ -396,6 +398,137 @@ def install_crash_handlers() -> None:
 
 
 # ---------------------------------------------------------------------------
+# live input settings -- the config file, applied to a RUNNING bridge
+# ---------------------------------------------------------------------------
+
+
+def _read_input_section(path: str):
+    """The `input` section of the config at `path`, or None. Never raises.
+
+    Deliberately NOT `config.load()`. That function is a rescue mission -- it
+    quarantines an unparseable file to config.json.bad and hands back
+    defaults -- which is exactly right once, at startup, and exactly wrong on
+    a 2 s poll: a file the user is mid-way through hand-editing would be
+    whisked aside and its settings replaced with defaults on a live pad. The
+    watcher's job is humbler: if the file cannot be read RIGHT NOW, say so at
+    debug level and try again in two seconds. Degrade, don't poison.
+    """
+    from . import config as K
+
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.loads(f.read())
+        if not isinstance(data, dict):
+            return None
+        return K.InputConfig.from_dict(data.get("input"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+class InputConfigWatcher:
+    """Applies saved `input` settings to a running bridge, within seconds.
+
+    Why this exists: every bridge is a CHILD PROCESS running `ds5bridge run`
+    (see `manager.default_child_command`), which reads config.json exactly
+    once, at spawn. The tray hears about a dashboard Save through an HTTP
+    callback and adopts the new config -- but its children never do, so a
+    user who tuned `double_press_ms` or switched remote mode on watched
+    nothing change and reasonably concluded the feature was broken. The file
+    itself is the only channel that already reaches every bridge process, on
+    every path (tray children, `--all` children, a bare `ds5bridge run`), so
+    each bridge watches the file.
+
+    The mechanics are deliberately boring: one daemon thread, one `os.stat`
+    every ~2 s (nanoseconds of I/O), a full read ONLY when the mtime moved,
+    and an apply ONLY when the input section's `to_dict()` actually differs
+    from what the engine is running -- so a save that changed a bridging
+    switch, or a rewrite of identical settings, touches the engine not at
+    all. The comparison and the file read happen entirely on this thread;
+    the engine lock is taken only inside `update_config`, for the swap.
+    Everything is injectable (`path`, `interval`, `load_fn`) so the tests
+    drive `poll_once()` against a temp file and never sleep.
+    """
+
+    def __init__(self, apply_fn, current_fn, *, path: str | None = None,
+                 interval: float = 2.0, load_fn=None, on_applied=None):
+        #: `apply_fn(input_cfg)` hands a changed section to the owner;
+        #: `current_fn()` returns the `InputConfig` the engine runs now.
+        self._apply = apply_fn
+        self._current = current_fn
+        if path is None:
+            from . import config as K
+
+            path = K.config_path()
+        self.path = path
+        self.interval = interval
+        self._load = load_fn or _read_input_section
+        #: Optional voice: called with the one applied-live line, so the
+        #: bridge can route it through its event stream (tray notification
+        #: channel, child stdout). Without it, the module log speaks.
+        self._on_applied = on_applied
+        self._mtime: int | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run,
+                                        name="ds5-input-config-watch",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stops and JOINS -- the host must be able to rely on no apply
+        landing on an engine it is about to close."""
+        self._stop.set()
+        t = self._thread
+        if t is not None:
+            t.join(timeout=5.0)
+        self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.poll_once()
+            except Exception:  # noqa: BLE001
+                log.exception("the input-config watcher failed a poll")
+
+    def poll_once(self) -> bool:
+        """One poll. True when a changed section was applied."""
+        try:
+            mtime = os.stat(self.path).st_mtime_ns
+        except OSError:
+            return False                 # no file (first run) -- nothing to do
+        if mtime == self._mtime:
+            return False
+        # Recorded before the read succeeds, so a file that STAYS broken is
+        # stat-only until somebody touches it again.
+        self._mtime = mtime
+        new = self._load(self.path)
+        if new is None:
+            log.debug("could not read the input settings from %s -- skipped",
+                      self.path)
+            return False
+        current = self._current()
+        new_d = new.to_dict()
+        cur_d = current.to_dict() if current is not None else None
+        if new_d == cur_d:
+            return False
+        changed = (sorted(k for k in set(new_d) | set(cur_d)
+                          if new_d.get(k) != cur_d.get(k))
+                   if cur_d is not None else ["all"])
+        self._apply(new)
+        msg = f"input settings applied live: {', '.join(changed)} changed"
+        if self._on_applied is not None:
+            self._on_applied(msg)
+        else:
+            log.info("%s", msg)
+        return True
+
+
+# ---------------------------------------------------------------------------
 # the service
 # ---------------------------------------------------------------------------
 
@@ -438,6 +571,10 @@ class BridgeService:
         #: the tray's children, `--all` and a bare `ds5bridge run`.
         self.input_config = input_config
         self._interceptor = None
+        #: Watches config.json and applies `input` changes to the running
+        #: engine (`InputConfigWatcher`) -- the dashboard's Save must reach a
+        #: bridge that is already up, without a restart.
+        self._input_watcher = None
 
         self.state = STOPPED
         self.error: str | None = None
@@ -635,6 +772,21 @@ class BridgeService:
                 log.exception("could not start the telemetry publisher")
                 self._telemetry = None
 
+        if self._interceptor is not None:
+            # Another passenger, and the same rules as telemetry: it starts
+            # last, and failing to start it costs a log line, never the
+            # bridge. From here on, a dashboard Save (or a hand edit) of the
+            # `input` section reaches this bridge within a couple of seconds.
+            try:
+                self._input_watcher = InputConfigWatcher(
+                    apply_fn=self._apply_input_config,
+                    current_fn=lambda: self.input_config,
+                    on_applied=lambda text: self._emit("info", text))
+                self._input_watcher.start()
+            except Exception:  # noqa: BLE001
+                log.exception("could not start the input-config watcher")
+                self._input_watcher = None
+
     def _start_server(self) -> None:
         from ds5emu.bridge import BridgeBackend
         from ds5emu.server import UsbIpServer
@@ -697,18 +849,24 @@ class BridgeService:
     def _attach_interceptor(self) -> None:
         """Hang the chord/shortcut engine on the backend, when configured.
 
+        Attached even when `input.enabled` is False -- a disabled engine is a
+        pure passthrough (one attribute read per report), and having it there
+        means the config watcher can switch it ON live instead of owing the
+        user a restart. Only a missing section (`input_config=None`, the
+        embedded-API case) attaches nothing.
+
         Wrapped whole: bridging is the product and chords are a convenience,
         so a broken engine build must cost a log line, never the bridge.
         """
-        if self.input_config is None or not getattr(self.input_config,
-                                                    "enabled", False):
+        if self.input_config is None:
             return
         try:
             from . import intercept as I
 
             self._interceptor = I.attach_to_backend(self._backend,
-                                                    self.input_config)
-            if self._interceptor is not None:
+                                                    self.input_config,
+                                                    allow_disabled=True)
+            if self._interceptor is not None and self.input_config.enabled:
                 self._emit("info",
                            f"chord engine armed (chord button: "
                            f"{self.input_config.chord_button}, idle off-timer: "
@@ -716,6 +874,19 @@ class BridgeService:
         except Exception:  # noqa: BLE001
             log.exception("the chord engine could not be attached")
             self._interceptor = None
+
+    def _apply_input_config(self, new_cfg) -> None:
+        """The watcher found a changed `input` section: make it live.
+
+        Adopting the object BEFORE the engine swap keeps `input_config`
+        (what the watcher compares against next poll) and the engine's own
+        `cfg` moving together -- a failure in `update_config` would log, and
+        the next differing save retries the whole thing.
+        """
+        self.input_config = new_cfg
+        eng = self._interceptor
+        if eng is not None:
+            eng.update_config(new_cfg)
 
     # -- stop --------------------------------------------------------------
 
@@ -730,6 +901,15 @@ class BridgeService:
         if self._battery is not None:
             self._battery.stop()
             self._battery = None
+
+        # The config watcher before the engine it feeds: `stop()` joins, so
+        # no late apply can land on an engine mid-close.
+        if self._input_watcher is not None:
+            try:
+                self._input_watcher.stop()
+            except Exception:  # noqa: BLE001
+                log.exception("stopping the input-config watcher failed")
+            self._input_watcher = None
 
         # The chord engine first: it may be holding a synthetic key down (an
         # Alt-Tab mid-gesture), and a stuck Alt key outlives everything else

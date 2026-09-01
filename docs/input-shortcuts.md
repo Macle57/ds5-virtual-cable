@@ -9,7 +9,9 @@ layer — the game just sees a pad nobody is pressing chords on.
 Everything below is configurable in the `input` section of `config.json`
 (`%APPDATA%\ds5bridge\config.json`); every default works untouched. The engine
 runs inside every bridge (`ds5bridge run`, `--all`, the tray's children) and
-can be switched off wholesale with `"input": {"enabled": false}`.
+can be switched off wholesale with `"input": {"enabled": false}`. A saved
+change to the `input` section — from the dashboard or a hand edit — reaches
+every running bridge within a couple of seconds; no restart needed.
 
 ## Where it hooks (for developers)
 
