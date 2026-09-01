@@ -598,6 +598,7 @@ def cmd_run(args) -> int:
                           hidhide_cli=(getattr(args, "hidhide_cli", None)
                                        or cfg.hidhide_cli),
                           telemetry_port=getattr(args, "telemetry_port", None),
+                          input_config=cfg.input,
                           on_event=_log)
     try:
         svc.start()
