@@ -522,6 +522,31 @@ class RemoteModeToggle(EngineCase):
                 ons += 1
         self.assertEqual(ons, 2)
 
+    def test_the_remote_colour_is_reasserted_while_the_mode_holds(self):
+        # One engine write can be lost in flight (GameInput gate, a game
+        # writing in a gap) -- while remote mode is on the colour claim
+        # repeats about once a second, and stops the moment the mode ends.
+        self.make_remote()
+        self.enter()
+        self.eng.tick()
+        self.sent.clear()
+        for _ in range(36):                       # 3.6 s in the mode
+            self.clock.advance(0.1)
+            self.eng.tick()
+        orange = [b for b in self.sent
+                  if b[P.VALID_FLAG1] & P.F1_LIGHTBAR_CONTROL
+                  and (b[P.LED_R], b[P.LED_G], b[P.LED_B]) == (255, 120, 0)]
+        # ~once a second: 3-4 claims over 3.6 s depending on tick phase
+        self.assertIn(len(orange), (3, 4))
+        self.enter()                              # leave
+        self.eng.tick()
+        self.sent.clear()
+        for _ in range(30):
+            self.clock.advance(0.1)
+            self.eng.tick()
+        self.assertFalse([b for b in self.sent
+                          if b[P.VALID_FLAG1] & P.F1_LIGHTBAR_CONTROL])
+
     def test_leaving_restores_the_games_lightbar(self):
         self.make_remote()
         game = P.SetState()
