@@ -170,26 +170,36 @@ class DashboardCase(unittest.TestCase):
         self.assertFalse(cc.enabled)
 
     def test_unknown_sections_survive_the_round_trip(self):
-        """Forward compatibility: the section another agent's build writes.
+        """Forward compatibility: the section a newer build writes.
 
-        An `input` section this build has never heard of must be served by
-        GET (so the page can render it generically), be editable by POST, and
-        come out of `Config.extra` untouched -- not silently dropped by a
-        save that only knows today's keys.
+        A section this build has never heard of must be served by GET (so the
+        page can render it generically), be editable by POST, and come out of
+        `Config.extra` untouched -- not silently dropped by a save that only
+        knows today's keys. (This test once used `input` as its example;
+        `input` has since become a real, known section -- see the next test.)
         """
         cfg = K.load()
-        cfg.extra["input"] = {"off_timer_minutes": 15, "chords": ["PS+mute"]}
+        cfg.extra["someday"] = {"off_timer_minutes": 15, "chords": ["PS+mute"]}
         cfg.save()
         doc = self.get_json("/api/config")
-        self.assertEqual(doc["config"]["input"]["off_timer_minutes"], 15)
+        self.assertEqual(doc["config"]["someday"]["off_timer_minutes"], 15)
 
         status, _, _ = self.post_config(
-            {"input": {"off_timer_minutes": 30}, "port_base": 3260})
+            {"someday": {"off_timer_minutes": 30}, "port_base": 3260})
         self.assertEqual(status, 200)
         cfg = K.load()
-        self.assertEqual(cfg.extra["input"]["off_timer_minutes"], 30)
-        self.assertEqual(cfg.extra["input"]["chords"], ["PS+mute"])  # merged,
-        self.assertEqual(cfg.port_base, 3260)                        # not replaced
+        self.assertEqual(cfg.extra["someday"]["off_timer_minutes"], 30)
+        self.assertEqual(cfg.extra["someday"]["chords"], ["PS+mute"])  # merged,
+        self.assertEqual(cfg.port_base, 3260)                          # not replaced
+
+    def test_the_input_section_posts_as_a_known_section(self):
+        # The chord engine's section is known now: a POST must land in the
+        # parsed `Config.input`, not in `extra`.
+        status, _, _ = self.post_config({"input": {"off_timer_minutes": 30}})
+        self.assertEqual(status, 200)
+        cfg = K.load()
+        self.assertNotIn("input", cfg.extra)
+        self.assertEqual(cfg.input.off_timer_minutes, 30)
 
     def test_config_post_coerces_garbage_instead_of_saving_it(self):
         # `Config.from_dict` is the gate: nonsense degrades to defaults, so a

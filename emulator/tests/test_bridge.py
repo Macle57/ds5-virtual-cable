@@ -958,5 +958,135 @@ class LinkLossTests(unittest.TestCase):
         self.assertEqual(be.stats["disconnects"], 1)
 
 
+@unittest.skipUnless(HAVE_DEPS, "numpy / PyAV / hidapi not available")
+class InterceptorSeamTests(unittest.TestCase):
+    """The chord-engine seam: containment, masking, and the pad power-off.
+
+    The engine itself lives in `app/ds5app/intercept.py` and is tested there;
+    what belongs HERE is the bridge's half of the contract: a broken engine
+    costs one report and a counter, never the bridge, and the engine's two
+    callbacks (`push_setstate_body`, `power_off_pad`) put exactly the right
+    bytes on the (fake) air. `_defer` runs inline while no threads are
+    started, so every deferred write really happens on the calling thread.
+    """
+
+    def setUp(self):
+        self.be = B.BridgeBackend()
+        self.dev = _FakeDev()
+        self.be._dev = self.dev
+        self.be.connected.set()
+
+    # -- containment ------------------------------------------------------
+
+    def test_no_interceptor_is_pure_passthrough(self):
+        usb = bytes([0x01]) + bytes(range(63))
+        self.assertEqual(self.be._intercept_input(usb), usb)
+        body = bytes(47)
+        self.assertEqual(self.be._intercept_setstate(body), body)
+
+    def test_on_input_result_replaces_the_report(self):
+        masked = bytes([0x01]) + bytes(63)
+
+        class Engine:
+            def on_input(self, usb):
+                return masked
+        self.be.interceptor = Engine()
+        self.assertEqual(self.be._intercept_input(b"\x01" + b"\xff" * 63),
+                         masked)
+
+    def test_a_raising_engine_costs_a_counter_not_the_report(self):
+        class Engine:
+            def on_input(self, usb):
+                raise RuntimeError("boom")
+
+            def rewrite_setstate(self, body):
+                raise RuntimeError("boom")
+
+            def tick(self):
+                raise RuntimeError("boom")
+        self.be.interceptor = Engine()
+        usb = bytes([0x01]) + bytes(63)
+        self.assertEqual(self.be._intercept_input(usb), usb)
+        body = bytes(47)
+        self.assertEqual(self.be._intercept_setstate(body), body)
+        self.be._intercept_tick()
+        self.assertEqual(self.be.stats["interceptor_errors"], 3)
+
+    def test_an_engine_returning_none_means_passthrough(self):
+        class Engine:
+            def on_input(self, usb):
+                return None
+
+            def rewrite_setstate(self, body):
+                return None
+        self.be.interceptor = Engine()
+        usb = bytes([0x01]) + bytes(63)
+        self.assertEqual(self.be._intercept_input(usb), usb)
+        self.assertEqual(self.be._intercept_setstate(bytes(47)), bytes(47))
+
+    # -- push_setstate_body ------------------------------------------------
+
+    def test_push_setstate_body_reaches_the_pad_signed_and_unmerged(self):
+        from ds5emu import translate as T
+        from ds5bridge import protocol as P
+
+        st = P.SetState()
+        st.lightbar(1, 2, 3)
+        self.be.push_setstate_body(bytes(st.body))
+        self.assertEqual(len(self.dev.writes), 1)
+        report = self.dev.writes[0]
+        self.assertEqual(report[0], P.BT_OUT_31)
+        self.assertTrue(T.verify_bt_output_crc(report))
+        self.assertEqual(T.bt31_output_body(report), bytes(st.body))
+        # Engine traffic must NOT contaminate the host's replayed state or the
+        # coalescing key -- it is ours, not something the game asked for.
+        self.assertIsNone(self.be._setstate_host)
+        self.assertIsNone(self.be._setstate_last)
+
+    # -- power_off_pad -----------------------------------------------------
+
+    def test_power_off_sends_the_captured_0x08_kill_signed(self):
+        from ds5bridge.crc import crc32_seeded, SEED_SET_FEATURE
+
+        self.be.power_off_pad()
+        self.assertEqual(len(self.dev.h.feature_writes), 1)
+        report = self.dev.h.feature_writes[0]
+        # id + the 63-byte payload: same framing the pad demands of 0x80.
+        self.assertEqual(report[0], B.FEATURE_BLUETOOTH_CONTROL)
+        self.assertEqual(len(report), 1 + B.FEATURE_TEST_PAYLOAD_LEN)
+        payload = report[1:]
+        # action 0x02 = drop the Bluetooth link -> the pad powers off
+        # (docs/wired-gap-findings.md symptom 3, captured 2026-08-31).
+        self.assertEqual(payload[0], B.BT_CONTROL_DISCONNECT)
+        want = crc32_seeded(SEED_SET_FEATURE, B.FEATURE_BLUETOOTH_CONTROL,
+                            payload[:-4])
+        self.assertEqual(payload[-4:], want.to_bytes(4, "little"))
+        self.assertEqual(self.be.stats["pad_power_off"], 1)
+
+    def test_power_off_unsigned_over_usb_transport(self):
+        # A USB-connected pad (is_bt False) never wants the BT CRC.
+        self.be._dev = dev = _FakeDev(is_bt=False)
+        self.be.power_off_pad()
+        payload = dev.h.feature_writes[0][1:]
+        self.assertEqual(payload[-4:], b"\0\0\0\0")
+
+    def test_power_off_rejected_by_the_stack_is_not_counted_sent(self):
+        self.dev.h.send_feature_report = lambda data: -1
+        self.be.power_off_pad()
+        self.assertEqual(self.be.stats["pad_power_off"], 0)
+
+    def test_power_off_with_no_device_is_a_no_op(self):
+        self.be._dev = None
+        self.be.power_off_pad()          # must not raise
+        self.assertEqual(self.be.stats["pad_power_off"], 0)
+
+    def test_host_0x08_writes_are_still_recorded_and_dropped(self):
+        # Defence in depth from symptom 3 must survive this feature: only the
+        # ENGINE may power the pad off; a host-issued 0x08 never reaches it.
+        self.be.set_feature_report(0x08, b"\x08\x02" + bytes(46))
+        self.assertEqual(self.dev.h.feature_writes, [])
+        self.assertIn((0x08, b"\x08\x02" + bytes(46)), self.be.feature_writes)
+
+
 if __name__ == "__main__":
     unittest.main()
