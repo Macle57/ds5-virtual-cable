@@ -59,9 +59,16 @@ changes nothing persistent — one PS press brings the pad back. Host-issued
 ## Default keymap
 
 Chords fire while the chord button (PS) is held; a short haptic pulse acks
-each accepted chord. **Everything digital is swallowed while PS is held** —
-buttons, dpad, touchpad; sticks and triggers still pass so aiming is never
-frozen by reaching for a shortcut.
+each accepted chord (`haptic_ack` to silence it, `haptic_strength` 0–100 for
+how hard it hits, default 25). **Everything digital is swallowed while PS is
+held** — buttons, dpad, touchpad; triggers still pass. The sticks are lent to
+the OS by default (`stick_mouse_in_chord`): left stick moves the pointer,
+right stick scrolls, at the same `remote.*` speeds as remote mode, and the
+game sees them centred for the duration of the hold — the "major controls"
+mean the same thing whether PS is held or remote mode is on. The cost is a
+camera frozen while reaching for a shortcut; set
+`"stick_mouse_in_chord": false` to restore pure stick passthrough during
+chords.
 
 | input (with PS held) | action | notes |
 |---|---|---|
@@ -90,7 +97,9 @@ dependencies. Per-action parameters go in `input.actions`, e.g.
 
 ## Remote mode
 
-**Double-press PS** (two presses within `double_press_ms`) — the pad stops
+**Ships OFF** (`remote.enabled`, switched on from the dashboard) — a mode a
+mistimed PS double-tap can fall into must be opted into. When enabled,
+**double-press PS** (two presses within `double_press_ms`) — the pad stops
 driving the game (which sees a neutral pad with real battery/status bytes) and
 drives the OS instead. Feedback: a double haptic pulse and the lightbar held
 orange (`remote.lightbar_color`); single pulse and the game's colour restored
@@ -101,6 +110,7 @@ on exit. Chords stay active in remote mode.
 | touchpad 1-finger drag | move the pointer (`remote.mouse_speed`) |
 | touchpad 1-finger tap | left click |
 | touchpad 2-finger drag | scroll, vertical + horizontal (`remote.scroll_speed`) |
+| touchpad 2-finger horizontal slide | alt-tab hold, same semantics as the chord-held gesture — a decisive ≥150 px horizontal travel (before any vertical wheel has been emitted) opens the switcher; further travel steps it; lifting commits |
 | touchpad 2-finger tap | right click |
 | left stick | move the pointer (rate) |
 | right stick (vertical) | scroll (rate) |
@@ -138,6 +148,8 @@ excluded (gyro noise never sleeps; a pad face-down on the couch must idle).
   "tap_replay_ms": 100,
   "repeat_ms": 150,
   "haptic_ack": true,
+  "haptic_strength": 25,
+  "stick_mouse_in_chord": true,
   "off_timer_minutes": 15.0,
   "chords": { "triangle": "pad_power_off", "...": "see the table above" },
   "actions": { "volume_up": {"step": 1} },
@@ -146,7 +158,7 @@ excluded (gyro noise never sleeps; a pad face-down on the couch must idle).
                "low_color": [255, 140, 0], "critical_color": [255, 0, 0],
                "low_blinks": 2, "critical_blinks": 3 },
   "lightbar": { "dim_after_minutes": 0.0, "dim_level": 0.3 },
-  "remote": { "enabled": true, "mouse_speed": 1.6, "scroll_speed": 1.0,
+  "remote": { "enabled": false, "mouse_speed": 1.6, "scroll_speed": 1.0,
               "lightbar_color": [255, 120, 0] }
 }
 ```
@@ -163,12 +175,13 @@ No hardware anywhere: synthetic `0x01` reports feed the engine, an injected
 clock drives every timing rule, `SendInput` is a recorder, PowerShell a stub.
 
 - `app/tests/test_intercept.py` — masking, chord edges/repeats, tap replay
-  and double-press timing, all gestures, the full remote-mode map, idle timer,
-  battery flash schedule, lightbar rewrites, wiring (67 tests)
+  and double-press timing, all gestures (chord-held and remote), chord-held
+  stick translation, the full remote-mode map, haptic strength scaling, idle
+  timer, battery flash schedule, lightbar rewrites, wiring (84 tests)
 - `app/tests/test_actions.py` — exact VK sequences, one-`SendInput` atomicity,
-  Alt-Tab hold lifecycle and stuck-Alt protection (17)
+  Alt-Tab hold lifecycle and stuck-Alt protection (18)
 - `app/tests/test_input_config.py` — defaults, merge/removal durability,
-  never-raise coercion, round-trips (19)
+  never-raise coercion, round-trips (23)
 - `emulator/tests/test_bridge.py::InterceptorSeamTests` — containment (a
   raising engine costs a counter, never the bridge), `push_setstate_body`
   signing and non-contamination of host state, the 0x08 power-off bytes (10)
