@@ -405,7 +405,8 @@ class BridgeService:
                  host: str = "127.0.0.1", busid: str = "1-1",
                  usbip_exe: str | None = None, audio_target: str = "speaker",
                  auto_cleanup: bool = True, on_event=None,
-                 hide_bluetooth: bool = False, hidhide_cli: str | None = None):
+                 hide_bluetooth: bool = False, hidhide_cli: str | None = None,
+                 input_config=None):
         self.serial = serial
         self.port = port
         self.host = host
@@ -425,6 +426,11 @@ class BridgeService:
         self.hide_bluetooth = bool(hide_bluetooth)
         self.hidhide_cli = hidhide_cli
         self._hidden_ids: list[str] = []
+        #: `config.InputConfig` (or None): the chord/shortcut engine. Owned
+        #: here for the same reason `hide_bluetooth` is -- one code path for
+        #: the tray's children, `--all` and a bare `ds5bridge run`.
+        self.input_config = input_config
+        self._interceptor = None
 
         self.state = STOPPED
         self.error: str | None = None
@@ -614,6 +620,7 @@ class BridgeService:
         from ds5emu.timing import TimerResolution
 
         self._backend = BridgeBackend(target=self.audio_target, serial=self.serial)
+        self._attach_interceptor()
         self._server = UsbIpServer(self._backend, host=self.host, port=self.port,
                                    busid=self.busid)
         self._ready.clear()
@@ -666,6 +673,29 @@ class BridgeService:
         if self._start_error is not None:
             raise RuntimeError(f"could not start the bridge: {self._start_error}")
 
+    def _attach_interceptor(self) -> None:
+        """Hang the chord/shortcut engine on the backend, when configured.
+
+        Wrapped whole: bridging is the product and chords are a convenience,
+        so a broken engine build must cost a log line, never the bridge.
+        """
+        if self.input_config is None or not getattr(self.input_config,
+                                                    "enabled", False):
+            return
+        try:
+            from . import intercept as I
+
+            self._interceptor = I.attach_to_backend(self._backend,
+                                                    self.input_config)
+            if self._interceptor is not None:
+                self._emit("info",
+                           f"chord engine armed (chord button: "
+                           f"{self.input_config.chord_button}, idle off-timer: "
+                           f"{self.input_config.off_timer_minutes:g} min)")
+        except Exception:  # noqa: BLE001
+            log.exception("the chord engine could not be attached")
+            self._interceptor = None
+
     # -- stop --------------------------------------------------------------
 
     def stop(self, quiet: bool = False) -> None:
@@ -679,6 +709,16 @@ class BridgeService:
         if self._battery is not None:
             self._battery.stop()
             self._battery = None
+
+        # The chord engine first: it may be holding a synthetic key down (an
+        # Alt-Tab mid-gesture), and a stuck Alt key outlives everything else
+        # this teardown touches.
+        if self._interceptor is not None:
+            try:
+                self._interceptor.close()
+            except Exception:  # noqa: BLE001
+                log.exception("closing the chord engine failed")
+            self._interceptor = None
 
         # Unhide BEFORE the detach, not after. If the unhide fails we have not
         # yet begun tearing the virtual device down, so the failure is

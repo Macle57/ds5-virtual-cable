@@ -173,8 +173,283 @@ class ControllerConfig:
         return out
 
 
+# ---------------------------------------------------------------------------
+# the `input` section: chords, gestures, remote mode, idle timer, lightbar
+# ---------------------------------------------------------------------------
+#
+# Consumed by `ds5app.intercept.InputInterceptor`, which sits on the decoded
+# Bluetooth input stream BEFORE the emulated USB layer -- so everything
+# configured here is invisible to the game. This module only owns the SHAPE:
+# plain JSON-able dataclasses, defaults that work untouched, and the same
+# never-raise coercion discipline as the rest of the file, so a hand-edited
+# chord table can be wrong without costing the user their tray icon.
+
+#: Buttons a chord can be built from / act as the chord button. The names are
+#: the config vocabulary; `intercept.py` maps them onto report bits.
+CHORD_BUTTONS = ("cross", "circle", "square", "triangle",
+                 "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+                 "l1", "r1", "l3", "r3", "create", "options", "ps",
+                 "touchpad_click", "mute")
+
+#: Touchpad gestures that can carry an action while the chord button is held.
+CHORD_GESTURES = ("touch_slide_horizontal", "touch_swipe_up", "touch_swipe_down")
+
+#: chord key (a button or gesture name) -> action name. Action names resolve
+#: against `ds5app.actions.registry()`; an unknown name is ignored with one
+#: log line, so a config written for a newer build degrades instead of dying.
+#: A user entry of "" or "none" REMOVES a default binding.
+DEFAULT_CHORDS = {
+    "triangle": "pad_power_off",
+    "cross": "media_play_pause",
+    "square": "volume_mute",
+    "dpad_up": "volume_up",
+    "dpad_down": "volume_down",
+    "dpad_left": "media_prev",
+    "dpad_right": "media_next",
+    "l1": "brightness_down",
+    "r1": "brightness_up",
+    "options": "projection_cycle",
+    "create": "show_desktop",
+    "touch_slide_horizontal": "alt_tab",
+    "touch_swipe_up": "task_view",
+    "touch_swipe_down": "minimize_all",
+}
+
+_BATTERY_KNOWN = ("enabled", "low_percent", "critical_percent",
+                  "low_interval_s", "critical_interval_s",
+                  "low_color", "critical_color", "low_blinks", "critical_blinks")
+
+
+@dataclass
+class BatteryAlerts:
+    """Flash the lightbar when the pad is running down. All overridable."""
+
+    enabled: bool = True
+    low_percent: int = 20
+    critical_percent: int = 10
+    low_interval_s: float = 30.0
+    critical_interval_s: float = 10.0
+    low_color: list = field(default_factory=lambda: [255, 140, 0])   # amber
+    critical_color: list = field(default_factory=lambda: [255, 0, 0])
+    low_blinks: int = 2
+    critical_blinks: int = 3
+    extra: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "BatteryAlerts":
+        if not isinstance(data, dict):
+            return cls()
+        b = cls(
+            enabled=_as_bool(data.get("enabled"), True),
+            low_percent=_as_int(data.get("low_percent"), 20, 0, 100),
+            critical_percent=_as_int(data.get("critical_percent"), 10, 0, 100),
+            low_interval_s=_as_float(data.get("low_interval_s"), 30.0, 1.0),
+            critical_interval_s=_as_float(data.get("critical_interval_s"), 10.0, 1.0),
+            low_color=_as_color(data.get("low_color"), [255, 140, 0]),
+            critical_color=_as_color(data.get("critical_color"), [255, 0, 0]),
+            low_blinks=_as_int(data.get("low_blinks"), 2, 1, 10),
+            critical_blinks=_as_int(data.get("critical_blinks"), 3, 1, 10),
+        )
+        b.extra = {k: v for k, v in data.items() if k not in _BATTERY_KNOWN}
+        return b
+
+    def to_dict(self) -> dict:
+        out = dict(self.extra)
+        out.update(enabled=bool(self.enabled),
+                   low_percent=int(self.low_percent),
+                   critical_percent=int(self.critical_percent),
+                   low_interval_s=float(self.low_interval_s),
+                   critical_interval_s=float(self.critical_interval_s),
+                   low_color=list(self.low_color),
+                   critical_color=list(self.critical_color),
+                   low_blinks=int(self.low_blinks),
+                   critical_blinks=int(self.critical_blinks))
+        return out
+
+
+_LIGHTBAR_KNOWN = ("dim_after_minutes", "dim_level")
+
+
+@dataclass
+class LightbarPolicy:
+    """Dim (or kill) the lightbar after a while, to save the pad's battery.
+
+    The override happens by rewriting the game's outgoing SetState before it
+    reaches the pad, so the game's own idea of its lightbar is untouched.
+    """
+
+    #: Minutes of bridged play before the dim engages. 0 disables (default:
+    #: this ships OFF -- a lightbar that goes dark unasked reads as a fault).
+    dim_after_minutes: float = 0.0
+    #: 0.0 = lightbar fully off, 1.0 = untouched. Applied as a multiplier on
+    #: the RGB the game asked for.
+    dim_level: float = 0.3
+    extra: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "LightbarPolicy":
+        if not isinstance(data, dict):
+            return cls()
+        lp = cls(
+            dim_after_minutes=_as_float(data.get("dim_after_minutes"), 0.0, 0.0),
+            dim_level=min(1.0, _as_float(data.get("dim_level"), 0.3, 0.0)),
+        )
+        lp.extra = {k: v for k, v in data.items() if k not in _LIGHTBAR_KNOWN}
+        return lp
+
+    def to_dict(self) -> dict:
+        out = dict(self.extra)
+        out.update(dim_after_minutes=float(self.dim_after_minutes),
+                   dim_level=float(self.dim_level))
+        return out
+
+
+_REMOTE_KNOWN = ("enabled", "mouse_speed", "scroll_speed", "lightbar_color")
+
+
+@dataclass
+class RemoteMode:
+    """Double-press of the chord button: the pad becomes an OS remote.
+
+    No input reaches the game (it sees a neutral pad); the touchpad drives the
+    mouse pointer, Cross clicks, dpad is arrow keys. The full map lives in
+    `docs/input-shortcuts.md` and `intercept.py`.
+    """
+
+    enabled: bool = True
+    #: Pointer speed multiplier for touchpad drags and the left stick.
+    mouse_speed: float = 1.6
+    scroll_speed: float = 1.0
+    #: The lightbar while remote mode is on -- the visible "you are not in the
+    #: game any more" cue, alongside the haptic pattern.
+    lightbar_color: list = field(default_factory=lambda: [255, 120, 0])
+    extra: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "RemoteMode":
+        if not isinstance(data, dict):
+            return cls()
+        rm = cls(
+            enabled=_as_bool(data.get("enabled"), True),
+            mouse_speed=_as_float(data.get("mouse_speed"), 1.6, 0.1),
+            scroll_speed=_as_float(data.get("scroll_speed"), 1.0, 0.1),
+            lightbar_color=_as_color(data.get("lightbar_color"), [255, 120, 0]),
+        )
+        rm.extra = {k: v for k, v in data.items() if k not in _REMOTE_KNOWN}
+        return rm
+
+    def to_dict(self) -> dict:
+        out = dict(self.extra)
+        out.update(enabled=bool(self.enabled),
+                   mouse_speed=float(self.mouse_speed),
+                   scroll_speed=float(self.scroll_speed),
+                   lightbar_color=list(self.lightbar_color))
+        return out
+
+
+_INPUT_KNOWN = ("enabled", "chord_button", "chords", "actions",
+                "double_press_ms", "tap_replay_ms", "repeat_ms",
+                "haptic_ack", "off_timer_minutes",
+                "battery", "lightbar", "remote")
+
+
+@dataclass
+class InputConfig:
+    """The chord/shortcut engine. One section, global to every bridged pad."""
+
+    enabled: bool = True
+    #: Which button arms chords while held. Held alone and released quickly it
+    #: is REPLAYED to the game, so a plain PS tap still opens the game's menu.
+    chord_button: str = "ps"
+    #: chord key -> action name. Stored MERGED over `DEFAULT_CHORDS`: a config
+    #: that names one chord changes that one and keeps the rest, and mapping a
+    #: key to ""/"none" removes it.
+    chords: dict = field(default_factory=lambda: dict(DEFAULT_CHORDS))
+    #: Per-action parameter overrides, keyed by action name, e.g.
+    #: {"volume_up": {"step": 2}}. Passed verbatim to the action registry.
+    actions: dict = field(default_factory=dict)
+    #: Two chord-button presses within this window toggle remote mode.
+    double_press_ms: int = 400
+    #: How long the replayed chord-button tap is held down for the game.
+    tap_replay_ms: int = 100
+    #: Repeat cadence for repeatable chord actions (volume, brightness) while
+    #: the chord is held.
+    repeat_ms: int = 150
+    #: A short rumble pulse on the pad whenever a chord is accepted.
+    haptic_ack: bool = True
+    #: Minutes without input activity before the pad is powered off
+    #: (feature 0x08, the same mechanism as PS+Triangle). 0 disables.
+    off_timer_minutes: float = 15.0
+    battery: BatteryAlerts = field(default_factory=BatteryAlerts)
+    lightbar: LightbarPolicy = field(default_factory=LightbarPolicy)
+    remote: RemoteMode = field(default_factory=RemoteMode)
+    extra: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "InputConfig":
+        if not isinstance(data, dict):
+            if data is not None:
+                log.warning("'input' is %s, not an object -- using defaults",
+                            type(data).__name__)
+            return cls()
+        ic = cls(
+            enabled=_as_bool(data.get("enabled"), True),
+            chord_button=_as_choice(data.get("chord_button"), CHORD_BUTTONS, "ps"),
+            double_press_ms=_as_int(data.get("double_press_ms"), 400, 100, 2000),
+            tap_replay_ms=_as_int(data.get("tap_replay_ms"), 100, 20, 1000),
+            repeat_ms=_as_int(data.get("repeat_ms"), 150, 30, 2000),
+            haptic_ack=_as_bool(data.get("haptic_ack"), True),
+            off_timer_minutes=_as_float(data.get("off_timer_minutes"), 15.0, 0.0),
+            battery=BatteryAlerts.from_dict(data.get("battery")),
+            lightbar=LightbarPolicy.from_dict(data.get("lightbar")),
+            remote=RemoteMode.from_dict(data.get("remote")),
+        )
+        raw = data.get("chords")
+        if raw is not None and not isinstance(raw, dict):
+            log.warning("'input.chords' is %s, not an object -- keeping the "
+                        "defaults", type(raw).__name__)
+            raw = None
+        for key, action in (raw or {}).items():
+            key = str(key).strip().lower()
+            if not key:
+                continue
+            name = action.strip().lower() if isinstance(action, str) else ""
+            if name in ("", "none", "off"):
+                ic.chords.pop(key, None)
+            else:
+                ic.chords[key] = name
+        acts = data.get("actions")
+        ic.actions = dict(acts) if isinstance(acts, dict) else {}
+        ic.extra = {k: v for k, v in data.items() if k not in _INPUT_KNOWN}
+        return ic
+
+    def to_dict(self) -> dict:
+        # A default chord the user removed must be WRITTEN as "none", not
+        # merely absent: `from_dict` merges the file over `DEFAULT_CHORDS`, so
+        # an absent key would resurrect the default on the very next load and
+        # the removal would survive exactly one session.
+        chords = dict(self.chords)
+        for key in DEFAULT_CHORDS:
+            if key not in chords:
+                chords[key] = "none"
+        out = dict(self.extra)
+        out.update(enabled=bool(self.enabled),
+                   chord_button=self.chord_button,
+                   chords={k: chords[k] for k in sorted(chords)},
+                   actions=dict(self.actions),
+                   double_press_ms=int(self.double_press_ms),
+                   tap_replay_ms=int(self.tap_replay_ms),
+                   repeat_ms=int(self.repeat_ms),
+                   haptic_ack=bool(self.haptic_ack),
+                   off_timer_minutes=float(self.off_timer_minutes),
+                   battery=self.battery.to_dict(),
+                   lightbar=self.lightbar.to_dict(),
+                   remote=self.remote.to_dict())
+        return out
+
+
 _CFG_KNOWN = ("enabled", "autostart_on_login", "auto_bridge_new", "port_base",
-              "controllers", "hide_bluetooth_default", "hidhide_cli")
+              "controllers", "hide_bluetooth_default", "hidhide_cli", "input")
 
 
 @dataclass
@@ -197,6 +472,10 @@ class Config:
     hidhide_cli: str | None = None
     #: Keyed by LOWERCASED bdaddr, e.g. "d42f4ba1485d".
     controllers: dict = field(default_factory=dict)
+    #: The chord/shortcut engine (PS-button chords, touch gestures, remote
+    #: mode, idle off-timer, battery lightbar alerts). Global, not
+    #: per-controller: a chord means the same thing on every pad.
+    input: InputConfig = field(default_factory=InputConfig)
     extra: dict = field(default_factory=dict)
     #: Where this was loaded from, so `save()` round-trips to the same file even
     #: if the environment changes underneath a long-running tray process.
@@ -316,6 +595,7 @@ class Config:
             hide_bluetooth_default=_as_bool(data.get("hide_bluetooth_default"),
                                             False),
             hidhide_cli=_as_str(data.get("hidhide_cli"), "") or None,
+            input=InputConfig.from_dict(data.get("input")),
         )
         raw = data.get("controllers")
         if raw is not None and not isinstance(raw, dict):
@@ -344,6 +624,7 @@ class Config:
                    port_base=int(self.port_base),
                    hide_bluetooth_default=bool(self.hide_bluetooth_default),
                    hidhide_cli=self.hidhide_cli,
+                   input=self.input.to_dict(),
                    controllers={s: cc.to_dict()
                                 for s, cc in sorted(self.controllers.items())})
         return out
@@ -378,6 +659,35 @@ def _as_bool(value: object, default: bool) -> bool:
 
 def _as_str(value: object, default: str) -> str:
     return value if isinstance(value, str) else default
+
+
+def _as_int(value: object, default: int, lo: int, hi: int) -> int:
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    return v if lo <= v <= hi else default
+
+
+def _as_float(value: object, default: float, lo: float) -> float:
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if v >= lo else default
+
+
+def _as_color(value: object, default: list) -> list:
+    """[r, g, b], each 0..255. Anything else -> the default, whole."""
+    if (isinstance(value, (list, tuple)) and len(value) == 3
+            and all(isinstance(c, (int, float)) and not isinstance(c, bool)
+                    for c in value)):
+        return [max(0, min(255, int(c))) for c in value]
+    return list(default)
 
 
 def _as_choice(value: object, allowed: tuple, default: str) -> str:

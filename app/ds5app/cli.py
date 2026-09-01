@@ -555,6 +555,7 @@ def cmd_run(args) -> int:
                           hide_bluetooth=hide,
                           hidhide_cli=(getattr(args, "hidhide_cli", None)
                                        or cfg.hidhide_cli),
+                          input_config=cfg.input,
                           on_event=_log)
     try:
         svc.start()

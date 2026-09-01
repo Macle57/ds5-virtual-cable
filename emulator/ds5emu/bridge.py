@@ -221,6 +221,16 @@ PRIME_LIGHTBAR_FADE_OUT = False
 FEATURE_TEST_CMD = 0x80
 FEATURE_TEST_RESULT = 0x81
 
+#: Feature report 0x08 -- DS_FEATURE_REPORT_BLUETOOTH_CONTROL (nondebug/
+#: dualsense). Action 0x02 tells the pad to drop its Bluetooth link, and with
+#: no console to fall back to it powers off. CAPTURED on this machine
+#: 2026-08-31 (docs/wired-gap-findings.md symptom 3): TLOU writes `08 02 00...`
+#: to a redundant pad and the link is dead 26 ms later. `power_off_pad()`
+#: sends the same command deliberately, for PS+Triangle and the idle
+#: off-timer. Host-issued 0x08 writes stay recorded-and-dropped.
+FEATURE_BLUETOOTH_CONTROL = 0x08
+BT_CONTROL_DISCONNECT = 0x02
+
 #: Both are `95 3f` in the HID report descriptor: 63 data bytes after the id.
 #: On Bluetooth the 4-byte CRC lives in the LAST 4 of those 63 -- it does not
 #: make the report longer (STATUS.md section 5 gotcha 6, confirmed for feature 0x05).
@@ -769,6 +779,12 @@ class BridgeBackend(Backend):
             "link_watchdog_trips": 0,
             #: Disconnect events seen from any cause.
             "disconnects": 0,
+            #: Calls into the attached interceptor that raised. Non-zero means
+            #: the chord engine has a bug; the bridge carried on without it for
+            #: that report.
+            "interceptor_errors": 0,
+            #: Deliberate pad power-offs sent (PS+Triangle, the idle timer).
+            "pad_power_off": 0,
         }
         #: Optional flight recorder (`ds5emu.capture.BlackBox`). When set,
         #: every host->device request and every post-translation Bluetooth
@@ -777,6 +793,29 @@ class BridgeBackend(Backend):
         #: reproduction of a disconnect preserves the ~10 s that caused it.
         #: `python -m ds5emu serve --capture PATH` turns it on.
         self.blackbox = None
+        #: Optional chord/shortcut engine (`ds5app.intercept.InputInterceptor`
+        #: or anything with the same three methods). It sits on the decoded
+        #: input stream BEFORE the emulated USB layer, so a chord the user
+        #: presses is consumed here and the game never sees it:
+        #:
+        #:     on_input(usb01)  reader thread, once per BT control payload.
+        #:                      Returns the (possibly masked) 64-byte report
+        #:                      that becomes `_latest_input`.
+        #:     rewrite_setstate(body)  writer thread, just before a host
+        #:                      SetState goes on the air. Returns the body to
+        #:                      transmit; the HOST's body stays the coalescing
+        #:                      key, so an override that changes over time can
+        #:                      never be mistaken for new host state.
+        #:     tick()           writer thread, every wakeup (<= 50 ms apart).
+        #:                      Drives the engine's timers (haptic pulse tails,
+        #:                      idle off-timer, battery flashes) even when no
+        #:                      input and no host traffic is flowing.
+        #:
+        #: Every call is wrapped: an engine bug costs one report, never the
+        #: bridge. The emulator has no dependency on the engine's module --
+        #: the app layer builds it and assigns it here (see
+        #: `ds5app.intercept.attach_to_backend`).
+        self.interceptor = None
         #: Sampled mic-ring depth in bytes, for the drift report. Cheap: three
         #: integers updated per `read_audio_in`.
         self._mic_depth_n = 0
@@ -1125,6 +1164,7 @@ class BridgeBackend(Backend):
                              note=f"#{self.stats['bt_control']}")
                 usb = T.bt31_payload_to_usb01(payload)
                 if usb is not None:
+                    usb = self._intercept_input(usb)
                     with self._input_lock:
                         self._latest_input = usb
                         self._latest_input_at = time.perf_counter()
@@ -1134,6 +1174,133 @@ class BridgeBackend(Backend):
             elif ptype == P.PAYLOAD_TYPE_AUDIO:
                 self.stats["bt_mic"] += 1
                 self._on_mic_payload(dec, payload)
+
+    # =====================================================================
+    # the chord-engine seam (see the `interceptor` attribute)
+    # =====================================================================
+
+    def _intercept_input(self, usb: bytes) -> bytes:
+        """Give the chord engine the decoded report; contain any failure.
+
+        Runs on the reader thread at the Bluetooth rate (~476 Hz), which is the
+        whole point of hooking HERE rather than in `read_input_report`: the
+        engine sees every report the pad sent -- no 250 Hz decimation can eat
+        the edge of a button press -- and what it returns is what the game can
+        ever see, on both the interrupt and the control-transfer path.
+        """
+        icept = self.interceptor
+        if icept is None:
+            return usb
+        try:
+            out = icept.on_input(usb)
+            return usb if out is None else out
+        except Exception:  # noqa: BLE001
+            self.stats["interceptor_errors"] += 1
+            log.exception("interceptor.on_input failed; forwarding unmasked")
+            return usb
+
+    def _intercept_setstate(self, body: bytes) -> bytes:
+        """Let the engine rewrite an outgoing host SetState body (writer thread).
+
+        The caller keeps coalescing on the HOST body, not on what this returns:
+        an override that varies over time (a battery flash, a dimming ramp)
+        must not make an unchanged host body look new, nor a changed one look
+        coalesced.
+        """
+        icept = self.interceptor
+        if icept is None:
+            return body
+        try:
+            out = icept.rewrite_setstate(body)
+            return body if out is None else out
+        except Exception:  # noqa: BLE001
+            self.stats["interceptor_errors"] += 1
+            log.exception("interceptor.rewrite_setstate failed; forwarding as-is")
+            return body
+
+    def _intercept_tick(self) -> None:
+        icept = self.interceptor
+        if icept is None:
+            return
+        try:
+            icept.tick()
+        except Exception:  # noqa: BLE001
+            self.stats["interceptor_errors"] += 1
+            log.exception("interceptor.tick failed")
+
+    def push_setstate_body(self, body: bytes) -> None:
+        """Send one engine-built SetState body to the pad. Any thread.
+
+        The engine's own traffic (haptic ack pulses, lightbar flashes, the
+        remote-mode colour) deliberately does NOT go through the host pending/
+        coalesce path: it must not become the coalescing key the next host
+        report is compared against, and it must not be merged into
+        `_setstate_host` -- it is OURS, not state the host asked for, and a
+        reconnect must not replay it. Valid-flag discipline makes this safe:
+        an engine body only carries the fields whose flag bits it set.
+        """
+        self._defer(self._write_setstate_body, bytes(body))
+
+    def power_off_pad(self) -> None:
+        """Power the physical pad off, the way a PS5 does: feature 0x08.
+
+        The mechanism is this project's own capture, not folklore
+        (docs/wired-gap-findings.md, symptom 3): when libScePad decides a
+        Bluetooth DualSense is redundant it writes SET feature 0x08 with
+        action byte 0x02 -- DS_FEATURE_REPORT_BLUETOOTH_CONTROL in the public
+        research (nondebug/dualsense) -- down the pad's own HID handle, and a
+        DualSense told to drop its Bluetooth link with no console to fall back
+        to powers off. Observed here 2026-08-31: link dead 26 ms after the
+        write, pad off until the PS button, 2/2 runs. This method sends the
+        same command on purpose, for the user's own PS+Triangle chord and the
+        idle off-timer.
+
+        SAFETY: this is the ONE deliberate non-0x80 feature write this project
+        makes, and it is neither of the two the safety rail forbids
+        (docs/ARCHITECTURE.md: never write pairing 0x09 or firmware reports).
+        It changes nothing persistent -- the pad comes back with one PS press.
+        Host-issued 0x08 writes are still recorded and dropped in
+        `set_feature_report`; only the engine can reach this path.
+
+        The Bluetooth write runs on the writer thread (`_defer`), so this is
+        safe to call from the reader thread mid-`on_input`. The link death it
+        causes then takes the normal disconnect path: input neutralises, the
+        virtual device stays attached, and the reconnect loop waits for the
+        pad to be switched back on.
+        """
+        self._defer(self._bt_power_off_now)
+
+    def _bt_power_off_now(self) -> None:
+        """Writer thread: the signed 0x08 [action=0x02] SET feature report.
+
+        Framed like the factory-test channel's 0x80 (`_bt_send_test_command`),
+        the only BT SET-feature framing verified on this hardware: a 63-byte
+        payload with the 0x53-seeded CRC32 in its last 4 bytes. TLOU's own kill
+        was captured as `08 02 00...` over USB; over Bluetooth an unsigned
+        feature write is refused by the pad, so it is signed here.
+        """
+        dev = self._dev
+        if dev is None:
+            return
+        payload = bytearray(FEATURE_TEST_PAYLOAD_LEN)
+        payload[0] = BT_CONTROL_DISCONNECT
+        if dev.is_bt:
+            fill_feature_checksum(FEATURE_BLUETOOTH_CONTROL, payload)
+        self._bb("bt.power_off",
+                 bytes([FEATURE_BLUETOOTH_CONTROL]) + bytes(payload[:8]))
+        log.info("powering the pad off (feature 0x08, action 0x02)")
+        try:
+            rc = dev.h.send_feature_report(
+                bytes([FEATURE_BLUETOOTH_CONTROL]) + bytes(payload))
+        except Exception as e:  # noqa: BLE001
+            log.warning("pad power-off write failed: %s", e)
+            return
+        if rc is not None and rc < 0:
+            # hidapi returns -1 rather than raising when the stack refuses the
+            # report (same behaviour measured for an unsigned 0x80).
+            log.warning("pad power-off rejected by the HID stack (rc=%d)", rc)
+            return
+        self.stats["pad_power_off"] += 1
 
     def _on_mic_payload(self, dec, payload: bytes) -> None:
         try:
@@ -1329,6 +1496,10 @@ class BridgeBackend(Backend):
             if self._stop.is_set():
                 return
             self._drain_control_q()
+            # The engine's clock, whether or not any traffic is flowing: this
+            # loop wakes at least every 50 ms, which is plenty for pulse tails,
+            # battery flashes and the idle off-timer.
+            self._intercept_tick()
             if not self.connected.is_set():
                 # Do NOT consume the pending body while the link is down: it
                 # would be dropped on the floor, and the pending body is exactly
@@ -1357,7 +1528,12 @@ class BridgeBackend(Backend):
             if delta > 0:
                 if self._stop.wait(delta):
                     return
-            if self._write_raw(T.usb02_to_bt31(body, self._next_bt_seq())):
+            # The engine may rewrite what actually goes on the air (lightbar
+            # dim/flash, remote-mode colour). `body` -- the HOST's bytes --
+            # stays the coalescing key and what `_setstate_last` remembers,
+            # so a time-varying override never masquerades as host state.
+            wire_body = self._intercept_setstate(body)
+            if self._write_raw(T.usb02_to_bt31(wire_body, self._next_bt_seq())):
                 self.stats["setstate_sent"] += 1
                 self._setstate_last = body
                 last_sent_at = time.perf_counter()
