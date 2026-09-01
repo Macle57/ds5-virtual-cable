@@ -105,6 +105,12 @@ class EngineCase(unittest.TestCase):
             power_off=power_off, clock=self.clock, dispatch=lambda fn: fn())
         return self.eng
 
+    def make_remote(self, **over):
+        """An engine with remote mode switched on -- it ships OFF, so every
+        test that toggles into it has to opt in the way a user would."""
+        over.setdefault("remote", {}).setdefault("enabled", True)
+        return self.make(**over)
+
     @property
     def events(self):
         return [e for b in self.batches for e in b]
@@ -144,8 +150,21 @@ class ChordMasking(EngineCase):
         st = P.decode_input(out[1:], usb=True)
         self.assertFalse(st.touch[0].active)
 
-    def test_sticks_and_triggers_still_pass_during_a_chord(self):
+    def test_triggers_still_pass_during_a_chord(self):
         self.make()
+        out = self.feed(report(buttons=("ps",), r2=180))
+        self.assertEqual(out[6], 180)
+
+    def test_sticks_are_centred_during_a_chord_by_default(self):
+        # stick_mouse_in_chord ships ON: the sticks belong to the OS while the
+        # chord is held, so the game must not see the deflection.
+        self.make()
+        out = self.feed(report(buttons=("ps",), lx=0x10, ry=0xF0))
+        self.assertEqual(out[1], 0x80)
+        self.assertEqual(out[4], 0x80)
+
+    def test_sticks_pass_through_when_stick_mouse_in_chord_is_off(self):
+        self.make(stick_mouse_in_chord=False)
         out = self.feed(report(buttons=("ps",), lx=0x10, r2=180))
         self.assertEqual(out[1], 0x10)
         self.assertEqual(out[6], 180)
@@ -227,10 +246,31 @@ class ChordActions(EngineCase):
         rumble = [b for b in self.sent
                   if b[P.VALID_FLAG0] & P.F0_COMPATIBLE_VIBRATION]
         self.assertTrue(rumble)
-        self.assertEqual(rumble[0][P.BC_VIBRATION_RIGHT], I.ACK_RUMBLE)
+        # the default strength (25 of 100) maps linearly onto the motor byte
+        self.assertEqual(rumble[0][P.BC_VIBRATION_RIGHT], 0x40)
         self.clock.advance(0.2)
         self.eng.tick()                              # and its tail returns to 0
         self.assertEqual(self.sent[-1][P.BC_VIBRATION_RIGHT], 0)
+
+    def test_haptic_strength_scales_the_pulse(self):
+        for strength, amplitude in ((100, 0xFF), (50, 0x80), (10, 0x1A)):
+            self.make(haptic_strength=strength)
+            self.feed(report(buttons=("ps",)),
+                      report(buttons=("ps", "cross")))
+            self.eng.tick()
+            rumble = [b for b in self.sent
+                      if b[P.VALID_FLAG0] & P.F0_COMPATIBLE_VIBRATION]
+            self.assertEqual(rumble[0][P.BC_VIBRATION_RIGHT], amplitude,
+                             f"strength {strength}")
+
+    def test_haptic_strength_out_of_range_falls_back_to_default(self):
+        self.make(haptic_strength=400)
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps", "cross")))
+        self.eng.tick()
+        rumble = [b for b in self.sent
+                  if b[P.VALID_FLAG0] & P.F0_COMPATIBLE_VIBRATION]
+        self.assertEqual(rumble[0][P.BC_VIBRATION_RIGHT], 0x40)
 
     def test_haptic_ack_can_be_configured_off(self):
         self.make(haptic_ack=False)
@@ -243,7 +283,8 @@ class ChordActions(EngineCase):
 
 class TapReplay(EngineCase):
     def test_a_plain_tap_is_replayed_after_the_double_press_window(self):
-        self.make()
+        # Only with remote mode on is there a double press to wait out.
+        self.make(remote={"enabled": True})
         self.feed(report(buttons=("ps",)), report())
         # nothing yet: the window must expire first
         self.clock.advance(0.5)
@@ -259,6 +300,13 @@ class TapReplay(EngineCase):
 
     def test_replay_is_immediate_when_remote_mode_is_disabled(self):
         self.make(remote={"enabled": False})
+        self.feed(report(buttons=("ps",)))
+        out = self.feed(report())
+        self.assertIn("ps", {b.lower() for b in buttons_of(out)})
+
+    def test_replay_is_immediate_by_default(self):
+        # Remote mode ships OFF, so out of the box a PS tap costs no 400 ms.
+        self.make()
         self.feed(report(buttons=("ps",)))
         out = self.feed(report())
         self.assertIn("ps", {b.lower() for b in buttons_of(out)})
@@ -351,6 +399,72 @@ class Gestures(EngineCase):
         self.assertFalse(P.decode_input(out[1:], usb=True).touch[0].active)
 
 
+class ChordStickMouse(EngineCase):
+    """`stick_mouse_in_chord` (ships ON): while the chord button is held the
+    sticks drive the OS at `remote.*` speeds -- the same "major controls" as
+    remote mode -- and the game sees them centred. Remote mode itself ships
+    OFF; the chord-held translation must not depend on it."""
+
+    def deflect(self, n=60, **kw):
+        for _ in range(n):
+            self.clock.advance(0.004)
+            self.feed(report(buttons=("ps",), **kw))
+
+    def test_left_stick_moves_the_pointer_during_a_chord(self):
+        self.make()                       # remote.enabled False, and no matter
+        self.feed(report(buttons=("ps",)))
+        self.deflect(lx=0xFF)
+        moves = [e for e in self.events if e[0] == "move"]
+        self.assertTrue(moves)
+        self.assertGreater(sum(m[1] for m in moves), 0)
+
+    def test_right_stick_scrolls_during_a_chord(self):
+        self.make()
+        self.feed(report(buttons=("ps",)))
+        self.deflect(n=120, ry=0xFF)
+        wheels = [e for e in self.events if e[0] == "wheel"]
+        self.assertTrue(wheels)
+        self.assertLess(sum(w[1] for w in wheels), 0)
+
+    def test_triggers_do_not_scroll_during_a_chord(self):
+        # Triggers still belong to the game while a chord is held; only
+        # remote mode borrows them.
+        self.make()
+        self.feed(report(buttons=("ps",)))
+        self.deflect(n=120, r2=255)
+        self.assertEqual([e for e in self.events if e[0] == "wheel"], [])
+
+    def test_no_translation_when_the_flag_is_off(self):
+        self.make(stick_mouse_in_chord=False)
+        self.feed(report(buttons=("ps",)))
+        self.deflect(lx=0xFF)
+        self.assertEqual([e for e in self.events if e[0] == "move"], [])
+
+    def test_stick_speed_honours_remote_mouse_speed(self):
+        # The gains are cfg.remote's, so the pointer feels identical in both
+        # modes -- and one dashboard slider tunes them together.
+        self.make(remote={"mouse_speed": 1.0})
+        self.feed(report(buttons=("ps",)))
+        self.deflect(lx=0xFF)
+        slow = sum(m[1] for m in self.events if m[0] == "move")
+        self.make(remote={"mouse_speed": 3.0})
+        self.feed(report(buttons=("ps",)))
+        self.deflect(lx=0xFF)
+        fast = sum(m[1] for m in self.events if m[0] == "move")
+        self.assertGreater(fast, 2 * slow)
+
+    def test_stick_use_swallows_the_tap_replay(self):
+        # Mousing IS using the chord: releasing PS right after must not hand
+        # the game a phantom PS press.
+        self.make()
+        self.feed(report(buttons=("ps",)))
+        self.clock.advance(0.05)
+        self.feed(report(buttons=("ps",), lx=0xFF))
+        out = self.feed(report())
+        self.assertEqual(buttons_of(out), set())
+        self.assertEqual(self.eng.stats["taps_replayed"], 0)
+
+
 class RemoteModeToggle(EngineCase):
     def enter(self):
         """A clean double press of the chord button."""
@@ -359,7 +473,7 @@ class RemoteModeToggle(EngineCase):
         self.feed(report(buttons=("ps",)), report())
 
     def test_double_press_toggles_and_the_tap_never_leaks(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.assertTrue(self.eng.remote_mode)
         self.clock.advance(1.0)
@@ -369,7 +483,7 @@ class RemoteModeToggle(EngineCase):
         self.assertEqual(self.eng.stats["taps_replayed"], 0)
 
     def test_double_press_again_leaves_remote_mode(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.clock.advance(1.0)
         self.eng.tick()
@@ -377,7 +491,7 @@ class RemoteModeToggle(EngineCase):
         self.assertFalse(self.eng.remote_mode)
 
     def test_two_slow_presses_do_not_toggle(self):
-        self.make()
+        self.make_remote()
         self.feed(report(buttons=("ps",)), report())
         self.clock.advance(0.6)
         self.eng.tick()
@@ -385,7 +499,7 @@ class RemoteModeToggle(EngineCase):
         self.assertFalse(self.eng.remote_mode)
 
     def test_entering_gives_a_double_pulse_and_the_remote_lightbar(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.eng.tick()
         lightbars = [b for b in self.sent
@@ -405,7 +519,7 @@ class RemoteModeToggle(EngineCase):
         self.assertEqual(ons, 2)
 
     def test_leaving_restores_the_games_lightbar(self):
-        self.make()
+        self.make_remote()
         game = P.SetState()
         game.lightbar(10, 20, 30)
         self.eng.rewrite_setstate(bytes(game.body))   # engine learns the colour
@@ -421,10 +535,38 @@ class RemoteModeToggle(EngineCase):
         self.assertEqual((restored[-1][P.LED_R], restored[-1][P.LED_G],
                           restored[-1][P.LED_B]), (10, 20, 30))
 
+    def test_a_game_write_mid_mode_is_restored_on_exit(self):
+        # The game keeps talking while remote mode is on; its colour is learnt
+        # from the rewritten traffic, so leaving restores the LATEST one.
+        self.make_remote()
+        self.enter()
+        self.clock.advance(1.0)
+        self.eng.tick()
+        game = P.SetState()
+        game.lightbar(40, 50, 60)                      # written mid-mode
+        out = self.eng.rewrite_setstate(bytes(game.body))
+        self.assertEqual((out[P.LED_R], out[P.LED_G], out[P.LED_B]),
+                         (255, 120, 0))                # still overridden
+        self.sent.clear()
+        self.enter()                                   # leave
+        self.eng.tick()
+        restored = [b for b in self.sent
+                    if b[P.VALID_FLAG1] & P.F1_LIGHTBAR_CONTROL]
+        self.assertEqual((restored[-1][P.LED_R], restored[-1][P.LED_G],
+                          restored[-1][P.LED_B]), (40, 50, 60))
+
     def test_remote_mode_can_be_disabled(self):
         self.make(remote={"enabled": False})
         self.enter()
         self.assertFalse(self.eng.remote_mode)
+
+    def test_remote_mode_is_off_by_default(self):
+        # It ships OFF; a double press on an untouched config must do nothing
+        # (the dashboard is where a user opts in).
+        self.make()
+        self.enter()
+        self.assertFalse(self.eng.remote_mode)
+        self.assertEqual(self.eng.stats["remote_toggles"], 0)
 
 
 class RemoteModeInputs(EngineCase):
@@ -435,7 +577,7 @@ class RemoteModeInputs(EngineCase):
         self.batches.clear()
 
     def test_the_game_sees_a_neutral_pad(self):
-        self.make()
+        self.make_remote()
         self.enter()
         out = self.feed(report(buttons=("cross", "dpad_up"), lx=0x00, r2=255,
                                touches=((500, 500),)))
@@ -445,14 +587,14 @@ class RemoteModeInputs(EngineCase):
         self.assertFalse(st.touch[0].active)
 
     def test_battery_bytes_survive_neutralisation(self):
-        self.make()
+        self.make_remote()
         self.enter()
         out = self.feed(report(battery=3))
         st = P.decode_input(out[1:], usb=True)
         self.assertEqual(st.battery_level, 3)
 
     def test_cross_is_the_left_mouse_button_with_drag(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(buttons=("cross",)))
         self.assertEqual(self.events[-1], ("button", "left", True))
@@ -460,7 +602,7 @@ class RemoteModeInputs(EngineCase):
         self.assertEqual(self.events[-1], ("button", "left", False))
 
     def test_circle_is_esc_and_options_is_enter(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(buttons=("circle",)), report(),
                   report(buttons=("options",)), report())
@@ -470,7 +612,7 @@ class RemoteModeInputs(EngineCase):
         self.assertIn(("key", A.VK_RETURN, False), self.events)
 
     def test_dpad_is_arrow_keys_held_and_released(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(buttons=("dpad_left",)))
         self.assertEqual(self.events[-1], ("key", A.VK_LEFT, True))
@@ -478,7 +620,7 @@ class RemoteModeInputs(EngineCase):
         self.assertEqual(self.events[-1], ("key", A.VK_LEFT, False))
 
     def test_a_held_arrow_retriggers(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(buttons=("dpad_right",)))
         for _ in range(4):
@@ -488,7 +630,7 @@ class RemoteModeInputs(EngineCase):
         self.assertGreaterEqual(len(downs), 4)
 
     def test_one_finger_drag_moves_the_pointer(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(touches=((500, 500),)),
                   report(touches=((530, 510),)))
@@ -498,7 +640,7 @@ class RemoteModeInputs(EngineCase):
         self.assertGreater(sum(m[2] for m in moves), 0)   # net down
 
     def test_one_finger_tap_is_a_left_click(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(touches=((500, 500),)))
         self.clock.advance(0.1)
@@ -507,7 +649,7 @@ class RemoteModeInputs(EngineCase):
         self.assertIn(("button", "left", False), self.events)
 
     def test_a_long_press_is_not_a_click(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(touches=((500, 500),)))
         self.clock.advance(0.6)
@@ -515,7 +657,7 @@ class RemoteModeInputs(EngineCase):
         self.assertNotIn(("button", "left", True), self.events)
 
     def test_two_finger_tap_is_a_right_click(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(touches=((500, 500), (600, 500))))
         self.clock.advance(0.1)
@@ -523,7 +665,7 @@ class RemoteModeInputs(EngineCase):
         self.assertIn(("button", "right", True), self.events)
 
     def test_two_finger_drag_scrolls(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(touches=((500, 300), (600, 300))))
         for y in range(360, 900, 60):
@@ -533,8 +675,57 @@ class RemoteModeInputs(EngineCase):
         # fingers moved down -> wheel negative, like every Windows touchpad
         self.assertLess(sum(w[1] for w in wheels), 0)
 
+    def test_two_finger_horizontal_slide_is_alt_tab(self):
+        # The chord-held gesture, available without the chord: a decisive
+        # horizontal 2-finger slide opens the switcher with hold semantics.
+        self.make_remote()
+        self.enter()
+        self.feed(report(touches=((450, 500), (550, 500))),
+                  report(touches=((610, 500), (710, 500))))
+        self.assertTrue(self.acts.alt_tab_open)
+        n_tabs = len([e for e in self.events if e == ("key", A.VK_TAB, True)])
+        self.feed(report(touches=((770, 500), (870, 500))))   # step further
+        self.assertEqual(
+            len([e for e in self.events if e == ("key", A.VK_TAB, True)]),
+            n_tabs + 1)
+        self.feed(report())                                    # lift commits
+        self.assertFalse(self.acts.alt_tab_open)
+        self.assertEqual(self.events[-1], ("key", A.VK_MENU, False))
+
+    def test_an_alt_tab_contact_stops_scrolling(self):
+        self.make_remote()
+        self.enter()
+        self.feed(report(touches=((450, 500), (550, 500))),
+                  report(touches=((610, 500), (710, 500))))
+        self.assertTrue(self.acts.alt_tab_open)
+        before = [e for e in self.events if e[0] in ("wheel", "hwheel")]
+        self.feed(report(touches=((650, 560), (750, 560))))
+        after = [e for e in self.events if e[0] in ("wheel", "hwheel")]
+        self.assertEqual(before, after)
+
+    def test_vertical_scroll_locks_out_alt_tab(self):
+        # A contact that has already emitted vertical wheel is a scroll for
+        # good -- later horizontal drift must not pop the switcher open.
+        self.make_remote()
+        self.enter()
+        self.feed(report(touches=((450, 300), (550, 300))))
+        for y in (360, 420, 480):
+            self.feed(report(touches=((450, y), (550, y))))
+        self.assertTrue([e for e in self.events if e[0] == "wheel"])
+        self.feed(report(touches=((950, 480), (1050, 480))))
+        self.assertFalse(self.acts.alt_tab_open)
+
+    def test_a_chord_press_commits_a_remote_alt_tab(self):
+        self.make_remote()
+        self.enter()
+        self.feed(report(touches=((450, 500), (550, 500))),
+                  report(touches=((610, 500), (710, 500))))
+        self.assertTrue(self.acts.alt_tab_open)
+        self.feed(report(buttons=("ps",), touches=((610, 500), (710, 500))))
+        self.assertFalse(self.acts.alt_tab_open)
+
     def test_triggers_scroll(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report())
         for _ in range(120):
@@ -545,7 +736,7 @@ class RemoteModeInputs(EngineCase):
         self.assertLess(sum(w[1] for w in wheels), 0)
 
     def test_left_stick_moves_the_pointer(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report())
         for _ in range(60):
@@ -555,7 +746,7 @@ class RemoteModeInputs(EngineCase):
         self.assertGreater(sum(m[1] for m in moves), 0)
 
     def test_chords_still_fire_in_remote_mode(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(buttons=("ps",)),
                   report(buttons=("ps", "dpad_up")))
@@ -563,7 +754,7 @@ class RemoteModeInputs(EngineCase):
         self.assertTrue(self.eng.remote_mode)      # and it did not toggle
 
     def test_leaving_remote_mode_releases_held_keys(self):
-        self.make()
+        self.make_remote()
         self.enter()
         self.feed(report(buttons=("cross",)))      # left button held
         self.feed(report(buttons=("cross", "ps")))  # first toggle press
@@ -720,7 +911,7 @@ class LightbarRewrites(EngineCase):
         self.assertEqual((out[P.LED_R], out[P.LED_G], out[P.LED_B]), (0, 0, 0))
 
     def test_remote_mode_wins_over_the_games_colour(self):
-        self.make()
+        self.make_remote()
         self.feed(report(buttons=("ps",)), report())
         self.clock.advance(0.15)
         self.feed(report(buttons=("ps",)), report())
