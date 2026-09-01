@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ds5bridge dashboard</title>
+<style>
+  /* One deliberate dark look. This is a local diagnostic page for a thing
+     with a lightbar; it commits to dark and paints everything explicitly. */
+  :root {
+    color-scheme: dark;
+    --bg: #0d1017;          /* page ground */
+    --panel: #151a23;       /* cards */
+    --panel-2: #1b2130;     /* raised elements on cards */
+    --line: #262d3d;        /* hairlines */
+    --ink: #e8ebf1;         /* primary text */
+    --ink-2: #9aa3b2;       /* secondary text */
+    --ink-3: #667085;       /* muted text */
+    --accent: #4d8dff;      /* PS blue */
+    --accent-soft: rgba(77,141,255,.16);
+    --pressed: #79b1ff;     /* lit control fill */
+    --ok: #34c07c;          /* running */
+    --warn: #d79b28;        /* offline / low battery */
+    --bad: #e05d5d;         /* error */
+    --idle: #6e7076;        /* stopped */
+    --shape: #232837;       /* controller body */
+    --shape-edge: #2f3648;
+    --well: #10131b;        /* stick wells, touchpad */
+    font-size: 15px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 22px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #131826, #0f131d);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: .2px; }
+  header h1 span { color: var(--accent); }
+  #agg { color: var(--ink-2); font-size: 13px; }
+  .spacer { flex: 1; }
+  #live {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12.5px; color: var(--ink-2);
+  }
+  #live .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); }
+  #live.on .dot { background: var(--ok); box-shadow: 0 0 8px rgba(52,192,124,.7); }
+  button.ghost {
+    background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    padding: 7px 14px; border-radius: 8px; cursor: pointer; font: inherit;
+    font-size: 13.5px;
+  }
+  button.ghost:hover { border-color: var(--accent); }
+
+  main { max-width: 1240px; margin: 0 auto; padding: 18px 22px 60px; }
+
+  /* controller tabs */
+  #tabs { display: flex; gap: 8px; margin: 2px 0 16px; flex-wrap: wrap; }
+  #tabs button {
+    font: inherit; font-size: 13.5px; cursor: pointer;
+    background: var(--panel); color: var(--ink-2);
+    border: 1px solid var(--line); border-radius: 999px; padding: 7px 16px;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  #tabs button.active { color: var(--ink); border-color: var(--accent); background: var(--accent-soft); }
+  #tabs .st { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+  #tabs .st.running { background: var(--ok); }
+  #tabs .st.degraded { background: var(--warn); }
+  #tabs .st.error { background: var(--bad); }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 1.9fr) minmax(280px, 1fr); gap: 16px; }
+  @media (max-width: 920px) { .grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 16px;
+  }
+  .card h2 {
+    margin: 0 0 10px; font-size: 12px; font-weight: 600;
+    letter-spacing: .8px; text-transform: uppercase; color: var(--ink-3);
+  }
+
+  #empty { text-align: center; color: var(--ink-2); padding: 70px 20px; }
+  #empty .big { font-size: 17px; color: var(--ink); margin-bottom: 8px; }
+  #empty code { background: var(--panel-2); padding: 2px 7px; border-radius: 6px; }
+
+  /* ---- the controller drawing -------------------------------------- */
+  #pad-card { padding: 8px 10px 2px; }
+  svg#pad { width: 100%; height: auto; display: block; }
+  .body-shape { fill: var(--shape); stroke: var(--shape-edge); stroke-width: 2; }
+  .well { fill: var(--well); stroke: #2a3040; stroke-width: 1.5; }
+  .ctl { fill: var(--panel-2); stroke: #333b4e; stroke-width: 1.5; transition: fill .06s, filter .12s; }
+  .ctl .glyph, .glyph { stroke-width: 3; fill: none; }
+  .lit { fill: var(--pressed) !important; filter: drop-shadow(0 0 7px rgba(121,177,255,.85)); }
+  .lit .glyph { stroke: #0d1017 !important; }
+  .cap { fill: #2a3040; stroke: #3a4257; stroke-width: 2; }
+  .cap.lit { fill: var(--pressed); }
+  text.tag { fill: var(--ink-3); font: 600 13px "Segoe UI", system-ui, sans-serif; }
+  text.tag-sm { fill: var(--ink-3); font: 600 11px "Segoe UI", system-ui, sans-serif; }
+  .tp-dot { fill: var(--accent); opacity: .95; }
+  .tp-dot-ring { fill: none; stroke: var(--accent); stroke-width: 2; opacity: .5; }
+  .tp-id { fill: #0d1017; font: 700 12px "Segoe UI", system-ui, sans-serif; }
+  .lightbar { fill: var(--accent); opacity: .85; }
+  .trig-track { fill: var(--well); stroke: #2a3040; stroke-width: 1.5; }
+  .trig-fill { fill: var(--accent); }
+  .offline-veil { opacity: 0; transition: opacity .25s; pointer-events: none; }
+  #pad.offline .dim-on-offline { opacity: .35; }
+  #pad.offline .offline-veil { opacity: 1; }
+
+  /* ---- side panel ---------------------------------------------------- */
+  .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .tile { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .tile .k { font-size: 11px; letter-spacing: .6px; text-transform: uppercase; color: var(--ink-3); }
+  .tile .v { font-size: 20px; font-weight: 600; margin-top: 3px; }
+  .tile .v small { font-size: 12px; font-weight: 400; color: var(--ink-2); }
+  .tile .sub { font-size: 12px; color: var(--ink-2); margin-top: 1px; }
+  .statebadge { display: inline-flex; align-items: center; gap: 7px; font-size: 15px; font-weight: 600; }
+  .statebadge .dot { width: 10px; height: 10px; border-radius: 50%; }
+
+  .meter { height: 8px; background: var(--well); border-radius: 5px; margin-top: 8px; overflow: hidden; }
+  .meter > div { height: 100%; border-radius: 5px; background: var(--ok); transition: width .3s; }
+
+  .axisrow { display: flex; gap: 12px; margin-top: 4px; }
+  .axisbox {
+    width: 86px; height: 86px; background: var(--well); border: 1px solid var(--line);
+    border-radius: 10px; position: relative; flex: none;
+  }
+  .axisbox::before, .axisbox::after {
+    content: ""; position: absolute; background: var(--line);
+  }
+  .axisbox::before { left: 50%; top: 6%; bottom: 6%; width: 1px; }
+  .axisbox::after { top: 50%; left: 6%; right: 6%; height: 1px; }
+  .axisdot {
+    position: absolute; width: 12px; height: 12px; border-radius: 50%;
+    background: var(--accent); left: 50%; top: 50%;
+    transform: translate(-50%, -50%); box-shadow: 0 0 6px rgba(77,141,255,.6);
+  }
+  .axisvals { font-size: 12px; color: var(--ink-2); align-self: center; }
+  .axisvals b { color: var(--ink); font-weight: 600; }
+
+  .motion { display: grid; grid-template-columns: 42px 1fr 58px; gap: 6px 10px; align-items: center; font-size: 12px; }
+  .motion .lbl { color: var(--ink-3); }
+  .motion .val { color: var(--ink-2); text-align: right; font-variant-numeric: tabular-nums; }
+  .mbar { height: 6px; background: var(--well); border-radius: 4px; position: relative; overflow: hidden; }
+  .mbar > div { position: absolute; top: 0; height: 100%; background: var(--accent); border-radius: 4px; }
+
+  .flags { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .flag { font-size: 12px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; }
+  .flag.on { color: var(--ink); border-color: var(--accent); background: var(--accent-soft); }
+
+  /* ---- settings ------------------------------------------------------ */
+  #settings { margin-top: 18px; display: none; }
+  #settings.open { display: block; }
+  .set-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+  fieldset {
+    border: 1px solid var(--line); border-radius: 10px; margin: 0;
+    padding: 12px 14px 14px; background: var(--panel-2); min-width: 0;
+  }
+  fieldset legend { font-size: 12px; color: var(--accent); padding: 0 6px; letter-spacing: .4px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; }
+  .row label { color: var(--ink-2); font-size: 13.5px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .row input[type="text"], .row input[type="number"], .row select, .row textarea {
+    background: var(--well); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 9px; font: inherit; font-size: 13.5px; width: 170px;
+  }
+  .row textarea { width: 100%; min-height: 60px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .row.wide { flex-direction: column; align-items: stretch; gap: 4px; }
+  .row input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--accent); }
+  .set-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .set-head .path { color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
+  button.primary {
+    background: var(--accent); color: #0b1220; border: 0; font: inherit;
+    font-size: 13.5px; font-weight: 600; padding: 8px 18px; border-radius: 8px; cursor: pointer;
+  }
+  button.primary:hover { filter: brightness(1.1); }
+  #toast {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+    background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 18px; font-size: 13.5px; opacity: 0;
+    transition: opacity .25s; pointer-events: none; z-index: 10; max-width: 80vw;
+  }
+  #toast.show { opacity: 1; }
+  #toast.err { border-color: var(--bad); }
+  .hint { color: var(--ink-3); font-size: 12px; margin: 4px 0 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ds5bridge <span>dashboard</span></h1>
+  <div id="agg"></div>
+  <div class="spacer"></div>
+  <div id="live"><span class="dot"></span><span id="live-text">connecting&hellip;</span></div>
+  <button class="ghost" id="btn-settings">Settings</button>
+</header>
+
+<main>
+  <div id="tabs"></div>
+
+  <div id="empty" hidden>
+    <div class="big">No controller telemetry yet</div>
+    <div>Bridge a controller (the tray, or <code>ds5bridge --all</code>) and it appears here,
+    moving live. For a synthetic feed: <code>python -m ds5app.dashboard --fake</code></div>
+  </div>
+
+  <div class="grid" id="view">
+    <div class="card" id="pad-card">
+      <!-- The controller. Drawn from scratch for this project (simple
+           geometric shapes); layout conventions -- stick travel radius,
+           touchpad coordinate mapping -- follow daidr/dualsense-tester.
+           See docs/provenance.md. -->
+      <svg id="pad" viewBox="0 0 1000 620" role="img" aria-label="DualSense controller state">
+        <defs>
+          <radialGradient id="bodyshine" cx="50%" cy="18%" r="90%">
+            <stop offset="0%" stop-color="#2a3040"/><stop offset="55%" stop-color="#232837"/><stop offset="100%" stop-color="#1e2331"/>
+          </radialGradient>
+        </defs>
+
+        <g class="dim-on-offline">
+        <!-- triggers: fill = analogue value; the whole gauge lights on the digital bit -->
+        <g id="trig-L2">
+          <rect class="trig-track" x="150" y="18" rx="9" width="86" height="58"/>
+          <clipPath id="clip-l2"><rect x="150" y="18" rx="9" width="86" height="58"/></clipPath>
+          <rect id="l2-fill" class="trig-fill" clip-path="url(#clip-l2)" x="150" y="76" width="86" height="0"/>
+          <text class="tag" x="193" y="55" text-anchor="middle" id="l2-tag">L2</text>
+        </g>
+        <g id="trig-R2">
+          <rect class="trig-track" x="764" y="18" rx="9" width="86" height="58"/>
+          <clipPath id="clip-r2"><rect x="764" y="18" rx="9" width="86" height="58"/></clipPath>
+          <rect id="r2-fill" class="trig-fill" clip-path="url(#clip-r2)" x="764" y="76" width="86" height="0"/>
+          <text class="tag" x="807" y="55" text-anchor="middle" id="r2-tag">R2</text>
+        </g>
+        <!-- bumpers -->
+        <path id="btn-L1" class="ctl" d="M150 96 q43 -14 86 0 l0 22 q-43 -10 -86 0 z"/>
+        <text class="tag-sm" x="193" y="112" text-anchor="middle" pointer-events="none">L1</text>
+        <path id="btn-R1" class="ctl" d="M764 96 q43 -14 86 0 l0 22 q-43 -10 -86 0 z"/>
+        <text class="tag-sm" x="807" y="112" text-anchor="middle" pointer-events="none">R1</text>
+
+        <!-- body -->
+        <path class="body-shape" style="fill:url(#bodyshine)" d="
+          M 320 132
+          Q 500 108 680 132
+          L 760 138
+          Q 852 148 888 234
+          L 946 420
+          Q 968 500 920 546
+          Q 872 592 806 566
+          Q 742 540 700 480
+          Q 666 434 610 430
+          L 390 430
+          Q 334 434 300 480
+          Q 258 540 194 566
+          Q 128 592 80 546
+          Q 32 500 54 420
+          L 112 234
+          Q 148 148 240 138
+          Z"/>
+
+        <!-- lightbar: two strips flanking the touchpad -->
+        <rect id="lb-left"  class="lightbar" x="330" y="152" width="7" height="112" rx="3.5"/>
+        <rect id="lb-right" class="lightbar" x="663" y="152" width="7" height="112" rx="3.5"/>
+
+        <!-- touchpad (1920 x 1080 device space mapped onto it) -->
+        <g id="btn-touchpad" class="ctl">
+          <rect id="tp-rect" x="345" y="148" width="310" height="120" rx="16"
+                fill="var(--well)" stroke="#2a3040" stroke-width="1.5"/>
+        </g>
+        <g id="tp-points"></g>
+
+        <!-- create / options -->
+        <rect id="btn-create"  class="ctl" x="296" y="150" width="14" height="34" rx="7"/>
+        <rect id="btn-options" class="ctl" x="690" y="150" width="14" height="34" rx="7"/>
+
+        <!-- d-pad -->
+        <g id="dpad" transform="translate(196, 258)">
+          <rect id="dpad-N" class="ctl" x="-16" y="-58" width="32" height="42" rx="9"/>
+          <rect id="dpad-S" class="ctl" x="-16" y="16"  width="32" height="42" rx="9"/>
+          <rect id="dpad-W" class="ctl" x="-58" y="-16" width="42" height="32" rx="9"/>
+          <rect id="dpad-E" class="ctl" x="16"  y="-16" width="42" height="32" rx="9"/>
+        </g>
+
+        <!-- face buttons -->
+        <g id="face" transform="translate(804, 258)">
+          <g id="btn-tri" class="ctl"><circle r="26" cy="-52"/><path class="glyph" stroke="#3fbfa8" d="M -11 -45 L 0 -63 L 11 -45 Z"/></g>
+          <g id="btn-o"  class="ctl"><circle r="26" cx="52"/><circle class="glyph" stroke="#e0645d" cx="52" r="10"/></g>
+          <g id="btn-x"  class="ctl"><circle r="26" cy="52"/><path class="glyph" stroke="#7fa7e8" d="M -9 43 L 9 61 M 9 43 L -9 61"/></g>
+          <g id="btn-sq" class="ctl"><circle r="26" cx="-52"/><rect class="glyph" stroke="#d98bc0" x="-61" y="-9" width="18" height="18"/></g>
+        </g>
+
+        <!-- sticks: the cap group translates by the axis -->
+        <g id="stick-l">
+          <circle class="well" cx="372" cy="392" r="55"/>
+          <g id="stick-l-cap"><circle id="btn-L3" class="cap" cx="372" cy="392" r="38"/>
+            <circle cx="372" cy="392" r="26" fill="none" stroke="#3a4257" stroke-width="2"/></g>
+        </g>
+        <g id="stick-r">
+          <circle class="well" cx="628" cy="392" r="55"/>
+          <g id="stick-r-cap"><circle id="btn-R3" class="cap" cx="628" cy="392" r="38"/>
+            <circle cx="628" cy="392" r="26" fill="none" stroke="#3a4257" stroke-width="2"/></g>
+        </g>
+
+        <!-- PS + mute -->
+        <g id="btn-PS" class="ctl">
+          <rect x="478" y="398" width="44" height="30" rx="10"/>
+          <text class="tag-sm" x="500" y="418" text-anchor="middle" pointer-events="none" style="fill: var(--ink-2)">PS</text>
+        </g>
+        <rect id="btn-mute" class="ctl" x="488" y="444" width="24" height="10" rx="5"/>
+        </g>
+
+        <!-- offline veil -->
+        <g class="offline-veil">
+          <rect x="300" y="284" width="400" height="52" rx="12" fill="#0d1017" opacity="0.88"/>
+          <text x="500" y="317" text-anchor="middle" style="fill: var(--warn); font: 600 20px 'Segoe UI', system-ui, sans-serif" id="offline-text">link lost</text>
+        </g>
+      </svg>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>Status</h2>
+        <div class="tiles">
+          <div class="tile" style="grid-column: 1 / -1">
+            <div class="k">Bridge</div>
+            <div class="statebadge"><span class="dot" id="st-dot"></span><span id="st-text">&mdash;</span></div>
+            <div class="sub" id="st-sub"></div>
+          </div>
+          <div class="tile">
+            <div class="k">Battery</div>
+            <div class="v" id="bat-v">&mdash;</div>
+            <div class="meter"><div id="bat-bar" style="width:0%"></div></div>
+            <div class="sub" id="bat-sub"></div>
+          </div>
+          <div class="tile">
+            <div class="k">Input rate</div>
+            <div class="v" id="rate-v">&mdash;<small> reports/s</small></div>
+            <div class="sub" id="rate-sub"></div>
+          </div>
+        </div>
+        <div class="flags">
+          <span class="flag" id="fl-hp">headphones</span>
+          <span class="flag" id="fl-mic">mic</span>
+          <span class="flag" id="fl-muted">muted</span>
+          <span class="flag" id="fl-hidden">BT pad hidden</span>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 14px">
+        <h2>Sticks &amp; triggers</h2>
+        <div class="axisrow">
+          <div class="axisbox"><div class="axisdot" id="dot-l"></div></div>
+          <div class="axisbox"><div class="axisdot" id="dot-r"></div></div>
+          <div class="axisvals">
+            L <b id="ax-l">128, 128</b><br>
+            R <b id="ax-r">128, 128</b><br>
+            L2 <b id="ax-l2">0</b> &nbsp; R2 <b id="ax-r2">0</b>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 14px">
+        <h2>Motion</h2>
+        <div class="motion" id="motion"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="settings" class="card">
+    <div class="set-head">
+      <h2 style="margin:0">Settings</h2>
+      <span class="path" id="cfg-path"></span>
+      <div class="spacer"></div>
+      <button class="ghost" id="btn-reload">Reload</button>
+      <button class="primary" id="btn-save">Save</button>
+    </div>
+    <div class="set-grid" id="cfg-form"></div>
+    <p class="hint">Saved to the same config.json the tray uses (atomic write).
+    Bridging switches apply when the tray notices; ports and the dashboard port
+    apply at the next start.</p>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ==================================================================== *
+ *  live state via SSE                                                  *
+ * ==================================================================== */
+const $ = id => document.getElementById(id);
+let STATE = { controllers: {}, aggregate: {} };
+let ACTIVE = null;              // selected serial
+let TABS_KEY = "";              // fingerprint of the tab row, to avoid rebuilds
+
+function connect() {
+  // ?snap: poll the one-shot endpoint instead of holding the SSE stream
+  // open. For headless screenshots (an open EventSource keeps the page from
+  // ever reaching network-idle, so `--screenshot` would hang) and for tests.
+  if (new URLSearchParams(location.search).has("snap")) {
+    const once = async () => {
+      try {
+        STATE = await (await fetch("/api/state")).json();
+        $("live").classList.add("on"); $("live-text").textContent = "snapshot";
+        render();
+      } catch (e) { /* the next poll retries */ }
+    };
+    once();
+    setInterval(once, 500);
+    return;
+  }
+  const es = new EventSource("/api/stream");
+  es.onopen = () => { $("live").classList.add("on"); $("live-text").textContent = "live"; };
+  es.onerror = () => { $("live").classList.remove("on"); $("live-text").textContent = "reconnecting…"; };
+  es.onmessage = ev => {
+    try { STATE = JSON.parse(ev.data); } catch (e) { return; }
+    render();
+  };
+}
+
+function short(serial) {
+  return serial.length <= 8 ? serial : serial.slice(0, 4) + "…" + serial.slice(-4);
+}
+
+function controllerName(serial, c) {
+  return c && c.label ? `${c.label} (${short(serial)})` : short(serial);
+}
+
+/* ---------- tabs + aggregate ---------------------------------------- */
+function renderTabs() {
+  const serials = Object.keys(STATE.controllers).sort();
+  if (!serials.includes(ACTIVE)) ACTIVE = serials[0] || null;
+  const key = serials.map(s => {
+    const c = STATE.controllers[s];
+    return s + "|" + (c.state || "") + "|" + (c.label || "") + "|" + (s === ACTIVE);
+  }).join(";");
+  if (key !== TABS_KEY) {
+    TABS_KEY = key;
+    const tabs = $("tabs");
+    tabs.textContent = "";
+    for (const s of serials) {
+      const c = STATE.controllers[s];
+      const b = document.createElement("button");
+      if (s === ACTIVE) b.classList.add("active");
+      const dot = document.createElement("span");
+      dot.className = "st " + (c.state === "running" ? "running" :
+                               c.state === "controller offline" ? "degraded" :
+                               c.error ? "error" : "");
+      b.appendChild(dot);
+      b.appendChild(document.createTextNode(controllerName(s, c)));
+      b.onclick = () => { ACTIVE = s; TABS_KEY = ""; render(); };
+      tabs.appendChild(b);
+    }
+  }
+  const a = STATE.aggregate || {};
+  $("agg").textContent = serials.length
+    ? `${a.running ?? "?"} of ${a.present ?? serials.length} bridged · ` +
+      `${Math.round(a.reports_per_s ?? 0)} reports/s` +
+      (a.master_enabled === false ? " · bridging OFF" : "")
+    : "";
+  $("empty").hidden = serials.length > 0;
+  $("view").style.display = serials.length ? "" : "none";
+}
+
+/* ---------- the drawing --------------------------------------------- */
+const STICK_TRAVEL = 20;                    // px of cap travel at full deflection
+const TP = { x: 345, y: 148, w: 310, h: 120, rangeX: 1920, rangeY: 1080 };
+
+function setLit(id, on) { const el = $(id); if (el) el.classList.toggle("lit", !!on); }
+
+function renderPad(c) {
+  const t = c.telemetry || {};
+  const d = t.decoded;
+  const pad = $("pad");
+  const stale = !t || t.connected === false || (t.age_s ?? 99) > 2.5 ||
+                (t.stale_s != null && t.stale_s > 2.5);
+  pad.classList.toggle("offline", !d || stale);
+  $("offline-text").textContent = !d ? "no telemetry" :
+      (t.connected === false ? "Bluetooth link lost" : "telemetry stalled");
+  if (!d) return;
+
+  const B = d.buttons || {};
+  for (const n of ["x", "o", "sq", "tri", "L1", "R1", "create", "options",
+                   "PS", "touchpad", "mute"])
+    setLit("btn-" + n, B[n]);
+  setLit("btn-L3", B.L3); setLit("btn-R3", B.R3);
+
+  const dp = d.dpad || "-";
+  setLit("dpad-N", dp.includes("N")); setLit("dpad-S", dp.includes("S"));
+  setLit("dpad-E", dp.includes("E")); setLit("dpad-W", dp.includes("W"));
+
+  // sticks: raw 0..255, centre 0x80; +y is DOWN on the pad, same as SVG y
+  const off = v => ((v - 128) / 128) * STICK_TRAVEL;
+  $("stick-l-cap").setAttribute("transform", `translate(${off(d.lx)}, ${off(d.ly)})`);
+  $("stick-r-cap").setAttribute("transform", `translate(${off(d.rx)}, ${off(d.ry)})`);
+
+  // triggers: analogue fill from the bottom of the gauge + digital light
+  for (const [val, fill, tag, pressed] of [[d.l2, "l2-fill", "l2-tag", B.L2],
+                                           [d.r2, "r2-fill", "r2-tag", B.R2]]) {
+    const h = 58 * (val / 255);
+    const el = $(fill);
+    el.setAttribute("height", h.toFixed(1));
+    el.setAttribute("y", (76 - h).toFixed(1));
+    $(tag).style.fill = pressed ? "var(--ink)" : "";
+  }
+
+  // touch points, mapped from the 1920x1080 device space onto the pad rect
+  const g = $("tp-points");
+  g.textContent = "";
+  for (const p of (d.touch || [])) {
+    if (!p.active) continue;
+    const x = TP.x + (p.x / TP.rangeX) * TP.w;
+    const y = TP.y + (p.y / TP.rangeY) * TP.h;
+    const ring = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    ring.setAttribute("class", "tp-dot-ring");
+    ring.setAttribute("cx", x); ring.setAttribute("cy", y); ring.setAttribute("r", 16);
+    const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    dot.setAttribute("class", "tp-dot");
+    dot.setAttribute("cx", x); dot.setAttribute("cy", y); dot.setAttribute("r", 10);
+    const id = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    id.setAttribute("class", "tp-id"); id.setAttribute("x", x); id.setAttribute("y", y + 4);
+    id.setAttribute("text-anchor", "middle"); id.textContent = p.id;
+    g.append(ring, dot, id);
+  }
+}
+
+/* ---------- side panel ---------------------------------------------- */
+const STATE_COLOR = { "running": "var(--ok)", "controller offline": "var(--warn)",
+                      "starting": "var(--accent)", "stopping": "var(--idle)",
+                      "stopped": "var(--idle)", "error": "var(--bad)" };
+
+function renderSide(serial, c) {
+  const t = c.telemetry || {};
+  const d = t.decoded || null;
+
+  const st = c.state || (d ? "telemetry only" : "unknown");
+  $("st-dot").style.background = STATE_COLOR[st] || "var(--idle)";
+  $("st-text").textContent = st;
+  const bits = [];
+  if (c.port) bits.push(`usbip port ${c.port}`);
+  if (c.uptime_s) bits.push(`up ${Math.floor(c.uptime_s / 60)}m ${Math.floor(c.uptime_s % 60)}s`);
+  if (c.error) bits.push(c.error);
+  $("st-sub").textContent = bits.join(" · ");
+
+  const pct = d ? d.battery_percent : c.battery_percent;
+  const bstate = d ? d.battery_state : "";
+  $("bat-v").innerHTML = pct == null ? "&mdash;" : pct + "<small>%</small>";
+  const bar = $("bat-bar");
+  bar.style.width = (pct ?? 0) + "%";
+  bar.style.background = pct != null && pct <= 20 && !String(bstate).startsWith("charging")
+      ? "var(--bad)" : "var(--ok)";
+  $("bat-sub").textContent = bstate || "";
+
+  const rate = t.rps ?? c.reports_per_s;
+  $("rate-v").innerHTML = (rate != null ? Math.round(rate) : "&mdash;") + "<small> reports/s</small>";
+  $("rate-sub").textContent = t.stale_s != null ? `last report ${(t.stale_s * 1000).toFixed(0)} ms ago` : "";
+
+  $("fl-hp").classList.toggle("on", !!(d && d.headphone));
+  $("fl-mic").classList.toggle("on", !!(d && d.mic));
+  $("fl-muted").classList.toggle("on", !!(d && d.mic_muted));
+  $("fl-hidden").classList.toggle("on", !!c.hide_bluetooth);
+
+  // stick detail
+  const place = (dot, x, y) => {
+    dot.style.left = (50 + ((x - 128) / 128) * 44) + "%";
+    dot.style.top = (50 + ((y - 128) / 128) * 44) + "%";
+  };
+  if (d) {
+    place($("dot-l"), d.lx, d.ly); place($("dot-r"), d.rx, d.ry);
+    $("ax-l").textContent = `${d.lx}, ${d.ly}`;
+    $("ax-r").textContent = `${d.rx}, ${d.ry}`;
+    $("ax-l2").textContent = d.l2; $("ax-r2").textContent = d.r2;
+  }
+
+  // motion bars: signed 16-bit, drawn from the midline
+  const m = $("motion");
+  m.textContent = "";
+  const rows = d ? [["pitch", d.gyro[0]], ["yaw", d.gyro[1]], ["roll", d.gyro[2]],
+                    ["acc x", d.accel[0]], ["acc y", d.accel[1]], ["acc z", d.accel[2]]] : [];
+  for (const [name, v] of rows) {
+    const lbl = document.createElement("div"); lbl.className = "lbl"; lbl.textContent = name;
+    const bar = document.createElement("div"); bar.className = "mbar";
+    const f = document.createElement("div");
+    const frac = Math.max(-1, Math.min(1, v / 9000));   // +/-9000 shows normal motion well
+    f.style.left = frac < 0 ? (50 + frac * 50) + "%" : "50%";
+    f.style.width = Math.abs(frac) * 50 + "%";
+    bar.appendChild(f);
+    const val = document.createElement("div"); val.className = "val"; val.textContent = v;
+    m.append(lbl, bar, val);
+  }
+}
+
+function render() {
+  renderTabs();
+  if (!ACTIVE) return;
+  const c = STATE.controllers[ACTIVE] || {};
+  renderPad(c);
+  renderSide(ACTIVE, c);
+}
+
+/* ==================================================================== *
+ *  settings panel                                                      *
+ *                                                                      *
+ *  Known keys get purpose-built controls; EVERYTHING ELSE is rendered  *
+ *  generically from its JSON type, so a section another build adds     *
+ *  (say, "input" with chord keybinds) appears and is editable without  *
+ *  this page changing. The form edits a working copy of the document   *
+ *  and Save POSTs it whole; the server merges + coerces + saves        *
+ *  atomically through the config module.                               *
+ * ==================================================================== */
+let CFG = null;      // the working copy the form binds to
+
+const GLOBAL_FIELDS = [
+  ["enabled", "Bridging enabled (master switch)", "bool"],
+  ["autostart_on_login", "Start at login", "bool"],
+  ["auto_bridge_new", "Bridge new controllers automatically", "bool"],
+  ["hide_bluetooth_default", "Hide new controllers' Bluetooth pad", "bool"],
+  ["port_base", "First usbip TCP port", "number"],
+  ["dashboard_port", "Dashboard port (this page)", "number"],
+  ["hidhide_cli", "HidHideCLI.exe path (blank = auto)", "string"],
+];
+const CTRL_FIELDS = [
+  ["enabled", "Bridge this controller", "bool"],
+  ["label", "Label", "string"],
+  ["audio_target", "Audio target", "choice", ["speaker", "headphone"]],
+  ["hide_bluetooth", "Hide Bluetooth pad while bridged", "bool"],
+  ["port", "usbip TCP port (blank = automatic)", "number"],
+];
+const KNOWN_GLOBAL = new Set([...GLOBAL_FIELDS.map(f => f[0]), "controllers"]);
+const KNOWN_CTRL = new Set(CTRL_FIELDS.map(f => f[0]));
+
+function getPath(obj, path) { return path.reduce((o, k) => (o ?? {})[k], obj); }
+function setPath(obj, path, value) {
+  let o = obj;
+  for (const k of path.slice(0, -1)) o = o[k] = o[k] ?? {};
+  o[path[path.length - 1]] = value;
+}
+
+function inputFor(path, value, kind, choices) {
+  if (kind === "bool") {
+    const el = document.createElement("input");
+    el.type = "checkbox"; el.checked = !!value;
+    el.onchange = () => setPath(CFG, path, el.checked);
+    return el;
+  }
+  if (kind === "choice") {
+    const el = document.createElement("select");
+    for (const c of choices) {
+      const o = document.createElement("option");
+      o.value = c; o.textContent = c; if (c === value) o.selected = true;
+      el.appendChild(o);
+    }
+    el.onchange = () => setPath(CFG, path, el.value);
+    return el;
+  }
+  if (kind === "number") {
+    const el = document.createElement("input");
+    el.type = "number"; el.value = value ?? "";
+    el.onchange = () => setPath(CFG, path, el.value === "" ? null : Number(el.value));
+    return el;
+  }
+  if (kind === "json") {                    // arrays and anything exotic
+    const el = document.createElement("textarea");
+    el.value = JSON.stringify(value, null, 1);
+    el.onchange = () => {
+      try { setPath(CFG, path, JSON.parse(el.value)); el.style.borderColor = ""; }
+      catch (e) { el.style.borderColor = "var(--bad)"; }
+    };
+    return el;
+  }
+  const el = document.createElement("input");                 // string
+  el.type = "text"; el.value = value ?? "";
+  el.onchange = () => setPath(CFG, path, el.value === "" ? null : el.value);
+  return el;
+}
+
+function addRow(box, labelText, control, wide) {
+  const row = document.createElement("div");
+  row.className = "row" + (wide ? " wide" : "");
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  row.append(label, control);
+  box.appendChild(row);
+  return row;
+}
+
+function kindOf(value) {
+  if (typeof value === "boolean") return "bool";
+  if (typeof value === "number") return "number";
+  if (value === null || typeof value === "string") return "string";
+  return "json";
+}
+
+/* Unknown keys and whole unknown sections: render by type, recursively. */
+function addGenericRows(box, path, obj) {
+  for (const [key, value] of Object.entries(obj)) {
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      const sub = document.createElement("fieldset");
+      const lg = document.createElement("legend");
+      lg.textContent = key;
+      sub.appendChild(lg);
+      addGenericRows(sub, [...path, key], value);
+      box.appendChild(sub);
+    } else {
+      const kind = kindOf(value);
+      addRow(box, key, inputFor([...path, key], value, kind), kind === "json");
+    }
+  }
+}
+
+function buildForm() {
+  const form = $("cfg-form");
+  form.textContent = "";
+  if (!CFG) return;
+
+  const general = document.createElement("fieldset");
+  general.innerHTML = "<legend>General</legend>";
+  for (const [key, label, kind, choices] of GLOBAL_FIELDS)
+    addRow(general, label, inputFor([key], CFG[key], kind, choices));
+  // globals this build does not know about
+  const extraGlobals = Object.fromEntries(
+    Object.entries(CFG).filter(([k]) => !KNOWN_GLOBAL.has(k)));
+  addGenericRows(general, [], extraGlobals);
+  form.appendChild(general);
+
+  for (const serial of Object.keys(CFG.controllers || {}).sort()) {
+    const cc = CFG.controllers[serial];
+    const fs = document.createElement("fieldset");
+    const lg = document.createElement("legend");
+    lg.textContent = "Controller " + serial;
+    fs.appendChild(lg);
+    for (const [key, label, kind, choices] of CTRL_FIELDS)
+      addRow(fs, label, inputFor(["controllers", serial, key], cc[key], kind, choices));
+    const extra = Object.fromEntries(
+      Object.entries(cc).filter(([k]) => !KNOWN_CTRL.has(k)));
+    addGenericRows(fs, ["controllers", serial], extra);
+    form.appendChild(fs);
+  }
+}
+
+function toast(text, isError) {
+  const el = $("toast");
+  el.textContent = text;
+  el.classList.toggle("err", !!isError);
+  el.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove("show"), 3500);
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch("/api/config");
+    const doc = await r.json();
+    CFG = doc.config;
+    $("cfg-path").textContent = doc.path || "";
+    buildForm();
+  } catch (e) {
+    toast("Could not load the config: " + e, true);
+  }
+}
+
+async function saveConfig() {
+  try {
+    const r = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(CFG),
+    });
+    const doc = await r.json();
+    if (!r.ok || doc.error) throw new Error(doc.error || r.status);
+    CFG = doc.config;
+    buildForm();
+    toast("Saved to " + doc.path);
+  } catch (e) {
+    toast("Save failed: " + e.message, true);
+  }
+}
+
+$("btn-settings").onclick = () => {
+  const open = $("settings").classList.toggle("open");
+  if (open && !CFG) loadConfig();
+  if (open) $("settings").scrollIntoView({ behavior: "smooth", block: "start" });
+};
+$("btn-reload").onclick = loadConfig;
+$("btn-save").onclick = saveConfig;
+
+connect();
+render();
+// ?settings: open the panel on load (deep link + screenshot tests).
+if (new URLSearchParams(location.search).has("settings")) {
+  $("settings").classList.add("open");
+  loadConfig();
+}
+</script>
+</body>
+</html>

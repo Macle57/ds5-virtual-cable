@@ -426,9 +426,10 @@ def _as_port(value: object) -> int | None:
 def _as_dashboard_port(value: object) -> int:
     """The dashboard's TCP port, or the default for anything unusable.
 
-    Unlike `_as_port` there is no usbipd-win exclusion: this is an HTTP port,
-    not a USB/IP one, and a user who deliberately points the dashboard at 3240
-    is wrong in a way that only breaks the dashboard.
+    3240 is refused like everywhere else in this module: the dashboard is an
+    HTTP server, but it genuinely BINDS this port, and 3240 is where usbipd-win
+    listens on machines that have it -- an HTTP server there would fight a real
+    service, not merely break the dashboard.
     """
     if value is None or isinstance(value, bool):
         return DEFAULT_DASHBOARD_PORT
@@ -436,7 +437,7 @@ def _as_dashboard_port(value: object) -> int:
         port = int(value)
     except (TypeError, ValueError):
         return DEFAULT_DASHBOARD_PORT
-    if not (1 <= port <= 65535):
+    if not (1 <= port <= 65535) or port == USBIPD_WIN_PORT:
         log.warning("dashboard_port %r is not usable -- using %d", value,
                     DEFAULT_DASHBOARD_PORT)
         return DEFAULT_DASHBOARD_PORT

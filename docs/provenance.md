@@ -139,6 +139,15 @@ counterpart in either reference. `usb_descriptors.py` reimplements the *techniqu
 of Microsoft's USBView sample (SetupAPI enumeration + hub IOCTLs) in ctypes
 against the public Windows SDK API; no sample code was copied.
 
+### `app/ds5app/` dashboard (Phase 5) — original, with acknowledged inspiration
+
+*Added with the Phase 5 web dashboard; the audit method of §2 applies.*
+
+| file | verdict | notes |
+|---|---|---|
+| `dashboard.py`, `telemetry.py` | **O** | Server, SSE stream, config API and the UDP telemetry channel are this project's design; stdlib only. |
+| `dashboard.html` | **O**, ideas **F** | The page is written from scratch — every SVG path, style and script line is this project's. What it deliberately takes from **daidr/dualsense-tester** (MIT) is *presentation vocabulary, not code or assets*: the idea of a live SVG controller whose buttons light and sticks travel (their `ModelPanel.vue` + `DSCover.vue`); the touchpad's 1920×1080 device coordinate space and its scale-into-a-rectangle mapping (`DSCover.vue`, constants `TOUCHPAD_RANGE_X/Y` — itself a hardware fact this project's `protocol.py` already ports); and rendering stick deflection as normalised-axis × a fixed travel radius. Their three-layer SVG artwork (`DSBack/DSBody/DSCover`, ~26 KB of paths) was **not** copied — this page draws its own simplified controller from geometric primitives. Input-report byte offsets come from this project's own `ds5bridge.protocol` (whose `Offsets` port is already recorded above), never re-derived in JS. |
+
 ### `prototype/ds5bridge/protocol.py` in detail
 
 Five functions are hand-written ports. This is stated in the file's own docstring

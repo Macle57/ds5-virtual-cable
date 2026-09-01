@@ -404,7 +404,8 @@ def default_child_command(serial: str, port: int, usbip_exe: str | None = None,
                           audio_target: str = "speaker",
                           status_every: float = 2.0,
                           hide_bluetooth: bool = False,
-                          hidhide_cli: str | None = None) -> list[str]:
+                          hidhide_cli: str | None = None,
+                          telemetry_port: int | None = None) -> list[str]:
     """The command line for one bridge child.
 
     It runs the SAME `ds5bridge run` the CLI runs and the same `BridgeService`
@@ -428,6 +429,10 @@ def default_child_command(serial: str, port: int, usbip_exe: str | None = None,
         args += ["--hide-bluetooth"]
     if hidhide_cli:
         args += ["--hidhide-cli", hidhide_cli]
+    # Where the child should fire its live-input datagrams (telemetry.py).
+    # The parent's hub owns the port; a child with no flag publishes nothing.
+    if telemetry_port:
+        args += ["--telemetry-port", str(telemetry_port)]
     if getattr(sys, "frozen", False):
         here = os.path.dirname(os.path.abspath(sys.executable))
         exe = os.path.join(here, "ds5bridge.exe")
@@ -764,6 +769,7 @@ class BridgeManager:
                  hide_bluetooth: dict | None = None,
                  hide_default: bool = False,
                  hidhide_cli: str | None = None,
+                 telemetry_port: int | None = None,
                  child_command=None,
                  discover=None,
                  bridge_factory=None,
@@ -829,6 +835,10 @@ class BridgeManager:
         self.audio_target = audio_target
         self.hide_default = bool(hide_default)
         self.hidhide_cli = hidhide_cli
+        #: Handed to every child as `--telemetry-port` so the dashboard's hub
+        #: hears all of them. None -- no dashboard -- means no flag and no
+        #: telemetry, which is also what every existing test constructs.
+        self.telemetry_port = telemetry_port
         self.on_event = on_event or (lambda serial, kind, text: None)
         self.on_enabled_changed = on_enabled_changed or (lambda s, v: None)
         self.on_master_changed = on_master_changed or (lambda v: None)
@@ -840,7 +850,8 @@ class BridgeManager:
                 serial, port, usbip_exe=self.usbip_exe,
                 audio_target=self.audio_target,
                 hide_bluetooth=self.is_hiding(serial),
-                hidhide_cli=self.hidhide_cli))
+                hidhide_cli=self.hidhide_cli,
+                telemetry_port=self.telemetry_port))
         self._discover = discover or enumerate_serials
         self._bridge_factory = bridge_factory or ChildBridge
         self._port_free = port_free or S.port_free

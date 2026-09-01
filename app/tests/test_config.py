@@ -172,11 +172,11 @@ class DashboardPortTests(_Temp):
                 self.write(json.dumps({"dashboard_port": junk}))
                 self.assertEqual(CFG.load().dashboard_port, 8765)
 
-    def test_3240_is_allowed_here(self):
-        # The usbipd-win exclusion is about USB/IP ports; an HTTP dashboard on
-        # 3240 is a strange choice, not a conflict this module can foresee.
+    def test_3240_is_refused_here_too(self):
+        # The dashboard genuinely binds its port, and 3240 is where usbipd-win
+        # listens -- an HTTP server there would fight a real service.
         self.write(json.dumps({"dashboard_port": 3240}))
-        self.assertEqual(CFG.load().dashboard_port, 3240)
+        self.assertEqual(CFG.load().dashboard_port, 8765)
 
 
 class RoundTripTests(_Temp):
