@@ -668,16 +668,16 @@ class RemoteModeInputs(EngineCase):
         self.feed(report())
         self.assertIn(("button", "right", True), self.events)
 
-    def test_two_finger_drag_scrolls(self):
+    def test_two_finger_drag_does_not_scroll(self):
+        # Scrolling belongs to the right stick and triggers alone; a 2-finger
+        # drag is only ever an alt-tab slide (horizontal) or nothing.
         self.make_remote()
         self.enter()
         self.feed(report(touches=((500, 300), (600, 300))))
         for y in range(360, 900, 60):
             self.feed(report(touches=((500, y), (600, y))))
-        wheels = [e for e in self.events if e[0] == "wheel"]
-        self.assertTrue(wheels)
-        # fingers moved down -> wheel negative, like every Windows touchpad
-        self.assertLess(sum(w[1] for w in wheels), 0)
+        self.assertFalse([e for e in self.events
+                          if e[0] in ("wheel", "hwheel")])
 
     def test_two_finger_horizontal_slide_is_alt_tab(self):
         # The chord-held gesture, available without the chord: a decisive
@@ -707,16 +707,16 @@ class RemoteModeInputs(EngineCase):
         after = [e for e in self.events if e[0] in ("wheel", "hwheel")]
         self.assertEqual(before, after)
 
-    def test_vertical_scroll_locks_out_alt_tab(self):
-        # A contact that has already emitted vertical wheel is a scroll for
-        # good -- later horizontal drift must not pop the switcher open.
+    def test_vertical_two_finger_drag_does_nothing(self):
+        # Vertical-dominant travel is neither a scroll (removed on purpose)
+        # nor an alt-tab (that needs horizontal dominance).
         self.make_remote()
         self.enter()
         self.feed(report(touches=((450, 300), (550, 300))))
-        for y in (360, 420, 480):
+        for y in (360, 420, 480, 540, 600):
             self.feed(report(touches=((450, y), (550, y))))
-        self.assertTrue([e for e in self.events if e[0] == "wheel"])
-        self.feed(report(touches=((950, 480), (1050, 480))))
+        self.assertFalse([e for e in self.events
+                          if e[0] in ("wheel", "hwheel")])
         self.assertFalse(self.acts.alt_tab_open)
 
     def test_a_chord_press_commits_a_remote_alt_tab(self):

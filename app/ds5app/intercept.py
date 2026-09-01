@@ -56,12 +56,12 @@ games read those); the pad drives the OS instead:
 
     touchpad 1-finger drag      move the mouse pointer
     touchpad 1-finger tap       left click
-    touchpad 2-finger drag      scroll (vertical + horizontal)
     touchpad 2-finger slide     alt-tab hold, once the travel reads as the
       (horizontal, decisive)    chord-held gesture -- see `_rm_two_finger`
     touchpad 2-finger tap       right click
     left stick                  move the pointer (rate)
-    right stick                 scroll (rate)
+    right stick                 scroll (rate; scrolling is the sticks' and
+                                triggers' job -- the touchpad does not scroll)
     L2 / R2                     scroll up / down (analog rate)
     cross (hold = drag)         left mouse button down/up
     circle                      Esc
@@ -141,8 +141,6 @@ TAP_MOVE_PX = 40
 
 #: Touchpad points per mouse pixel, before `remote.mouse_speed`.
 MOUSE_GAIN = 1.0
-#: Wheel units accumulated per touchpad point of 2-finger drag.
-SCROLL_GAIN = 0.35
 #: Full-deflection stick speed, px per second, before `mouse_speed`.
 STICK_MOUSE_PX_S = 900.0
 #: Full-deflection scroll speed, wheel notches (120 units) per second.
@@ -296,7 +294,7 @@ class InputInterceptor:
         self._rm_touch_fingers = 0
         self._rm_touch_max_fingers = 0
         self._rm_mouse_frac = [0.0, 0.0]
-        self._rm_scroll_acc = [0.0, 0.0]   # vertical, horizontal wheel units
+        self._rm_scroll_acc = 0.0          # vertical wheel units pending
         self._rm_left_down = False
         self._rm_esc_down = False
         self._rm_enter_down = False
@@ -914,12 +912,11 @@ class InputInterceptor:
 
     def _rm_two_finger(self, c, dx: float, dy: float, now: float,
                        thunks: list) -> None:
-        """Remote-mode 2-finger movement: scroll -- unless the travel reads as
-        the same decisive horizontal slide the chord gestures turn into an
-        alt-tab hold. Scrolling must not wait 150 px for the decision, so an
-        undecided contact scrolls too; the first VERTICAL wheel event actually
-        emitted locks the contact to scrolling for good (a stray fraction of
-        horizontal wheel before an alt-tab opens is the cheaper artefact)."""
+        """Remote-mode 2-finger movement: the decisive horizontal slide the
+        chord gestures turn into an alt-tab hold, and nothing else. The
+        touchpad deliberately does NOT scroll -- scrolling belongs to the
+        right stick and triggers, so a sloppy 2-finger drag can never fight
+        the alt-tab decision or nudge the page by accident."""
         tx = c[0] - self._rm2_start[0]
         ty = c[1] - self._rm2_start[1]
         if self._rm2_decided is None and abs(tx) >= ALT_TAB_START_PX \
@@ -932,11 +929,6 @@ class InputInterceptor:
             return
         if self._rm2_decided == "alt_tab":
             self._alt_hold_track(tx, thunks)
-            return
-        rm = self.cfg.remote
-        if self._rm_scroll(dy * SCROLL_GAIN * rm.scroll_speed,
-                           dx * SCROLL_GAIN * rm.scroll_speed, thunks):
-            self._rm2_decided = "scroll"
 
     def _stick_rates(self, frame: _Frame, now: float, thunks: list,
                      *, triggers: bool) -> None:
@@ -960,7 +952,7 @@ class InputInterceptor:
         if triggers:
             sv += ((frame.r2 - frame.l2) / 255.0
                    * TRIGGER_SCROLL_NOTCH_S * 120 * dt)
-        self._rm_scroll(sv * rm.scroll_speed, 0.0, thunks, gain=1.0)
+        self._rm_scroll(sv * rm.scroll_speed, thunks, gain=1.0)
 
     def _rm_set_held(self, key: str, down: bool) -> None:
         if key == "cross":
@@ -980,26 +972,16 @@ class InputInterceptor:
         if ix or iy:
             thunks.append(lambda: self.actions.mouse_move(ix, iy))
 
-    def _rm_scroll(self, dv: float, dh: float, thunks: list,
-                   gain: float = 1.0) -> bool:
-        """Accumulate scroll; True when a VERTICAL wheel event was emitted --
-        the signal `_rm_two_finger` uses to lock a contact to scrolling."""
-        acc = self._rm_scroll_acc
-        acc[0] += dv * gain
-        acc[1] += dh * gain
-        vertical_emitted = False
-        # Fingers (or stick) moving down scroll the content down = wheel
-        # negative, matching every Windows touchpad's default.
-        for idx, horizontal in ((0, False), (1, True)):
-            whole = int(acc[idx] / 40) * 40   # emit in 1/3-notch steps
-            if whole:
-                acc[idx] -= whole
-                if not horizontal:
-                    vertical_emitted = True
-                delta = -whole if not horizontal else whole
-                thunks.append(lambda d=delta, h=horizontal:
-                              self.actions.wheel(d, horizontal=h))
-        return vertical_emitted
+    def _rm_scroll(self, dv: float, thunks: list, gain: float = 1.0) -> None:
+        """Accumulate vertical scroll from the right stick and triggers --
+        the only scroll sources; the touchpad deliberately has none."""
+        self._rm_scroll_acc += dv * gain
+        # Stick pushed down scrolls the content down = wheel negative,
+        # matching every Windows touchpad's default.
+        whole = int(self._rm_scroll_acc / 40) * 40   # emit in 1/3-notch steps
+        if whole:
+            self._rm_scroll_acc -= whole
+            thunks.append(lambda d=-whole: self.actions.wheel(d))
 
     # =====================================================================
     # masking / rewriting the forwarded report
