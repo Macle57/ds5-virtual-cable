@@ -56,6 +56,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import _bootstrap  # noqa: F401  (sys.path side effect)
+from . import actions as ACT
 from . import config as K
 from . import telemetry as TM
 
@@ -141,6 +142,9 @@ class DashboardServer:
         #: (and immediately by any successful POST).
         self._cfg_cache: tuple[float, "K.Config"] | None = None
         self._cfg_lock = threading.Lock()
+        #: /api/actions is static per process (the registry and the config
+        #: vocabulary are code, not state) -- built once, served forever.
+        self._actions_meta: dict | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -262,6 +266,36 @@ class DashboardServer:
                 log.exception("on_config_saved handler failed")
         return {"path": cfg.path or K.config_path(), "config": cfg.to_dict()}
 
+    def actions_meta(self) -> dict:
+        """What the settings page needs to build its chord/gesture pickers.
+
+        Sourced from the SAME registry and constants the engine resolves
+        against (`actions.OsActions().registry()`, `config.CHORD_BUTTONS`
+        et al.), never hardcoded in the page -- an action added to the
+        registry appears in the dropdowns with no HTML change. Constructing
+        `OsActions` is cheap and side-effect-free by its own design (the
+        injector seams default to plain function references); nothing is
+        injected by merely building the registry.
+
+        `chord_keys` is the button vocabulary a chord binding may use --
+        today identical to `chord_buttons` (any chordable button can also BE
+        the chord button), but served separately so the two can diverge
+        without a page change.
+        """
+        if self._actions_meta is None:
+            registry = ACT.OsActions().registry()
+            self._actions_meta = {
+                "actions": [
+                    {"name": spec.name, "doc": spec.doc,
+                     "repeatable": bool(spec.repeatable)}
+                    for _, spec in sorted(registry.items())],
+                "chord_buttons": list(K.CHORD_BUTTONS),
+                "chord_keys": list(K.CHORD_BUTTONS),
+                "gesture_keys": list(K.CHORD_GESTURES),
+                "defaults": {"chords": dict(K.DEFAULT_CHORDS)},
+            }
+        return self._actions_meta
+
     # -- the page ----------------------------------------------------------
 
     def page(self) -> bytes:
@@ -333,6 +367,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(self.dash.state())
             elif path == "/api/config":
                 self._send_json(self.dash.config_get())
+            elif path == "/api/actions":
+                self._send_json(self.dash.actions_meta())
             elif path == "/api/stream":
                 self._stream()
             else:
