@@ -14,13 +14,17 @@ callback. What is asserted is the CONTRACT the game and the OS see:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
 import unittest
 
 try:
     from ds5app import actions as A
     from ds5app import config as K
     from ds5app import intercept as I
+    from ds5app import service as SVC
     from ds5bridge import protocol as P
 except ImportError:  # pragma: no cover
     A = None
@@ -963,6 +967,266 @@ class Wiring(EngineCase):
         self.assertTrue(self.acts.alt_tab_open)
         self.eng.close()
         self.assertFalse(self.acts.alt_tab_open)
+
+    def test_attach_allow_disabled_attaches_a_passthrough_engine(self):
+        # `BridgeService` attaches even a disabled engine so the config
+        # watcher can switch it on live; until then it must be a pure
+        # passthrough.
+        class Backend:
+            interceptor = None
+
+            def push_setstate_body(self, body):
+                pass
+
+            def power_off_pad(self):
+                pass
+
+        be = Backend()
+        eng = I.attach_to_backend(be, K.InputConfig(enabled=False),
+                                  allow_disabled=True)
+        self.assertIsNotNone(eng)
+        self.assertIs(be.interceptor, eng)
+        r = report(buttons=("ps", "cross"), lx=0x10)
+        self.assertEqual(eng.on_input(r), r)
+        eng.close()
+
+
+class UpdateConfig(EngineCase):
+    """`update_config`: the dashboard's Save, landing on a running engine."""
+
+    def enter(self):
+        """A clean double press of the chord button (default window)."""
+        self.feed(report(buttons=("ps",)), report())
+        self.clock.advance(0.15)
+        self.feed(report(buttons=("ps",)), report())
+
+    def press_pair(self, gap: float) -> None:
+        """Two chord-button taps `gap` seconds apart."""
+        self.feed(report(buttons=("ps",)), report())
+        self.clock.advance(gap)
+        self.feed(report(buttons=("ps",)), report())
+
+    def test_a_new_double_press_window_takes_effect(self):
+        # THE user-visible bug: `double_press_ms` tuned in the dashboard did
+        # nothing until a bridge restart. Two taps a second apart must fail
+        # the shipped 400 ms window and pass a live-applied 1500 ms one.
+        self.make_remote()
+        self.press_pair(1.0)
+        self.assertFalse(self.eng.remote_mode)
+        self.eng.update_config(K.InputConfig.from_dict(
+            {"remote": {"enabled": True}, "double_press_ms": 1500}))
+        self.clock.advance(2.0)
+        self.press_pair(1.0)
+        self.assertTrue(self.eng.remote_mode)
+
+    def test_haptic_strength_is_recomputed(self):
+        self.make()
+        self.eng.update_config(K.InputConfig.from_dict(
+            {"haptic_strength": 100}))
+        self.feed(report(buttons=("ps",)), report(buttons=("ps", "cross")))
+        self.eng.tick()
+        rumble = [b for b in self.sent
+                  if b[P.VALID_FLAG0] & P.F0_COMPATIBLE_VIBRATION]
+        self.assertTrue(rumble)
+        self.assertEqual(rumble[0][P.BC_VIBRATION_RIGHT], 0xFF)
+
+    def test_disable_releases_everything_and_passes_through(self):
+        self.make_remote()
+        game = P.SetState()
+        game.lightbar(10, 20, 30)
+        self.eng.rewrite_setstate(bytes(game.body))   # engine learns the colour
+        self.enter()
+        self.clock.advance(1.0)
+        self.eng.tick()
+        self.assertTrue(self.eng.remote_mode)
+        self.feed(report(buttons=("cross",)))          # left mouse held (drag)
+        self.assertIn(("button", "left", True), self.events)
+        self.sent.clear()
+
+        self.eng.update_config(K.InputConfig.from_dict({"enabled": False}))
+        # remote mode exited, the held OS button let go IMMEDIATELY -- there
+        # is no "next report" release path once the engine is passthrough
+        self.assertFalse(self.eng.remote_mode)
+        self.assertIn(("button", "left", False), self.events)
+        # tick drains the goodbye effects (exit pulse, lightbar restore) ...
+        for _ in range(30):
+            self.clock.advance(0.05)
+            self.eng.tick()
+        lightbars = [b for b in self.sent
+                     if b[P.VALID_FLAG1] & P.F1_LIGHTBAR_CONTROL]
+        self.assertTrue(lightbars)
+        self.assertEqual((lightbars[-1][P.LED_R], lightbars[-1][P.LED_G],
+                          lightbars[-1][P.LED_B]), (10, 20, 30))
+        # ... and then the game sees an honest pad, byte for byte
+        r = report(buttons=("cross", "ps"), lx=0x10, touches=((500, 500),))
+        self.assertEqual(self.feed(r), r)
+        # no idle power-off from a timer the user just switched off
+        self.clock.advance(3600)
+        self.eng.tick()
+        self.assertEqual(self.power_offs, 0)
+
+    def test_setstate_rewrites_stop_while_disabled(self):
+        self.make(lightbar={"dim_after_minutes": 1.0, "dim_level": 0.5})
+        self.feed(report())
+        self.clock.advance(61)
+        self.eng.tick()                                # dim engages
+        game = P.SetState()
+        game.lightbar(100, 100, 100)
+        out = self.eng.rewrite_setstate(bytes(game.body))
+        self.assertEqual(out[P.LED_R], 50)             # dimmed
+        self.eng.update_config(K.InputConfig.from_dict({"enabled": False}))
+        out = self.eng.rewrite_setstate(bytes(game.body))
+        self.assertEqual(out[P.LED_R], 100)            # passthrough
+
+    def test_reenable_resumes_with_a_fresh_idle_clock(self):
+        self.make()
+        self.feed(report())
+        self.eng.update_config(K.InputConfig.from_dict({"enabled": False}))
+        # An hour passes with the engine off; the stale `_last_activity`,
+        # if honoured, would power the pad off seconds after re-enabling.
+        self.clock.advance(3600)
+        self.eng.update_config(K.InputConfig())
+        self.eng.tick()
+        self.assertEqual(self.power_offs, 0)
+        out = self.feed(report(buttons=("ps",)))       # masking is back
+        self.assertEqual(buttons_of(out), set())
+        self.feed(report())
+        self.clock.advance(901)                        # and the timer works,
+        self.eng.tick()                                # counted from NOW
+        self.assertEqual(self.power_offs, 1)
+
+    def test_chord_button_change_mid_hold_frees_the_old_button(self):
+        self.make()
+        out = self.feed(report(buttons=("ps",)))
+        self.assertEqual(buttons_of(out), set())       # held and masked
+        self.eng.update_config(K.InputConfig.from_dict(
+            {"chord_button": "mute"}))
+        out = self.feed(report(buttons=("ps",)))
+        self.assertEqual(buttons_of(out), {"PS"})      # honest on the NEXT
+                                                       # report (decoder name)
+        self.feed(report())
+        self.assertEqual(self.eng.stats["taps_replayed"], 0)   # no phantom tap
+        out = self.feed(report(buttons=("mute",)))
+        self.assertEqual(buttons_of(out), set())       # the new button arms
+        self.feed(report(buttons=("mute", "dpad_up")))
+        self.assertIn(("key", A.VK_VOLUME_UP, True), self.events)
+
+    def test_disabling_remote_alone_exits_remote_mode(self):
+        self.make_remote()
+        self.enter()
+        self.assertTrue(self.eng.remote_mode)
+        self.eng.update_config(K.InputConfig.from_dict(
+            {"remote": {"enabled": False}}))
+        self.assertFalse(self.eng.remote_mode)
+        out = self.feed(report(buttons=("ps",)))       # chords still armed
+        self.assertEqual(buttons_of(out), set())
+
+    def test_disable_commits_a_mid_gesture_alt_tab(self):
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=((450, 500), (550, 500))),
+                  report(buttons=("ps",), touches=((650, 500), (750, 500))))
+        self.assertTrue(self.acts.alt_tab_open)
+        self.eng.update_config(K.InputConfig.from_dict({"enabled": False}))
+        self.assertFalse(self.acts.alt_tab_open)       # no stuck Alt, ever
+
+
+@unittest.skipIf(A is None, "the app package is not importable here")
+class LiveSettingsWatcher(unittest.TestCase):
+    """`service.InputConfigWatcher`: the file-to-engine half of the pipeline.
+
+    Tested here rather than beside `BridgeService` because the watcher exists
+    for the engine: it is the delivery mechanism for every `update_config`
+    case above. All I/O is against a temp file with mtimes set explicitly --
+    `os.utime` -- so nothing sleeps and nothing depends on filesystem
+    timestamp granularity.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "config.json")
+        self.applied: list = []
+        self.current = K.InputConfig()
+
+        def apply(cfg):
+            self.applied.append(cfg)
+            self.current = cfg
+
+        self.watcher = SVC.InputConfigWatcher(
+            apply, lambda: self.current, path=self.path, interval=0.01)
+
+    def write(self, data: dict, mtime_s: int) -> None:
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.utime(self.path, ns=(mtime_s * 10**9, mtime_s * 10**9))
+
+    def write_text(self, text: str, mtime_s: int) -> None:
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.utime(self.path, ns=(mtime_s * 10**9, mtime_s * 10**9))
+
+    def test_a_changed_input_section_is_applied(self):
+        self.write({"input": {"double_press_ms": 900}}, 1)
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(len(self.applied), 1)
+        self.assertEqual(self.applied[0].double_press_ms, 900)
+
+    def test_an_identical_section_is_not_applied(self):
+        # A save that only flipped a bridging switch must not touch the engine.
+        self.write({"enabled": False,
+                    "input": K.InputConfig().to_dict()}, 1)
+        self.assertFalse(self.watcher.poll_once())
+        self.assertEqual(self.applied, [])
+
+    def test_an_unmoved_mtime_is_stat_only(self):
+        self.write({"input": {"double_press_ms": 900}}, 1)
+        self.assertTrue(self.watcher.poll_once())
+        self.assertFalse(self.watcher.poll_once())     # same mtime: no re-read
+        self.assertEqual(len(self.applied), 1)
+
+    def test_a_missing_file_is_nothing_to_do(self):
+        self.assertFalse(self.watcher.poll_once())
+        self.assertEqual(self.applied, [])
+
+    def test_an_unreadable_file_is_skipped_not_quarantined(self):
+        self.write({"input": {"double_press_ms": 900}}, 1)
+        self.assertTrue(self.watcher.poll_once())
+        self.write_text("{ this is not json", 2)
+        self.assertFalse(self.watcher.poll_once())
+        self.assertEqual(len(self.applied), 1)         # the engine keeps 900
+        # and, unlike `config.load`, the user's file is left exactly in place
+        self.assertTrue(os.path.exists(self.path))
+        self.assertFalse(os.path.exists(self.path + ".bad"))
+
+    def test_a_fixed_file_applies_on_the_next_touch(self):
+        self.write_text("{ this is not json", 1)
+        self.assertFalse(self.watcher.poll_once())
+        self.write({"input": {"double_press_ms": 1200}}, 2)
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(self.applied[-1].double_press_ms, 1200)
+
+    def test_start_and_stop_join_the_thread(self):
+        self.watcher.start()
+        self.watcher.stop()
+        self.assertIsNone(self.watcher._thread)
+
+    def test_service_apply_updates_the_engine_and_its_own_copy(self):
+        # The seam the watcher calls into: `BridgeService._apply_input_config`
+        # must move `input_config` (what `current_fn` reports next poll) and
+        # the engine together.
+        svc = SVC.BridgeService(serial="ab", input_config=K.InputConfig())
+        got: list = []
+
+        class Eng:
+            def update_config(self, cfg):
+                got.append(cfg)
+
+        svc._interceptor = Eng()
+        new = K.InputConfig.from_dict({"double_press_ms": 900})
+        svc._apply_input_config(new)
+        self.assertIs(svc.input_config, new)
+        self.assertEqual(got, [new])
 
 
 if __name__ == "__main__":
