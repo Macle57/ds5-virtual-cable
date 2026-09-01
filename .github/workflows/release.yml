@@ -1,0 +1,126 @@
+# Release pipeline: push a tag `vX.Y.Z`, get a GitHub release carrying the
+# one-dir build as a zip, a SHA256SUMS file, and the install scripts.
+#
+# The contract with the rest of the system, spelled out because three
+# consumers depend on it exactly:
+#
+#   * The tag MUST equal `v` + ds5app.__version__ (app/ds5app/__init__.py --
+#     the single source of truth; cli.py and the updater both read it). The
+#     first job fails the release on a mismatch, because a v0.5.0 release
+#     containing an exe that says 0.4.0 would make every installed copy offer
+#     itself its own "update" forever.
+#   * The zip is named  ds5bridge-<version>-win-x64.zip  and contains one
+#     top-level `ds5bridge/` folder. app/ds5app/update.py matches that name
+#     with an anchored regex and looks for the folder when it stages; the
+#     installer's regex in scripts/install.ps1 matches the same name.
+#   * SHA256SUMS is `sha256sum` format ("<hex>  <name>"), one line per asset.
+#     Both the installer and the in-app updater refuse a download that does
+#     not match it -- publishing a release without it downgrades them to
+#     size-only checks, so it is generated here, not by hand.
+#
+# Why one-dir and not one-file: measured in docs/STATUS.md section 18 (startup
+# cost and AV false-positive shape). The zip of the one-dir folder is both the
+# thing the installer unpacks and the thing the auto-updater swaps in.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # gh release create
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tag must match ds5app.__version__
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $init = Get-Content app/ds5app/__init__.py -Raw
+          if ($init -notmatch '__version__\s*=\s*"([^"]+)"') {
+            throw 'no __version__ in app/ds5app/__init__.py'
+          }
+          $ver = $Matches[1]
+          if ($tag -ne "v$ver") {
+            throw "tag '$tag' does not match ds5app.__version__ '$ver' -- bump app/ds5app/__init__.py (the single source of truth) and re-tag."
+          }
+          "version=$ver" | Out-File $env:GITHUB_OUTPUT -Append
+        id: version
+
+      # build.ps1 insists on this exact venv path, and that is a feature: the
+      # release build runs the same script a developer runs, not a parallel
+      # recipe that can drift from it.
+      - name: Create the build venv
+        run: |
+          python -m venv prototype\.venv
+          prototype\.venv\Scripts\python.exe -m pip install --upgrade pip
+          prototype\.venv\Scripts\python.exe -m pip install hidapi numpy av pystray pillow pyinstaller
+
+      # No release from a red tree. The app tests include the updater's
+      # decision logic -- the code that will evaluate THIS release's JSON.
+      - name: Unit tests (emulator + app, no hardware)
+        run: |
+          Push-Location emulator
+          ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t . -v
+          Pop-Location
+          Push-Location app
+          ..\prototype\.venv\Scripts\python.exe -m unittest discover -s tests -t . -v
+          Pop-Location
+
+      - name: Build (one-dir, via the same script developers use)
+        run: powershell -File app\packaging\build.ps1
+
+      - name: Package and checksum
+        run: |
+          $ver = '${{ steps.version.outputs.version }}'
+          $zip = "ds5bridge-$ver-win-x64.zip"
+          # Compress the folder itself so the zip carries a top-level
+          # ds5bridge/ directory -- the layout update.py's staging expects.
+          Compress-Archive -Path dist\ds5bridge -DestinationPath "dist\$zip"
+          Push-Location dist
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          # sha256sum format, two spaces: what update.py's parser and plain
+          # `sha256sum -c` both read.
+          "$hash  $zip" | Out-File SHA256SUMS -Encoding ascii
+          Get-Content SHA256SUMS
+          Pop-Location
+
+      # The smoke test that catches a broken bundle before users do: the
+      # frozen exe must at least start and answer --version with the version
+      # this release claims to be.
+      - name: Frozen exe answers --version
+        run: |
+          $ver = '${{ steps.version.outputs.version }}'
+          $out = & dist\ds5bridge\ds5bridge.exe --version
+          "exe says: $out"
+          if ("$out" -notmatch [regex]::Escape($ver)) {
+            throw "the built exe reports '$out', expected it to contain '$ver'"
+          }
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = '${{ steps.version.outputs.version }}'
+          # The install scripts ride along on every release so the one-paste
+          # command's raw URL and the release page always agree.
+          gh release create '${{ github.ref_name }}' `
+            "dist/ds5bridge-$ver-win-x64.zip" `
+            "dist/SHA256SUMS" `
+            "scripts/install.ps1" `
+            "scripts/uninstall.ps1" `
+            --title "ds5bridge $ver" `
+            --generate-notes `
+            --verify-tag
