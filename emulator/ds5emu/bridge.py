@@ -429,6 +429,58 @@ TEST_COMMAND_ALLOWLIST: dict[tuple[int, int], str] = {
 LINK_DEAD_S = 4.0
 INPUT_NEUTRAL_S = 1.0
 
+# --- the control-channel input fallback (Phase 5) ---------------------------
+# Windows' GameInput service gates HID *input report* delivery on gamepad
+# focus: while the foreground window belongs to a GameInput-client application
+# -- Google Chrome 15x is one, with any window on any page, even about:blank --
+# every OTHER handle on every DualSense in the system reads nothing at all.
+# MEASURED on this machine 2026-09-01 (docs/focus-gating-findings.md): the pad
+# streams 0x31 at ~576/s, a Chromium window takes focus, and within a second
+# both this bridge's handle AND an independent raw hidapi handle go to exactly
+# zero -- every read times out empty, no error, no 0x01 minimal-mode reports,
+# nothing -- then resume ~1 s after focus leaves. Stop GameInputSvc and the
+# identical focus flip starves nothing, 27 s clean at full rate. HidHide does
+# not help: the gate survives a pad power-cycle with the cloak active, so the
+# session-0 service is not subject to the per-image whitelist.
+#
+# The way through is that the gate stops only the interrupt-IN queue. The
+# control channel keeps working the whole time -- feature reads succeed, and,
+# decisively, GET_REPORT(Input, 0x31) answers with the pad's CURRENT full
+# extended state in 5-20 ms (measured mid-gate: live sticks, advancing seq).
+# So when the stream has been silent for POLL_AFTER_S while the link is
+# nominally up, the reader polls GET_REPORT(Input) at up to 1/POLL_INTERVAL_S
+# and feeds the replies through the exact same translate/intercept path as
+# streamed reports. The moment a streamed report arrives, the polls stop.
+#
+# Interactions, all deliberate:
+#   * successful polls refresh `_latest_input_at`, so neither the link
+#     watchdog (LINK_DEAD_S) nor neutralise-on-stale (INPUT_NEUTRAL_S) fires
+#     while the fallback is carrying input -- the game keeps playing and the
+#     dashboard stays live;
+#   * a pad that is genuinely OFF also goes stream-silent, but its polls FAIL,
+#     so after POLL_MAX_FAILURES the fallback stands down and the watchdog
+#     declares the link dead exactly as before this fallback existed;
+#   * microphone payloads (type 0x02) cannot be polled -- GET_REPORT answers
+#     control state only -- so mic capture degrades to silence while a gate is
+#     active. Input is the product; that trade is right.
+#
+#: How long the stream must be silent before the first poll. Well above any
+#: normal Bluetooth burst gap (tens of ms), well below INPUT_NEUTRAL_S, so
+#: the game never sees a neutralised report during a mere focus flip.
+POLL_AFTER_S = 0.15
+#: Minimum spacing between poll attempts. ~125 Hz ceiling; each poll is a
+#: 5-20 ms control-channel round trip, so the realised rate self-paces below
+#: that. The USB host polls at 250 Hz and repeats the freshest state between
+#: arrivals, exactly as it does for normal Bluetooth burst gaps.
+POLL_INTERVAL_S = 0.008
+#: `hid.read()` timeout while the fallback is active. Short, so the loop both
+#: notices the stream returning immediately and holds the poll cadence.
+POLL_READ_MS = 4
+#: Consecutive poll failures that stand the fallback down (until the stream
+#: itself returns). Keeps a powered-off pad's death detection on the
+#: watchdog's schedule instead of retrying a dead control channel forever.
+POLL_MAX_FAILURES = 3
+
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -738,6 +790,14 @@ class BridgeBackend(Backend):
             "input_delivered": 0,
             "input_repeated": 0,
             "input_none": 0,
+            #: Input states served by the control-channel fallback while the
+            #: interrupt stream was gated (see POLL_AFTER_S). Non-zero means a
+            #: foreground GameInput client (a Chromium window, say) starved
+            #: the stream and the bridge carried input through GET_REPORT.
+            "input_polled": 0,
+            "input_poll_errors": 0,
+            #: Times the fallback engaged (episodes, not polls).
+            "poll_fallbacks": 0,
             "setstate_in": 0,
             "setstate_sent": 0,
             "setstate_coalesced": 0,
@@ -1118,15 +1178,26 @@ class BridgeBackend(Backend):
     def _reader_loop(self) -> None:
         dec = A.MicDecoder()
         consecutive_errors = 0
+        #: perf_counter of the last non-empty STREAMED read. Deliberately not
+        #: `_latest_input_at`, which successful polls refresh -- entering and
+        #: leaving the fallback must key off the stream alone, or the first
+        #: poll would make the stream look alive and flap the fallback off.
+        last_stream_at = 0.0
+        polling = False
+        poll_failures = 0
+        poll_next_at = 0.0
         while not self._stop.is_set():
             dev = self._dev
             if dev is None or not self.connected.is_set():
                 if not self.reconnect or not self._reconnect_loop():
                     return
                 consecutive_errors = 0
+                last_stream_at = 0.0
+                polling = False
+                poll_failures = 0
                 continue
             try:
-                raw = dev.read_raw(200)
+                raw = dev.read_raw(POLL_READ_MS if polling else 200)
             except Exception as e:  # noqa: BLE001
                 self.stats["bt_read_errors"] += 1
                 consecutive_errors += 1
@@ -1136,18 +1207,57 @@ class BridgeBackend(Backend):
                 if consecutive_errors > 5:
                     self._on_io_error()
                 continue
+            now = time.perf_counter()
             if not raw:
                 # A quiet link, not a broken one: every read timed out cleanly.
                 # Nothing above will ever trip, so the watchdog has to.
                 if (self._latest_input_at
-                        and time.perf_counter() - self._latest_input_at > LINK_DEAD_S):
+                        and now - self._latest_input_at > LINK_DEAD_S):
                     self.stats["link_watchdog_trips"] += 1
                     log.warning("no Bluetooth report for %.1fs -- treating the link "
                                 "as dead", LINK_DEAD_S)
                     self._bb("link.watchdog", note=f"silent for {LINK_DEAD_S}s")
                     self._on_io_error()
+                    continue
+                # The control-channel fallback (the Phase 5 block up top): the
+                # stream is gated but the pad may still answer GET_REPORT.
+                # Armed only once a streamed report has ever been seen, so a
+                # connect that is still settling is never polled.
+                if (last_stream_at and now - last_stream_at >= POLL_AFTER_S
+                        and poll_failures < POLL_MAX_FAILURES):
+                    if not polling:
+                        polling = True
+                        poll_next_at = now
+                        self.stats["poll_fallbacks"] += 1
+                        log.info(
+                            "input stream silent for %.0f ms with the link up "
+                            "-- polling GET_REPORT(0x31) over the control "
+                            "channel (a foreground GameInput client is "
+                            "probably gating the stream)", POLL_AFTER_S * 1000)
+                        self._bb("bt.poll.start")
+                    if now >= poll_next_at:
+                        poll_next_at = now + POLL_INTERVAL_S
+                        if self._poll_input_report(dev):
+                            poll_failures = 0
+                        else:
+                            poll_failures += 1
+                            if poll_failures >= POLL_MAX_FAILURES:
+                                log.warning(
+                                    "control-channel polling failed %d times; "
+                                    "standing down until the stream returns "
+                                    "(a dead pad belongs to the watchdog)",
+                                    poll_failures)
+                                self._bb("bt.poll.giveup")
                 continue
             consecutive_errors = 0
+            last_stream_at = now
+            poll_failures = 0
+            if polling:
+                polling = False
+                log.info("input stream is back -- control-channel polling off "
+                         "(%d polled reports served so far)",
+                         self.stats["input_polled"])
+                self._bb("bt.poll.stop")
             self.stats["bt_reports"] += 1
             if raw[0] != P.BT_INPUT_31:
                 continue
@@ -1164,16 +1274,60 @@ class BridgeBackend(Backend):
                              note=f"#{self.stats['bt_control']}")
                 usb = T.bt31_payload_to_usb01(payload)
                 if usb is not None:
-                    usb = self._intercept_input(usb)
-                    with self._input_lock:
-                        self._latest_input = usb
-                        self._latest_input_at = time.perf_counter()
-                        if self.keep_raw:
-                            self._latest_bt_payload = payload
-                        self._input_serial += 1
+                    self._ingest_control_payload(usb, payload)
             elif ptype == P.PAYLOAD_TYPE_AUDIO:
                 self.stats["bt_mic"] += 1
                 self._on_mic_payload(dec, payload)
+
+    def _ingest_control_payload(self, usb: bytes, payload: bytes) -> None:
+        """One decoded input state into `_latest_input` -- both the streamed
+        path and the control-channel fallback end here, so a polled report is
+        intercepted, masked and serialised exactly like a streamed one."""
+        usb = self._intercept_input(usb)
+        with self._input_lock:
+            self._latest_input = usb
+            self._latest_input_at = time.perf_counter()
+            if self.keep_raw:
+                self._latest_bt_payload = payload
+            self._input_serial += 1
+
+    def _poll_input_report(self, dev) -> bool:
+        """One GET_REPORT(Input, 0x31) over the control channel. Reader thread.
+
+        Returns True when a control-type 0x31 answer was ingested. MEASURED on
+        this hardware 2026-09-01, mid-gate: 78 bytes, live state, 5-20 ms.
+        The answer is byte-compatible with a streamed report (same payload
+        shape, seq nibble advancing), so it takes the normal translate path.
+        """
+        getter = getattr(dev.h, "get_input_report", None)
+        if getter is None:
+            # hidapi predates get_input_report: the fallback simply does not
+            # exist on this install. Counted as a failure so the stand-down
+            # message fires once instead of a silent busy loop.
+            self.stats["input_poll_errors"] += 1
+            return False
+        try:
+            raw = bytes(getter(P.BT_INPUT_31, P.BT_INPUT_31_LEN))
+        except Exception as e:  # noqa: BLE001
+            self.stats["input_poll_errors"] += 1
+            log.debug("GET_REPORT(0x31) poll failed: %s", e)
+            self._bb("bt.poll.error", note=repr(e))
+            return False
+        if len(raw) < 2 or raw[0] != P.BT_INPUT_31:
+            self.stats["input_poll_errors"] += 1
+            self._bb("bt.poll.error",
+                     note=f"unexpected answer {raw[:2].hex() if raw else ''}")
+            return False
+        payload = raw[1:]
+        usb = T.bt31_payload_to_usb01(payload)
+        if usb is None:
+            self.stats["input_poll_errors"] += 1
+            return False
+        self.stats["input_polled"] += 1
+        if self.blackbox is not None and self.stats["input_polled"] % 100 == 1:
+            self._bb("bt.poll.hb", payload, note=f"#{self.stats['input_polled']}")
+        self._ingest_control_payload(usb, payload)
+        return True
 
     # =====================================================================
     # the chord-engine seam (see the `interceptor` attribute)
@@ -2049,6 +2203,8 @@ class BridgeBackend(Backend):
         return (
             f"bt={s['bt_reports']} (ctrl {s['bt_control']}, mic {s['bt_mic']}, "
             f"err {s['bt_read_errors']})  input_out={s['input_delivered']}  "
+            f"polled={s['input_polled']} (fallbacks {s['poll_fallbacks']}, "
+            f"err {s['input_poll_errors']})  "
             f"setstate in/sent/coalesced/merged={s['setstate_in']}/{s['setstate_sent']}/"
             f"{s['setstate_coalesced']}/{s['setstate_merged']}  "
             f"feature0x80 fwd/blocked={s['feature_test_forwarded']}/"

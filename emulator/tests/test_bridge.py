@@ -261,6 +261,202 @@ class _FakeDev:
         return bytes(self.h.get_feature_report(report_id, length))
 
 
+# ---------------------------------------------------------------------------
+# Phase 5: the control-channel input fallback (GameInput focus gating)
+# ---------------------------------------------------------------------------
+
+
+def _stream_report(seed: int = 0) -> bytes:
+    """A full 78-byte BT 0x31 input report with recognisable stick bytes."""
+    from ds5emu import translate as T
+
+    usb = bytearray(64)
+    usb[0] = 0x01
+    usb[1:5] = bytes([(seed + i) & 0xFF for i in range(4)])   # the sticks
+    return bytes([0x31]) + T.usb01_to_bt31_payload(bytes(usb))
+
+
+class _PollableHid(_FakeHid):
+    """`_FakeHid` plus a scriptable GET_REPORT(Input) control channel."""
+
+    def __init__(self):
+        super().__init__()
+        self.input_reads: list[tuple[int, int]] = []
+        #: bytes to answer with, or an Exception to raise, or None for b"".
+        self.input_answer: object = None
+
+    def get_input_report(self, report_id, length):
+        self.input_reads.append((report_id, length))
+        if isinstance(self.input_answer, Exception):
+            raise self.input_answer
+        return list(self.input_answer or b"")
+
+
+class _PollableDev(_FakeDev):
+    """`_FakeDev` plus the reader-loop surface: a scriptable `read_raw`.
+
+    `stream` is a queue of answers; empty means every read times out cleanly
+    (b""), which is exactly what a GameInput-gated stream looks like.
+    `forever_report`, once set, streams fresh copies of itself on every read
+    -- the "gate lifted" half of a test.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.h = _PollableHid()
+        self.stream: list[bytes] = []
+        self.forever_report: bytes | None = None
+
+    def read_raw(self, timeout_ms=1000, length=None):
+        time.sleep(min(timeout_ms, 5) / 1000.0)
+        if self.stream:
+            return self.stream.pop(0)
+        return self.forever_report or b""
+
+
+@unittest.skipUnless(HAVE_DEPS, "numpy / PyAV / hidapi not available")
+class ControlChannelFallbackTests(unittest.TestCase):
+    """Input through GET_REPORT(0x31) while something gates the stream.
+
+    The scenario is Windows' GameInput service muting interrupt-IN delivery on
+    every gamepad whenever a GameInput-client app (a Chromium window) holds
+    the foreground -- measured on hardware 2026-09-01, see the Phase 5 block
+    in bridge.py. The stream goes to exactly zero, the control channel keeps
+    answering, and the reader must carry input over GET_REPORT until the
+    stream returns.
+    """
+
+    def setUp(self):
+        self.be = B.BridgeBackend()
+        self.dev = _PollableDev()
+        self.be._dev = self.dev
+        self.be.connected.set()
+
+    # -- one poll, synchronously -------------------------------------------
+
+    def test_a_polled_answer_takes_the_normal_translate_path(self):
+        report = _stream_report(0x10)
+        self.dev.h.input_answer = report
+        self.assertTrue(self.be._poll_input_report(self.dev))
+        self.assertEqual(self.be.stats["input_polled"], 1)
+        self.assertEqual(self.be.stats["input_poll_errors"], 0)
+        got = self.be.read_input_report(64)
+        self.assertEqual(got[0], 0x01)
+        # usb body == bt payload[1:64], so the sticks land at got[1:5]
+        self.assertEqual(got[1:5], report[2:6])
+
+    def test_a_polled_report_goes_through_the_interceptor(self):
+        class Masker:
+            def on_input(self, usb):
+                b = bytearray(usb)
+                b[1] = 0xEE
+                return bytes(b)
+
+        self.be.interceptor = Masker()
+        self.dev.h.input_answer = _stream_report(0x20)
+        self.assertTrue(self.be._poll_input_report(self.dev))
+        self.assertEqual(self.be._latest_input[1], 0xEE)
+
+    def test_keep_raw_keeps_the_polled_payload(self):
+        self.be.keep_raw = True
+        report = _stream_report(0x30)
+        self.dev.h.input_answer = report
+        self.assertTrue(self.be._poll_input_report(self.dev))
+        self.assertEqual(self.be._latest_bt_payload, report[1:])
+
+    def test_a_raising_poll_is_a_counted_failure(self):
+        self.dev.h.input_answer = OSError("gated even on the control channel")
+        self.assertFalse(self.be._poll_input_report(self.dev))
+        self.assertEqual(self.be.stats["input_poll_errors"], 1)
+        self.assertEqual(self.be.stats["input_polled"], 0)
+
+    def test_a_wrong_report_id_is_a_counted_failure(self):
+        self.dev.h.input_answer = b"\x01" + bytes(63)
+        self.assertFalse(self.be._poll_input_report(self.dev))
+        self.assertEqual(self.be.stats["input_poll_errors"], 1)
+
+    def test_a_non_control_payload_is_a_counted_failure(self):
+        # payload type 0x02 is the microphone stream; it carries no input.
+        raw = bytearray(_stream_report(0x40))
+        raw[1] = 0x02
+        self.dev.h.input_answer = bytes(raw)
+        self.assertFalse(self.be._poll_input_report(self.dev))
+        self.assertEqual(self.be.stats["input_poll_errors"], 1)
+
+    def test_a_hidapi_without_get_input_report_cannot_poll(self):
+        # `_FakeHid` has no get_input_report, like a pre-0.10 hidapi.
+        dev = _FakeDev()
+        self.assertFalse(self.be._poll_input_report(dev))
+        self.assertEqual(self.be.stats["input_poll_errors"], 1)
+
+    # -- the reader loop, threaded ------------------------------------------
+
+    def _run_reader(self, dev, for_s, then=None, and_s=0.0):
+        import threading
+
+        self.be._dev = dev
+        self.be.reconnect = False
+        t = threading.Thread(target=self.be._reader_loop, daemon=True)
+        t.start()
+        time.sleep(for_s)
+        if then is not None:
+            then()
+            time.sleep(and_s)
+        self.be._stop.set()
+        t.join(timeout=2.0)
+        self.assertFalse(t.is_alive())
+
+    def test_stream_silence_engages_the_fallback_and_input_stays_fresh(self):
+        dev = _PollableDev()
+        dev.stream = [_stream_report(1)]          # one streamed report arms it
+        dev.h.input_answer = _stream_report(2)
+        self._run_reader(dev, B.POLL_AFTER_S + 0.45)
+        self.assertEqual(self.be.stats["poll_fallbacks"], 1)
+        self.assertGreater(self.be.stats["input_polled"], 3)
+        self.assertEqual(self.be.stats["input_poll_errors"], 0)
+        # the polls kept `_latest_input_at` fresh: no watchdog, no neutralise
+        self.assertEqual(self.be.stats["link_watchdog_trips"], 0)
+        self.assertLess(time.perf_counter() - self.be._latest_input_at, 1.0)
+
+    def test_the_fallback_never_engages_before_any_streamed_report(self):
+        # A connect that is still settling must not be polled: the fallback
+        # arms only once the stream has demonstrably worked.
+        dev = _PollableDev()
+        dev.h.input_answer = _stream_report(3)
+        self._run_reader(dev, B.POLL_AFTER_S + 0.3)
+        self.assertEqual(self.be.stats["poll_fallbacks"], 0)
+        self.assertEqual(dev.h.input_reads, [])
+
+    def test_failing_polls_stand_down_at_the_cap(self):
+        # A pad that is genuinely off is also stream-silent, but its polls
+        # fail. The fallback must hand it to the watchdog, not retry forever.
+        dev = _PollableDev()
+        dev.stream = [_stream_report(4)]
+        dev.h.input_answer = OSError("no pad")
+        self._run_reader(dev, B.POLL_AFTER_S + 0.45)
+        self.assertEqual(self.be.stats["input_poll_errors"], B.POLL_MAX_FAILURES)
+        self.assertEqual(self.be.stats["input_polled"], 0)
+
+    def test_a_returning_stream_switches_the_polls_off(self):
+        dev = _PollableDev()
+        dev.stream = [_stream_report(5)]
+        dev.h.input_answer = _stream_report(6)
+        polled_when_lifted = []
+
+        def lift_the_gate():
+            polled_when_lifted.append(self.be.stats["input_polled"])
+            dev.forever_report = _stream_report(7)
+
+        self._run_reader(dev, B.POLL_AFTER_S + 0.35,
+                         then=lift_the_gate, and_s=0.3)
+        self.assertGreater(polled_when_lifted[0], 0)
+        # once the stream is back, no further polls happen...
+        self.assertLessEqual(self.be.stats["input_polled"],
+                             polled_when_lifted[0] + 2)
+        # ...and streamed reports flow again
+        self.assertGreater(self.be.stats["bt_reports"], 2)
+
+
 @unittest.skipUnless(HAVE_DEPS, "numpy / PyAV / hidapi not available")
 class FactoryTestFeatureTests(unittest.TestCase):
     """Phase 4c: the 0x80 -> 0x81 factory-diagnostics channel.
