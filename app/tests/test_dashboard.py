@@ -225,6 +225,68 @@ class DashboardCase(unittest.TestCase):
             headers={"Content-Type": "application/json"})
         self.assertEqual(status, 400)
 
+    # -- /api/actions ------------------------------------------------------
+
+    def test_api_actions_shape(self):
+        """The metadata the settings page builds its pickers from: sourced
+        from the live registry and config constants, never hardcoded."""
+        doc = self.get_json("/api/actions")
+        self.assertTrue(doc["actions"], "empty action list")
+        names = [a["name"] for a in doc["actions"]]
+        self.assertEqual(names, sorted(names))          # stable, browsable
+        for a in doc["actions"]:
+            self.assertIsInstance(a["name"], str)
+            self.assertTrue(a["doc"], f"{a['name']} has no doc for the picker")
+            self.assertIsInstance(a["repeatable"], bool)
+        self.assertIn("volume_up", names)
+        self.assertNotIn("pad_power_off", names)        # engine-special, the
+        # page adds it (and "(none)") itself -- it is not an OS action.
+        self.assertEqual(doc["chord_buttons"], list(K.CHORD_BUTTONS))
+        self.assertEqual(doc["chord_keys"], list(K.CHORD_BUTTONS))
+        self.assertEqual(doc["gesture_keys"], list(K.CHORD_GESTURES))
+        self.assertEqual(doc["defaults"]["chords"], dict(K.DEFAULT_CHORDS))
+        # Every default chord must resolve inside the served vocabulary, or
+        # the page would show "(unknown)" rows on a fresh install.
+        vocab = set(names) | {"pad_power_off"}
+        for key, action in K.DEFAULT_CHORDS.items():
+            self.assertIn(action, vocab, f"default chord {key} -> {action}")
+
+    def test_api_actions_is_cached_and_guarded(self):
+        # Static per process: the exact same object every call ...
+        self.assertIs(self.dash.actions_meta(), self.dash.actions_meta())
+        # ... and behind the same loopback-Host guard as every other route.
+        status, _, _ = self.request("GET", "/api/actions",
+                                    headers={"Host": "evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_chord_set_to_none_round_trips_as_removed(self):
+        # The page writes "(none)" as the string "none". `from_dict` must
+        # REMOVE the default binding, and `to_dict` must serve it back as
+        # "none" -- an absent key would resurrect the default on the next
+        # load (InputConfig.to_dict's contract).
+        status, _, _ = self.post_config({"input": {"chords": {"cross": "none"}}})
+        self.assertEqual(status, 200)
+        self.assertNotIn("cross", K.load().input.chords)
+        doc = self.get_json("/api/config")
+        self.assertEqual(doc["config"]["input"]["chords"]["cross"], "none")
+
+    def test_chord_rebind_round_trips(self):
+        status, _, _ = self.post_config(
+            {"input": {"chords": {"circle": "media_next"}}})
+        self.assertEqual(status, 200)
+        cfg = K.load()
+        self.assertEqual(cfg.input.chords["circle"], "media_next")
+        # untouched defaults survive the merge
+        self.assertEqual(cfg.input.chords["cross"], "media_play_pause")
+
+    def test_page_wires_the_input_section(self):
+        _, body, _ = self.request("GET", "/")
+        text = body.decode("utf-8")
+        self.assertIn("/api/actions", text)      # pickers are fed, not typed
+        self.assertIn("Desktop Layout", text)    # the Steam remote-mode warning
+        self.assertIn("haptic_strength", text)   # sibling-agent keys rendered
+        self.assertIn("stick_mouse_in_chord", text)
+
     def test_foreign_host_header_is_refused(self):
         # DNS rebinding: evil.example resolves to 127.0.0.1 and the browser
         # happily connects -- but the Host header betrays it.
