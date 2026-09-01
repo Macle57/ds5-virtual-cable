@@ -154,6 +154,12 @@ ARROW_REPEAT_S = 0.30
 ACK_PULSE_S = 0.12
 FLASH_BLINK_ON_S = 0.15
 FLASH_BLINK_PERIOD_S = 0.30
+#: While remote mode holds the lightbar, the colour claim is repeated on this
+#: cadence. One engine write can be lost in flight (the GameInput gate has
+#: been seen interfering with pad traffic while a client owns the foreground,
+#: and a game may overwrite in a gap we cannot see), so the LED is allowed to
+#: be wrong for at most this long.
+REMOTE_LIGHTBAR_REASSERT_S = 1.0
 
 
 def _touch_point(body: bytes, base: int) -> tuple[bool, int, int, int]:
@@ -301,9 +307,11 @@ class InputInterceptor:
         self._rm_arrow: str | None = None
         self._rm_arrow_next = 0.0
         self._rm_needs_release = False
+        #: When the remote lightbar colour is next re-asserted (tick()).
+        self._rm_lightbar_next = 0.0
         #: 2-finger gesture per contact: None = undecided, "alt_tab" = the
-        #: switcher is open and stepping, "scroll" = a vertical wheel event
-        #: was emitted and the contact can never become alt-tab.
+        #: switcher is open and stepping. Nothing else -- the touchpad
+        #: deliberately does not scroll.
         self._rm2_decided: str | None = None
         self._rm2_start: tuple[float, float] = (0.0, 0.0)
 
@@ -556,6 +564,14 @@ class InputInterceptor:
             while self._fx and self._fx[0][0] <= now:
                 due.append(self._fx.pop(0)[1])
             if enabled:
+                # remote colour re-assert: the LED is allowed to be wrong for
+                # at most REMOTE_LIGHTBAR_REASSERT_S (a battery flash mid-burst
+                # is never stomped -- it outranks the remote colour).
+                if (self.remote_mode and now >= self._rm_lightbar_next
+                        and now >= self._flash_until):
+                    self._rm_lightbar_next = now + REMOTE_LIGHTBAR_REASSERT_S
+                    due.append(self._lightbar_body(
+                        tuple(self.cfg.remote.lightbar_color)))
                 # battery flash
                 if self._battery_flash_due(now):
                     due.extend(self._queue_flash_locked(now))
@@ -793,6 +809,7 @@ class InputInterceptor:
             # Distinct feedback: double pulse + the remote lightbar colour.
             self._queue_pulse(now, count=2)
             self._fx.append((now, self._lightbar_body(tuple(rm.lightbar_color))))
+            self._rm_lightbar_next = now + REMOTE_LIGHTBAR_REASSERT_S
         else:
             self._queue_pulse(now, count=1)
             restore = self._effective_lightbar(now, ignore_remote=True) \
