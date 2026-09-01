@@ -156,7 +156,7 @@
   /* ---- settings ------------------------------------------------------ */
   #settings { margin-top: 18px; display: none; }
   #settings.open { display: block; }
-  .set-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+  .set-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 14px; }
   fieldset {
     border: 1px solid var(--line); border-radius: 10px; margin: 0;
     padding: 12px 14px 14px; background: var(--panel-2); min-width: 0;
@@ -187,6 +187,52 @@
   #toast.show { opacity: 1; }
   #toast.err { border-color: var(--bad); }
   .hint { color: var(--ink-3); font-size: 12px; margin: 4px 0 0; }
+
+  /* ---- the purpose-built input section ------------------------------- */
+  /* Stacked rows: label line on top, a full-width control beneath. This is
+     what keeps a "media_play_pause — play/pause the active session" select
+     usable inside a 320px card. */
+  .row.stack { flex-direction: column; align-items: stretch; gap: 4px; }
+  .row.stack select, .row.stack input[type="text"] { width: 100%; }
+  .lbl-line { flex: 1; display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .keyname { color: var(--ink-3); font-size: 11px; font-family: Consolas, monospace; }
+  .unit { color: var(--ink-3); font-size: 12px; flex: none; }
+  /* numbers are short (ms, %, minutes): a narrower box leaves the label room */
+  .row .lbl-line + input[type="number"] { width: 110px; }
+  /* the (i) affordance: a real button, so it tabs and Enters */
+  button.i-btn {
+    flex: none; width: 20px; height: 20px; border-radius: 50%; padding: 0;
+    border: 1px solid var(--line); background: var(--well); color: var(--ink-3);
+    font: 600 12px/1 Georgia, "Times New Roman", serif; font-style: italic;
+    cursor: pointer;
+  }
+  button.i-btn:hover, button.i-btn[aria-expanded="true"] {
+    color: var(--accent); border-color: var(--accent);
+  }
+  .icard {
+    background: var(--well); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent); border-radius: 8px;
+    padding: 8px 11px; margin: 2px 0 8px;
+    font-size: 12.5px; line-height: 1.5; color: var(--ink-2);
+  }
+  .warn-card {
+    background: rgba(215,155,40,.08); border: 1px solid var(--warn);
+    border-radius: 8px; padding: 9px 11px; margin: 4px 0 8px;
+    font-size: 12.5px; line-height: 1.5; color: var(--ink-2);
+    display: flex; gap: 10px; align-items: flex-start;
+  }
+  .warn-card b { color: var(--warn); }
+  .warn-card button { flex: none; padding: 3px 10px; font-size: 12px; }
+  .row input[type="range"] { flex: 1; min-width: 90px; accent-color: var(--accent); height: 22px; }
+  .rangewrap { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+  .rangeval {
+    flex: none; width: 42px; text-align: right; color: var(--ink);
+    font-size: 13px; font-variant-numeric: tabular-nums;
+  }
+  .row input[type="color"] {
+    width: 46px; height: 27px; padding: 1px 2px; background: var(--well);
+    border: 1px solid var(--line); border-radius: 7px; cursor: pointer;
+  }
 </style>
 </head>
 <body>
@@ -604,14 +650,17 @@ function render() {
 /* ==================================================================== *
  *  settings panel                                                      *
  *                                                                      *
- *  Known keys get purpose-built controls; EVERYTHING ELSE is rendered  *
+ *  Known keys get purpose-built controls -- including the whole        *
+ *  `input` section (chords, gestures, remote mode), whose pickers are  *
+ *  fed by /api/actions so an action added to the registry appears in   *
+ *  the dropdowns with no page change. EVERYTHING ELSE is rendered      *
  *  generically from its JSON type, so a section another build adds     *
- *  (say, "input" with chord keybinds) appears and is editable without  *
- *  this page changing. The form edits a working copy of the document   *
- *  and Save POSTs it whole; the server merges + coerces + saves        *
- *  atomically through the config module.                               *
+ *  appears and is editable without this page changing. The form edits  *
+ *  a working copy of the document and Save POSTs it whole; the server  *
+ *  merges + coerces + saves atomically through the config module.      *
  * ==================================================================== */
 let CFG = null;      // the working copy the form binds to
+let ACTIONS = null;  // /api/actions metadata (static per server process)
 
 const GLOBAL_FIELDS = [
   ["enabled", "Bridging enabled (master switch)", "bool"],
@@ -629,7 +678,8 @@ const CTRL_FIELDS = [
   ["hide_bluetooth", "Hide Bluetooth pad while bridged", "bool"],
   ["port", "usbip TCP port (blank = automatic)", "number"],
 ];
-const KNOWN_GLOBAL = new Set([...GLOBAL_FIELDS.map(f => f[0]), "controllers"]);
+const KNOWN_GLOBAL = new Set([...GLOBAL_FIELDS.map(f => f[0]),
+                              "controllers", "input"]);
 const KNOWN_CTRL = new Set(CTRL_FIELDS.map(f => f[0]));
 
 function getPath(obj, path) { return path.reduce((o, k) => (o ?? {})[k], obj); }
@@ -711,6 +761,405 @@ function addGenericRows(box, path, obj) {
   }
 }
 
+/* ==================================================================== *
+ *  the `input` section: purpose-built                                  *
+ *                                                                      *
+ *  Steam's controller-config picker is the bar to clear: every chord   *
+ *  and gesture binding is a browsable dropdown (name + one-line doc    *
+ *  from /api/actions), never typed text, and every row can explain     *
+ *  itself through a click-toggled inline (i) card -- a hover title is  *
+ *  useless on a touchscreen and invisible to a keyboard.               *
+ * ==================================================================== */
+
+/* Help text, written from config.py / intercept.py's docstrings. */
+const HELP = {
+  enabled: "Master switch for the whole shortcut engine. Off, the pad is a plain bridged controller: no chords, no gestures, no remote mode, no idle off-timer, no battery flashes.",
+  chord_button: "Hold this button to arm shortcuts: while it is held, other buttons fire their bound actions instead of reaching the game (sticks and triggers still pass -- your aim is never frozen). A quick plain tap is replayed to the game afterwards, so a normal PS press still opens the game's own menu.",
+  double_press_ms: "Two presses of the chord button within this window toggle remote mode instead of replaying a tap to the game.",
+  tap_replay_ms: "When the chord button is tapped on its own, the press is replayed to the game and held down for this long. The game gets a slightly late press; menus do not care.",
+  repeat_ms: "While a chord stays held, repeatable actions (volume, brightness) fire again this often.",
+  haptic_ack: "A short rumble pulse whenever a chord is accepted, so you know it landed without looking at the screen.",
+  haptic_strength: "How strong the acknowledgement rumble is. 0 is silent, 100 is full motor.",
+  stick_mouse_in_chord: "While the chord button is held, the left stick moves the mouse pointer -- a quick nudge-and-click without switching into remote mode.",
+  off_timer_minutes: "Minutes without any pad activity before the pad powers itself off to save its battery (the same mechanism as the PS+Triangle chord). 0 disables the timer.",
+  chords: "Fires while the chord button is held; the game sees none of these presses. Diagonal d-pad counts as both directions.",
+  touch_slide_horizontal: "Slide two fingers left or right across the touchpad while the chord button is held. Bound to alt_tab, it opens the window switcher and steps through it as you slide; lift to switch.",
+  touch_swipe_up: "Swipe two fingers up the touchpad while the chord button is held.",
+  touch_swipe_down: "Swipe two fingers down the touchpad while the chord button is held.",
+  remote_enabled: "Double-press the chord button to toggle remote mode: the game is handed a neutral pad while the pad drives the OS. Touchpad drags move the pointer (tap = click, two-finger drag = scroll, two-finger tap = right click), Cross clicks and holds to drag, the sticks move and scroll, the d-pad is arrow keys, Circle is Esc, Options is Enter. The lightbar holds the colour below while it is on.",
+  mouse_speed: "Pointer speed multiplier for touchpad drags and the left stick in remote mode.",
+  scroll_speed: "Scroll speed multiplier for two-finger drags, the right stick and the triggers in remote mode.",
+  remote_lightbar: "Lightbar colour while remote mode is on -- the visible cue that input is going to the OS, not the game.",
+  dim_after_minutes: "Minutes of bridged play before the lightbar dims to save the pad's battery. 0 never dims (the default -- a lightbar going dark unasked reads as a fault). The game's colour is rewritten in flight, so the game's own idea of its lightbar stays untouched.",
+  dim_level: "Brightness once dimmed: 0% is fully off, 100% is untouched. Applied as a multiplier on whatever colour the game asked for.",
+  battery_enabled: "Flash the lightbar when the pad's battery runs low. The flash overlays the game's colour briefly; nothing the game set is lost.",
+  low_percent: "Battery percentage at which the low-battery flashes begin.",
+  critical_percent: "Battery percentage at which the more urgent critical flashes take over.",
+  low_interval_s: "Seconds between low-battery flashes.",
+  critical_interval_s: "Seconds between critical-battery flashes.",
+  low_blinks: "How many blinks per low-battery flash.",
+  critical_blinks: "How many blinks per critical-battery flash.",
+};
+
+/* Human names for the config's button/gesture vocabulary. */
+const KEY_LABELS = {
+  cross: "Cross", circle: "Circle", square: "Square", triangle: "Triangle",
+  dpad_up: "D-pad up", dpad_down: "D-pad down",
+  dpad_left: "D-pad left", dpad_right: "D-pad right",
+  l1: "L1", r1: "R1", l3: "L3 (left stick click)", r3: "R3 (right stick click)",
+  create: "Create", options: "Options", ps: "PS",
+  touchpad_click: "Touchpad click", mute: "Mute",
+  touch_slide_horizontal: "Two-finger slide (left/right)",
+  touch_swipe_up: "Two-finger swipe up",
+  touch_swipe_down: "Two-finger swipe down",
+};
+const keyLabel = k => KEY_LABELS[k] || k.replace(/_/g, " ");
+
+/* Keys each level of the input section owns; anything else (a newer build's
+   settings) still renders generically inside the right card. */
+const KNOWN_INPUT = new Set(["enabled", "chord_button", "chords", "actions",
+  "double_press_ms", "tap_replay_ms", "repeat_ms", "haptic_ack",
+  "haptic_strength", "stick_mouse_in_chord", "off_timer_minutes",
+  "battery", "lightbar", "remote"]);
+const KNOWN_REMOTE = new Set(["enabled", "mouse_speed", "scroll_speed",
+                              "lightbar_color"]);
+const KNOWN_LIGHTBAR = new Set(["dim_after_minutes", "dim_level"]);
+const KNOWN_BATTERY = new Set(["enabled", "low_percent", "critical_percent",
+  "low_interval_s", "critical_interval_s", "low_color", "critical_color",
+  "low_blinks", "critical_blinks"]);
+
+function genericExtras(box, path, obj, known) {
+  addGenericRows(box, path, Object.fromEntries(
+    Object.entries(obj || {}).filter(([k]) => !known.has(k))));
+}
+
+/* [r,g,b] <-> #rrggbb for <input type=color>. */
+const rgbToHex = c => "#" + (Array.isArray(c) && c.length === 3 ? c : [0, 0, 0])
+  .map(v => Math.max(0, Math.min(255, Math.round(v) || 0))
+  .toString(16).padStart(2, "0")).join("");
+const hexToRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) || 0);
+
+/* The (i) affordance: returns [button, card]. A real <button> with
+   aria-expanded, so it works by keyboard and screen reader too. The config
+   key rides subtly inside the card -- putting it on the label line starved
+   the labels of width inside 320px cards. */
+function iToggle(help, key) {
+  const card = document.createElement("div");
+  card.className = "icard"; card.hidden = true; card.textContent = help;
+  if (key) {
+    const k = document.createElement("div");
+    k.className = "keyname"; k.style.marginTop = "5px";
+    k.textContent = "config key: input." + key;
+    card.appendChild(k);
+  }
+  const btn = document.createElement("button");
+  btn.type = "button"; btn.className = "i-btn"; btn.textContent = "i";
+  btn.setAttribute("aria-expanded", "false");
+  btn.setAttribute("aria-label", "explain this setting");
+  btn.onclick = () => {
+    card.hidden = !card.hidden;
+    btn.setAttribute("aria-expanded", String(!card.hidden));
+  };
+  return [btn, card];
+}
+
+/* One settings row: label line (label + subtle key name + optional (i)),
+   then the control beside it -- or beneath it, full width, when `stack`. */
+function settingRow(box, opts) {
+  const row = document.createElement("div");
+  row.className = "row" + (opts.stack ? " stack" : "");
+  const line = document.createElement("div");
+  line.className = "lbl-line";
+  const label = document.createElement("label");
+  label.textContent = opts.label;
+  line.appendChild(label);
+  if (opts.key && opts.stack) {
+    // Stacked rows have a free label line; side-by-side rows put the key
+    // in the (i) card instead, so the label keeps its width.
+    const k = document.createElement("span");
+    k.className = "keyname"; k.style.flex = "none";
+    k.textContent = opts.key;
+    line.appendChild(k);
+  }
+  let icard = null;
+  if (opts.help) {
+    const [btn, card] = iToggle(opts.help, opts.stack ? null : opts.key);
+    line.appendChild(btn); icard = card;
+  }
+  row.appendChild(line);
+  row.appendChild(opts.control);
+  if (opts.unit && !opts.stack) {
+    const u = document.createElement("span");
+    u.className = "unit"; u.textContent = opts.unit;
+    row.appendChild(u);
+  }
+  box.appendChild(row);
+  if (icard) box.appendChild(icard);
+  return row;
+}
+
+/* Controls bound to CFG paths. Each renders the engine default when the
+   running config predates the key, and writes only once the user touches
+   it -- an untouched default stays the engine's business. */
+function boolCtl(path, dflt) {
+  const el = document.createElement("input");
+  el.type = "checkbox";
+  const v = getPath(CFG, path);
+  el.checked = (v === undefined || v === null) ? !!dflt : !!v;
+  el.onchange = () => setPath(CFG, path, el.checked);
+  return el;
+}
+
+function numCtl(path, dflt, step) {
+  const el = document.createElement("input");
+  el.type = "number";
+  if (step) el.step = step;
+  const v = getPath(CFG, path);
+  el.value = (v === undefined || v === null) ? dflt : v;
+  el.onchange = () => setPath(CFG, path,
+                              el.value === "" ? dflt : Number(el.value));
+  return el;
+}
+
+function rangeCtl(path, dflt, min, max, step, fmt) {
+  const wrap = document.createElement("span");
+  wrap.className = "rangewrap";
+  const el = document.createElement("input");
+  el.type = "range"; el.min = min; el.max = max; el.step = step;
+  const v = getPath(CFG, path);
+  el.value = (v === undefined || v === null) ? dflt : v;
+  const out = document.createElement("span");
+  out.className = "rangeval";
+  const show = () => { out.textContent = fmt(Number(el.value)); };
+  show();
+  el.oninput = () => { setPath(CFG, path, Number(el.value)); show(); };
+  wrap.append(el, out);
+  return wrap;
+}
+
+function colorCtl(path, dflt) {
+  const el = document.createElement("input");
+  el.type = "color";
+  el.value = rgbToHex(getPath(CFG, path) ?? dflt);
+  el.onchange = () => setPath(CFG, path, hexToRgb(el.value));
+  return el;
+}
+
+/* The action picker for one chord/gesture key. "(none)" serializes as the
+   string "none" -- InputConfig.to_dict's contract for a removed default
+   binding (absent would resurrect the default on the next load). */
+function actionCtl(key) {
+  const el = document.createElement("select");
+  const bound = (CFG.input.chords || {})[key];
+  const current = (typeof bound === "string" && bound.trim())
+      ? bound.trim().toLowerCase() : "none";
+  const add = (value, text) => {
+    const o = document.createElement("option");
+    o.value = value; o.textContent = text;
+    el.appendChild(o);
+  };
+  add("none", "(none)");
+  add("pad_power_off", "pad_power_off — power the pad off");
+  for (const a of ACTIONS.actions) add(a.name, a.name + " — " + a.doc);
+  if (![...el.options].some(o => o.value === current))
+    add(current, current + " — (unknown to this build; kept)");
+  el.value = current;
+  el.onchange = () => {
+    if (!CFG.input.chords) CFG.input.chords = {};
+    CFG.input.chords[key] = el.value;
+  };
+  return el;
+}
+
+function steamWarning() {
+  const div = document.createElement("div");
+  div.className = "warn-card";
+  const txt = document.createElement("div");
+  txt.innerHTML = "<b>Check Steam first.</b> If Steam is running, Steam " +
+    "Input's <b>Desktop Layout</b> is probably already translating this pad " +
+    "to mouse/keyboard whenever a non-game window has focus — with " +
+    "remote mode on top you get doubled input (the pointer moving twice, " +
+    "ghost keys). In Steam, set this controller's Desktop Layout to a plain " +
+    "gamepad, or disable Steam Input for it.";
+  const btn = document.createElement("button");
+  btn.type = "button"; btn.className = "ghost"; btn.textContent = "Got it";
+  btn.onclick = () => div.remove();
+  div.append(txt, btn);
+  return div;
+}
+
+function inputCards(form) {
+  const inp = CFG.input = (CFG.input && typeof CFG.input === "object")
+      ? CFG.input : {};
+  inp.chords = (inp.chords && typeof inp.chords === "object") ? inp.chords : {};
+  inp.remote = (inp.remote && typeof inp.remote === "object") ? inp.remote : {};
+  inp.lightbar = (inp.lightbar && typeof inp.lightbar === "object") ? inp.lightbar : {};
+  inp.battery = (inp.battery && typeof inp.battery === "object") ? inp.battery : {};
+
+  const card = (title) => {
+    const fs = document.createElement("fieldset");
+    const lg = document.createElement("legend");
+    lg.textContent = title;
+    fs.appendChild(lg);
+    form.appendChild(fs);
+    return fs;
+  };
+  const hint = (fs, text) => {
+    const p = document.createElement("p");
+    p.className = "hint"; p.style.margin = "0 0 8px"; p.textContent = text;
+    fs.appendChild(p);
+  };
+
+  // -- general ----------------------------------------------------------
+  const g = card("Shortcuts — general");
+  settingRow(g, { label: "Shortcut engine", key: "enabled",
+                  control: boolCtl(["input", "enabled"], true),
+                  help: HELP.enabled });
+  const cb = document.createElement("select");
+  for (const b of ACTIONS.chord_buttons) {
+    const o = document.createElement("option");
+    o.value = b; o.textContent = keyLabel(b);
+    cb.appendChild(o);
+  }
+  cb.value = ACTIONS.chord_buttons.includes(inp.chord_button)
+      ? inp.chord_button : "ps";
+  cb.onchange = () => {
+    setPath(CFG, ["input", "chord_button"], cb.value);
+    buildForm();          // the chords card hides the arming button's own row
+  };
+  settingRow(g, { label: "Chord button (hold to arm)", key: "chord_button",
+                  control: cb, help: HELP.chord_button });
+  settingRow(g, { label: "Double-press window", key: "double_press_ms",
+                  unit: "ms", control: numCtl(["input", "double_press_ms"], 400),
+                  help: HELP.double_press_ms });
+  settingRow(g, { label: "Replayed tap hold", key: "tap_replay_ms",
+                  unit: "ms", control: numCtl(["input", "tap_replay_ms"], 100),
+                  help: HELP.tap_replay_ms });
+  settingRow(g, { label: "Held-chord repeat", key: "repeat_ms",
+                  unit: "ms", control: numCtl(["input", "repeat_ms"], 150),
+                  help: HELP.repeat_ms });
+  settingRow(g, { label: "Idle power-off", key: "off_timer_minutes",
+                  unit: "min",
+                  control: numCtl(["input", "off_timer_minutes"], 15),
+                  help: HELP.off_timer_minutes });
+  settingRow(g, { label: "Rumble on chord accept", key: "haptic_ack",
+                  control: boolCtl(["input", "haptic_ack"], true),
+                  help: HELP.haptic_ack });
+  settingRow(g, { label: "Rumble strength", key: "haptic_strength", stack: true,
+                  control: rangeCtl(["input", "haptic_strength"], 25, 0, 100, 1,
+                                    v => v + "%"),
+                  help: HELP.haptic_strength });
+  settingRow(g, { label: "Stick moves mouse while chording",
+                  key: "stick_mouse_in_chord",
+                  control: boolCtl(["input", "stick_mouse_in_chord"], true),
+                  help: HELP.stick_mouse_in_chord });
+  if (inp.actions && Object.keys(inp.actions).length)
+    addRow(g, "actions (per-action parameters)",
+           inputFor(["input", "actions"], inp.actions, "json"), true);
+  genericExtras(g, ["input"], inp, KNOWN_INPUT);
+
+  // -- button chords ----------------------------------------------------
+  const ch = card("Chords — hold " + keyLabel(cb.value) + " + …");
+  hint(ch, HELP.chords);
+  const listed = new Set();
+  for (const key of ACTIONS.chord_keys) {
+    if (key === cb.value) continue;      // the arming button can't chord itself
+    listed.add(key);
+    settingRow(ch, { label: keyLabel(key), key,
+                     stack: true, control: actionCtl(key) });
+  }
+  // bindings for keys this build's vocabulary doesn't list: keep them editable
+  for (const key of Object.keys(inp.chords).sort()) {
+    if (listed.has(key) || key === cb.value
+        || ACTIONS.gesture_keys.includes(key)) continue;
+    settingRow(ch, { label: keyLabel(key), key,
+                     stack: true, control: actionCtl(key) });
+  }
+
+  // -- touch gestures ---------------------------------------------------
+  const tg = card("Touch gestures — while chording");
+  hint(tg, "Two-finger touchpad gestures, active while the chord button is held.");
+  for (const key of ACTIONS.gesture_keys)
+    settingRow(tg, { label: keyLabel(key), key, stack: true,
+                     control: actionCtl(key), help: HELP[key] });
+
+  // -- remote mode ------------------------------------------------------
+  const rm = card("Remote mode");
+  const en = boolCtl(["input", "remote", "enabled"], false);
+  const enRow = settingRow(rm, { label: "Remote mode", key: "remote.enabled",
+                                 control: en, help: HELP.remote_enabled });
+  // The Steam Desktop Layout warning: shown the moment the switch flips ON,
+  // dismissable, inline -- never an alert(). Doubled input from Steam's own
+  // desktop translation is a real, observed confusion.
+  en.addEventListener("change", () => {
+    if (en.checked && !rm.querySelector(".warn-card"))
+      enRow.after(steamWarning());
+  });
+  settingRow(rm, { label: "Pointer speed", key: "remote.mouse_speed",
+                   unit: "×",
+                   control: numCtl(["input", "remote", "mouse_speed"], 1.6, 0.1),
+                   help: HELP.mouse_speed });
+  settingRow(rm, { label: "Scroll speed", key: "remote.scroll_speed",
+                   unit: "×",
+                   control: numCtl(["input", "remote", "scroll_speed"], 1.0, 0.1),
+                   help: HELP.scroll_speed });
+  settingRow(rm, { label: "Lightbar colour in remote mode",
+                   key: "remote.lightbar_color",
+                   control: colorCtl(["input", "remote", "lightbar_color"],
+                                     [255, 120, 0]),
+                   help: HELP.remote_lightbar });
+  genericExtras(rm, ["input", "remote"], inp.remote, KNOWN_REMOTE);
+
+  // -- lightbar ---------------------------------------------------------
+  const lb = card("Lightbar saver");
+  settingRow(lb, { label: "Dim after", key: "lightbar.dim_after_minutes",
+                   unit: "min",
+                   control: numCtl(["input", "lightbar", "dim_after_minutes"], 0),
+                   help: HELP.dim_after_minutes });
+  settingRow(lb, { label: "Dimmed brightness", key: "lightbar.dim_level",
+                   stack: true,
+                   control: rangeCtl(["input", "lightbar", "dim_level"],
+                                     0.3, 0, 1, 0.05,
+                                     v => Math.round(v * 100) + "%"),
+                   help: HELP.dim_level });
+  genericExtras(lb, ["input", "lightbar"], inp.lightbar, KNOWN_LIGHTBAR);
+
+  // -- battery alerts ---------------------------------------------------
+  const bt = card("Battery alerts");
+  settingRow(bt, { label: "Flash lightbar when low", key: "battery.enabled",
+                   control: boolCtl(["input", "battery", "enabled"], true),
+                   help: HELP.battery_enabled });
+  settingRow(bt, { label: "Low below", key: "battery.low_percent", unit: "%",
+                   control: numCtl(["input", "battery", "low_percent"], 20),
+                   help: HELP.low_percent });
+  settingRow(bt, { label: "Critical below", key: "battery.critical_percent",
+                   unit: "%",
+                   control: numCtl(["input", "battery", "critical_percent"], 10),
+                   help: HELP.critical_percent });
+  settingRow(bt, { label: "Low flash every", key: "battery.low_interval_s",
+                   unit: "s",
+                   control: numCtl(["input", "battery", "low_interval_s"], 30),
+                   help: HELP.low_interval_s });
+  settingRow(bt, { label: "Critical flash every",
+                   key: "battery.critical_interval_s", unit: "s",
+                   control: numCtl(["input", "battery", "critical_interval_s"], 10),
+                   help: HELP.critical_interval_s });
+  settingRow(bt, { label: "Low colour", key: "battery.low_color",
+                   control: colorCtl(["input", "battery", "low_color"],
+                                     [255, 140, 0]) });
+  settingRow(bt, { label: "Critical colour", key: "battery.critical_color",
+                   control: colorCtl(["input", "battery", "critical_color"],
+                                     [255, 0, 0]) });
+  settingRow(bt, { label: "Blinks per low flash", key: "battery.low_blinks",
+                   control: numCtl(["input", "battery", "low_blinks"], 2),
+                   help: HELP.low_blinks });
+  settingRow(bt, { label: "Blinks per critical flash",
+                   key: "battery.critical_blinks",
+                   control: numCtl(["input", "battery", "critical_blinks"], 3),
+                   help: HELP.critical_blinks });
+  genericExtras(bt, ["input", "battery"], inp.battery, KNOWN_BATTERY);
+}
+
 function buildForm() {
   const form = $("cfg-form");
   form.textContent = "";
@@ -725,6 +1174,19 @@ function buildForm() {
     Object.entries(CFG).filter(([k]) => !KNOWN_GLOBAL.has(k)));
   addGenericRows(general, [], extraGlobals);
   form.appendChild(general);
+
+  if (ACTIONS) {
+    inputCards(form);
+  } else if (CFG.input !== undefined) {
+    // /api/actions unreachable (an older server under a newer page?): fall
+    // back to the generic by-type rendering so nothing becomes uneditable.
+    const fs = document.createElement("fieldset");
+    const lg = document.createElement("legend");
+    lg.textContent = "input";
+    fs.appendChild(lg);
+    addGenericRows(fs, ["input"], CFG.input);
+    form.appendChild(fs);
+  }
 
   for (const serial of Object.keys(CFG.controllers || {}).sort()) {
     const cc = CFG.controllers[serial];
@@ -752,6 +1214,11 @@ function toast(text, isError) {
 
 async function loadConfig() {
   try {
+    if (!ACTIONS) {
+      // Static per server process, so one fetch per page life is plenty.
+      try { ACTIONS = await (await fetch("/api/actions")).json(); }
+      catch (e) { ACTIONS = null; }   // buildForm falls back to generic
+    }
     const r = await fetch("/api/config");
     const doc = await r.json();
     CFG = doc.config;
