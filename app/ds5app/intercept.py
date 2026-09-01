@@ -32,25 +32,33 @@ see `BridgeBackend.power_off_pad`).
 The chord button (default PS)
 -----------------------------
 While it is held, EVERYTHING digital is swallowed: buttons, dpad, touchpad.
-Sticks, triggers and motion still pass -- no chord is built from them, and
-freezing the camera mid-aim because the user reached for a volume chord would
-be worse than useless. What the game sees at chord start is therefore nothing
-at all: the chord button itself is masked from the first report. A plain tap
-still works because it is REPLAYED -- if the button comes back up quickly with
-no chord fired, the engine waits out the double-press window (a second press
-in that window toggles remote mode instead) and then holds the button down for
-`tap_replay_ms` in the forwarded reports. The game gets a slightly late PS
-press; the PS menu does not care.
+Triggers and motion still pass -- no chord is built from them. The sticks are
+LENT TO THE OS by default (`stick_mouse_in_chord`): left stick moves the
+pointer, right stick scrolls, with the very same `remote.*` speeds as remote
+mode, and the game sees them centred for the duration of the hold -- the
+"major controls" never change meaning between a held chord and remote mode.
+The cost is a camera frozen mid-aim while the user reaches for a volume
+chord; a user who hates that flips `stick_mouse_in_chord` off and the sticks
+pass through untouched again. What the game sees at chord start is therefore
+nothing at all: the chord button itself is masked from the first report. A
+plain tap still works because it is REPLAYED -- if the button comes back up
+quickly with no chord fired, the engine waits out the double-press window (a
+second press in that window toggles remote mode instead) and then holds the
+button down for `tap_replay_ms` in the forwarded reports. The game gets a
+slightly late PS press; the PS menu does not care.
 
 Remote mode
 -----------
-Double-press the chord button. The game is handed a neutral pad (centred,
-released, touch up, motion zeroed -- battery/status bytes intact, games read
-those); the pad drives the OS instead:
+Double-press the chord button (only when `remote.enabled` -- it ships OFF and
+is switched on from the dashboard). The game is handed a neutral pad
+(centred, released, touch up, motion zeroed -- battery/status bytes intact,
+games read those); the pad drives the OS instead:
 
     touchpad 1-finger drag      move the mouse pointer
     touchpad 1-finger tap       left click
     touchpad 2-finger drag      scroll (vertical + horizontal)
+    touchpad 2-finger slide     alt-tab hold, once the travel reads as the
+      (horizontal, decisive)    chord-held gesture -- see `_rm_two_finger`
     touchpad 2-finger tap       right click
     left stick                  move the pointer (rate)
     right stick                 scroll (rate)
@@ -62,7 +70,8 @@ those); the pad drives the OS instead:
 
 Chords stay active in remote mode. Feedback on switch: a distinct double
 haptic pulse and the lightbar held at `remote.lightbar_color` (single pulse
-and the game's colour back on exit).
+and the game's colour back on exit). Every pulse's amplitude comes from
+`haptic_strength` (0-100, mapped linearly onto the motor byte).
 
 Threading
 ---------
@@ -143,7 +152,6 @@ ARROW_REPEAT_S = 0.30
 
 # --- pad feedback ------------------------------------------------------------
 
-ACK_RUMBLE = 0x50          # right (small) motor, ~1/3 strength
 ACK_PULSE_S = 0.12
 FLASH_BLINK_ON_S = 0.15
 FLASH_BLINK_PERIOD_S = 0.30
@@ -261,6 +269,11 @@ class InputInterceptor:
         self._tap_replay_s = cfg.tap_replay_ms / 1000.0
         self._repeat_s = cfg.repeat_ms / 1000.0
         self._off_timer_s = cfg.off_timer_minutes * 60.0
+        #: `haptic_strength` is a percentage; the motor wants a byte. 100 maps
+        #: to 0xFF linearly, so the default 25 lands at 0x40 -- felt, never
+        #: startling. `haptic_ack` stays the on/off switch.
+        self._ack_rumble = max(0, min(0xFF,
+                                      round(cfg.haptic_strength * 255 / 100)))
 
         self._lock = threading.Lock()
         self._prev: _Frame | None = None
@@ -279,6 +292,8 @@ class InputInterceptor:
         self._g2_active = False
         self._g2_start: tuple[float, float] = (0.0, 0.0)
         self._g2_decided: str | None = None
+        #: Shared by the chord-held and remote-mode alt-tab trackers; never
+        #: both live at once (a chord press ends the remote gesture first).
         self._alt_anchor = 0.0
 
         # -- remote mode ------------------------------------------------------
@@ -296,8 +311,18 @@ class InputInterceptor:
         self._rm_enter_down = False
         self._rm_arrow: str | None = None
         self._rm_arrow_next = 0.0
-        self._rm_last_report_at: float | None = None
         self._rm_needs_release = False
+        #: 2-finger gesture per contact: None = undecided, "alt_tab" = the
+        #: switcher is open and stepping, "scroll" = a vertical wheel event
+        #: was emitted and the contact can never become alt-tab.
+        self._rm2_decided: str | None = None
+        self._rm2_start: tuple[float, float] = (0.0, 0.0)
+
+        # -- rate translation (sticks/triggers -> pointer/scroll) -------------
+        #: Timestamp of the last rate-translated report, shared between remote
+        #: mode and the chord-held stick translation -- the two are mutually
+        #: exclusive per report and use identical dt semantics.
+        self._rate_last_at: float | None = None
 
         # -- effects / lightbar / battery / idle ------------------------------
         self._fx: list[tuple[float, bytes]] = []
@@ -339,6 +364,15 @@ class InputInterceptor:
             if self._chord_down:
                 self._chord_held(frame, now, thunks)
                 self._chord_gestures(frame, now, thunks)
+                if self.cfg.stick_mouse_in_chord:
+                    # The sticks drive the OS during the hold, same speeds as
+                    # remote mode. Deflecting one IS using the chord -- no tap
+                    # replay afterwards, or the game would get a phantom PS
+                    # press right after the user finished mousing.
+                    if frame.stick_active():
+                        self._chord_used = True
+                    self._stick_rates(frame, now, thunks, triggers=False)
+
             if self._rm_needs_release:
                 self._rm_needs_release = False
                 self._remote_release_held(thunks)
@@ -351,6 +385,8 @@ class InputInterceptor:
                 self._neutralize(body)
             elif self._chord_down:
                 self._mask_digital(body)
+                if self.cfg.stick_mouse_in_chord:
+                    self._center_sticks(body)
             if self._replay_until and now < self._replay_until:
                 # The delayed chord-button tap: hold it down for the game.
                 self._press_button(body, self.chord_button)
@@ -547,12 +583,7 @@ class InputInterceptor:
                 if self._fire_gesture_action(key, now, thunks):
                     self.stats["gestures_fired"] += 1
         elif self._g2_decided == "alt_tab":
-            while dx - self._alt_anchor >= ALT_TAB_STEP_PX:
-                self._alt_anchor += ALT_TAB_STEP_PX
-                thunks.append(lambda: self.actions.alt_tab_step(True))
-            while dx - self._alt_anchor <= -ALT_TAB_STEP_PX:
-                self._alt_anchor -= ALT_TAB_STEP_PX
-                thunks.append(lambda: self.actions.alt_tab_step(False))
+            self._alt_hold_track(dx, thunks)
 
     def _start_horizontal(self, dx: float, now: float, thunks: list) -> None:
         name = self.cfg.chords.get("touch_slide_horizontal")
@@ -567,16 +598,34 @@ class InputInterceptor:
             # down; sliding steps through it; lifting them (or releasing the
             # chord button) commits.
             self._g2_decided = "alt_tab"
-            self._alt_anchor = dx
-            first_back = dx < 0
-            thunks.append(lambda: self.actions.alt_tab_start())
-            if first_back:
-                thunks.append(lambda: self.actions.alt_tab_step(False))
-                thunks.append(lambda: self.actions.alt_tab_step(False))
+            self._alt_hold_begin(dx, thunks)
         else:
             self._g2_decided = "fired"
             self._fire_gesture_action("touch_slide_horizontal", now, thunks,
                                       ack=False)
+
+    # -- the alt-tab hold tracker, shared with remote mode -------------------
+
+    def _alt_hold_begin(self, dx: float, thunks: list) -> None:
+        """Open the switcher mid-slide. The travel already made is the anchor,
+        so the opening slide itself is step zero; a leftward opening means the
+        user wants the OTHER direction, hence the two immediate back-steps
+        (one to undo the Tab that opening implies, one to actually go back)."""
+        self._alt_anchor = dx
+        first_back = dx < 0
+        thunks.append(lambda: self.actions.alt_tab_start())
+        if first_back:
+            thunks.append(lambda: self.actions.alt_tab_step(False))
+            thunks.append(lambda: self.actions.alt_tab_step(False))
+
+    def _alt_hold_track(self, dx: float, thunks: list) -> None:
+        """One switcher step per further ALT_TAB_STEP_PX of travel, either way."""
+        while dx - self._alt_anchor >= ALT_TAB_STEP_PX:
+            self._alt_anchor += ALT_TAB_STEP_PX
+            thunks.append(lambda: self.actions.alt_tab_step(True))
+        while dx - self._alt_anchor <= -ALT_TAB_STEP_PX:
+            self._alt_anchor -= ALT_TAB_STEP_PX
+            thunks.append(lambda: self.actions.alt_tab_step(False))
 
     def _fire_gesture_action(self, key: str, now: float, thunks: list,
                              ack: bool = True) -> bool:
@@ -644,6 +693,12 @@ class InputInterceptor:
             vk = _ARROW_VKS[self._rm_arrow]
             self._rm_arrow = None
             thunks.append(lambda: self.actions.key(vk, False))
+        if self._rm2_decided == "alt_tab":
+            # A mid-slide switcher commits, exactly as lifting the fingers
+            # would -- leaving Alt down across a mode change is the stuck-key
+            # failure actions.py is built to avoid.
+            thunks.append(lambda: self.actions.alt_tab_commit())
+        self._rm2_decided = None
         self._rm_touch_fingers = 0
         self._rm_touch_max_fingers = 0
 
@@ -651,10 +706,6 @@ class InputInterceptor:
         was = self._prev.buttons if self._prev is not None else set()
         a = self.actions
         rm = self.cfg.remote
-        dt = 0.0
-        if self._rm_last_report_at is not None:
-            dt = min(0.05, max(0.0, now - self._rm_last_report_at))
-        self._rm_last_report_at = now
 
         # -- buttons ---------------------------------------------------------
         for key, on_press, on_release in (
@@ -695,6 +746,15 @@ class InputInterceptor:
             self._rm_touch_start = c
             self._rm_touch_moved = 0.0
         if fingers:
+            if fingers < 2 and self._rm2_decided == "alt_tab":
+                # One finger left mid-slide: commit, as a full lift would.
+                self._rm2_decided = None
+                thunks.append(lambda: self.actions.alt_tab_commit())
+            if fingers >= 2 and self._rm_touch_fingers < 2:
+                # The second finger just landed: gesture travel counts from
+                # HERE, so 1-finger mousing cannot pre-load an alt-tab.
+                self._rm2_start = c
+                self._rm2_decided = None
             if self._rm_touch_fingers:
                 dx = c[0] - self._rm_touch_last[0]
                 dy = c[1] - self._rm_touch_last[1]
@@ -702,13 +762,14 @@ class InputInterceptor:
                 if fingers == 1 and self._rm_touch_max_fingers <= 1:
                     self._rm_mouse(dx, dy, rm.mouse_speed, thunks)
                 elif fingers >= 2:
-                    self._rm_scroll(dy * SCROLL_GAIN * rm.scroll_speed,
-                                    dx * SCROLL_GAIN * rm.scroll_speed, thunks)
+                    self._rm_two_finger(c, dx, dy, now, thunks)
             self._rm_touch_last = c
             self._rm_touch_max_fingers = max(self._rm_touch_max_fingers, fingers)
         elif self._rm_touch_fingers:
-            # contact ended: was it a tap?
-            if (now - self._rm_touch_at <= TAP_S
+            # contact ended: an open switcher commits; otherwise, was it a tap?
+            if self._rm2_decided == "alt_tab":
+                thunks.append(lambda: self.actions.alt_tab_commit())
+            elif (now - self._rm_touch_at <= TAP_S
                     and self._rm_touch_moved <= TAP_MOVE_PX):
                 if self._rm_touch_max_fingers >= 2:
                     thunks.append(lambda: (a.mouse_button("right", True),
@@ -716,18 +777,62 @@ class InputInterceptor:
                 else:
                     thunks.append(lambda: (a.mouse_button("left", True),
                                            a.mouse_button("left", False)))
+            self._rm2_decided = None
             self._rm_touch_max_fingers = 0
         self._rm_touch_fingers = fingers
 
         # -- sticks and triggers ----------------------------------------------
-        if dt > 0:
-            mx = _stick_norm(frame.lx) * STICK_MOUSE_PX_S * rm.mouse_speed * dt
-            my = _stick_norm(frame.ly) * STICK_MOUSE_PX_S * rm.mouse_speed * dt
-            self._rm_mouse(mx, my, 1.0, thunks, gain=1.0)
-            sv = _stick_norm(frame.ry) * STICK_SCROLL_NOTCH_S * 120 * dt
+        self._stick_rates(frame, now, thunks, triggers=True)
+
+    def _rm_two_finger(self, c, dx: float, dy: float, now: float,
+                       thunks: list) -> None:
+        """Remote-mode 2-finger movement: scroll -- unless the travel reads as
+        the same decisive horizontal slide the chord gestures turn into an
+        alt-tab hold. Scrolling must not wait 150 px for the decision, so an
+        undecided contact scrolls too; the first VERTICAL wheel event actually
+        emitted locks the contact to scrolling for good (a stray fraction of
+        horizontal wheel before an alt-tab opens is the cheaper artefact)."""
+        tx = c[0] - self._rm2_start[0]
+        ty = c[1] - self._rm2_start[1]
+        if self._rm2_decided is None and abs(tx) >= ALT_TAB_START_PX \
+                and abs(tx) > abs(ty):
+            self._rm2_decided = "alt_tab"
+            self.stats["gestures_fired"] += 1
+            if self.cfg.haptic_ack:
+                self._ack_locked(now)
+            self._alt_hold_begin(tx, thunks)
+            return
+        if self._rm2_decided == "alt_tab":
+            self._alt_hold_track(tx, thunks)
+            return
+        rm = self.cfg.remote
+        if self._rm_scroll(dy * SCROLL_GAIN * rm.scroll_speed,
+                           dx * SCROLL_GAIN * rm.scroll_speed, thunks):
+            self._rm2_decided = "scroll"
+
+    def _stick_rates(self, frame: _Frame, now: float, thunks: list,
+                     *, triggers: bool) -> None:
+        """Rate-based stick translation: left stick moves the pointer, right
+        stick scrolls, at `remote.*` speeds. This is remote mode's stick map,
+        and it is also live while the chord button is held
+        (`stick_mouse_in_chord`) -- the sticks mean the same thing in both.
+        Triggers join the scroll only in remote mode; during a chord they
+        still belong to the game."""
+        dt = 0.0
+        if self._rate_last_at is not None:
+            dt = min(0.05, max(0.0, now - self._rate_last_at))
+        self._rate_last_at = now
+        if dt <= 0:
+            return
+        rm = self.cfg.remote
+        mx = _stick_norm(frame.lx) * STICK_MOUSE_PX_S * rm.mouse_speed * dt
+        my = _stick_norm(frame.ly) * STICK_MOUSE_PX_S * rm.mouse_speed * dt
+        self._rm_mouse(mx, my, 1.0, thunks, gain=1.0)
+        sv = _stick_norm(frame.ry) * STICK_SCROLL_NOTCH_S * 120 * dt
+        if triggers:
             sv += ((frame.r2 - frame.l2) / 255.0
                    * TRIGGER_SCROLL_NOTCH_S * 120 * dt)
-            self._rm_scroll(sv * rm.scroll_speed, 0.0, thunks, gain=1.0)
+        self._rm_scroll(sv * rm.scroll_speed, 0.0, thunks, gain=1.0)
 
     def _rm_set_held(self, key: str, down: bool) -> None:
         if key == "cross":
@@ -748,27 +853,34 @@ class InputInterceptor:
             thunks.append(lambda: self.actions.mouse_move(ix, iy))
 
     def _rm_scroll(self, dv: float, dh: float, thunks: list,
-                   gain: float = 1.0) -> None:
+                   gain: float = 1.0) -> bool:
+        """Accumulate scroll; True when a VERTICAL wheel event was emitted --
+        the signal `_rm_two_finger` uses to lock a contact to scrolling."""
         acc = self._rm_scroll_acc
         acc[0] += dv * gain
         acc[1] += dh * gain
+        vertical_emitted = False
         # Fingers (or stick) moving down scroll the content down = wheel
         # negative, matching every Windows touchpad's default.
         for idx, horizontal in ((0, False), (1, True)):
             whole = int(acc[idx] / 40) * 40   # emit in 1/3-notch steps
             if whole:
                 acc[idx] -= whole
+                if not horizontal:
+                    vertical_emitted = True
                 delta = -whole if not horizontal else whole
                 thunks.append(lambda d=delta, h=horizontal:
                               self.actions.wheel(d, horizontal=h))
+        return vertical_emitted
 
     # =====================================================================
     # masking / rewriting the forwarded report
     # =====================================================================
 
     def _mask_digital(self, body: bytearray) -> None:
-        """Chord held: the game sees no buttons, no dpad, no touch. Sticks,
-        triggers and motion still pass."""
+        """Chord held: the game sees no buttons, no dpad, no touch. Triggers
+        and motion still pass; the sticks pass too unless
+        `stick_mouse_in_chord` has lent them to the OS (`_center_sticks`)."""
         d = O.digital_keys
         body[d] = DPAD_RELEASED           # hat neutral, face buttons cleared
         body[d + 1] = 0
@@ -776,11 +888,17 @@ class InputInterceptor:
         body[O.touch_data] |= 0x80
         body[O.touch_data + 4] |= 0x80
 
+    def _center_sticks(self, body: bytearray) -> None:
+        """Chord held with `stick_mouse_in_chord`: the sticks are the OS's for
+        the duration, so the game must see them centred -- half a camera turn
+        per volume chord is exactly the leak this exists to stop."""
+        for off in (O.stick_lx, O.stick_ly, O.stick_rx, O.stick_ry):
+            body[off] = STICK_CENTER
+
     def _neutralize(self, body: bytearray) -> None:
         """Remote mode: the game sees a pad nobody is touching. Battery and
         status bytes stay -- games display those."""
-        for off in (O.stick_lx, O.stick_ly, O.stick_rx, O.stick_ry):
-            body[off] = STICK_CENTER
+        self._center_sticks(body)
         body[O.trigger_l] = 0
         body[O.trigger_r] = 0
         self._mask_digital(body)
@@ -825,7 +943,7 @@ class InputInterceptor:
     def _queue_pulse(self, now: float, count: int) -> None:
         for i in range(count):
             t = now + i * (ACK_PULSE_S + 0.08)
-            self._fx.append((t, self._rumble_body(ACK_RUMBLE)))
+            self._fx.append((t, self._rumble_body(self._ack_rumble)))
             self._fx.append((t + ACK_PULSE_S, self._rumble_body(0)))
         self._fx.sort(key=lambda e: e[0])
 

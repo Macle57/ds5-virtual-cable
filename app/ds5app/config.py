@@ -320,9 +320,16 @@ class RemoteMode:
     No input reaches the game (it sees a neutral pad); the touchpad drives the
     mouse pointer, Cross clicks, dpad is arrow keys. The full map lives in
     `docs/input-shortcuts.md` and `intercept.py`.
+
+    Ships OFF: a mode the pad can fall into from a mistimed double-tap of the
+    PS button reads as "my controller broke" to anyone who did not turn it on.
+    The dashboard is where a user opts in. Note the speed/colour fields below
+    stay meaningful even while `enabled` is False -- the chord-held stick
+    translation (`InputConfig.stick_mouse_in_chord`) borrows them, so the
+    pointer feels identical in both modes.
     """
 
-    enabled: bool = True
+    enabled: bool = False
     #: Pointer speed multiplier for touchpad drags and the left stick.
     mouse_speed: float = 1.6
     scroll_speed: float = 1.0
@@ -336,7 +343,7 @@ class RemoteMode:
         if not isinstance(data, dict):
             return cls()
         rm = cls(
-            enabled=_as_bool(data.get("enabled"), True),
+            enabled=_as_bool(data.get("enabled"), False),
             mouse_speed=_as_float(data.get("mouse_speed"), 1.6, 0.1),
             scroll_speed=_as_float(data.get("scroll_speed"), 1.0, 0.1),
             lightbar_color=_as_color(data.get("lightbar_color"), [255, 120, 0]),
@@ -355,7 +362,8 @@ class RemoteMode:
 
 _INPUT_KNOWN = ("enabled", "chord_button", "chords", "actions",
                 "double_press_ms", "tap_replay_ms", "repeat_ms",
-                "haptic_ack", "off_timer_minutes",
+                "haptic_ack", "haptic_strength", "stick_mouse_in_chord",
+                "off_timer_minutes",
                 "battery", "lightbar", "remote")
 
 
@@ -383,6 +391,17 @@ class InputConfig:
     repeat_ms: int = 150
     #: A short rumble pulse on the pad whenever a chord is accepted.
     haptic_ack: bool = True
+    #: How hard that pulse (and the remote-mode toggle pulses) hits, 0-100.
+    #: 100 is the motor flat out; the default is deliberately gentle -- the
+    #: first hardware test found even 1/3 strength startling in a quiet room.
+    #: `haptic_ack` stays the on/off switch; this is only the volume knob.
+    haptic_strength: int = 25
+    #: While the chord button is held, lend the sticks to the OS: left stick
+    #: moves the pointer, right stick scrolls, with the same `remote.*` speeds
+    #: as remote mode -- and the game sees them centred. The cost is a frozen
+    #: camera for as long as the chord is held, which is why this is a switch:
+    #: turning it off restores pure stick passthrough during chords.
+    stick_mouse_in_chord: bool = True
     #: Minutes without input activity before the pad is powered off
     #: (feature 0x08, the same mechanism as PS+Triangle). 0 disables.
     off_timer_minutes: float = 15.0
@@ -405,6 +424,9 @@ class InputConfig:
             tap_replay_ms=_as_int(data.get("tap_replay_ms"), 100, 20, 1000),
             repeat_ms=_as_int(data.get("repeat_ms"), 150, 30, 2000),
             haptic_ack=_as_bool(data.get("haptic_ack"), True),
+            haptic_strength=_as_int(data.get("haptic_strength"), 25, 0, 100),
+            stick_mouse_in_chord=_as_bool(data.get("stick_mouse_in_chord"),
+                                          True),
             off_timer_minutes=_as_float(data.get("off_timer_minutes"), 15.0, 0.0),
             battery=BatteryAlerts.from_dict(data.get("battery")),
             lightbar=LightbarPolicy.from_dict(data.get("lightbar")),
@@ -447,6 +469,8 @@ class InputConfig:
                    tap_replay_ms=int(self.tap_replay_ms),
                    repeat_ms=int(self.repeat_ms),
                    haptic_ack=bool(self.haptic_ack),
+                   haptic_strength=int(self.haptic_strength),
+                   stick_mouse_in_chord=bool(self.stick_mouse_in_chord),
                    off_timer_minutes=float(self.off_timer_minutes),
                    battery=self.battery.to_dict(),
                    lightbar=self.lightbar.to_dict(),
