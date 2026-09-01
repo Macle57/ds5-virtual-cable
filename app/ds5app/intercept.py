@@ -76,8 +76,9 @@ and the game's colour back on exit). Every pulse's amplitude comes from
 Threading
 ---------
 `on_input` and `tick`/`rewrite_setstate` run on two different bridge threads;
-one lock guards all mutable state and every critical section is bit-twiddling
-only. Nothing slow runs under the lock or on the reader thread: registry
+a third -- `service.InputConfigWatcher`'s poll thread -- calls
+`update_config` when the dashboard saves new settings. One lock guards all
+mutable state and every critical section is bit-twiddling only. Nothing slow runs under the lock or on the reader thread: registry
 actions (one of which shells out to PowerShell) go through a single dispatch
 worker; only the remote-mode `SendInput` primitives -- microseconds -- run
 inline. An injectable `clock` makes every timing rule unit-testable.
@@ -255,7 +256,6 @@ class InputInterceptor:
     def __init__(self, cfg: K.InputConfig, *, actions: OsActions,
                  send_setstate, power_off,
                  clock=time.monotonic, dispatch=None):
-        self.cfg = cfg
         self.actions = actions
         self.send_setstate = send_setstate
         self.power_off = power_off
@@ -264,16 +264,7 @@ class InputInterceptor:
         self.dispatch = dispatch or self._dispatcher
         self.registry = actions.registry()
 
-        self.chord_button = cfg.chord_button
-        self._double_press_s = cfg.double_press_ms / 1000.0
-        self._tap_replay_s = cfg.tap_replay_ms / 1000.0
-        self._repeat_s = cfg.repeat_ms / 1000.0
-        self._off_timer_s = cfg.off_timer_minutes * 60.0
-        #: `haptic_strength` is a percentage; the motor wants a byte. 100 maps
-        #: to 0xFF linearly, so the default 25 lands at 0x40 -- felt, never
-        #: startling. `haptic_ack` stays the on/off switch.
-        self._ack_rumble = max(0, min(0xFF,
-                                      round(cfg.haptic_strength * 255 / 100)))
+        self._adopt_cfg(cfg)
 
         self._lock = threading.Lock()
         self._prev: _Frame | None = None
@@ -340,6 +331,117 @@ class InputInterceptor:
                       "remote_toggles": 0, "battery_flashes": 0,
                       "idle_power_off": 0}
 
+    def _adopt_cfg(self, cfg: K.InputConfig) -> None:
+        """Every field derived from the config, recomputed as one unit.
+
+        Both the constructor and `update_config` come through here, so a hot
+        swap can never miss a derived field that a later feature adds -- the
+        bug this prevents (a new `cfg`-derived cache updated in `__init__`
+        only) would be invisible until somebody changed that one setting live.
+        Callers other than the constructor hold the engine lock.
+        """
+        self.cfg = cfg
+        self.chord_button = cfg.chord_button
+        self._double_press_s = cfg.double_press_ms / 1000.0
+        self._tap_replay_s = cfg.tap_replay_ms / 1000.0
+        self._repeat_s = cfg.repeat_ms / 1000.0
+        self._off_timer_s = cfg.off_timer_minutes * 60.0
+        #: `haptic_strength` is a percentage; the motor wants a byte. 100 maps
+        #: to 0xFF linearly, so the default 25 lands at 0x40 -- felt, never
+        #: startling. `haptic_ack` stays the on/off switch.
+        self._ack_rumble = max(0, min(0xFF,
+                                      round(cfg.haptic_strength * 255 / 100)))
+
+    def update_config(self, new_cfg: K.InputConfig) -> None:
+        """Adopt a changed config on a RUNNING engine, no bridge restart.
+
+        This is the other end of the dashboard's Save button: the settings
+        panel writes config.json, `service.InputConfigWatcher` notices, and
+        the new `input` section lands here within a couple of seconds --
+        because a user who drags `double_press_ms` and feels no difference
+        concludes the feature is broken, not that a restart is owed.
+
+        The swap itself is a handful of assignments under the engine lock.
+        The care is all in the TRANSITIONS -- three ways the OLD config can
+        have left something held or masked that the NEW config will never
+        release on its own:
+
+          * remote mode is on and the new config forbids it (`remote.enabled`
+            off, or the whole section off): leave through the SAME exit the
+            double-press takes, so the pad gets its goodbye pulse and the
+            game gets its lightbar back -- and anything remote mode holds on
+            the OS (a dragged mouse button, a held arrow, a mid-slide
+            Alt-Tab) is let go HERE, not "on the next report", because a
+            disabled engine never processes another report;
+          * the chord button changed (or the section turned off) while a
+            chord hold was masking the pad: commit any open gesture and drop
+            every bit of hold state, so the very next report shows the game
+            an honest pad -- the old button, still physically held, simply
+            reappears as pressed;
+          * the section turned off entirely: the engine stays attached and
+            becomes a pure passthrough (see `on_input`). Passthrough rather
+            than detach, deliberately: `BridgeBackend.interceptor` is read by
+            the reader thread mid-stream, and hot-unhooking it swaps
+            correctness for a teardown/attach dance nobody needs when "do
+            nothing per report" costs one attribute read. It also makes
+            re-enabling later a plain state change instead of a rebuild.
+
+        Held-key releases run OUTSIDE the lock, exactly like `on_input`'s
+        thunks -- `SendInput` is microseconds, but nothing slow or foreign
+        runs under the engine lock, ever.
+        """
+        now = self.clock()
+        thunks: list = []
+        with self._lock:
+            was_enabled = bool(self.cfg.enabled)
+            old_button = self.chord_button
+            self._adopt_cfg(new_cfg)
+            disabled = not new_cfg.enabled
+            chord_changed = new_cfg.chord_button != old_button
+            leave_remote = self.remote_mode and (disabled
+                                                 or not new_cfg.remote.enabled)
+
+            if leave_remote:
+                # The regular exit path: goodbye pulse, the game's lightbar
+                # restored via `_fx` (tick drains those even while disabled).
+                self._toggle_remote(now)
+            if disabled or leave_remote:
+                # `_toggle_remote` defers the release to the next report; a
+                # config change cannot wait for one -- do it now.
+                self._rm_needs_release = False
+                self._remote_release_held(thunks)
+            if disabled or chord_changed:
+                self._end_gesture(thunks)     # commits a mid-slide Alt-Tab
+                self._chord_down = False
+                self._repeating = None
+                self._pending_tap_at = None
+                self._replay_until = 0.0
+            if disabled:
+                # A dimmed lightbar must not outlive the policy that dimmed
+                # it; queue the game's own colour back before going quiet.
+                if self._dim_engaged and self._game_lightbar is not None:
+                    self._fx.append((now,
+                                     self._lightbar_body(self._game_lightbar)))
+                    self._fx.sort(key=lambda e: e[0])
+                self._dim_engaged = False
+            if not was_enabled and not disabled:
+                # Re-enabled: a fresh session. The idle clock in particular
+                # must restart from the next report -- `_last_activity` froze
+                # the moment passthrough began, and honouring the stale value
+                # would power the pad off seconds after the user turned the
+                # feature back ON.
+                self._started_at = None
+                self._last_activity = None
+                self._idle_fired = False
+                self._dim_engaged = False
+                self._prev = None
+                self._rate_last_at = None
+        for fn in thunks:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                log.exception("config-change release failed")
+
     # =====================================================================
     # bridge contract
     # =====================================================================
@@ -347,12 +449,24 @@ class InputInterceptor:
     def on_input(self, report: bytes) -> bytes:
         if len(report) < 1 + O.status0 + 1 or report[0] != 0x01:
             return report
+        # Disabled means PASSTHROUGH, not detached (see `update_config` for
+        # why passthrough beats unhooking). `update_config` already released
+        # everything and cleared all hold state before flipping the flag, so
+        # returning untouched is honest from the first disabled report. The
+        # unlocked read keeps the ~476 Hz steady state allocation-free; the
+        # re-check under the lock below closes the swap race.
+        if not self.cfg.enabled:
+            return report
         now = self.clock()
         body = bytearray(report[1:])
         frame = _Frame(body)
         thunks: list = []
 
         with self._lock:
+            if not self.cfg.enabled:
+                # The swap landed between the fast check and here: this report
+                # must not arm a chord on state `update_config` just cleared.
+                return report
             if self._started_at is None:
                 self._started_at = now
                 self._last_activity = now
@@ -409,8 +523,14 @@ class InputInterceptor:
             has_lightbar = bool(body[P.VALID_FLAG1] & P.F1_LIGHTBAR_CONTROL)
             if has_lightbar:
                 # Remember what the game wants -- restores and flash gaps
-                # return to THIS, not to darkness.
+                # return to THIS, not to darkness. Learnt even while disabled,
+                # so a re-enabled engine restores the CURRENT colour, not the
+                # one from before the feature was switched off.
                 self._game_lightbar = (body[P.LED_R], body[P.LED_G], body[P.LED_B])
+            if not self.cfg.enabled:
+                # Passthrough: no dim, no flash, no remote colour -- the
+                # game's bytes go to the pad as written.
+                return bytes(body)
             rgb = self._effective_lightbar(now)
             if has_lightbar and rgb is not None:
                 body[P.LED_R], body[P.LED_G], body[P.LED_B] = rgb
@@ -422,33 +542,41 @@ class InputInterceptor:
         due: list[bytes] = []
         power_off = False
         with self._lock:
+            enabled = bool(self.cfg.enabled)
             # tap replay: the double-press window expired with no second press
-            if self._pending_tap_at is not None and now >= self._pending_tap_at:
+            if (enabled and self._pending_tap_at is not None
+                    and now >= self._pending_tap_at):
                 self._pending_tap_at = None
                 self._replay_until = now + self._tap_replay_s
                 self.stats["taps_replayed"] += 1
-            # queued pad effects
+            # queued pad effects. Drained even while disabled: a disable
+            # transition queues its own goodbyes (the remote-exit pulse, the
+            # lightbar restores), and swallowing those would strand the pad
+            # on the engine's colour. Once `_fx` is empty a disabled tick
+            # does nothing at all -- no flashes, no dim, and above all no
+            # idle power-off from a timer the user just switched off.
             while self._fx and self._fx[0][0] <= now:
                 due.append(self._fx.pop(0)[1])
-            # battery flash
-            if self._battery_flash_due(now):
-                due.extend(self._queue_flash_locked(now))
-            # lightbar dim engages once, mid-play
-            if (not self._dim_engaged and self._started_at is not None
-                    and self.cfg.lightbar.dim_after_minutes > 0
-                    and now - self._started_at
-                    >= self.cfg.lightbar.dim_after_minutes * 60.0):
-                self._dim_engaged = True
-                rgb = self._effective_lightbar(now)
-                if rgb is not None:
-                    due.append(self._lightbar_body(rgb))
-            # idle off-timer
-            if (self._off_timer_s > 0 and self._last_activity is not None
-                    and not self._idle_fired
-                    and now - self._last_activity >= self._off_timer_s):
-                self._idle_fired = True
-                self.stats["idle_power_off"] += 1
-                power_off = True
+            if enabled:
+                # battery flash
+                if self._battery_flash_due(now):
+                    due.extend(self._queue_flash_locked(now))
+                # lightbar dim engages once, mid-play
+                if (not self._dim_engaged and self._started_at is not None
+                        and self.cfg.lightbar.dim_after_minutes > 0
+                        and now - self._started_at
+                        >= self.cfg.lightbar.dim_after_minutes * 60.0):
+                    self._dim_engaged = True
+                    rgb = self._effective_lightbar(now)
+                    if rgb is not None:
+                        due.append(self._lightbar_body(rgb))
+                # idle off-timer
+                if (self._off_timer_s > 0 and self._last_activity is not None
+                        and not self._idle_fired
+                        and now - self._last_activity >= self._off_timer_s):
+                    self._idle_fired = True
+                    self.stats["idle_power_off"] += 1
+                    power_off = True
         for body in due:
             self._send(body)
         if power_off:
@@ -1021,14 +1149,22 @@ def _stick_norm(v: int) -> float:
 
 def attach_to_backend(backend, input_cfg: K.InputConfig | None,
                       *, actions: OsActions | None = None,
-                      clock=time.monotonic) -> InputInterceptor | None:
+                      clock=time.monotonic,
+                      allow_disabled: bool = False) -> InputInterceptor | None:
     """Build the engine from config and hang it on a `BridgeBackend`.
 
-    Returns None (and attaches nothing) when the section is missing or
-    disabled. The backend only ever sees the three-method contract; this is
-    the single place the app layer and the emulator meet for input.
+    Returns None (and attaches nothing) when the section is missing, or --
+    unless `allow_disabled` -- disabled. `BridgeService` passes
+    `allow_disabled=True`: its config watcher can flip `input.enabled` on a
+    RUNNING bridge, and an engine sitting in passthrough (`update_config`)
+    is a live state change away from working, where an engine that was never
+    attached would need the hot-attach dance passthrough exists to avoid.
+    The backend only ever sees the three-method contract; this is the single
+    place the app layer and the emulator meet for input.
     """
-    if input_cfg is None or not getattr(input_cfg, "enabled", False):
+    if input_cfg is None:
+        return None
+    if not getattr(input_cfg, "enabled", False) and not allow_disabled:
         return None
     engine = InputInterceptor(
         input_cfg,
