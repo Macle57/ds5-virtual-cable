@@ -250,6 +250,22 @@ class TrayApp:
         #: deliberately: see its module docstring, "The tray touchpoint".
         self.updater = U.start_if_enabled(self.cfg, notify=self._notify)
 
+        #: The dashboard's two halves, both strictly optional passengers: the
+        #: telemetry hub (a UDP socket every child is told about, so live
+        #: input reaches the page) and the web server itself. Either failing
+        #: is a log line -- a tray that cannot serve a web page must still
+        #: bridge controllers exactly as before.
+        self.hub = None
+        self.dash = None
+        try:
+            from . import telemetry as TM
+
+            self.hub = TM.TelemetryHub()
+            self.hub.start()
+        except Exception:  # noqa: BLE001
+            log.exception("the telemetry hub could not start; the dashboard "
+                          "will have no live input")
+
         self.mgr = M.BridgeManager(
             base_port=self.cfg.port_base,
             ports=self._ports(),
@@ -263,12 +279,23 @@ class TrayApp:
             usbip_exe=getattr(args, "usbip", None),
             audio_target=getattr(args, "audio_target", "speaker"),
             hotplug_interval=float(getattr(args, "hotplug_interval", 5.0)),
+            telemetry_port=(self.hub.port if self.hub is not None else None),
             on_event=self._on_event,
             on_enabled_changed=self._persist_enabled,
             on_master_changed=self._persist_master,
             on_port_assigned=self._persist_port,
             on_hide_changed=self._persist_hide)
         self._snap = self.mgr.snapshot()
+
+        try:
+            from . import dashboard as DB
+
+            self.dash = DB.DashboardServer(
+                hub=self.hub, snapshot_fn=self.mgr.snapshot,
+                port=self.cfg.dashboard_port,
+                on_config_saved=self._on_dashboard_config)
+        except Exception:  # noqa: BLE001
+            log.exception("the dashboard could not be constructed")
 
     @staticmethod
     def _detect_hidhide() -> bool:
@@ -363,6 +390,54 @@ class TrayApp:
         # to outlive the process for the port to be stable.
         self.cfg.get(serial).port = port
         self._save()
+
+    def _on_dashboard_config(self, cfg) -> None:
+        """The dashboard's settings panel just SAVED a config. Make it true.
+
+        The file is already written (the dashboard goes through `config.save`
+        itself); what is left is this process's copy and the running state.
+        Adopting the object first means the tray's next `_save()` writes the
+        dashboard's values instead of resurrecting the old ones -- the same
+        stale-copy hazard `_reconcile_autostart` documents for the registry.
+
+        The manager work is pushed through `_work`, exactly like a menu click,
+        because `set_enabled(True)` blocks for as long as a bridge start takes
+        and this callback runs on the dashboard's HTTP thread.
+        """
+        self.cfg = cfg
+
+        def apply():
+            if self.mgr.master_enabled != bool(cfg.enabled):
+                self.mgr.set_master_enabled(bool(cfg.enabled))
+            for serial, cc in list(cfg.controllers.items()):
+                if self.only and serial != self.only:
+                    continue          # --serial is a one-run override; keep it
+                if self.mgr.is_enabled(serial) != bool(cc.enabled):
+                    self.mgr.set_enabled(serial, bool(cc.enabled))
+                if self.mgr.is_hiding(serial) != bool(cc.hide_bluetooth):
+                    self.mgr.set_hide_bluetooth(serial, bool(cc.hide_bluetooth))
+            self.mgr.hide_default = bool(cfg.hide_bluetooth_default)
+            # Autostart: the registry normally wins (`_reconcile_autostart`),
+            # but a saved checkbox is the user speaking, same as the menu row.
+            try:
+                if A.available() and A.is_enabled() != bool(cfg.autostart_on_login):
+                    A.set_enabled(bool(cfg.autostart_on_login))
+            except A.AutostartError as e:
+                self._notify("Start at login", str(e))
+            self._refresh_now()
+
+        self._work("dashboard-config", apply)
+
+    def _stop_dashboard(self) -> None:
+        """Best-effort, idempotent, and never in the way of the real teardown."""
+        for attr in ("dash", "hub"):
+            obj = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.stop()
+                except Exception:  # noqa: BLE001
+                    log.exception("stopping the %s failed", attr)
 
     # -- events from the manager -------------------------------------------
 
@@ -1294,6 +1369,18 @@ class TrayApp:
 
         self._startup_reconcile()
 
+        # The dashboard, before the first bridge: its URL should already serve
+        # when the "ready" balloon appears. A failure here (usually the port
+        # being taken by another instance) costs the page, never the bridging.
+        if self.dash is not None:
+            try:
+                self.dash.start()
+                print(f"  dashboard at {self.dash.url}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"  the dashboard could not start ({e}); "
+                      f"bridging continues without it", flush=True)
+                self.dash = None
+
         # This is the answer to "do I have to do anything after setup?".
         # Nothing is clicked: the watcher bridges every enabled controller that
         # is already on, and every one that appears later.
@@ -1309,6 +1396,7 @@ class TrayApp:
             self._stop.set()
             self._cancel_pending()
             self.mgr.close()
+            self._stop_dashboard()
         return 0
 
 
