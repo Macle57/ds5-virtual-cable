@@ -31,6 +31,7 @@ Nothing here knows about controllers, reports or Bluetooth.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import sys
 import threading
@@ -81,7 +82,11 @@ if sys.platform == "win32":
 
     #: Arrow keys, Home/End-cluster keys etc. are "extended" keys; without the
     #: flag some applications see the numpad variants instead.
-    _EXTENDED_VKS = frozenset({VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, VK_LWIN})
+    _EXTENDED_VKS = frozenset({VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, VK_LWIN,
+                               0x5C, 0x5D,              # RWin, the menu key
+                               0x21, 0x22, 0x23, 0x24,  # PgUp PgDn End Home
+                               0x2C, 0x2D, 0x2E,        # PrtSc Ins Del
+                               0x90, 0x6F})             # NumLock, numpad /
 
     class _MOUSEINPUT(ctypes.Structure):
         _fields_ = (("dx", wintypes.LONG), ("dy", wintypes.LONG),
@@ -171,6 +176,29 @@ def run_powershell(script: str, timeout: float = 10.0) -> bool:
         return False
 
 
+_DETACHED_PROCESS = 0x00000008 if sys.platform == "win32" else 0
+_CREATE_NEW_PROCESS_GROUP = 0x00000200 if sys.platform == "win32" else 0
+
+
+def launch_command(cmd: str) -> bool:
+    """Start a program the way the Run box would, and forget about it.
+
+    Used only by user macros of the `run` kind. The child is detached (its
+    own process group, no console inherited from a windowless tray) and its
+    handles point at NUL, so a chatty command can neither block the engine's
+    dispatch thread nor outlive it as a zombie. True when it started.
+    """
+    try:
+        subprocess.Popen(cmd, shell=True, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("macro command did not start (%s): %s", cmd[:80], e)
+        return False
+
+
 #: One WMI round trip that clamps and applies a relative brightness change.
 #: `{step}` is a signed integer. Laptops and WMI-capable externals only;
 #: on a desktop with a dumb monitor it exits non-zero and the action is a no-op.
@@ -183,6 +211,60 @@ _BRIGHTNESS_PS = (
     "Invoke-CimMethod -MethodName WmiSetBrightness "
     "-Arguments @{{Timeout=0; Brightness=$b}} | Out-Null"
 )
+
+
+# ---------------------------------------------------------------------------
+# key names: the vocabulary a user macro is written in
+# ---------------------------------------------------------------------------
+
+#: name -> VK, the way people write a shortcut ("ctrl", "shift", "f5",
+#: "printscreen"); letters and digits are their own names. Insertion order
+#: is meaningful: /api/actions serves the list in this order and the settings
+#: page shows it as-is, so modifiers come first and the numpad last.
+KEY_NAMES: dict[str, int] = {
+    "ctrl": 0x11, "shift": VK_SHIFT, "alt": VK_MENU, "win": VK_LWIN,
+    "enter": VK_RETURN, "esc": VK_ESCAPE, "tab": VK_TAB, "space": 0x20,
+    "backspace": 0x08, "delete": 0x2E, "insert": 0x2D,
+    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+    "up": VK_UP, "down": VK_DOWN, "left": VK_LEFT, "right": VK_RIGHT,
+    "printscreen": 0x2C, "pause": 0x13, "capslock": 0x14, "numlock": 0x90,
+    "scrolllock": 0x91, "menu": 0x5D,
+    "volume_up": VK_VOLUME_UP, "volume_down": VK_VOLUME_DOWN,
+    "volume_mute": VK_VOLUME_MUTE, "media_play_pause": VK_MEDIA_PLAY_PAUSE,
+    "media_next": VK_MEDIA_NEXT_TRACK, "media_prev": VK_MEDIA_PREV_TRACK,
+    "media_stop": 0xB2,
+    "minus": 0xBD, "equals": 0xBB, "comma": 0xBC, "period": 0xBE,
+    "slash": 0xBF, "backslash": 0xDC, "semicolon": 0xBA, "quote": 0xDE,
+    "lbracket": 0xDB, "rbracket": 0xDD, "grave": 0xC0,
+}
+KEY_NAMES.update({f"f{n}": 0x70 + n - 1 for n in range(1, 25)})
+KEY_NAMES.update({c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"})
+KEY_NAMES.update({d: ord(d) for d in "0123456789"})
+KEY_NAMES.update({f"numpad{d}": 0x60 + d for d in range(10)})
+
+#: Spellings a hand-written config is likely to use.
+_KEY_ALIASES = {
+    "control": "ctrl", "escape": "esc", "return": "enter", "windows": "win",
+    "super": "win", "meta": "win", "del": "delete", "ins": "insert",
+    "pgup": "pageup", "pgdn": "pagedown", "pgdown": "pagedown",
+    "bksp": "backspace", "prtsc": "printscreen", "print": "printscreen",
+    "spacebar": "space", "apps": "menu", "option": "alt",
+    "arrowup": "up", "arrowdown": "down", "arrowleft": "left",
+    "arrowright": "right",
+}
+
+
+def key_vk(name: object) -> int | None:
+    """A key name (any case, spaces/dashes tolerated) -> VK, or None."""
+    if not isinstance(name, str):
+        return None
+    n = name.strip().lower().replace(" ", "").replace("-", "_")
+    n = _KEY_ALIASES.get(n, n)
+    return KEY_NAMES.get(n)
+
+
+#: A macro's name is a config identifier: it is what a chord binds to.
+MACRO_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +291,10 @@ class OsActions:
     thread because one of them (brightness) shells out.
     """
 
-    def __init__(self, inject=None, run_ps=None):
+    def __init__(self, inject=None, run_ps=None, launch=None):
         self.inject = inject or send_input_events
         self.run_ps = run_ps or run_powershell
+        self.launch = launch or launch_command
         self._lock = threading.Lock()
         self._alt_held = False
         self._shift_held = False
@@ -296,6 +379,55 @@ class OsActions:
     def _brightness(self, sign: int, params: dict) -> None:
         step = max(1, min(100, int(params.get("step", 10))))
         self.run_ps(_BRIGHTNESS_PS.format(step=sign * step))
+
+    # -- user macros --------------------------------------------------------
+
+    def macro_spec(self, name: str, definition: object) -> ActionSpec | None:
+        """Compile one `input.macros` entry into an ActionSpec, or None.
+
+        Two kinds, told apart by which key is present:
+
+          {"keys": ["ctrl", "shift", "esc"]}   one chord: press in order,
+                                               release in reverse, ONE
+                                               SendInput (see `tap`)
+          {"run": "notepad.exe"}               start a program, detached
+
+        plus optional `label` (what the settings page shows) and `repeat`
+        (True: fires again at `repeat_ms` while the chord is held -- only
+        sensible for key macros). Anything malformed is logged and skipped;
+        a bad macro must never take the engine down, only itself.
+        """
+        if not isinstance(name, str) or not MACRO_NAME_RE.match(name):
+            log.warning("macro %r: bad name (a-z, 0-9, _; max 40)", name)
+            return None
+        if not isinstance(definition, dict):
+            log.warning("macro %r: definition is %s, not an object",
+                        name, type(definition).__name__)
+            return None
+        label = definition.get("label")
+        doc = label.strip() if isinstance(label, str) and label.strip() else name
+        repeat = bool(definition.get("repeat", False))
+        keys = definition.get("keys")
+        cmd = definition.get("run")
+        if isinstance(keys, list) and keys:
+            vks = []
+            for k in keys:
+                vk = key_vk(k)
+                if vk is None:
+                    log.warning("macro %r: unknown key %r -- skipped", name, k)
+                    return None
+                vks.append(vk)
+            if len(vks) > 8:
+                log.warning("macro %r: more than 8 keys -- skipped", name)
+                return None
+            return ActionSpec(name, lambda p, vks=tuple(vks): self.tap(*vks),
+                              repeat, doc)
+        if isinstance(cmd, str) and cmd.strip():
+            return ActionSpec(name, lambda p, c=cmd.strip(): self.launch(c),
+                              False, doc)
+        log.warning("macro %r: needs a non-empty 'keys' list or a 'run' "
+                    "command -- skipped", name)
+        return None
 
     def registry(self) -> dict:
         """Action name -> ActionSpec. The names are the config vocabulary.

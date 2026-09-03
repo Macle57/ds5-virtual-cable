@@ -294,6 +294,12 @@ class DashboardServer:
                 "chord_buttons": list(K.CHORD_BUTTONS),
                 "chord_keys": list(K.CHORD_BUTTONS),
                 "gesture_keys": list(K.CHORD_GESTURES),
+                # the key vocabulary a user macro may use, engine order
+                "macro_keys": list(ACT.KEY_NAMES),
+                # the engine's own actions (pad power / lightbar), which the
+                # OS registry deliberately does not contain
+                "engine_actions": [{"name": n, "doc": d}
+                                   for n, d in K.ENGINE_ACTIONS.items()],
                 "defaults": {"chords": dict(K.DEFAULT_CHORDS)},
             }
         return self._actions_meta

@@ -948,6 +948,80 @@ class LightbarRewrites(EngineCase):
         self.assertEqual((out[P.LED_R], out[P.LED_G], out[P.LED_B]),
                          (255, 120, 0))
 
+    # -- PS+<chord> lightbar toggle (an engine action, like pad_power_off) --
+
+    def _led(self, body):
+        return (body[P.LED_R], body[P.LED_G], body[P.LED_B])
+
+    def _sent_leds(self):
+        """LED colours of every SetState the engine pushed to the pad."""
+        out = []
+        for b in self.sent:
+            body = b[1:] if b and b[0] == 0x02 else b
+            if len(body) > P.LED_B and body[P.VALID_FLAG1] & P.F1_LIGHTBAR_CONTROL:
+                out.append(self._led(body))
+        return out
+
+    def _toggle(self):
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps", "circle")),
+                  report())
+        self.eng.tick()
+
+    def test_toggle_darkens_the_pad_and_the_games_writes(self):
+        self.make(chords={"circle": "pad_lightbar_toggle"})
+        self.eng.rewrite_setstate(self.game_body(200, 100, 50))  # learn it
+        self._toggle()
+        self.assertIn((0, 0, 0), self._sent_leds())        # pushed at once
+        out = self.eng.rewrite_setstate(self.game_body(200, 100, 50))
+        self.assertEqual(self._led(out), (0, 0, 0))         # and held
+        self.assertEqual(self.eng.stats["lightbar_toggles"], 1)
+
+    def test_second_toggle_restores_the_games_colour(self):
+        self.make(chords={"circle": "pad_lightbar_toggle"})
+        self.eng.rewrite_setstate(self.game_body(200, 100, 50))
+        self._toggle()
+        self.sent.clear()
+        self._toggle()
+        self.assertIn((200, 100, 50), self._sent_leds())
+        out = self.eng.rewrite_setstate(self.game_body(9, 8, 7))
+        self.assertEqual(self._led(out), (9, 8, 7))          # passthrough again
+
+    def test_off_wins_over_dim_and_remote_but_not_the_battery_flash(self):
+        self.make_remote(chords={"circle": "pad_lightbar_toggle"},
+                         lightbar={"dim_after_minutes": 1, "dim_level": 0.5})
+        self.eng.rewrite_setstate(self.game_body(200, 100, 50))
+        self._toggle()
+        self.clock.advance(61)
+        self.eng.tick()                                       # dim engages
+        self.assertEqual(self._led(self.eng.rewrite_setstate(
+            self.game_body(200, 100, 50))), (0, 0, 0))
+        # enter remote mode: the double-press feedback must not light it
+        self.sent.clear()
+        self.feed(report(buttons=("ps",)), report())
+        self.clock.advance(0.15)
+        self.feed(report(buttons=("ps",)), report())
+        self.eng.tick()
+        self.assertTrue(self.eng.remote_mode)
+        self.assertNotIn((255, 120, 0), self._sent_leds())
+        self.assertEqual(self._led(self.eng.rewrite_setstate(
+            self.game_body(1, 2, 3))), (0, 0, 0))
+        # a battery flash still shows (it outranks everything)
+        self.eng._flash_until = self.clock() + 1.0
+        self.eng._flash_color = (255, 0, 0)
+        self.assertEqual(self._led(self.eng.rewrite_setstate(
+            self.game_body(1, 2, 3))), (255, 0, 0))
+
+    def test_disabling_the_engine_lets_the_light_back(self):
+        self.make(chords={"circle": "pad_lightbar_toggle"})
+        self.eng.rewrite_setstate(self.game_body(200, 100, 50))
+        self._toggle()
+        self.sent.clear()
+        self.eng.update_config(K.InputConfig.from_dict({"enabled": False}))
+        self.eng.tick()
+        self.assertIn((200, 100, 50), self._sent_leds())
+        self.assertFalse(self.eng._lightbar_off)
+
     def test_bodies_without_the_lightbar_flag_are_untouched(self):
         self.make(lightbar={"dim_after_minutes": 1, "dim_level": 0})
         self.feed(report())
