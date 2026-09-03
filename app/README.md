@@ -54,6 +54,28 @@ cd D:\Codes\dualSense\ds5-virtual-usb\app
 End-user instructions are `docs/USER-GUIDE.md`. Build the exe with
 `powershell -File app\packaging\build.ps1`.
 
+### The dashboard page
+
+`ds5app/dashboard.html` -- the page the tray's *Dashboard* item opens -- is a
+build product, not a source file. Its source is the Vite + React + Tailwind
+project in `dashboard-ui/`; the build inlines everything (JS, CSS, the
+Rajdhani font) into that one file so the page fetches nothing from anywhere,
+and the built file is committed so a Python-only checkout still works.
+
+```powershell
+cd app\dashboard-ui
+npm install                      # once
+npm run dev                      # Vite on :5173, /api proxied to a feed on :8799
+npm run build                    # type-check + write ..\ds5app\dashboard.html
+```
+
+For a feed without a pad: `python -m ds5app.dashboard --fake --port 8799`
+from `app\`. The page keeps two query flags the tests and screenshots rely
+on -- `?snap` polls `/api/state` instead of holding the SSE stream, and
+`?settings` opens the settings panel on load. `build.ps1` rebuilds the page
+before PyInstaller when `dashboard-ui\node_modules` is present, and otherwise
+packages the committed file.
+
 ## The five things that are easy to get wrong
 
 Each one cost a real debugging session in Phase 4a. They are the reason this

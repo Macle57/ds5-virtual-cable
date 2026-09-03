@@ -45,6 +45,21 @@ if ($Clean) {
     }
 }
 
+# The dashboard page is built from app/dashboard-ui (see app/README.md). Do it
+# here when the toolchain is set up, so a stale committed page cannot ship by
+# accident; a checkout without node just packages the committed file.
+$ui = Join-Path $repo 'app\dashboard-ui'
+if ((Test-Path (Join-Path $ui 'node_modules')) -and (Get-Command npm -ErrorAction SilentlyContinue)) {
+    Write-Host '--- dashboard page (npm run build) ---'
+    Push-Location $ui
+    try {
+        & npm run build
+        if ($LASTEXITCODE -ne 0) { throw "dashboard build failed ($LASTEXITCODE)" }
+    } finally { Pop-Location }
+} else {
+    Write-Host '--- dashboard page: no node_modules, packaging the committed ds5app\dashboard.html ---'
+}
+
 $env:DS5_ONEFILE = if ($OneFile) { '1' } else { '0' }
 Write-Host "--- building ($(if ($OneFile) {'one-file'} else {'one-dir'})) ---"
 
