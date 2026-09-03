@@ -92,8 +92,26 @@ F1_OVERALL_EFFECT_POWER = 1 << 5
 F1_AUDIO_CONTROL2 = 1 << 7
 
 # validFlag2 bits
-F2_LIGHTBAR_SETUP = 1 << 0     # ledBrightness / lightbarSetup
+#: Gates LIGHTBAR_SETUP (byte 41). Linux hid-playstation's
+#: DS_OUTPUT_VALID_FLAG2_LIGHTBAR_SETUP_CONTROL_ENABLE -- and the bit VERIFIED
+#: on two pads over Bluetooth (2026-09-03): with bit 1 the setup byte takes
+#: effect, with bit 0 it is silently ignored. docs/FINDINGS.md, "lightbar setup".
+F2_LIGHTBAR_SETUP = 1 << 1
+#: What daidr's tester sets for ledBrightness (byte 42): `setValidFlag2(0)` in
+#: OutputPanel.vue. Not verified here; kept as the tester's convention.
+F2_LED_BRIGHTNESS = 1 << 0
 F2_COMPATIBLE_VIBRATION2 = 1 << 2
+
+#: LIGHTBAR_SETUP values. LIGHT_OUT ends the pad's own Bluetooth connect
+#: animation -- and until a host has sent it once, a Bluetooth DualSense
+#: IGNORES every lightbar colour write while applying rumble and player LEDs
+#: from the very same reports (verified on hardware, see FINDINGS). Sending it
+#: in the same report as a colour works: the colour is what ends up shown.
+LIGHTBAR_SETUP_LIGHT_OUT = 1 << 1
+
+#: The colour a pad shows once its lightbar is unlocked and no host has painted
+#: one yet: hid-playstation's player-1 blue (`player_leds_info` colours).
+DEFAULT_LIGHTBAR = (0x00, 0x00, 0x40)
 
 # Mute LED control values
 MUTE_LED_OFF = 0
@@ -154,8 +172,18 @@ class SetState:
         self.body[VALID_FLAG1] &= ~F1_RELEASE_LEDS & 0xFF
         if brightness is not None:
             self.body[LED_BRIGHTNESS] = brightness & 0xFF
-            self.flag2(F2_LIGHTBAR_SETUP)
+            self.flag2(F2_LED_BRIGHTNESS)
         return self
+
+    def lightbar_setup(self, value: int = LIGHTBAR_SETUP_LIGHT_OUT) -> "SetState":
+        """The lightbar-setup control (byte 41, gated by validFlag2 bit 1).
+
+        A Bluetooth DualSense applies no lightbar colour until a host has
+        sent this once per connection; the bridge sends it in its connect-time
+        prime. Combines with `lightbar()` in one report.
+        """
+        self.body[LIGHTBAR_SETUP] = value & 0xFF
+        return self.flag2(F2_LIGHTBAR_SETUP)
 
     def mute_led(self, mode: int) -> "SetState":
         self.body[MUTE_LED_CONTROL] = mode & 0xFF

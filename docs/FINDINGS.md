@@ -67,24 +67,35 @@ that field's flag, otherwise the older body's. The gating map (this repo's
 | validFlag1 | 3 **release LEDs** | none -- hands the LEDs back to the firmware |
 | validFlag1 | 4 **player indicator** | 43 (5-bit LED mask, bit0 = leftmost) |
 | validFlag1 | 5 overall effect power / 7 audio control 2 | 36,37 |
-| validFlag2 | 0 or 1 lightbar setup | 41 (lightbarSetup), 42 (ledBrightness) |
+| validFlag2 | 1 lightbar setup (**verified**); 0 ledBrightness (tester) | 41 (lightbarSetup), 42 (ledBrightness) |
 
-Two disagreements found and worth recording:
+Two disagreements found, both SETTLED on hardware 2026-09-03 (two pads over
+Bluetooth, webcam-verified):
 
 1. `validFlag2` "lightbar setup": the tester uses **bit 0**
    (`setValidFlag2(0)` in `OutputPanel.vue` for LED brightness), Linux
    `hid-playstation` uses **bit 1**
    (`DS_OUTPUT_VALID_FLAG2_LIGHTBAR_SETUP_CONTROL_ENABLE = BIT(1)`, with
-   `DS_OUTPUT_LIGHTBAR_SETUP_LIGHT_OUT = BIT(1)` as the value). Unresolved; the
-   merge treats *either* bit as gating bytes 41/42, which is safe because
-   carrying a byte forward only matters when some bit is set.
-2. Player LEDs need **only** `validFlag1` bit 4 plus byte 43 -- neither
-   `ledBrightness` nor the `lightbar setup` dance is required
-   (`dualsense_set_player_leds` in `hid-playstation.c`). `hid-playstation` does
-   send one lightbar "fade out" at connect (`dualsense_reset_leds`) purely to
-   kill the Bluetooth startup animation; it is not part of player-LED control.
-   `bridge.PRIME_LIGHTBAR_FADE_OUT` exists to try it, and is off by default
-   because the lightbar demonstrably already obeys us without it.
+   `DS_OUTPUT_LIGHTBAR_SETUP_LIGHT_OUT = BIT(1)` as the value). **Bit 1 is
+   the one the pad honours** for byte 41: `flag2=0x01, setup=0x02` changed
+   nothing, `flag2=0x02, setup=0x02` did, on both pads. `protocol.
+   F2_LIGHTBAR_SETUP` is bit 1; bit 0 is kept as `F2_LED_BRIGHTNESS` (the
+   tester's convention, unverified). The merge still gates bytes 41/42 on
+   either bit, which is safe because carrying a byte forward only matters when
+   some bit is set.
+2. **A Bluetooth DualSense ignores every lightbar colour until a host has
+   sent the lightbar-setup control once per connection.** Colour writes
+   (`validFlag1` bit 2 + RGB) were applied by neither pad -- not one, not
+   fifty a second -- while rumble (audible on a microphone) and the player
+   LEDs (`validFlag1` bit 4 + byte 43, no setup needed) from the very same
+   handle were. One `flag2=0x02, lightbarSetup=0x02` report and every colour
+   after it worked; setup and colour in the SAME report work too, and the
+   colour is what ends up shown. `hid-playstation` sends exactly this at
+   connect (`dualsense_reset_leds`), and libScePad titles do it themselves --
+   which is why "Miles Morales set the lightbar fine" had looked like proof
+   the prime was unnecessary. `bridge.PRIME_LIGHTBAR_FADE_OUT` is therefore
+   ON: the connect-time prime carries the setup plus `P.DEFAULT_LIGHTBAR`
+   (hid-playstation's player-1 blue), so the pad is never left dark.
 
 ### Output 0x36 (host -> controller), 398 bytes — audio+haptics, 1 frame
 Built in `btAudioStream.ts:buildReportSix`. Payload (index = report offset - 1):

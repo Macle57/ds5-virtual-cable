@@ -812,10 +812,11 @@ class InputInterceptor:
             self._rm_lightbar_next = now + REMOTE_LIGHTBAR_REASSERT_S
         else:
             self._queue_pulse(now, count=1)
+            # No game colour yet -> the bridge's default blue, never "leave
+            # it red": the pad shows whatever was written last.
             restore = self._effective_lightbar(now, ignore_remote=True) \
-                or self._game_lightbar
-            if restore is not None:
-                self._fx.append((now, self._lightbar_body(restore)))
+                or self._game_lightbar or P.DEFAULT_LIGHTBAR
+            self._fx.append((now, self._lightbar_body(restore)))
             # Anything remote mode still holds (mouse button, an arrow key)
             # must be let go; done on the next report, which has the thunk list.
             self._rm_needs_release = True
@@ -1116,7 +1117,7 @@ class InputInterceptor:
         self._flash_color = color
         self.stats["battery_flashes"] += 1
         base = self._effective_lightbar(self._flash_until + 0.001)
-        restore = base or self._game_lightbar or (0, 0, 0)
+        restore = base or self._game_lightbar or P.DEFAULT_LIGHTBAR
         due: list[bytes] = []
         for i in range(blinks):
             t = now + i * FLASH_BLINK_PERIOD_S

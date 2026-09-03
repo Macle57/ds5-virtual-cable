@@ -198,17 +198,21 @@ AUDIO_IDLE_TIMEOUT = 0.5
 SETSTATE_MIN_INTERVAL = 0.006
 SETSTATE_REFRESH = 0.0
 
-#: Send one lightbar "fade out" (validFlag2 lightbar-setup + lightbarSetup bit 1)
-#: at every connect, the way Linux `hid-playstation`'s `dualsense_reset_leds`
-#: does, to end the controller's own Bluetooth startup animation.
+#: Send the lightbar-setup "light out" control at every connect, the way Linux
+#: `hid-playstation`'s `dualsense_reset_leds` does, with the default blue
+#: painted in the same report.
 #:
-#: OFF, on evidence: the lightbar already obeys us without it (Miles Morales set
-#: it fine), so the animation is demonstrably not holding the LEDs hostage, and
-#: turning it on costs a visibly dark lightbar until the game paints one. It is
-#: wired up rather than deleted because it is the only remaining once-per-connect
-#: candidate if a real pad still refuses to light its player LEDs -- flip it to
-#: True and re-test. See docs/FINDINGS.md "Output 0x31 ... MERGEABLE".
-PRIME_LIGHTBAR_FADE_OUT = False
+#: ON, on evidence (2026-09-03, two pads, both over Bluetooth, photo-verified):
+#: a freshly connected DualSense IGNORES every lightbar colour write until a
+#: host has sent this control once -- the game's colour, remote mode's red and
+#: the battery flashes all silently did nothing, while rumble and the player
+#: LEDs in the very same reports were applied. One report carrying the setup
+#: AND a colour is enough, so the prime also paints `P.DEFAULT_LIGHTBAR` and
+#: the pad never goes dark. The earlier "off: Miles Morales set it fine"
+#: reading was a libScePad title, which sends this control itself -- it hid
+#: the gap rather than disproving it. The host's own replayed lightbar, if it
+#: has one, follows straight after and wins. docs/FINDINGS.md "lightbar setup".
+PRIME_LIGHTBAR_FADE_OUT = True
 
 # --- factory-test feature reports 0x80 / 0x81 (Phase 4c) --------------------
 # The DualSense's whole factory-diagnostics channel is one request/response
@@ -230,6 +234,14 @@ FEATURE_TEST_RESULT = 0x81
 #: off-timer. Host-issued 0x08 writes stay recorded-and-dropped.
 FEATURE_BLUETOOTH_CONTROL = 0x08
 BT_CONTROL_DISCONNECT = 0x02
+#: Feature 0x08 is `count=47` in the pad's OWN Bluetooth report descriptor
+#: (read back with hidapi 2026-09-03), not the 63 of the 0x80 test channel;
+#: TLOU's captured kill was the same 47 + id = 48 bytes over USB. A 63-byte
+#: payload is refused by the HID stack before it reaches the air
+#: (`HidD_SetFeature` fails, hidapi returns -1) -- MEASURED: 64-byte write
+#: rc=-1 and the pad stays on; 48-byte signed write rc=48 and the pad is off
+#: within a second. The 0x53-seeded CRC still lives in the last 4 bytes.
+FEATURE_BLUETOOTH_CONTROL_LEN = 47
 
 #: Both are `95 3f` in the HID report descriptor: 63 data bytes after the id.
 #: On Bluetooth the 4-byte CRC lives in the LAST 4 of those 63 -- it does not
@@ -1045,9 +1057,12 @@ class BridgeBackend(Backend):
         """One SetState that routes audio and sets the volumes, then a replay of
         whatever the host has already commanded.
 
-        Only the audio valid-flag bits are set in the priming report, so nothing
-        the host later sends (lightbar, rumble, triggers) is affected — the
-        controller applies a field only when its valid-flag bit is present.
+        Besides the audio fields the priming report carries the lightbar-setup
+        control and the default blue (PRIME_LIGHTBAR_FADE_OUT): without the
+        setup a Bluetooth pad ignores every lightbar colour for the whole
+        connection. Nothing else the host later sends (rumble, triggers, LEDs)
+        is touched — the controller applies a field only when its valid-flag
+        bit is present.
 
         The replay afterwards exists because a controller that has just come
         back has forgotten its LEDs and trigger effects, and the game will not
@@ -1063,8 +1078,8 @@ class BridgeBackend(Backend):
             st.speaker_volume(self.speaker_volume)
         st.haptic_volume(self.haptic_volume)
         if PRIME_LIGHTBAR_FADE_OUT:
-            st.flag2(P.F2_LIGHTBAR_SETUP | (1 << 1))
-            st.body[P.LIGHTBAR_SETUP] = 1 << 1     # hid-playstation: fade light out
+            st.lightbar_setup(P.LIGHTBAR_SETUP_LIGHT_OUT)
+            st.lightbar(*P.DEFAULT_LIGHTBAR)
         self._write_raw(P.build_bt_setstate(bytes(st.body), self._next_bt_seq()))
 
         with self._setstate_lock:
@@ -1427,16 +1442,18 @@ class BridgeBackend(Backend):
     def _bt_power_off_now(self) -> None:
         """Writer thread: the signed 0x08 [action=0x02] SET feature report.
 
-        Framed like the factory-test channel's 0x80 (`_bt_send_test_command`),
-        the only BT SET-feature framing verified on this hardware: a 63-byte
-        payload with the 0x53-seeded CRC32 in its last 4 bytes. TLOU's own kill
-        was captured as `08 02 00...` over USB; over Bluetooth an unsigned
-        feature write is refused by the pad, so it is signed here.
+        Framed at the length the pad's own descriptor gives feature 0x08
+        (FEATURE_BLUETOOTH_CONTROL_LEN, 47 -- the 63 of the 0x80 test channel
+        is refused by the HID stack and never reaches the pad), with the
+        0x53-seeded CRC32 in the last 4 bytes: TLOU's own kill was captured as
+        a 48-byte `08 02 00...` over USB, and over Bluetooth an unsigned
+        feature write is refused by the pad, so it is signed here. VERIFIED on
+        hardware 2026-09-03: pad off within a second of this exact write.
         """
         dev = self._dev
         if dev is None:
             return
-        payload = bytearray(FEATURE_TEST_PAYLOAD_LEN)
+        payload = bytearray(FEATURE_BLUETOOTH_CONTROL_LEN)
         payload[0] = BT_CONTROL_DISCONNECT
         if dev.is_bt:
             fill_feature_checksum(FEATURE_BLUETOOTH_CONTROL, payload)

@@ -42,21 +42,16 @@ research (nondebug/dualsense) — tells a DualSense to drop its Bluetooth link,
 and with no console to fall back to it powers off. TLOU was captured sending
 exactly `08 02 00…` at a pad it considered redundant; the link was dead 26 ms
 later, 2/2 runs. `BridgeBackend._bt_power_off_now` sends the same command down
-our own handle, framed the one way this hardware has accepted BT feature
-writes (63-byte payload, `0x53`-seeded CRC32 in the last 4 bytes — the framing
-verified for `0x80`).
+our own handle, framed at the length the pad's **own Bluetooth report
+descriptor** gives feature `0x08`: 47 data bytes (48 with the id, TLOU's
+captured length), `0x53`-seeded CRC32 in the last 4.
 
-This is the one deliberate non-`0x80` feature write in the project. It is
-neither of the two the safety rail forbids (pairing `0x09`, firmware), and it
-changes nothing persistent — one PS press brings the pad back. Host-issued
-`0x08` writes are still recorded and dropped.
-
-> **Hardware window:** the `0x08` framing (63-byte signed payload over BT) is
-> the one part of this feature not yet proven on a live pad — TLOU's captured
-> kill went over USB framing to a raw BT handle via the HID stack. If the pad
-> ignores it, the fallbacks to try, in order: 48-byte signed payload (TLOU's
-> observed length), then a Windows-side ACL disconnect
-> (`IOCTL_BTH_DISCONNECT_DEVICE` on the radio handle, the DS4Windows way).
+> **Verified on hardware 2026-09-03.** The first cut used the 63-byte framing
+> of the `0x80` test channel, and that is why PS+Triangle "went through" but
+> the pad stayed on: Windows' HID stack refuses a feature write whose length
+> disagrees with the descriptor (`HidD_SetFeature` fails, hidapi `-1`) before
+> anything reaches the air. The 48-byte signed write switches the pad off
+> within a second.
 
 ## Default keymap
 
@@ -154,6 +149,9 @@ excluded (gyro noise never sleeps; a pad face-down on the couch must idle).
   "off_timer_minutes": 15.0,
   "chords": { "triangle": "pad_power_off", "...": "see the table above" },
   "actions": { "volume_up": {"step": 1} },
+  "macros": { "task_manager": { "keys": ["ctrl", "shift", "esc"],
+                                "label": "Task Manager" },
+              "spotify": { "run": "spotify.exe" } },
   "battery": { "enabled": true, "low_percent": 20, "critical_percent": 10,
                "low_interval_s": 30.0, "critical_interval_s": 10.0,
                "low_color": [255, 140, 0], "critical_color": [255, 0, 0],
@@ -170,6 +168,29 @@ survive a save/load cycle). Unknown action names are ignored with one log
 line; unknown keys everywhere ride along untouched, so a config written by a
 newer build loses nothing here.
 
+### Custom macros
+
+`macros` are user-defined actions, keyed by the name a chord binds to
+(`a-z`, digits, `_`, starting with a letter). Two kinds:
+
+- `{"keys": [...]}` — one keyboard chord, pressed in order and released in
+  reverse inside a single `SendInput` (the same atomicity rule the built-ins
+  live by). Key names are the ones `/api/actions` serves as `macro_keys`:
+  `ctrl shift alt win`, `enter esc tab space backspace delete insert home end
+  pageup pagedown up down left right`, `f1`..`f24`, letters, digits,
+  `numpad0`..`numpad9`, the media/volume keys and punctuation (`minus`,
+  `equals`, `lbracket`, ...). Common aliases (`control`, `escape`, `pgup`,
+  `del`) are accepted. At most 8 keys. `"repeat": true` makes it fire again
+  at `repeat_ms` while the chord is held.
+- `{"run": "..."}` — a command line, started detached with no console and
+  never waited for, the way the Run box would.
+
+`label` is what the settings page shows. A macro may not shadow a built-in
+name; a malformed one is skipped with one log line and takes nothing else
+down. The dashboard's *Macros* tab edits these (with a press-the-shortcut
+capture box), and its Save POSTs `"name": null` to delete one — the config
+API deep-merges, so absence alone cannot express removal.
+
 ## Testing
 
 No hardware anywhere: synthetic `0x01` reports feed the engine, an injected
@@ -183,6 +204,10 @@ clock drives every timing rule, `SendInput` is a recorder, PowerShell a stub.
   Alt-Tab hold lifecycle and stuck-Alt protection (18)
 - `app/tests/test_input_config.py` — defaults, merge/removal durability,
   never-raise coercion, round-trips (23)
+- `app/tests/test_macros.py` — key-name vocabulary, macro compilation (one
+  `SendInput`, the `launch` seam, every malformed shape), config round-trip
+  and null tombstones, chords bound to macros, built-in shadowing, live
+  `update_config` re-resolution (16)
 - `emulator/tests/test_bridge.py::InterceptorSeamTests` — containment (a
   raising engine costs a counter, never the bridge), `push_setstate_body`
   signing and non-contamination of host state, the 0x08 power-off bytes (10)
