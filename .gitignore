@@ -19,6 +19,10 @@ build/
 dist/
 target/
 
+# Dashboard UI (app/dashboard-ui): deps only -- the built page,
+# app/ds5app/dashboard.html, IS committed (the tray serves it as-is).
+node_modules/
+
 # Editors
 .vscode/
 .idea/

@@ -62,8 +62,10 @@ from . import telemetry as TM
 
 log = logging.getLogger("ds5app.dashboard")
 
-#: The page, as one self-contained file next to this module (inline CSS/JS,
-#: no external resources -- nothing to fetch, nothing to leak to). Shipped as
+#: The page, as one self-contained file next to this module (inline CSS/JS/
+#: fonts, no external resources -- nothing to fetch, nothing to leak to).
+#: It is BUILT, not hand-edited: the source is the Vite/React project in
+#: app/dashboard-ui, and `npm run build` there writes this file. Shipped as
 #: a data file by app/packaging/ds5bridge.spec.
 PAGE_NAME = "dashboard.html"
 

@@ -93,7 +93,11 @@ class DashboardCase(unittest.TestCase):
         text = body.decode("utf-8")
         self.assertIn("ds5bridge", text)
         self.assertIn("api/stream", text)       # the page really is this page
-        self.assertIn('id="pad"', text)         # ... with the controller SVG
+        # ... and the built bundle, not a stray file: the mount point is the
+        # one static element (the controller SVG is rendered by React).
+        self.assertIn('data-app="ds5bridge-dashboard"', text)
+        # Zero-network rule: nothing may load from anywhere but this page.
+        self.assertNotRegex(text, r'(src|href)="https?://')
 
     def test_unknown_path_is_404(self):
         status, _, _ = self.request("GET", "/nope")
