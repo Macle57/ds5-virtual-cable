@@ -859,11 +859,27 @@ class SetStateCoalescingTests(unittest.TestCase):
         self.assertEqual(len(dev.writes), 1)
         self.assertEqual(self.be.stats["setstate_replayed"], 0)
 
-    def test_the_lightbar_fade_out_prime_is_off_by_default(self):
-        # It is wired up as the last once-per-connect candidate if a real pad
-        # still refuses to light its player LEDs, but the lightbar demonstrably
-        # already obeys us, so it stays off.
-        self.assertFalse(B.PRIME_LIGHTBAR_FADE_OUT)
+    def test_the_prime_unlocks_the_lightbar_and_paints_the_default(self):
+        # A Bluetooth pad ignores every lightbar colour until a host has sent
+        # the lightbar-setup control once (hardware, 2026-09-03), so the prime
+        # carries it -- gated by validFlag2 bit 1, the bit that actually works
+        # -- together with the default blue, in ONE report.
+        self.assertTrue(B.PRIME_LIGHTBAR_FADE_OUT)
+        dev = _FakeDev()
+        self.be._dev = dev
+        self.be._prime_setstate()
+        from ds5emu import translate as T
+        from ds5bridge import protocol as P
+        primed = T.bt31_output_body(dev.writes[0])
+        self.assertTrue(primed[P.VALID_FLAG2] & (1 << 1))
+        self.assertEqual(primed[P.LIGHTBAR_SETUP], P.LIGHTBAR_SETUP_LIGHT_OUT)
+        self.assertTrue(primed[P.VALID_FLAG1] & P.F1_LIGHTBAR_CONTROL)
+        self.assertEqual(tuple(primed[P.LED_R:P.LED_B + 1]), P.DEFAULT_LIGHTBAR)
+        # and still nothing the host owns: no rumble, triggers or player LEDs
+        self.assertFalse(primed[P.VALID_FLAG0] & (P.F0_COMPATIBLE_VIBRATION
+                                                  | P.F0_LEFT_TRIGGER_FFB
+                                                  | P.F0_RIGHT_TRIGGER_FFB))
+        self.assertFalse(primed[P.VALID_FLAG1] & P.F1_PLAYER_INDICATOR)
 
 
 @unittest.skipUnless(HAVE_DEPS, "numpy / PyAV / hidapi not available")
@@ -1247,9 +1263,12 @@ class InterceptorSeamTests(unittest.TestCase):
         self.be.power_off_pad()
         self.assertEqual(len(self.dev.h.feature_writes), 1)
         report = self.dev.h.feature_writes[0]
-        # id + the 63-byte payload: same framing the pad demands of 0x80.
+        # id + the 47-byte payload the pad's descriptor gives feature 0x08
+        # (TLOU's captured kill was 48 bytes); the 63 of 0x80 is refused by
+        # the HID stack and never reaches the pad -- measured 2026-09-03.
         self.assertEqual(report[0], B.FEATURE_BLUETOOTH_CONTROL)
-        self.assertEqual(len(report), 1 + B.FEATURE_TEST_PAYLOAD_LEN)
+        self.assertEqual(len(report), 1 + B.FEATURE_BLUETOOTH_CONTROL_LEN)
+        self.assertEqual(len(report), 48)
         payload = report[1:]
         # action 0x02 = drop the Bluetooth link -> the pad powers off
         # (docs/wired-gap-findings.md symptom 3, captured 2026-08-31).

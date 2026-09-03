@@ -209,11 +209,12 @@ def usb02_to_bt31(data: bytes, seq: int) -> bytes:
 # `ds5bridge.protocol`'s own constants cross-checked against Linux
 # `hid-playstation` and the tester's OutputPanel.
 
-#: `validFlag2` "lightbar setup": the tester uses bit 0, Linux hid-playstation
-#: uses bit 1, and nobody has settled it. Treat either as gating bytes 41/42 --
-#: over-gating is harmless here, because a gate only ever decides whether an
-#: older byte is *carried forward*, never whether it is applied.
-F2_LIGHTBAR_SETUP_EITHER = P.F2_LIGHTBAR_SETUP | (1 << 1)
+#: `validFlag2`: bit 1 gates the lightbar-setup byte (Linux hid-playstation,
+#: VERIFIED on hardware 2026-09-03), the tester uses bit 0 for ledBrightness.
+#: Treat either as gating bytes 41/42 -- over-gating is harmless here, because
+#: a gate only ever decides whether an older byte is *carried forward*, never
+#: whether it is applied.
+F2_LIGHTBAR_SETUP_EITHER = P.F2_LIGHTBAR_SETUP | P.F2_LED_BRIGHTNESS
 
 #: (valid-flag byte, bit mask, the body offsets that bit gates).
 FLAG_GATES = (
