@@ -1,22 +1,23 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   SlidersHorizontal, Keyboard, Grid3x3, Hand, MousePointer2, Lightbulb, BatteryWarning, Gamepad2,
-  RotateCcw, Save, Loader2,
+  RotateCcw, Save, Loader2, Wand2,
 } from "lucide-react";
 import { useStore } from "../../lib/store";
 import {
   BatterySection, ChordsSection, ControllersSection, GeneralSection, GenericInputSection,
-  GesturesSection, LightbarSection, RemoteSection, ShortcutsSection,
+  GesturesSection, LightbarSection, MacrosSection, RemoteSection, ShortcutsSection,
 } from "./sections";
 
-type Tab = "general" | "shortcuts" | "chords" | "gestures" | "remote" | "lightbar" | "battery" | "controllers";
+type Tab = "general" | "shortcuts" | "chords" | "gestures" | "macros" | "remote" | "lightbar" | "battery" | "controllers";
 
 const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "general", label: "General", icon: <SlidersHorizontal size={16} /> },
   { id: "shortcuts", label: "Shortcuts", icon: <Keyboard size={16} /> },
   { id: "chords", label: "Chords", icon: <Grid3x3 size={16} /> },
   { id: "gestures", label: "Gestures", icon: <Hand size={16} /> },
+  { id: "macros", label: "Macros", icon: <Wand2 size={16} /> },
   { id: "remote", label: "Remote mode", icon: <MousePointer2 size={16} /> },
   { id: "lightbar", label: "Lightbar", icon: <Lightbulb size={16} /> },
   { id: "battery", label: "Battery", icon: <BatteryWarning size={16} /> },
@@ -33,7 +34,10 @@ export default function SettingsPanel() {
   const loading = useStore((s) => s.loading);
   const loadConfig = useStore((s) => s.loadConfig);
   const saveConfig = useStore((s) => s.saveConfig);
-  const [tab, setTab] = useState<Tab>("general");
+  // The tab lives in the store so a picker's "New macro…" can jump here.
+  const tabRaw = useStore((s) => s.settingsTab);
+  const setTab = useStore((s) => s.setSettingsTab);
+  const tab: Tab = TABS.some((t) => t.id === tabRaw) ? (tabRaw as Tab) : "general";
   const ref = useRef<HTMLElement>(null);
 
   useEffect(() => { ref.current?.scrollIntoView({ behavior: "smooth", block: "start" }); }, []);
@@ -45,6 +49,7 @@ export default function SettingsPanel() {
       case "shortcuts": return <ShortcutsSection actions={actions} />;
       case "chords": return <ChordsSection actions={actions} />;
       case "gestures": return <GesturesSection actions={actions} />;
+      case "macros": return <MacrosSection actions={actions} />;
       case "remote": return <RemoteSection />;
       case "lightbar": return <LightbarSection />;
       case "battery": return <BatterySection />;

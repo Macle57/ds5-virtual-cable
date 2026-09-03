@@ -173,6 +173,20 @@ class DashboardCase(unittest.TestCase):
         self.assertEqual(cc.label, "sofa")
         self.assertFalse(cc.enabled)
 
+    def test_macros_round_trip_and_delete_through_the_api(self):
+        self.post_config({"input": {"macros": {
+            "tm": {"keys": ["ctrl", "shift", "esc"], "label": "Task Manager"},
+            "notes": {"run": "notepad.exe"}}}})
+        self.assertEqual(set(K.load().input.macros), {"tm", "notes"})
+        doc = self.get_json("/api/config")["config"]
+        self.assertEqual(doc["input"]["macros"]["tm"]["label"], "Task Manager")
+        # A merge cannot express removal, so the page sends a tombstone.
+        status, body, _ = self.post_config({"input": {"macros": {"tm": None}}})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(set(K.load().input.macros), {"notes"})
+        doc = self.get_json("/api/config")["config"]
+        self.assertNotIn("tm", doc["input"]["macros"])
+
     def test_unknown_sections_survive_the_round_trip(self):
         """Forward compatibility: the section a newer build writes.
 
@@ -249,6 +263,10 @@ class DashboardCase(unittest.TestCase):
         self.assertEqual(doc["chord_keys"], list(K.CHORD_BUTTONS))
         self.assertEqual(doc["gesture_keys"], list(K.CHORD_GESTURES))
         self.assertEqual(doc["defaults"]["chords"], dict(K.DEFAULT_CHORDS))
+        # The macro editor's key vocabulary is the engine's, in its order.
+        from ds5app import actions as ACT
+        self.assertEqual(doc["macro_keys"], list(ACT.KEY_NAMES))
+        self.assertEqual(doc["macro_keys"][:4], ["ctrl", "shift", "alt", "win"])
         # Every default chord must resolve inside the served vocabulary, or
         # the page would show "(unknown)" rows on a fresh install.
         vocab = set(names) | {"pad_power_off"}

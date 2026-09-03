@@ -62,7 +62,7 @@ export const CTRL_FIELDS: [string, string, "bool" | "number" | "string" | "choic
 ];
 export const KNOWN_GLOBAL = new Set([...GLOBAL_FIELDS.map((f) => f[0]), "controllers", "input"]);
 export const KNOWN_CTRL = new Set(CTRL_FIELDS.map((f) => f[0]));
-export const KNOWN_INPUT = new Set(["enabled", "chord_button", "chords", "actions",
+export const KNOWN_INPUT = new Set(["enabled", "chord_button", "chords", "actions", "macros",
   "double_press_ms", "tap_replay_ms", "repeat_ms", "haptic_ack", "haptic_strength",
   "stick_mouse_in_chord", "off_timer_minutes", "battery", "lightbar", "remote"]);
 export const KNOWN_REMOTE = new Set(["enabled", "mouse_speed", "scroll_speed", "lightbar_color"]);

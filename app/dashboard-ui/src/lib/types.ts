@@ -70,6 +70,8 @@ export interface ActionsMeta {
   chord_buttons: string[];
   chord_keys: string[];
   gesture_keys: string[];
+  macro_keys?: string[];          // the key vocabulary a user macro may use
+  engine_actions?: { name: string; doc: string }[];   // pad power / lightbar
   defaults: { chords: Record<string, string> };
 }
 

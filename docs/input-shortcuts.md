@@ -70,6 +70,7 @@ chords.
 | input (with PS held) | action | notes |
 |---|---|---|
 | Triangle | `pad_power_off` | feature 0x08 — same as holding PS on a console |
+| *(unbound by default)* | `pad_lightbar_toggle` | lightbar off until the next press; outranks dim and the remote-mode colour, but a battery flash still shows; the engine turning off or the session ending brings it back |
 | Cross | `media_play_pause` | |
 | Square | `volume_mute` | |
 | Dpad up / down | `volume_up` / `volume_down` | repeats while held |
@@ -161,6 +162,11 @@ excluded (gyro noise never sleeps; a pad face-down on the couch must idle).
               "lightbar_color": [255, 120, 0] }
 }
 ```
+
+Two action names are the engine's own rather than OS actions
+(`config.ENGINE_ACTIONS`, served as `engine_actions` by `/api/actions`):
+`pad_power_off` and `pad_lightbar_toggle`. Both act on the pad through the
+bridge, never on the desktop.
 
 `chords` entries MERGE over the defaults — name one to change one; map a key
 to `"none"` to remove it (removals are written back as `"none"` so they

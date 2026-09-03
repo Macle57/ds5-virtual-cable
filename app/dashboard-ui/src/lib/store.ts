@@ -16,6 +16,8 @@ interface Store {
   /* settings */
   settingsOpen: boolean;
   toggleSettings: (open?: boolean) => void;
+  settingsTab: string;
+  setSettingsTab: (tab: string) => void;   // also opens the panel
   cfg: ConfigDoc | null;                     // the working copy the form binds to
   cfgPath: string;
   actions: ActionsMeta | null;
@@ -70,6 +72,8 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   settingsOpen: false,
+  settingsTab: "general",
+  setSettingsTab: (tab) => { set({ settingsTab: tab }); get().toggleSettings(true); },
   toggleSettings: (open) => {
     const next = open ?? !get().settingsOpen;
     set({ settingsOpen: next });

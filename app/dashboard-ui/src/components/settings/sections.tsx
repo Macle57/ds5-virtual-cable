@@ -10,6 +10,8 @@ import {
 import { Card, ColorField, JsonField, NumberField, RangeField, Row, SelectField, TextField, Toggle } from "./controls";
 import GenericRows from "./GenericRows";
 import ButtonGlyph from "./ButtonGlyph";
+import ActionPickerUI from "./ActionPicker";
+export { MacrosSection } from "./MacrosSection";
 
 const useCfg = () => useStore((s) => s.cfg as ConfigDoc);
 const asObj = (v: unknown): Record<string, Json> =>
@@ -67,24 +69,16 @@ export function ShortcutsSection({ actions }: { actions: ActionsMeta }) {
    next load). */
 function ActionPicker({ chordKey, actions }: { chordKey: string; actions: ActionsMeta }) {
   const bound = useStore((s) => getPath(s.cfg, ["input", "chords", chordKey]));
+  const macros = useStore((s) => getPath(s.cfg, ["input", "macros"]));
   const patch = useStore((s) => s.patchConfig);
   const current = typeof bound === "string" && bound.trim() ? bound.trim().toLowerCase() : "none";
-  const options = [
-    { value: "none", label: "(none)" },
-    { value: "pad_power_off", label: "pad_power_off — power the pad off" },
-    ...actions.actions.map((a) => ({ value: a.name, label: a.name + " — " + a.doc })),
-  ];
-  if (!options.some((o) => o.value === current))
-    options.push({ value: current, label: current + " — (unknown to this build; kept)" });
   return (
-    <select className="field" value={current}
-            onChange={(e) => patch((cfg) => {
-              const inp = asObj(cfg.input); cfg.input = inp;
-              const chords = asObj(inp.chords); inp.chords = chords;
-              chords[chordKey] = e.target.value;
-            })}>
-      {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-    </select>
+    <ActionPickerUI value={current} meta={actions} macros={macros}
+                    onChange={(name) => patch((cfg) => {
+                      const inp = asObj(cfg.input); cfg.input = inp;
+                      const chords = asObj(inp.chords); inp.chords = chords;
+                      chords[chordKey] = name;
+                    })} />
   );
 }
 

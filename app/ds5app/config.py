@@ -360,7 +360,15 @@ class RemoteMode:
         return out
 
 
-_INPUT_KNOWN = ("enabled", "chord_button", "chords", "actions",
+#: Actions the ENGINE owns -- they act on the pad, not the OS -- so they are
+#: not in `actions.OsActions.registry()`. A chord names them like any other
+#: action; /api/actions serves them as `engine_actions`.
+ENGINE_ACTIONS = {
+    "pad_power_off": "power the pad off",
+    "pad_lightbar_toggle": "lightbar off; press again to bring it back",
+}
+
+_INPUT_KNOWN = ("enabled", "chord_button", "chords", "actions", "macros",
                 "double_press_ms", "tap_replay_ms", "repeat_ms",
                 "haptic_ack", "haptic_strength", "stick_mouse_in_chord",
                 "off_timer_minutes",
@@ -382,6 +390,11 @@ class InputConfig:
     #: Per-action parameter overrides, keyed by action name, e.g.
     #: {"volume_up": {"step": 2}}. Passed verbatim to the action registry.
     actions: dict = field(default_factory=dict)
+    #: User-defined actions, keyed by the name a chord binds to:
+    #: {"task_manager": {"keys": ["ctrl", "shift", "esc"], "label": "..."}}
+    #: or {"notes": {"run": "notepad.exe"}}. Stored as written; the engine
+    #: compiles them (`actions.OsActions.macro_spec`) and skips bad ones.
+    macros: dict = field(default_factory=dict)
     #: Two chord-button presses within this window toggle remote mode.
     double_press_ms: int = 400
     #: How long the replayed chord-button tap is held down for the game.
@@ -448,6 +461,24 @@ class InputConfig:
                 ic.chords[key] = name
         acts = data.get("actions")
         ic.actions = dict(acts) if isinstance(acts, dict) else {}
+        macros = data.get("macros")
+        if macros is not None and not isinstance(macros, dict):
+            log.warning("'input.macros' is %s, not an object -- ignored",
+                        type(macros).__name__)
+            macros = None
+        for name, macro in (macros or {}).items():
+            name = str(name).strip().lower()
+            if not name:
+                continue
+            if macro is None:
+                # The settings page's tombstone: a POST deep-merges onto the
+                # file, so "delete this macro" arrives as {"name": null}.
+                continue
+            if not isinstance(macro, dict):
+                log.warning("macro %r is %s, not an object -- dropped",
+                            name, type(macro).__name__)
+                continue
+            ic.macros[name] = dict(macro)
         ic.extra = {k: v for k, v in data.items() if k not in _INPUT_KNOWN}
         return ic
 
@@ -465,6 +496,7 @@ class InputConfig:
                    chord_button=self.chord_button,
                    chords={k: chords[k] for k in sorted(chords)},
                    actions=dict(self.actions),
+                   macros={k: dict(self.macros[k]) for k in sorted(self.macros)},
                    double_press_ms=int(self.double_press_ms),
                    tap_replay_ms=int(self.tap_replay_ms),
                    repeat_ms=int(self.repeat_ms),

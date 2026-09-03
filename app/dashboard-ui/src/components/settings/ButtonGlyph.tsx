@@ -1,7 +1,7 @@
 /* A 28px icon for each key in the config's chord/gesture vocabulary, in the
    face-button colour where it has one. Falls back to a labelled pill. */
-export default function ButtonGlyph({ name }: { name: string }) {
-  const s = 30;
+export default function ButtonGlyph({ name, size = 30 }: { name: string; size?: number }) {
+  const s = size;
   const wrap = (child: React.ReactNode, color = "var(--color-ink-2)") => (
     <svg width={s} height={s} viewBox="-15 -15 30 30" fill="none" stroke={color} strokeWidth={2.2}
          strokeLinejoin="round" strokeLinecap="round" style={{ filter: `drop-shadow(0 0 5px ${color})` }} aria-hidden>

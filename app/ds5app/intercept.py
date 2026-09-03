@@ -266,7 +266,6 @@ class InputInterceptor:
         self.clock = clock
         self._dispatcher = _Dispatcher() if dispatch is None else None
         self.dispatch = dispatch or self._dispatcher
-        self.registry = actions.registry()
 
         self._adopt_cfg(cfg)
 
@@ -329,13 +328,17 @@ class InputInterceptor:
         self._next_flash_at = 0.0
         self._started_at: float | None = None
         self._dim_engaged = False
+        #: PS+<chord> "pad_lightbar_toggle": the LED is held dark until the
+        #: next toggle. Runtime state, never persisted -- a fresh session
+        #: starts lit, like the pad itself.
+        self._lightbar_off = False
         self._last_activity: float | None = None
         self._idle_fired = False
 
         self.stats = {"chords_fired": 0, "chord_repeats": 0,
                       "gestures_fired": 0, "taps_replayed": 0,
                       "remote_toggles": 0, "battery_flashes": 0,
-                      "idle_power_off": 0}
+                      "idle_power_off": 0, "lightbar_toggles": 0}
 
     def _adopt_cfg(self, cfg: K.InputConfig) -> None:
         """Every field derived from the config, recomputed as one unit.
@@ -357,6 +360,20 @@ class InputInterceptor:
         #: startling. `haptic_ack` stays the on/off switch.
         self._ack_rumble = max(0, min(0xFF,
                                       round(cfg.haptic_strength * 255 / 100)))
+        #: What a chord name resolves to: the built-ins, then the user's
+        #: macros. A macro may not shadow a built-in -- "volume_up" must mean
+        #: the same thing in every config -- and a malformed one is skipped
+        #: by `macro_spec` with a log line, never fatal.
+        registry = self.actions.registry()
+        for name, macro in cfg.macros.items():
+            if name in registry:
+                log.warning("macro %r shadows a built-in action -- ignored",
+                            name)
+                continue
+            spec = self.actions.macro_spec(name, macro)
+            if spec is not None:
+                registry[name] = spec
+        self.registry = registry
 
     def update_config(self, new_cfg: K.InputConfig) -> None:
         """Adopt a changed config on a RUNNING engine, no bridge restart.
@@ -423,13 +440,19 @@ class InputInterceptor:
                 self._pending_tap_at = None
                 self._replay_until = 0.0
             if disabled:
-                # A dimmed lightbar must not outlive the policy that dimmed
-                # it; queue the game's own colour back before going quiet.
-                if self._dim_engaged and self._game_lightbar is not None:
-                    self._fx.append((now,
-                                     self._lightbar_body(self._game_lightbar)))
+                # A dimmed or held-off lightbar must not outlive the engine
+                # that did it; queue the game's own colour back before going
+                # quiet.
+                restore = None
+                if self._lightbar_off:
+                    restore = self._game_lightbar or P.DEFAULT_LIGHTBAR
+                elif self._dim_engaged and self._game_lightbar is not None:
+                    restore = self._game_lightbar
+                if restore is not None:
+                    self._fx.append((now, self._lightbar_body(restore)))
                     self._fx.sort(key=lambda e: e[0])
                 self._dim_engaged = False
+                self._lightbar_off = False
             if not was_enabled and not disabled:
                 # Re-enabled: a fresh session. The idle clock in particular
                 # must restart from the next report -- `_last_activity` froze
@@ -571,7 +594,8 @@ class InputInterceptor:
                         and now >= self._flash_until):
                     self._rm_lightbar_next = now + REMOTE_LIGHTBAR_REASSERT_S
                     due.append(self._lightbar_body(
-                        tuple(self.cfg.remote.lightbar_color)))
+                        self._effective_lightbar(now)
+                        or tuple(self.cfg.remote.lightbar_color)))
                 # battery flash
                 if self._battery_flash_due(now):
                     due.extend(self._queue_flash_locked(now))
@@ -667,11 +691,11 @@ class InputInterceptor:
         if not name:
             return False
         self._chord_used = True
-        if name == "pad_power_off":
+        if name in K.ENGINE_ACTIONS:
             if first:
                 self.stats["chords_fired"] += 1
                 self._ack_locked(now)
-                thunks.append(self.power_off)
+                self._engine_action(name, now, thunks)
             return True
         spec = self.registry.get(name)
         if spec is None:
@@ -774,8 +798,8 @@ class InputInterceptor:
         name = self.cfg.chords.get(key)
         if not name:
             return False
-        if name == "pad_power_off":
-            thunks.append(self.power_off)
+        if name in K.ENGINE_ACTIONS:
+            self._engine_action(name, now, thunks)
             return True
         spec = self.registry.get(name)
         if spec is None:
@@ -796,6 +820,23 @@ class InputInterceptor:
         self._g2_active = False
         self._g2_decided = None
 
+    def _engine_action(self, name: str, now: float, thunks: list) -> None:
+        """The actions that act on the PAD rather than the OS (see
+        `config.ENGINE_ACTIONS`). Called under the engine lock. Power-off is
+        deferred to the thunk list (it talks to the bridge); the lightbar
+        toggle only queues bytes, so it needs no thunk."""
+        if name == "pad_power_off":
+            thunks.append(self.power_off)
+        elif name == "pad_lightbar_toggle":
+            self._lightbar_off = not self._lightbar_off
+            self.stats["lightbar_toggles"] += 1
+            # Show it NOW, host traffic or not: dark, or whatever the policy
+            # stack says the pad should be showing again.
+            rgb = (self._effective_lightbar(now)
+                   or self._game_lightbar or P.DEFAULT_LIGHTBAR)
+            self._fx.append((now, self._lightbar_body(rgb)))
+            self._fx.sort(key=lambda e: e[0])
+
     # =====================================================================
     # remote mode
     # =====================================================================
@@ -808,7 +849,8 @@ class InputInterceptor:
         if self.remote_mode:
             # Distinct feedback: double pulse + the remote lightbar colour.
             self._queue_pulse(now, count=2)
-            self._fx.append((now, self._lightbar_body(tuple(rm.lightbar_color))))
+            self._fx.append((now, self._lightbar_body(
+                self._effective_lightbar(now) or tuple(rm.lightbar_color))))
             self._rm_lightbar_next = now + REMOTE_LIGHTBAR_REASSERT_S
         else:
             self._queue_pulse(now, count=1)
@@ -1078,10 +1120,12 @@ class InputInterceptor:
     def _effective_lightbar(self, now: float,
                             ignore_remote: bool = False):
         """What the pad's lightbar should show right now, or None for 'whatever
-        the game says'. Priority: battery flash > remote colour > dimmed game
-        colour > None."""
+        the game says'. Priority: battery flash > held off > remote colour >
+        dimmed game colour > None."""
         if now < self._flash_until:
             return self._flash_color
+        if self._lightbar_off:
+            return (0, 0, 0)
         if self.remote_mode and not ignore_remote:
             return tuple(self.cfg.remote.lightbar_color)
         if self._dim_engaged and self._game_lightbar is not None:
