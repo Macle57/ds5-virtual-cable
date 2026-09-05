@@ -586,7 +586,7 @@ installer, `pnputil`, `schtasks /Create`, or the tray.
 ### What changed
 
 * **Hides are verified, not assumed.** `hidhide.py` reads
-  `DEVPKEY_Device_Stack` ({3AB22E31-...}, pid 14) through
+  `DEVPKEY_Device_Stack` ({540B947E-8B40-45BC-A8A2-6A0B894CBDA2}, pid 14) through
   `CM_Get_DevNode_PropertyW` (`device_stack`, `filter_attached`,
   `filter_covers`: an entry counts as covered when `\Driver\HidHide` is in
   its own stack or in its parent's -- the BTHENUM HIDClass node is where the

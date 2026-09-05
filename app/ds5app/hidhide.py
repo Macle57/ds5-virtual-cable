@@ -1170,11 +1170,15 @@ def _pnputil_restart(instance_id: str) -> tuple[int, str]:
 # same call that revives a phantom child -- and on the machine where everything
 # is fine the whole thing costs one property read per hide.
 
-#: {3ab22e31-8264-4b4e-9af5-a8d2d8e33e62}, 14 -- DEVPKEY_Device_Stack, the
+#: {540b947e-8b40-45bc-a8a2-6a0b894cbda2}, 14 -- DEVPKEY_Device_Stack, the
 #: driver objects in a devnode's stack, top first. DEVPROP_TYPE_STRING_LIST.
+#: (Not {3ab22e31-...}: that GUID is the DEVPKEY_PciDevice_* set, and asking
+#: it for pid 14 answers CR_NO_SUCH_VALUE on every devnode -- measured
+#: 2026-09-06, the reason the first 0.5.0 build reported every hide as
+#: "unknown".)
 DEVPKEY_Device_Stack = _DEVPROPKEY(
-    _guid(0x3AB22E31, 0x8264, 0x4B4E,
-          0x9A, 0xF5, 0xA8, 0xD2, 0xD8, 0xE3, 0x3E, 0x62), 14)
+    _guid(0x540B947E, 0x8B40, 0x45BC,
+          0xA8, 0xA2, 0x6A, 0x0B, 0x89, 0x4C, 0xBD, 0xA2), 14)
 
 #: The driver object name HidHide's filter shows up under. Compared casefolded.
 HIDHIDE_DRIVER_OBJECT = r"\Driver\HidHide"
