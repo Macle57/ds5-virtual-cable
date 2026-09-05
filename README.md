@@ -96,50 +96,75 @@ problems. The emulator now hands out 1 ms service intervals itself.
 - **Windows 10 x64 (1903+) or Windows 11.**
 - **A DualSense controller** paired over Bluetooth. (A second one, wired, is
   only needed if you want to reproduce the development measurements.)
-- **[usbip-win2](https://github.com/vadimgrn/usbip-win2) 0.9.7.7 or later.**
+- **[usbip-win2](https://github.com/vadimgrn/usbip-win2) 0.9.7.7**, exactly.
   Its drivers are **signed by Microsoft** — no test-signing, no unsigned-driver
-  mode, no BIOS changes. Install it from its own releases page.
+  mode, no BIOS changes. The installer below puts it there, after creating a
+  System Restore point as usbip-win2's own README asks (it installs two kernel
+  drivers and restarts every USB 3.0 hub on the machine while it does).
   **Do not install 0.9.7.8**; its own maintainer warns it can corrupt memory.
+- **[HidHide](https://github.com/nefarius/HidHide) 1.5.230**, optional: only
+  the "hide the Bluetooth pad while bridged" feature needs it. The installer
+  includes it; it needs one reboot before it does anything.
 - **Python 3.12+** if you are running from source.
-
-**Create a system restore point before installing usbip-win2.** Its own README
-says so and so do we: it installs two kernel drivers and restarts every USB 3.0
-hub on the machine while it does.
 
 ## Getting it running
 
-Two ways.
+Three ways. The first is the one to use unless you have a reason not to.
 
-**The easy way** — one line, in PowerShell:
+**1. The installer (recommended).** Download
+**`ds5bridge-setup-<version>-bundled.exe`** from the
+[latest release](../../releases/latest) and run it. Everything is inside the
+file — the app, usbip-win2 0.9.7.7 and HidHide 1.5.230 — so nothing is
+downloaded during the install and it works offline. A checkbox per component,
+a System Restore point before the driver goes in, an *Installation check* page
+at the end, and an entry in Settings → Apps whose uninstaller takes the
+drivers back out. `ds5bridge-setup-<version>.exe` (without `-bundled`) is the
+same installer fetching the two driver packages from their vendors' release
+pages during the install, SHA-256-checked: 34 MB less to download, otherwise
+identical. Silent switches, the uninstaller's options and everything else are
+in [`docs/installer.md`](docs/installer.md).
+
+Nothing is code-signed yet, so Windows shows **"Windows protected your PC"**
+the first time: *More info → Run anyway*. The two driver packages inside are
+signed by their own publishers; SmartScreen is reacting to the installer and
+the app, not to the drivers. That warning stays until the project has a
+code-signing certificate.
+
+**2. One line of PowerShell** — the same steps as the installer, scripted, for
+people who would rather read what runs:
 
 ```powershell
 irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1 | iex
 ```
 
-That does the whole list above in one pass: creates the restore point, installs
-the pinned usbip-win2 **0.9.7.7** silently (SHA-256-verified, never 0.9.7.8),
-installs HidHide (optional — it only powers "hide the Bluetooth pad while
-bridged", and a failure there is a warning, not a stop), then puts the latest
-ds5bridge release in `%LOCALAPPDATA%\ds5bridge`, checksum-verified, with a
-Start Menu shortcut and the tray running at the end. Re-running it is safe —
-every step checks whether its work is already done. To see the full plan
-without changing anything:
+That creates the restore point, installs the pinned usbip-win2 **0.9.7.7**
+silently (SHA-256-verified, never 0.9.7.8), installs HidHide (a failure there
+is a warning, not a stop), then puts the latest ds5bridge release in
+`%LOCALAPPDATA%\ds5bridge`, checksum-verified, with a Start Menu shortcut and
+the tray running at the end. Re-running it is safe — every step checks whether
+its work is already done. To see the full plan without changing anything:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1))) -DryRun
 ```
 
-The tray bridges every controller that is switched on, picks up ones you turn
-on later, and can start itself when you log in — so after setup the routine is
-"turn the controller on, start the game". A tray menu switches any controller
-(or all of them) back to plain Bluetooth when you would rather a game used the
-native stack. It also checks GitHub once a day for a newer release and offers
-it as a menu item — one click updates in place, checksum-verified again
-(`update_check: false` in the config turns the check off). Step-by-step
-instructions, options and the uninstaller live in the user guide
-(`docs/USER-GUIDE.md`).
+Either way, the tray bridges every controller that is switched on, picks up
+ones you turn on later, and can start itself when you log in — so after setup
+the routine is "turn the controller on, start the game". A tray menu switches
+any controller (or all of them) back to plain Bluetooth when you would rather
+a game used the native stack. It also checks GitHub once a day for a newer
+release and offers it as a menu item — one click updates in place,
+checksum-verified again (`update_check: false` in the config turns the check
+off). Step-by-step instructions, options and the uninstaller live in the user
+guide (`docs/USER-GUIDE.md`).
 
-**From source:**
+**Uninstalling:** Settings → Apps → *ds5bridge*, or the uninstall one-liner in
+the user guide. Both remove the drivers too unless told to keep them.
+usbip-win2's driver cannot be unloaded while Windows is running, so its
+removal finishes at your next logon: **uninstall → reboot → reboot again
+before any reinstall**. Why, and what to expect, is in `docs/installer.md`.
+
+**3. From source:**
 
 ```powershell
 git clone <this repo>
@@ -289,6 +314,7 @@ twice. Read the battery level, charge it, try again.
 | | |
 |---|---|
 | `docs/USER-GUIDE.md` | how to install and use it, for people who just want it to work |
+| `docs/installer.md` | the setup exe and its uninstaller: every checkbox, the silent switches, the reboot sequence |
 | `docs/STATUS.md` | the full engineering history: what is verified, what is not, every trap |
 | `docs/e2e-results.md` | the end-to-end results, with numbers and with the defects found |
 | `docs/FINDINGS.md` | the reverse-engineered Bluetooth protocol |

@@ -20,6 +20,12 @@
 > with evidence, and the remaining matrix. Sections above are the state as
 > of the evening before; Known bugs #1, #2 and #6 are addressed there.
 
+> **2026-09-05, later:** everything below is committed (the "uncommitted"
+> table is history). `build-installer.ps1 -Bundle` now fetches the vendor
+> installers itself and names the result `-bundled.exe`, so the output-name
+> caveat in C-18 is gone; `.github/workflows/release.yml` builds both flavours
+> with Inno Setup 6.7.3 pinned. Nothing in "Still unproven" has changed.
+
 Companion to `docs/installer.md` (the user-facing description). This file is
 the engineering state: what exists, what was proven, what was not, what broke
 on the test machine and how to recover it after the reboot.

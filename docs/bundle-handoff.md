@@ -1,5 +1,12 @@
 # Bundling usbip-win2 + HidHide into one ds5bridge installer — handoff
 
+> **Retired (2026-09-05).** This was a parallel attempt; the shipping
+> installer is `app/packaging/ds5bridge.iss`, and its bundled build is
+> `build-installer.ps1 -Bundle` (see `docs/installer.md`). What survives from
+> here: §1's licence findings, `THIRD-PARTY-NOTICES.txt`, and the sequencing
+> rules of §4. `ds5bridge-bundle.iss` and `build-bundle.ps1` are reference
+> only and are not built or tested any more.
+
 *bundle-agent, 2026-09-04. Session ended by a machine reboot mid-test; this is
 the state of the work, the evidence, and what to do next.*
 

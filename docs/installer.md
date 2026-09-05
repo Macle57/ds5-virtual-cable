@@ -1,18 +1,30 @@
 # ds5bridge-setup.exe — the Windows installer and uninstaller
 
-`ds5bridge-setup-<version>.exe` is an Inno Setup installer that does what
-`scripts/install.ps1` does, as a wizard with a checkbox per step, and ships an
-uninstaller (registered in Settings → Apps) that takes the drivers back out
-too. The PowerShell scripts keep working and do the same things; use
+`ds5bridge-setup-<version>-bundled.exe` is an Inno Setup installer that does
+what `scripts/install.ps1` does, as a wizard with a checkbox per step, and
+ships an uninstaller (registered in Settings → Apps) that takes the drivers
+back out too. The PowerShell scripts keep working and do the same things; use
 whichever you prefer.
+
+Every release carries two builds of it:
+
+| file | the two driver packages | when |
+|---|---|---|
+| **`ds5bridge-setup-<version>-bundled.exe`** | carried inside the exe, unmodified and byte-for-byte as their authors published them (~73 MB) | **Recommended.** Nothing is downloaded during the install; works offline; one file to keep. |
+| `ds5bridge-setup-<version>.exe` | downloaded from the vendors' own release pages during the install (~39 MB) | If you would rather the driver bytes came straight from their publishers, or want the smaller download. |
+
+Everything below applies to both. The only visible difference is one line in
+the setup log — `Extracting temporary file: ...USBip-0.9.7.7-x64.exe` versus
+`Downloading temporary file` — and the bundled build's copy of the vendors'
+licence notices (`THIRD-PARTY-NOTICES.txt`, next to the uninstaller).
 
 ## What it installs
 
 | checkbox | default | what happens |
 |---|---|---|
 | **ds5bridge app** | always | Copied from inside the exe to `%LOCALAPPDATA%\ds5bridge\app` (the layout the in-app updater owns). Start Menu shortcut. Cannot be unticked: this installer always installs ds5bridge. |
-| **usbip-win2 0.9.7.7** | on | The virtual-USB driver the bridge needs. **Downloaded** at install time from its GitHub release, SHA-256 checked against the pinned hash, then run silently. Exactly 0.9.7.7 — its maintainer warns 0.9.7.8 corrupts memory. Your USB 3.0 hubs restart briefly while it installs. |
-| **HidHide 1.5.230** | on | Optional; only the "hide the Bluetooth pad while bridged" feature needs it. Downloaded and hash-checked the same way. Its filter driver activates after the next **reboot**; the installer says so and never reboots on its own. |
+| **usbip-win2 0.9.7.7** | on | The virtual-USB driver the bridge needs. Its own installer — extracted from the exe, or downloaded from its GitHub release — is SHA-256 checked against the pinned hash, then run silently. Exactly 0.9.7.7 — its maintainer warns 0.9.7.8 corrupts memory. Your USB 3.0 hubs restart briefly while it installs. |
+| **HidHide 1.5.230** | on | Optional; only the "hide the Bluetooth pad while bridged" feature needs it. Extracted or downloaded, and hash-checked, the same way. Its filter driver activates after the next **reboot**; the installer says so and never reboots on its own. |
 | *task:* restore point | on | A System Restore point before the driver goes in (usbip-win2's README asks for one). Only offered when usbip-win2 is selected; only made when it is actually about to be installed. |
 | *task:* start at login | off | The same HKCU Run entry the tray's own menu switch writes. |
 
@@ -36,15 +48,15 @@ goes on. It also repairs one specific piece of damage if it finds it: a
 service behind it (what an interrupted HidHide install/uninstall leaves), which
 otherwise kills every keyboard, mouse and pad from the next boot.
 
-**Why the app is embedded but the drivers are downloaded.** The app is our
-own code and is the thing being installed, so it is inside the exe. The two
-driver packages are third-party signed kernel drivers that this project does
-not redistribute (see `NOTICE`); the installer fetches each from its pinned
-URL and refuses to run anything whose SHA-256 does not match the hash baked
-into the installer — the same URLs and hashes `scripts/install.ps1` uses. The
-script is structured so that a build can carry either file inside the exe
-instead (`build-installer.ps1 -BundleUsbip ... -BundleHidHide ...`); the hash
-check applies either way.
+**The hash check applies to both builds.** The two driver packages are
+third-party signed kernel drivers. The bundled build carries the vendors'
+official installers exactly as published (the build refuses to embed a file
+whose SHA-256 or Authenticode signature is wrong, and `NOTICE` and
+`THIRD-PARTY-NOTICES.txt` say so); the download build fetches each from its
+pinned URL. Either way, nothing runs until the file on disk has the SHA-256
+baked into the installer — the same URLs and hashes `scripts/install.ps1`
+uses. The app itself is always inside the exe: it is our own code and the
+thing being installed.
 
 **After installing** the wizard shows an *Installation check* page listing
 each verification it ran:
@@ -74,7 +86,7 @@ you name with `/LOG=`).
 ## Silent install
 
 ```
-ds5bridge-setup-0.4.0.exe /SILENT /NORESTART /LOG="%TEMP%\ds5bridge-install.log"
+ds5bridge-setup-0.4.0-bundled.exe /SILENT /NORESTART /LOG="%TEMP%\ds5bridge-install.log"
 ```
 
 Standard Inno Setup switches apply. The ones that matter here:
@@ -189,10 +201,12 @@ the exe installer had made one.
 
 ## Things to know
 
-* **"Windows protected your PC".** Nothing here is code-signed — not the
-  setup exe, not the app. SmartScreen shows that dialog the first time it
-  sees the file; *More info → Run anyway* if you trust where you got it. The
-  two driver packages it downloads are signed by their own publishers
+* **"Windows protected your PC".** Nothing here is code-signed — not either
+  setup exe, not the app — and that will stay so until the project has a
+  code-signing certificate. SmartScreen shows that dialog the first time it
+  sees the file; *More info → Run anyway* if you trust where you got it (the
+  release page's `SHA256SUMS` lists the hash of every file, which is the way
+  to check). The two driver packages are signed by their own publishers
   (usbip-win2 with an EV certificate, HidHide by Nefarius) and Windows loads
   their kernel drivers without test-signing or Secure Boot changes.
 * **Administrator rights** are needed for the drivers, so the installer and
@@ -226,14 +240,19 @@ the exe installer had made one.
 ## Building it
 
 ```
-powershell -File app\packaging\build-installer.ps1              # builds dist\ds5bridge first if missing
+powershell -File app\packaging\build-installer.ps1              # download build; builds dist\ds5bridge first if missing
+powershell -File app\packaging\build-installer.ps1 -Bundle      # bundled build (fetches + verifies the vendor installers once)
 powershell -File app\packaging\build-installer.ps1 -Rebuild     # PyInstaller clean build first
 ```
 
-Needs Inno Setup 6.7 or newer (`winget install --id JRSoftware.InnoSetup
---exact --scope user`) and the PyInstaller venv `build.ps1` uses. Output:
-`dist\ds5bridge-setup-<version>.exe`, version taken from
-`app/ds5app/__init__.py`. Files involved:
+Needs Inno Setup **6.7.3** (`winget install --id JRSoftware.InnoSetup --exact
+--scope user --version 6.7.3` — the version the installer was verified with;
+7.x has not been tried) and the PyInstaller venv `build.ps1` uses. Output:
+`dist\ds5bridge-setup-<version>.exe` or `dist\ds5bridge-setup-<version>-bundled.exe`
+(`-OutputDir` to put it elsewhere), version taken from `app/ds5app/__init__.py`.
+Builds are deterministic. `.github/workflows/release.yml` runs exactly these
+two commands on a tag and publishes both exes, the zip and `SHA256SUMS`.
+Files involved:
 
 | file | role |
 |---|---|
@@ -241,16 +260,12 @@ Needs Inno Setup 6.7 or newer (`winget install --id JRSoftware.InnoSetup
 | `app/packaging/setup-helper.ps1` | the worker both halves call for everything that reads or changes machine state (services, devnodes, HidHide lists, the vendors' uninstallers); one `KIND|label|detail` line per fact |
 | `app/packaging/build-installer.ps1` | builds the app if needed, compiles the script, prints the result's SHA-256 |
 
-To carry the driver installers inside the exe instead of downloading them,
-pass `-BundleUsbip <USBip-0.9.7.7-x64.exe> -BundleHidHide <HidHide_1.5.230_x64.exe>`;
-the build refuses a file whose SHA-256 is not the pinned one, and the result
-also installs `app/packaging/bundle/THIRD-PARTY-NOTICES.txt` next to the
-uninstaller (the BSD-2 notice obligation; `NOTICE` describes the bundled
-build too). Such a build behaves exactly like the download one except that
-its log shows `Extracting temporary file: ...USBip-0.9.7.7-x64.exe` /
-`...HidHide_1.5.230_x64.exe` instead of `Downloading temporary file` (the
-SHA-256 check runs either way). Note that `build-installer.ps1` always
-writes `dist\ds5bridge-setup-<version>.exe`: move a bundled build aside (for
-example to `dist\bundle\ds5bridge-setup-<version>-bundled.exe`) before
-building the download flavour again. `docs/bundle-handoff.md` has the
-licence findings.
+`-Bundle` downloads `USBip-0.9.7.7-x64.exe` and `HidHide_1.5.230_x64.exe`
+into `app/packaging/bundle/vendor/` (git-ignored; skipped when they are
+already there with the right hash), refuses either unless its SHA-256 is the
+pinned one and its Authenticode signature is valid, and embeds both;
+`-BundleUsbip <file> -BundleHidHide <file>` does the same from files you
+already have. The result also installs `app/packaging/bundle/THIRD-PARTY-NOTICES.txt`
+next to the uninstaller (the BSD-2 notice obligation; `NOTICE` describes the
+bundled build too) and gets the `-bundled` name, so the two flavours can sit
+side by side in `dist\`. `docs/bundle-handoff.md` has the licence findings.
