@@ -1,26 +1,46 @@
 # Release pipeline: push a tag `vX.Y.Z`, get a GitHub release carrying the
-# one-dir build as a zip, a SHA256SUMS file, and the install scripts.
+# one-dir build as a zip, the two setup exes, a SHA256SUMS file, and the
+# install scripts.
 #
 # The contract with the rest of the system, spelled out because three
 # consumers depend on it exactly:
 #
 #   * The tag MUST equal `v` + ds5app.__version__ (app/ds5app/__init__.py --
-#     the single source of truth; cli.py and the updater both read it). The
-#     first job fails the release on a mismatch, because a v0.5.0 release
-#     containing an exe that says 0.4.0 would make every installed copy offer
-#     itself its own "update" forever.
+#     the single source of truth; cli.py, the updater and build-installer.ps1
+#     all read it). The first job fails the release on a mismatch, because a
+#     v0.5.0 release containing an exe that says 0.4.0 would make every
+#     installed copy offer itself its own "update" forever.
 #   * The zip is named  ds5bridge-<version>-win-x64.zip  and contains one
 #     top-level `ds5bridge/` folder. app/ds5app/update.py matches that name
 #     with an anchored regex and looks for the folder when it stages; the
 #     installer's regex in scripts/install.ps1 matches the same name.
-#   * SHA256SUMS is `sha256sum` format ("<hex>  <name>"), one line per asset.
-#     Both the installer and the in-app updater refuse a download that does
-#     not match it -- publishing a release without it downgrades them to
-#     size-only checks, so it is generated here, not by hand.
+#   * The setup exes are  ds5bridge-setup-<version>-bundled.exe  (the
+#     recommended one: usbip-win2 and HidHide carried inside, no download at
+#     install time) and  ds5bridge-setup-<version>.exe  (the same installer,
+#     fetching the two driver packages from their vendors' release pages).
+#     Nothing consumes them programmatically: install.ps1 and the in-app
+#     updater use the zip, and their asset regexes cannot match an exe. Both
+#     are built by app/packaging/build-installer.ps1, which chooses those
+#     names (ds5bridge.iss's OutputName define) -- the names here are only
+#     checked, never invented.
+#   * SHA256SUMS is `sha256sum` format ("<hex>  <name>"), one line per asset,
+#     covering the zip and both exes. The installer and the in-app updater
+#     refuse a zip that does not match it -- publishing a release without it
+#     downgrades them to size-only checks, so it is generated here, not by
+#     hand. The exe lines are for people: nothing is code-signed (see
+#     docs/installer.md), so the published hash is the only thing a
+#     download can be checked against.
 #
 # Why one-dir and not one-file: measured in docs/STATUS.md section 18 (startup
 # cost and AV false-positive shape). The zip of the one-dir folder is both the
 # thing the installer unpacks and the thing the auto-updater swaps in.
+#
+# Why Inno Setup is pinned to 6.7.3 and fetched from its own GitHub release
+# rather than `choco install innosetup`: the installer was verified with
+# 6.7.3 (docs/installer-handoff.md), Chocolatey tracks the latest major
+# (7.x now), and a compiler upgrade in the middle of a release is not a
+# thing to discover on the release page. The hash is the one in winget's
+# manifest for JRSoftware.InnoSetup 6.7.3 and was re-measured on 2026-09-05.
 
 name: release
 
@@ -82,24 +102,10 @@ jobs:
       - name: Build (one-dir, via the same script developers use)
         run: powershell -File app\packaging\build.ps1
 
-      - name: Package and checksum
-        run: |
-          $ver = '${{ steps.version.outputs.version }}'
-          $zip = "ds5bridge-$ver-win-x64.zip"
-          # Compress the folder itself so the zip carries a top-level
-          # ds5bridge/ directory -- the layout update.py's staging expects.
-          Compress-Archive -Path dist\ds5bridge -DestinationPath "dist\$zip"
-          Push-Location dist
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          # sha256sum format, two spaces: what update.py's parser and plain
-          # `sha256sum -c` both read.
-          "$hash  $zip" | Out-File SHA256SUMS -Encoding ascii
-          Get-Content SHA256SUMS
-          Pop-Location
-
       # The smoke test that catches a broken bundle before users do: the
       # frozen exe must at least start and answer --version with the version
-      # this release claims to be.
+      # this release claims to be. Before the installers are built, because
+      # build-installer.ps1 embeds exactly this folder.
       - name: Frozen exe answers --version
         run: |
           $ver = '${{ steps.version.outputs.version }}'
@@ -109,6 +115,92 @@ jobs:
             throw "the built exe reports '$out', expected it to contain '$ver'"
           }
 
+      - name: Install Inno Setup 6.7.3 (pinned, SHA-256 checked)
+        run: |
+          $url = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+          $sha = '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
+          $exe = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+          $got = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $sha) { throw "innosetup-6.7.3.exe: SHA-256 $got, expected $sha -- not installing it" }
+          $p = Start-Process -FilePath $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/ALLUSERS' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the Inno Setup installer exited with $($p.ExitCode)" }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe is not at $iscc after the install" }
+          "ISCC: $iscc"
+
+      # Same script, twice: download mode into dist\, then the bundled
+      # flavour into dist\bundle\ (-Bundle fetches the two vendor installers
+      # from their pinned URLs and refuses to embed either unless its SHA-256
+      # matches the pin and its Authenticode signature is valid).
+      - name: Build the setup exes (download mode, then bundled)
+        run: |
+          powershell -File app\packaging\build-installer.ps1
+          if ($LASTEXITCODE -ne 0) { throw "download-mode installer build failed ($LASTEXITCODE)" }
+          powershell -File app\packaging\build-installer.ps1 -Bundle -OutputDir dist\bundle
+          if ($LASTEXITCODE -ne 0) { throw "bundled installer build failed ($LASTEXITCODE)" }
+
+      # Cheap checks that the two exes are what their names say. Neither is
+      # run: installing kernel drivers on the runner would prove nothing
+      # about a user's machine, and the install paths were verified by hand
+      # (docs/installer-handoff.md).
+      - name: Setup exes exist and the bundled one carries the drivers
+        run: |
+          $ver = '${{ steps.version.outputs.version }}'
+          $plain   = Get-Item "dist\ds5bridge-setup-$ver.exe"
+          $bundled = Get-Item "dist\bundle\ds5bridge-setup-$ver-bundled.exe"
+          "download mode: $($plain.Length) bytes; bundled: $($bundled.Length) bytes"
+          # The two vendor installers are 33 MB + 8 MB; LZMA squeezes them to
+          # a ~34 MiB difference (measured 2026-09-05: 38.7 vs 72.9 MiB). A
+          # bundled exe not at least 30 MiB bigger did not embed them.
+          if ($bundled.Length - $plain.Length -lt 30MB) {
+            throw 'the bundled exe is not ~34 MiB larger than the download-mode one -- the vendor installers are missing from it'
+          }
+
+      - name: Package and checksum
+        run: |
+          $ver = '${{ steps.version.outputs.version }}'
+          $zip = "ds5bridge-$ver-win-x64.zip"
+          # Compress the folder itself so the zip carries a top-level
+          # ds5bridge/ directory -- the layout update.py's staging expects.
+          Compress-Archive -Path dist\ds5bridge -DestinationPath "dist\$zip"
+          # Every asset side by side, so SHA256SUMS names them as the release
+          # page will (bare file names, no directories).
+          Move-Item "dist\bundle\ds5bridge-setup-$ver-bundled.exe" dist\
+          Push-Location dist
+          $assets = @($zip, "ds5bridge-setup-$ver-bundled.exe", "ds5bridge-setup-$ver.exe")
+          # sha256sum format, two spaces: what update.py's parser and plain
+          # `sha256sum -c` both read.
+          $lines = foreach ($a in $assets) {
+            $hash = (Get-FileHash $a -Algorithm SHA256).Hash.ToLower()
+            "$hash  $a"
+          }
+          $lines | Out-File SHA256SUMS -Encoding ascii
+          Get-Content SHA256SUMS
+          Pop-Location
+
+      # A single-quoted here-string (no expansion: markdown backticks would
+      # otherwise be PowerShell escapes), with the version substituted after.
+      - name: Write the release notes header
+        run: |
+          $ver = '${{ steps.version.outputs.version }}'
+          $notes = @'
+          ## Which file?
+
+          | file | what it is |
+          |---|---|
+          | `ds5bridge-setup-VERSION-bundled.exe` | **Recommended.** The installer with usbip-win2 0.9.7.7 and HidHide 1.5.230 carried inside it: nothing is downloaded during the install. |
+          | `ds5bridge-setup-VERSION.exe` | The same installer, fetching the two driver packages from their vendors' release pages during the install (SHA-256 checked). Smaller download. |
+          | `ds5bridge-VERSION-win-x64.zip` | The app alone, for a manual install or for `scripts/install.ps1`; also what the in-app updater downloads. |
+          | `SHA256SUMS` | Hashes of the three files above. Nothing here is code-signed, so this is how to check a download. |
+          | `install.ps1` / `uninstall.ps1` | The one-line PowerShell install and uninstall (see the user guide). |
+
+          Nothing is code-signed yet: Windows SmartScreen shows "Windows protected your PC" on first run (*More info* > *Run anyway*). Uninstalling removes the drivers in two halves around a reboot; **reboot twice before reinstalling** (docs/installer.md).
+
+          '@
+          $notes.Replace('VERSION', $ver) | Out-File dist
+otes.md -Encoding utf8
+
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -117,10 +209,13 @@ jobs:
           # The install scripts ride along on every release so the one-paste
           # command's raw URL and the release page always agree.
           gh release create '${{ github.ref_name }}' `
+            "dist/ds5bridge-setup-$ver-bundled.exe" `
+            "dist/ds5bridge-setup-$ver.exe" `
             "dist/ds5bridge-$ver-win-x64.zip" `
             "dist/SHA256SUMS" `
             "scripts/install.ps1" `
             "scripts/uninstall.ps1" `
             --title "ds5bridge $ver" `
+            --notes-file dist/notes.md `
             --generate-notes `
             --verify-tag
