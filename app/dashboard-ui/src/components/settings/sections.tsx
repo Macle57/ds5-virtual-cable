@@ -177,8 +177,9 @@ export function RemoteBindingsSection({ actions }: { actions: ActionsMeta }) {
               <div>
                 <b style={{ color }}>No chord button in remote mode.</b> Nothing reaches the game while remote mode is on, so
                 each button or gesture below fires its action <b className="text-ink">directly, on its own</b> — no button held
-                first. A binding here overrides that button's built-in remote job (Cross clicks, d-pad arrows, Circle is Esc,
-                Options is Enter); a row left unbound keeps it.
+                first. This table is the whole truth: the defaults spell out the classic remote map (Cross clicks, d-pad
+                arrows, Circle is Esc, Options is Enter), so a row set to <b className="text-ink">none</b> makes that button do
+                nothing in remote mode. Only the touchpad and stick pointer controls are fixed.
               </div>
             </div>
             <div className="grid gap-3 pb-2 pt-1 sm:grid-cols-2 xl:grid-cols-3">
