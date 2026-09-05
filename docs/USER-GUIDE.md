@@ -31,6 +31,12 @@ You do **not** need to turn on test signing, disable Secure Boot, or reboot.
 
 ## Install — one line
 
+**Prefer a setup wizard?** Download `ds5bridge-setup-<version>.exe` from the
+releases page and run it: the same steps as below, with a checkbox for each,
+a verification page at the end, and an entry in Settings → Apps whose
+uninstaller also removes the drivers. Details, silent switches and the
+uninstall options are in [docs/installer.md](installer.md).
+
 Open **PowerShell** (Start menu, type "powershell", Enter) and paste:
 
 ```powershell
@@ -418,15 +424,30 @@ irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/uni
 ```
 
 It quits the tray, detaches the virtual pad, un-hides anything HidHide was
-hiding, and removes the app, its shortcut and its start-at-login entry. Your
-settings in `%APPDATA%\ds5bridge` are kept (add `-PurgeSettings` via the
-scriptblock form above to remove them too).
+hiding, removes the app, its shortcut and its start-at-login entry — and then
+**removes the two drivers too**, verifying each removal. The exception: a
+driver that was already on the machine before `ds5bridge-setup.exe` installed
+ds5bridge is kept (the setup exe remembers which was which; the script says
+"kept: it was already installed before ..." and `-RemoveUsbip` /
+`-RemoveHidHide` override that). Add `-KeepUsbip` and/or `-KeepHidHide` (via
+the scriptblock form above) if other software uses them: DS4Windows also
+uses HidHide, and usbip-win2 may be your own tool. (`usbipd` for WSL is a
+different product entirely and is never touched.) HidHide asks for a reboot
+to finish unloading its filter driver. usbip-win2 is removed in two halves:
+its driver cannot be unloaded while Windows is running (it would freeze Plug
+and Play and blue-screen the next shutdown), so the script disables it, asks
+you to **reboot**, and a one-shot task finishes the removal at your next
+logon (USB devices blink once; "USBip" stays in Settings → Apps until then
+— expected). Nothing reboots on its own. It asks for administrator rights
+once, for the drivers, and refuses to start while another installer is
+running.
 
-The two drivers are **left installed, on purpose** — other software may use
-them (DS4Windows also uses HidHide, and `usbipd` for WSL is a different product
-entirely). The script prints exactly how to remove each one if you decide to:
-usbip-win2 via Settings → Apps → **USBip**, HidHide via
-`winget uninstall Nefarius.HidHide` (it asks for a reboot).
+Your settings in `%APPDATA%\ds5bridge` are kept (add `-PurgeSettings` to
+remove them too).
+
+If you installed with `ds5bridge-setup.exe`, Settings → Apps → **ds5bridge** →
+Uninstall does the same with checkboxes for the two drivers and the settings
+— see [docs/installer.md](installer.md).
 
 ---
 

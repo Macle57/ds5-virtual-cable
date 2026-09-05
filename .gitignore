@@ -8,6 +8,8 @@ prototype/.venv/
 .mypy_cache/
 .ruff_cache/
 
+README-human.md
+
 # Claude Code agent worktrees
 .claude/worktrees/
 
@@ -37,3 +39,6 @@ node_modules/
 # Emulator run artefacts
 stats*.json
 ds5*_stats.json
+
+# Bundle installer: pinned vendor installers are downloaded at build time
+app/packaging/bundle/vendor/
