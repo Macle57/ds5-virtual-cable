@@ -39,7 +39,8 @@ app/               the product layer: what a person actually runs
                     the measurements that chose processes over threads.
     config.py       %APPDATA% settings. load() must never raise -- it runs at
                     login, before there is anywhere to show an error.
-    autostart.py    the HKCU Run key
+    autostart.py    the start-at-login scheduled task (RunLevel Highest: the
+                    tray is elevated, and the Run key cannot start that)
     cli.py          ds5bridge
     tray.py         the tray icon, built once over callables
   tests/            158 unit tests, all against fakes

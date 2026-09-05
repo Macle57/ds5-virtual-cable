@@ -104,67 +104,68 @@ problems. The emulator now hands out 1 ms service intervals itself.
   **Do not install 0.9.7.8**; its own maintainer warns it can corrupt memory.
 - **[HidHide](https://github.com/nefarius/HidHide) 1.5.230**, optional: only
   the "hide the Bluetooth pad while bridged" feature needs it. The installer
-  includes it; it needs one reboot before it does anything.
+  includes it and attaches it to your connected controllers on the spot, so
+  it normally needs no reboot.
 - **Python 3.12+** if you are running from source.
 
 ## Getting it running
 
-Three ways. The first is the one to use unless you have a reason not to.
+One install, two ways to start it, plus source.
 
-**1. The installer (recommended).** Download
-**`ds5bridge-setup-<version>-bundled.exe`** from the
-[latest release](../../releases/latest) and run it. Everything is inside the
-file — the app, usbip-win2 0.9.7.7 and HidHide 1.5.230 — so nothing is
-downloaded during the install and it works offline. A checkbox per component,
-a System Restore point before the driver goes in, an *Installation check* page
-at the end, and an entry in Settings → Apps whose uninstaller takes the
-drivers back out. `ds5bridge-setup-<version>.exe` (without `-bundled`) is the
-same installer fetching the two driver packages from their vendors' release
-pages during the install, SHA-256-checked: 34 MB less to download, otherwise
-identical. Silent switches, the uninstaller's options and everything else are
-in [`docs/installer.md`](docs/installer.md).
+**The installer.** Download **`ds5bridge-setup-<version>-bundled.exe`** from
+the [latest release](../../releases/latest) and run it — that is the whole
+install. Everything is inside the file: the app, usbip-win2 0.9.7.7 and
+HidHide 1.5.230, so nothing is downloaded during the install and it works
+offline. A checkbox per component, a System Restore point before the driver
+goes in, an *Installation check* page at the end (which also proves HidHide's
+filter is really attached to each connected pad), and an entry in Settings →
+Apps whose uninstaller takes the drivers back out. Silent switches, the
+uninstaller's options and everything else are in
+[`docs/installer.md`](docs/installer.md).
 
-Nothing is code-signed yet, so Windows shows **"Windows protected your PC"**
-the first time: *More info → Run anyway*. The two driver packages inside are
-signed by their own publishers; SmartScreen is reacting to the installer and
-the app, not to the drivers. That warning stays until the project has a
-code-signing certificate.
-
-**2. One line of PowerShell** — the same steps as the installer, scripted, for
-people who would rather read what runs:
+Or fetch and run the same file from PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1 | iex
 ```
 
-That creates the restore point, installs the pinned usbip-win2 **0.9.7.7**
-silently (SHA-256-verified, never 0.9.7.8), installs HidHide (a failure there
-is a warning, not a stop), then puts the latest ds5bridge release in
-`%LOCALAPPDATA%\ds5bridge`, checksum-verified, with a Start Menu shortcut and
-the tray running at the end. Re-running it is safe — every step checks whether
-its work is already done. To see the full plan without changing anything:
+That looks up the latest release, downloads its installer, checks it against
+the release's `SHA256SUMS`, and runs it (interactively; `-Silent`,
+`-NoHidHide`, `-Autostart` and friends via the scriptblock form below). To
+see what it would do without changing anything:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1))) -DryRun
 ```
 
-Either way, the tray bridges every controller that is switched on, picks up
-ones you turn on later, and can start itself when you log in — so after setup
-the routine is "turn the controller on, start the game". A tray menu switches
-any controller (or all of them) back to plain Bluetooth when you would rather
-a game used the native stack. It also checks GitHub once a day for a newer
-release and offers it as a menu item — one click updates in place,
-checksum-verified again (`update_check: false` in the config turns the check
-off). Step-by-step instructions, options and the uninstaller live in the user
-guide (`docs/USER-GUIDE.md`).
+Nothing is code-signed yet, so Windows shows **"Windows protected your PC"**
+the first time: *More info → Run anyway*. The two driver packages inside are
+signed by their own publishers; SmartScreen is reacting to the installer and
+the app, not to the drivers. That warning stays until the project has a
+code-signing certificate. **The tray runs as administrator** (it has to be
+able to restart a controller's device node — that is what makes hiding and
+unhiding reliable), so starting it by hand is one UAC prompt; "Start at login"
+uses a scheduled task and shows none.
+
+After that, the tray bridges every controller that is switched on, picks up
+ones you turn on later, and can start itself when you log in — so the routine
+is "turn the controller on, start the game". A tray menu switches any
+controller (or all of them) back to plain Bluetooth when you would rather a
+game used the native stack. It also checks GitHub once a day for a newer
+release and offers it as a menu item — one click downloads the new installer,
+checks it against `SHA256SUMS`, and runs it silently (`update_check: false`
+in the config turns the check off). Step-by-step instructions, options and
+the uninstaller live in the user guide (`docs/USER-GUIDE.md`).
 
 **Uninstalling:** Settings → Apps → *ds5bridge*, or the uninstall one-liner in
-the user guide. Both remove the drivers too unless told to keep them.
-usbip-win2's driver cannot be unloaded while Windows is running, so its
-removal finishes at your next logon: **uninstall → reboot → reboot again
-before any reinstall**. Why, and what to expect, is in `docs/installer.md`.
+the user guide (which runs that same uninstaller). Both remove the drivers too
+unless told to keep them, and both end by telling you, unmistakably, that
+**one restart** finishes the job — usbip-win2's driver cannot be unloaded
+while Windows is running, so its removal finishes at your next logon:
+**uninstall → reboot → reboot again before any reinstall**. Why, and what to
+expect, is in `docs/installer.md`.
 
-**3. From source:**
+**From source:**
 
 ```powershell
 git clone <this repo>
