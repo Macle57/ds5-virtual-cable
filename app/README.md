@@ -72,7 +72,8 @@ npm run build                    # type-check + write ..\ds5app\dashboard.html
 For a feed without a pad: `python -m ds5app.dashboard --fake --port 8799`
 from `app\`. The page keeps two query flags the tests and screenshots rely
 on -- `?snap` polls `/api/state` instead of holding the SSE stream, and
-`?settings` opens the settings panel on load. `build.ps1` rebuilds the page
+`?settings` opens the settings panel on load (`?settings=chords` opens a
+specific tab). `build.ps1` rebuilds the page
 before PyInstaller when `dashboard-ui\node_modules` is present, and otherwise
 packages the committed file.
 
