@@ -223,6 +223,7 @@ class TelemetryPublisher:
         self._t: threading.Thread | None = None
         self._sock: socket.socket | None = None
         self._last_sent: bytes | None = None
+        self._last_modes: tuple | None = None
         self._last_sent_at = 0.0
         #: (perf_counter, input_delivered) for the rate differencer -- the same
         #: trick `BridgeService.snapshot()` uses, for the same reason: O(1).
@@ -268,12 +269,29 @@ class TelemetryPublisher:
             self._rate_prev = (now, n)
         return self._rate_hz
 
+    def _modes(self) -> tuple:
+        """(remote_mode, keyboard_open) from the chord engine hanging on the
+        backend, or (False, False) when there is none. Two attribute reads;
+        the engine keeps both as plain booleans for exactly this."""
+        icept = getattr(self.backend, "interceptor", None)
+        if icept is None:
+            return (False, False)
+        try:
+            return (bool(getattr(icept, "remote_mode", False)),
+                    bool(getattr(icept, "keyboard_open", False)))
+        except Exception:  # noqa: BLE001
+            return (False, False)
+
     def _tick(self) -> None:
         be = self.backend
         report = be.latest_input_report(64)
         now = time.monotonic()
         due = now - self._last_sent_at >= KEEPALIVE_S
-        if report == self._last_sent and not due:
+        modes = self._modes()
+        # A mode flip is a change worth a datagram even with the pad still:
+        # the dashboard's badge must follow the double-press, not the next
+        # keepalive.
+        if report == self._last_sent and modes == self._last_modes and not due:
             return
         try:
             status = be.device_status()
@@ -286,6 +304,8 @@ class TelemetryPublisher:
             "connected": bool(status.get("connected")),
             "stale_s": status.get("stale_s"),
             "rps": round(self._rate(), 1),
+            "remote_mode": modes[0],
+            "keyboard_open": modes[1],
             "t": time.time(),
         }
         try:
@@ -293,6 +313,7 @@ class TelemetryPublisher:
                               self.addr)
             self.sent += 1
             self._last_sent = report
+            self._last_modes = modes
             self._last_sent_at = now
         except OSError as e:
             # Nobody listening (WSAECONNRESET on loopback), or the socket is
@@ -364,8 +385,9 @@ class TelemetryHub:
         """{serial: entry} for every controller heard from within `max_age` s.
 
         Each entry: {"decoded": <decode_report dict or None>, "connected",
-        "stale_s", "rps", "t", "age_s"}. The raw report bytes are NOT kept
-        past decoding -- nothing downstream re-parses them.
+        "stale_s", "rps", "remote_mode", "keyboard_open", "t", "age_s"}. The
+        raw report bytes are NOT kept past decoding -- nothing downstream
+        re-parses them.
         """
         now = time.monotonic()
         out = {}
@@ -404,6 +426,10 @@ class TelemetryHub:
             "connected": bool(msg.get("connected")),
             "stale_s": msg.get("stale_s"),
             "rps": msg.get("rps") or 0.0,
+            # the chord engine's two modes, booleans; absent in a datagram
+            # from an older bridge, which reads as "off"
+            "remote_mode": bool(msg.get("remote_mode", False)),
+            "keyboard_open": bool(msg.get("keyboard_open", False)),
             "t": msg.get("t"),
         }
         with self._lock:
