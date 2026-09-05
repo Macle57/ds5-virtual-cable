@@ -16,7 +16,9 @@ export const HELP: Record<string, string> = {
   remote_enabled: "Double-press the chord button to toggle remote mode: the game is handed a neutral pad while the pad drives the OS. Touchpad drags move the pointer (tap = click, two-finger tap = right click, two-finger horizontal slide = alt-tab), Cross clicks and holds to drag, the left stick moves the pointer, the right stick and triggers scroll, the d-pad is arrow keys, Circle is Esc, Options is Enter. The lightbar holds the colour below while it is on.",
   mouse_speed: "Pointer speed multiplier for touchpad drags and the left stick in remote mode.",
   scroll_speed: "Scroll speed multiplier for the right stick and the triggers in remote mode.",
-  remote_lightbar: "Lightbar colour while remote mode is on -- the visible cue that input is going to the OS, not the game.",
+  remote_lightbar: "Lightbar colour while remote mode is on -- the visible cue that input is going to the OS, not the game. The dashboard's REMOTE MODE badge wears the same colour.",
+  same_bindings: "On, remote mode reuses the chord table above: the same button or gesture fires the same action, just without the chord button held. Off, remote mode gets its own table (below), so a button can mean one thing while chording in a game and another while driving the desktop.",
+  remote_chords: "In remote mode nothing reaches the game, so there is no chord button to hold: a bound button or gesture fires its action directly, on its own. Buttons the remote map already uses for the pointer (Cross clicks, d-pad arrows, Circle is Esc, Options is Enter) are overridden by a binding here; leave a row unbound to keep the built-in remote behaviour.",
   dim_after_minutes: "Minutes of bridged play before the lightbar dims to save the pad's battery. 0 never dims (the default -- a lightbar going dark unasked reads as a fault). The game's colour is rewritten in flight, so the game's own idea of its lightbar stays untouched.",
   dim_level: "Brightness once dimmed: 0% is fully off, 100% is untouched. Applied as a multiplier on whatever colour the game asked for.",
   battery_enabled: "Flash the lightbar when the pad's battery runs low. The flash overlays the game's colour briefly; nothing the game set is lost.",
@@ -65,7 +67,7 @@ export const KNOWN_CTRL = new Set(CTRL_FIELDS.map((f) => f[0]));
 export const KNOWN_INPUT = new Set(["enabled", "chord_button", "chords", "actions", "macros",
   "double_press_ms", "tap_replay_ms", "repeat_ms", "haptic_ack", "haptic_strength",
   "stick_mouse_in_chord", "off_timer_minutes", "battery", "lightbar", "remote"]);
-export const KNOWN_REMOTE = new Set(["enabled", "mouse_speed", "scroll_speed", "lightbar_color"]);
+export const KNOWN_REMOTE = new Set(["enabled", "mouse_speed", "scroll_speed", "lightbar_color", "same_bindings", "chords"]);
 export const KNOWN_LIGHTBAR = new Set(["dim_after_minutes", "dim_level"]);
 export const KNOWN_BATTERY = new Set(["enabled", "low_percent", "critical_percent",
   "low_interval_s", "critical_interval_s", "low_color", "critical_color", "low_blinks", "critical_blinks"]);
