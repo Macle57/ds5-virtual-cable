@@ -276,7 +276,11 @@ class DashboardCase(unittest.TestCase):
         # defaults and the keys it accepts, next to the existing fields.
         self.assertEqual(doc["defaults"]["remote_chords"],
                          dict(K.DEFAULT_REMOTE_CHORDS))
-        self.assertEqual(doc["remote_keys"], list(K.CHORD_BUTTONS))
+        self.assertEqual(doc["remote_keys"],
+                         [b for b in K.CHORD_BUTTONS if b != "ps"]
+                         + list(K.CHORD_GESTURES))
+        for key in K.DEFAULT_REMOTE_CHORDS:
+            self.assertIn(key, doc["remote_keys"])
         for key, action in K.DEFAULT_REMOTE_CHORDS.items():
             self.assertIn(action, vocab, f"default remote {key} -> {action}")
         engine_names = [e["name"] for e in doc["engine_actions"]]
