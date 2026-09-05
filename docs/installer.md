@@ -1,22 +1,23 @@
 # ds5bridge-setup.exe — the Windows installer and uninstaller
 
-`ds5bridge-setup-<version>-bundled.exe` is an Inno Setup installer that does
-what `scripts/install.ps1` does, as a wizard with a checkbox per step, and
-ships an uninstaller (registered in Settings → Apps) that takes the drivers
-back out too. The PowerShell scripts keep working and do the same things; use
-whichever you prefer.
+`ds5bridge-setup-<version>-bundled.exe` is **the** install: an Inno Setup
+installer that carries the app and the two driver packages — usbip-win2
+0.9.7.7 and HidHide 1.5.230, unmodified and byte-for-byte as their authors
+published them (~73 MB in total) — with a checkbox per step, a verification
+page at the end, and an uninstaller (registered in Settings → Apps) that
+takes the drivers back out too. Nothing is downloaded during the install; it
+works offline; it is the one file on every release page (with its
+`SHA256SUMS`). `scripts/install.ps1` is a one-line bootstrapper around it
+(fetch, check the hash, run), and the app's own "Install update" menu item
+downloads and runs the same file silently.
 
-Every release carries two builds of it:
-
-| file | the two driver packages | when |
-|---|---|---|
-| **`ds5bridge-setup-<version>-bundled.exe`** | carried inside the exe, unmodified and byte-for-byte as their authors published them (~73 MB) | **Recommended.** Nothing is downloaded during the install; works offline; one file to keep. |
-| `ds5bridge-setup-<version>.exe` | downloaded from the vendors' own release pages during the install (~39 MB) | If you would rather the driver bytes came straight from their publishers, or want the smaller download. |
-
-Everything below applies to both. The only visible difference is one line in
-the setup log — `Extracting temporary file: ...USBip-0.9.7.7-x64.exe` versus
-`Downloading temporary file` — and the bundled build's copy of the vendors'
-licence notices (`THIRD-PARTY-NOTICES.txt`, next to the uninstaller).
+(A download-mode flavour, `ds5bridge-setup-<version>.exe`, which fetches the
+two driver packages from their vendors' release pages during the install, can
+still be built locally — `build-installer.ps1` without `-Bundle` — and behaves
+identically apart from one log line, `Downloading temporary file` instead of
+`Extracting temporary file: ...USBip-0.9.7.7-x64.exe`, and the absence of the
+vendors' licence notices `THIRD-PARTY-NOTICES.txt` next to the uninstaller.
+It is not published.)
 
 ## What it installs
 
@@ -24,9 +25,9 @@ licence notices (`THIRD-PARTY-NOTICES.txt`, next to the uninstaller).
 |---|---|---|
 | **ds5bridge app** | always | Copied from inside the exe to `%LOCALAPPDATA%\ds5bridge\app` (the layout the in-app updater owns). Start Menu shortcut. Cannot be unticked: this installer always installs ds5bridge. |
 | **usbip-win2 0.9.7.7** | on | The virtual-USB driver the bridge needs. Its own installer — extracted from the exe, or downloaded from its GitHub release — is SHA-256 checked against the pinned hash, then run silently. Exactly 0.9.7.7 — its maintainer warns 0.9.7.8 corrupts memory. Your USB 3.0 hubs restart briefly while it installs. |
-| **HidHide 1.5.230** | on | Optional; only the "hide the Bluetooth pad while bridged" feature needs it. Extracted or downloaded, and hash-checked, the same way. Its filter driver activates after the next **reboot**; the installer says so and never reboots on its own. |
+| **HidHide 1.5.230** | on | Optional; only the "hide the Bluetooth pad while bridged" feature needs it. Extracted and hash-checked the same way. Its class filter only joins a HID device's stack when that stack is built, so right after installing it the installer **restarts the device node of every connected Bluetooth DualSense** (only those — never a keyboard or mouse) and then reads each one's driver stack (`DEVPKEY_Device_Stack`) to prove `\Driver\HidHide` is in it: `[ok] HidHide filter -- attached to N DualSense device(s), no reboot needed`. Only a pad it could not fix gets a `[reboot]` line. The installer never reboots on its own. |
 | *task:* restore point | on | A System Restore point before the driver goes in (usbip-win2's README asks for one). Only offered when usbip-win2 is selected; only made when it is actually about to be installed. |
-| *task:* start at login | off | The same HKCU Run entry the tray's own menu switch writes. |
+| *task:* start at login | off | The scheduled task `ds5bridge` (Task Scheduler library root): at logon of the installing user only, *Run with highest privileges*, interactive token, no execution time limit, one instance, runs on battery — the same task the tray's own "Start at login" switch creates, and the only way to start an elevated program at logon without a prompt (an HKCU Run entry cannot; Windows skips it silently). |
 
 Every step is idempotent: if usbip-win2 0.9.7.7 or HidHide is already there,
 its box stays ticked but reads "already installed (will be verified, not
@@ -48,15 +49,14 @@ goes on. It also repairs one specific piece of damage if it finds it: a
 service behind it (what an interrupted HidHide install/uninstall leaves), which
 otherwise kills every keyboard, mouse and pad from the next boot.
 
-**The hash check applies to both builds.** The two driver packages are
-third-party signed kernel drivers. The bundled build carries the vendors'
-official installers exactly as published (the build refuses to embed a file
-whose SHA-256 or Authenticode signature is wrong, and `NOTICE` and
-`THIRD-PARTY-NOTICES.txt` say so); the download build fetches each from its
-pinned URL. Either way, nothing runs until the file on disk has the SHA-256
-baked into the installer — the same URLs and hashes `scripts/install.ps1`
-uses. The app itself is always inside the exe: it is our own code and the
-thing being installed.
+**The hash check.** The two driver packages are third-party signed kernel
+drivers. The bundled build carries the vendors' official installers exactly
+as published (the build refuses to embed a file whose SHA-256 or Authenticode
+signature is wrong, and `NOTICE` and `THIRD-PARTY-NOTICES.txt` say so); a
+download-mode build fetches each from its pinned URL. Either way, nothing
+runs until the file on disk has the SHA-256 baked into the installer. The
+app itself is always inside the exe: it is our own code and the thing being
+installed.
 
 **After installing** the wizard shows an *Installation check* page listing
 each verification it ran:
@@ -69,15 +69,29 @@ each verification it ran:
 [info] port 3240 -- in use by usbipd (pid 1234) -- that is usbipd-win (WSL USB passthrough); fine, ds5bridge uses 3241 and never touches it
 [ok] HidHideCLI.exe -- 1.5.230.0 (C:\Program Files\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe)
 [ok] service HidHide -- running
-[ok] ds5bridge.exe --version -- 0.4.0 (C:\Users\you\AppData\Local\ds5bridge\app\ds5bridge.exe)
+[ok] HidHide filter -- attached to 2 DualSense device(s), no reboot needed
+[ok] start-at-login -- scheduled task 'ds5bridge' registered (at logon of PC\you, highest privileges, no prompt)
+[ok] ds5bridge.exe --version -- 0.5.0 (C:\Users\you\AppData\Local\ds5bridge\app\ds5bridge.exe)
 [ok] ds5bridge-tray.exe -- present
 ```
 
-(When HidHide was installed in this run, an `[ok] HidHide installer -- ran
-(exit 0)` and a `[reboot] HidHide -- freshly installed; ...` line precede
-those: its service starts at once, but the filter only joins HID devices
-enumerated after it was registered, so a controller that is already paired
-needs the reboot before it can be hidden.)
+(When HidHide was installed in this run, `[ok] HidHide installer -- ran
+(exit 0)` and the result of the attach step precede those: its service starts
+at once, but the filter only joins HID devices whose stack is built after it
+was registered, so the installer restarts the connected DualSenses' device
+nodes and checks — `[ok] HidHide filter -- attached to N DualSense device(s),
+no reboot needed (restarted N device(s) to make it so)`, or `[info] HidHide
+filter -- no Bluetooth DualSense connected right now; HidHide joins a
+controller's device stack when it connects`, or, only when a pad still lacks
+the filter afterwards, `[reboot] HidHide -- its filter is not attached to 1
+of 2 connected DualSense device(s) ...`. The `start-at-login` line appears
+when that task was ticked.)
+
+The app checks the same thing every time it hides a pad (`hide_effective` /
+`hide_note` in the dashboard's `/api/state`, the `[filter]` block of
+`ds5bridge doctor`, and the tray balloon, which says "NOT hidden yet" instead
+of "hidden" when the filter is missing) and, running as administrator,
+restarts the device node itself before it bridges the pad.
 
 The same list is saved to `%LOCALAPPDATA%\ds5bridge\installer\last-install-check.txt`
 and written into the setup log (`%TEMP%\Setup Log <date>.txt`, or the file
@@ -86,22 +100,42 @@ you name with `/LOG=`).
 ## Silent install
 
 ```
-ds5bridge-setup-0.4.0-bundled.exe /SILENT /NORESTART /LOG="%TEMP%\ds5bridge-install.log"
+ds5bridge-setup-0.5.0-bundled.exe /SILENT /NORESTART /LOG="%TEMP%\ds5bridge-install.log"
 ```
 
 Standard Inno Setup switches apply. The ones that matter here:
 
 | switch | meaning |
 |---|---|
-| `/SILENT` or `/VERYSILENT` | no wizard (`/SILENT` still shows a progress bar) |
+| `/SILENT` or `/VERYSILENT` | no wizard (`/SILENT` still shows a progress bar). A silent install never starts the tray (see `/STARTTRAY`). |
 | `/NORESTART` | never reboot. **Always pass it in silent mode.** The installer itself never asks Windows to restart, but it is the safe habit with any Inno installer. |
 | `/VERYSILENT /SUPPRESSMSGBOXES` | fully unattended. With plain `/SILENT`, a refusal (another installer running, a usbip-win2 removal waiting for a reboot) is shown as a message box that waits for OK; with these two it goes to the log only (exit code 7). |
 | `/COMPONENTS="app,usbip"` | choose the checkboxes; names are `app`, `usbip`, `hidhide` (`app` is always installed, whatever the list says). Without the switch, Inno Setup reuses the selection of the previous run on that machine. |
 | `/TASKS="autostart"` / `/MERGETASKS="!restorepoint"` | tick / untick the two tasks (`restorepoint` is on by default, `autostart` off) |
+| `/STARTTRAY=1` | ds5bridge's own: start the tray at the end of a **silent** run (the installer is elevated, and so is the tray, so no prompt). What the in-app updater passes. Ignored in an interactive run, where the Finish page's checkbox decides. |
 | `/LOG="file"` | full log including every helper line |
 
 Exit code 0 means Setup finished; read `last-install-check.txt` (or grep the
 log for `[FAIL]`) to know whether every verification passed.
+
+The in-app updater runs exactly
+`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /COMPONENTS=app /MERGETASKS=!restorepoint /STARTTRAY=1 /LOG="%LOCALAPPDATA%\ds5bridge\updates\install-<ver>.log"`
+after downloading the release's installer and checking it against
+`SHA256SUMS` — so an update never installs a driver, never makes a restore
+point and never reboots, and a refusal (exit 7) relaunches the version that
+was already there. `/COMPONENTS=app` is remembered by Inno as the previous
+selection, so the next interactive run of the installer on that machine opens
+with the two driver boxes unticked; they read "already installed" anyway.
+
+`scripts/install.ps1` is the one-line way to get here: it downloads the
+release's `ds5bridge-setup-<version>-bundled.exe`, verifies it against the
+release's `SHA256SUMS` (a mismatch deletes the file; a `SHA256SUMS` that does
+not name the installer is a refusal, not a pass), and runs it — interactively
+by default, or with `-Silent` (→ `/SILENT /NORESTART /SUPPRESSMSGBOXES`),
+`-NoHidHide` / `-NoUsbip` (→ `/COMPONENTS=...`), `-NoRestorePoint` /
+`-Autostart` (→ `/MERGETASKS=...`), `-AppVersion v0.5.0` (a specific tag),
+`-Setup <local exe>` (a build you already have; no hash to check it against)
+and `-DryRun`. It never elevates itself; the installer does.
 
 ## Uninstall
 
@@ -112,14 +146,26 @@ Settings → Apps → **ds5bridge** → Uninstall, or run
   put it there, unticked if it was already on the machine (the box says
   which). Untick if something else on the machine uses it.
 * **Also remove HidHide** — same rule. Untick if DS4Windows or similar uses
-  it. (It asks for a reboot to finish unloading its filter driver.)
+  it. (Its filter driver unloads at the next reboot.)
 * **Delete my settings too** — off by default. `%APPDATA%\ds5bridge`
   (per-controller settings, labels, the hide journal).
 
-Before anything is deleted the uninstaller stops the tray, runs
-`ds5bridge cleanup` and `ds5bridge unhide`, stops usbip's auto-re-attach
-(`usbip attach -X`) and detaches every attached device, and removes
-ds5bridge's own entries from HidHide's whitelist and hide list. When HidHide
+Removing either driver needs **one restart** afterwards, and the uninstaller
+makes that unmistakable: its result dialog opens with a bold **"A RESTART IS
+REQUIRED to finish removing the drivers."** and a paragraph saying what the
+restart does (HidHide's filter unloads at boot; usbip-win2's disabled driver
+is taken out by the logon task — one reboot finishes both halves), and when
+you close that dialog Inno's own **"restart now?"** question follows
+(`UninstallNeedRestart`). Nothing restarts before you answer it. A silent
+uninstall (`/SILENT` or `/VERYSILENT`) never restarts and never asks — not
+even without `/NORESTART` — and reports the same facts as `[reboot]` lines in
+`%TEMP%\ds5bridge-uninstall-check.txt`.
+
+Before anything is deleted the uninstaller stops the tray, removes the
+start-at-login task (and a pre-0.5.0 Run value), runs `ds5bridge cleanup` and
+`ds5bridge unhide`, stops usbip's auto-re-attach (`usbip attach -X`) and
+detaches every attached device, and removes ds5bridge's own entries from
+HidHide's whitelist and hide list. When HidHide
 itself is being removed, its whole hide list is cleared and the cloak turned
 off first, so no device can be left invisible. Then the vendors' own
 uninstallers run silently, HidHide first
@@ -193,11 +239,12 @@ Silent:
 was adopted; keep wins when both are given; with neither, the recorded origin
 decides. The result list is saved to `%TEMP%\ds5bridge-uninstall-check.txt`.
 
-The PowerShell equivalent, for people who never used the exe, is
-`scripts/uninstall.ps1` with `-KeepUsbip`, `-KeepHidHide`, `-RemoveUsbip`,
-`-RemoveHidHide`, `-PurgeSettings` and `-DryRun`; it follows the same origin
-records and the same guards, and also cleans up the Settings → Apps entry if
-the exe installer had made one.
+`scripts/uninstall.ps1` takes the same choices as switches (`-KeepUsbip`,
+`-KeepHidHide`, `-RemoveUsbip`, `-RemoveHidHide`, `-PurgeSettings`, `-Silent`,
+`-DryRun`). When the exe's uninstaller is registered it simply runs that with
+the switches mapped onto the parameters above and prints its result list;
+only on a machine without one (an install that predates the exe) does it do
+the removal itself, following the same origin records and the same guards.
 
 ## Things to know
 
@@ -209,21 +256,32 @@ the exe installer had made one.
   to check). The two driver packages are signed by their own publishers
   (usbip-win2 with an EV certificate, HidHide by Nefarius) and Windows loads
   their kernel drivers without test-signing or Secure Boot changes.
-* **Administrator rights** are needed for the drivers, so the installer and
-  uninstaller elevate (one UAC prompt each). The app itself never runs
-  elevated: the "Start ds5bridge now" box on the last page launches it with
-  your ordinary token, and so does the shortcut.
-* **The app lives in your profile** (`%LOCALAPPDATA%\ds5bridge`), so that its
-  updater can replace it without asking for administrator rights. If you are
-  a standard user and elevate the installer with a *different*
-  administrator account, the app lands in that account's profile instead;
-  install from an administrator account, or use the zip.
-* **Reboot.** HidHide needs one to start hiding (after install) and to unload
-  (after uninstall). usbip-win2's removal always needs one (see above: its
-  driver is disabled first, removed at the next logon). The installer never
-  reboots for you. Until HidHide's reboot, a bridged controller is *not*
-  hidden even though the tray asks for it (the installer's `[reboot]` line
-  and the tray's own warning say so).
+* **Administrator rights.** The installer and uninstaller elevate (one UAC
+  prompt each) for the drivers. Since 0.5.0 **the tray runs as administrator
+  too** (`ds5bridge-tray.exe` carries a requireAdministrator manifest):
+  restarting a device node — the fix for both "unhide does not unhide" and
+  "hide does not hide on a fresh install" — cannot be done from an ordinary
+  token. Consequences: the "Start ds5bridge now" box launches it straight
+  from the elevated installer (no second prompt); the Start Menu shortcut and
+  a manual launch show one UAC prompt; start-at-login is a scheduled task with
+  highest privileges, so the logon start shows none; "Open dashboard" hands
+  the URL to `explorer.exe` so your browser does *not* inherit the token; and
+  the in-app updater runs the installer without a prompt of its own. The
+  console `ds5bridge.exe` (`doctor`, `unhide`, `run`) stays unelevated and
+  says so when a step needs more.
+* **The app lives in your profile** (`%LOCALAPPDATA%\ds5bridge`), the layout
+  the updater and the installer share. If you are a standard user and elevate
+  the installer with a *different* administrator account, the app — and the
+  start-at-login task — land in that account's profile instead; install from
+  an administrator account.
+* **Reboot.** After an install, usually none: the installer attaches HidHide's
+  filter to the connected controllers itself and the app does the same for a
+  pad it bridges (a pad that connects later gets the filter as its device
+  stack is built). A `[reboot]` line appears only when a connected pad still
+  lacks the filter after that, and the tray then says "NOT hidden yet" instead
+  of "hidden". After an uninstall that removed a driver, **one** reboot is
+  required (HidHide unloads at boot, usbip-win2's second half runs at the next
+  logon), and the uninstaller asks. Nothing ever reboots on its own.
 * **HidHide's leftover driver file.** HidHide's own uninstaller leaves
   `C:\Windows\System32\drivers\HidHide.sys` behind (in use until the reboot).
   The uninstaller reports it as `[info]` and deletes it once no HidHide
@@ -240,24 +298,24 @@ the exe installer had made one.
 ## Building it
 
 ```
-powershell -File app\packaging\build-installer.ps1              # download build; builds dist\ds5bridge first if missing
-powershell -File app\packaging\build-installer.ps1 -Bundle      # bundled build (fetches + verifies the vendor installers once)
+powershell -File app\packaging\build-installer.ps1 -Bundle      # THE release build (fetches + verifies the vendor installers once)
+powershell -File app\packaging\build-installer.ps1              # download-mode build, for local use; builds dist\ds5bridge first if missing
 powershell -File app\packaging\build-installer.ps1 -Rebuild     # PyInstaller clean build first
 ```
 
 Needs Inno Setup **6.7.3** (`winget install --id JRSoftware.InnoSetup --exact
 --scope user --version 6.7.3` — the version the installer was verified with;
 7.x has not been tried) and the PyInstaller venv `build.ps1` uses. Output:
-`dist\ds5bridge-setup-<version>.exe` or `dist\ds5bridge-setup-<version>-bundled.exe`
+`dist\ds5bridge-setup-<version>-bundled.exe` or `dist\ds5bridge-setup-<version>.exe`
 (`-OutputDir` to put it elsewhere), version taken from `app/ds5app/__init__.py`.
-Builds are deterministic. `.github/workflows/release.yml` runs exactly these
-two commands on a tag and publishes both exes, the zip and `SHA256SUMS`.
-Files involved:
+Builds are deterministic. `.github/workflows/release.yml` runs the `-Bundle`
+command on a tag and publishes that one exe and its `SHA256SUMS` — nothing
+else. Files involved:
 
 | file | role |
 |---|---|
 | `app/packaging/ds5bridge.iss` | the Inno script: wizard, components, download + hash check, summary page, uninstaller dialog |
-| `app/packaging/setup-helper.ps1` | the worker both halves call for everything that reads or changes machine state (services, devnodes, HidHide lists, the vendors' uninstallers); one `KIND|label|detail` line per fact |
+| `app/packaging/setup-helper.ps1` | the worker both halves call for everything that reads or changes machine state (services, devnodes, HidHide lists and its filter attachment, the start-at-login task, the vendors' uninstallers); one `KIND|label|detail` line per fact |
 | `app/packaging/build-installer.ps1` | builds the app if needed, compiles the script, prints the result's SHA-256 |
 
 `-Bundle` downloads `USBip-0.9.7.7-x64.exe` and `HidHide_1.5.230_x64.exe`

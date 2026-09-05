@@ -273,6 +273,24 @@ def _hidden_serials() -> list[str]:
         return []
 
 
+def _hide_status(serial: str) -> dict:
+    """`{"hide_effective", "hide_note"}` for a serial -- what THIS process's
+    last hide of it found (hidhide.hide_status). Never raises, never touches
+    the machine: it is read inside `snapshot()`, on the 2 s tray tick.
+
+    The two fields are the contract with the dashboard: `hide_effective` is
+    None until a hide has been checked, True when HidHide's filter is verifiably
+    in the pad's device stack, False when it verifiably is not (the 2026-09-05
+    "UI says hidden, games see the pad" report), and `hide_note` says why.
+    """
+    try:
+        from . import hidhide as HH
+
+        return HH.hide_status(serial)
+    except Exception:  # noqa: BLE001
+        return {"hide_effective": None, "hide_note": ""}
+
+
 def _unhide_serial(serial: str, cli_override: str | None = None,
                    log_fn=None) -> bool:
     """Repay one controller's hide debt from THIS process. Never raises.
@@ -344,8 +362,13 @@ def _prehide_serial(serial: str, cli_override: str | None = None,
     try:
         from . import hidhide as HH
 
+        # allow_restart: no child exists yet, so nothing of ours holds the
+        # pad open, and this is the one moment a device restart -- what makes
+        # HidHide's filter join a pad that was paired before HidHide was
+        # installed -- costs nobody a handle. The child's own hide, and the
+        # toggle on a running bridge, never restart.
         return HH.hide_for_bridge(serial, cli_override=cli_override,
-                                  log_fn=log_fn)
+                                  log_fn=log_fn, allow_restart=True)
     except Exception:  # noqa: BLE001
         log.debug("could not pre-hide %s", serial, exc_info=True)
         return []
@@ -1719,6 +1742,11 @@ class BridgeManager:
             snap = b.snapshot()
             snap["enabled"] = enabled.get(serial, default_enabled)
             snap["hide_bluetooth"] = hide.get(serial, hide_default)
+            # Whether that hide actually bites (hidhide.hide_status): the
+            # filter check the pre-hide ran in this process. Only meaningful
+            # while hiding is on; a dict lookup either way.
+            snap.update(_hide_status(serial) if snap["hide_bluetooth"]
+                        else {"hide_effective": None, "hide_note": ""})
             snap["present"] = (serial in present_set
                                or snap["state"] in _HOLDING)
             controllers[serial] = snap
@@ -1739,6 +1767,8 @@ class BridgeManager:
                     "uptime_s": 0, "attached": False, "last_event": "",
                     "enabled": enabled.get(serial, default_enabled),
                     "hide_bluetooth": hide.get(serial, hide_default),
+                    **(_hide_status(serial) if hide.get(serial, hide_default)
+                       else {"hide_effective": None, "hide_note": ""}),
                     "present": True}
         return {
             "master_enabled": master,

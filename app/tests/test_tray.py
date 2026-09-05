@@ -635,17 +635,39 @@ class DashboardTests(unittest.TestCase):
     """The `Open dashboard` row: one URL, from the config, in the default
     browser."""
 
-    def open_with(self, app, result=True):
+    def open_with(self, app, result=True, elevated=False):
         import webbrowser
         opened = []
         saved = webbrowser.open
+        saved_elev = T._is_elevated
         webbrowser.open = lambda url: opened.append(url) or result
+        # Pinned, not read from the machine: the suite may itself be running
+        # from an elevated shell, and these tests are about the URL.
+        T._is_elevated = lambda: elevated
         try:
             app._open_dashboard()
             settle()
         finally:
             webbrowser.open = saved
+            T._is_elevated = saved_elev
         return opened
+
+    def test_an_elevated_tray_hands_the_url_to_explorer(self):
+        # The tray runs as administrator now; a browser started with our token
+        # would be an administrator browser. explorer.exe opens it with the
+        # desktop's ordinary token, and webbrowser.open is not used at all.
+        import subprocess
+        launched = []
+        saved = subprocess.Popen
+        subprocess.Popen = lambda argv, **kw: launched.append(list(argv))
+        try:
+            app = app_with([controller(A)])
+            opened = self.open_with(app, elevated=True)
+        finally:
+            subprocess.Popen = saved
+        self.assertEqual(opened, [])
+        self.assertEqual(launched, [["explorer.exe", "http://127.0.0.1:8765"]])
+        self.assertEqual(app.notes, [])
 
     def test_it_opens_the_configured_port_on_loopback(self):
         app = app_with([controller(A)])

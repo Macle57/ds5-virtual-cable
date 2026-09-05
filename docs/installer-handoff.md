@@ -571,3 +571,157 @@ Lock held, no PnP call issued by anything of ours, no reboot. Evidence `phaseC-2
 * Concurrency against a real second installer mid-transaction (only mocks, a bare msiexec, and the blocked devnode of Phase B).
 * `usbip2_filter` unload on the physical hubs happens inside the vendor's `pnputil /delete-driver` after the reboot; it worked twice, but nothing of ours guards it beyond the timeout/no-kill rule.
 * A machine where the logon task cannot run (no admin logon, task disabled by policy): the fallback is the message + `preflight` guard, untested.
+
+---
+
+## 0.5.0 work (installer agent, 2026-09-05 -> 2026-09-06, worktree branch, NOT run on the machine)
+
+Everything below is built and unit-tested (app suite green), compiled into
+`dist\bundle\ds5bridge-setup-0.5.0-bundled.exe` (SHA-256
+`FAEC773157B59F784110953D2B98552CB75BB657764BBDCDF0C51E5CDDD5342B`, 76 504 635 B,
+in the worktree's `dist\`), and **not executed against the machine** -- per
+the brief, the main agent tests it after the reboot. Nothing here ran the
+installer, `pnputil`, `schtasks /Create`, or the tray.
+
+### What changed
+
+* **Hides are verified, not assumed.** `hidhide.py` reads
+  `DEVPKEY_Device_Stack` ({3AB22E31-...}, pid 14) through
+  `CM_Get_DevNode_PropertyW` (`device_stack`, `filter_attached`,
+  `filter_covers`: an entry counts as covered when `\Driver\HidHide` is in
+  its own stack or in its parent's -- the BTHENUM HIDClass node is where the
+  filter sits, per the 2026-09-05 measurement). `ensure_filter` runs BEFORE
+  the list is written: covered -> effective; missing and `allow_restart`
+  and elevated -> `pnputil /restart-device` on that HIDClass node, wait,
+  re-resolve the serial (a restart can churn the HID child's instance ID),
+  re-check; missing otherwise -> `hide_effective=False` with one of the
+  `NOTE_FILTER_*` sentences; unreadable -> `None`, never a restart.
+  `hide_for_bridge(..., allow_restart=False)` records the result
+  (`hide_status(serial)`), and says "on HidHide's hide list ... but NOT
+  actually hidden yet: <note>" instead of "hidden" when false. The manager's
+  pre-hide passes `allow_restart=True` (no child holds the pad yet); the
+  toggle on a running bridge and the child's own hide never restart.
+  `manager.snapshot()` adds `hide_effective` / `hide_note` to every
+  controller (null/"" until checked, or when hiding is off); the tray
+  balloon says "NOT hidden yet: <note>"; `doctor` prints a `filter` block
+  (`[ok]`/`[warn]`/`[note]`) for every hidden or set-to-hide connected pad.
+* **The tray runs as administrator.** `ds5bridge.spec`: `uac_admin=True`
+  on `ds5bridge-tray.exe` only (verified in the built exe: tray
+  `requireAdministrator`, console `asInvoker`). "Open dashboard" goes
+  through `explorer.exe <url>` when elevated, so the browser is not.
+* **Start-at-login is a scheduled task**, `\ds5bridge`, created via
+  `schtasks /Create /XML` from an XML this code writes: LogonTrigger with
+  `<UserId>DOMAIN\user</UserId>` (current user only), Principal
+  `InteractiveToken` + `HighestAvailable`, `ExecutionTimeLimit PT0S`,
+  `MultipleInstancesPolicy IgnoreNew`, `DisallowStartIfOnBatteries false`,
+  `StopIfGoingOnBatteries false`, `AllowHardTerminate false`,
+  `StartWhenAvailable true`, `Priority 4` (NORMAL; the scheduler's default
+  7 is BELOW_NORMAL), action = the tray exe in its own directory.
+  `autostart.py` keeps `available / current_command / is_enabled / enable /
+  disable / set_enabled / AutostartError`; `enable`/`disable` delete a
+  leftover HKCU Run value; `migrate_legacy()` (called from the tray's
+  `_reconcile_autostart`) turns a pre-0.5.0 Run value into the task once.
+  The installer's `autostart` task and the uninstaller use the helper's
+  `autostart-enable` / `autostart-disable` verbs (same XML, same name); the
+  `[Registry]` Run entry is gone from the .iss.
+* **Fewer reboots.** Helper verb `hidhide-attach`, run right after a fresh
+  HidHide install: for every present `BTHENUM\{00001124-...}_VID&0002054C_PID&0CE6*`
+  HIDClass node without `\Driver\HidHide` in `DEVPKEY_Device_Stack`,
+  `pnputil /restart-device` (60 s, never killed), then re-check ->
+  `PASS HidHide filter|attached to N DualSense device(s), no reboot needed`,
+  or `REBOOT HidHide|its filter is not attached to X of N ...` only when a
+  pad still lacks it, or `INFO ... no Bluetooth DualSense connected right
+  now`. `verify-install` reports the same check (without restarting). No
+  other HIDClass device is ever touched.
+* **Uninstaller reboot.** `UninstallNeedRestart()` returns True when any
+  `[reboot]` line was written AND the run is interactive, so Inno's own
+  "restart now?" follows our result dialog; silent runs never restart, even
+  without `/NORESTART` (deliberate: a silent uninstaller that reboots the
+  PC is the thing `/NORESTART` exists to prevent). The result dialog opens
+  with a bold `A RESTART IS REQUIRED to finish removing the drivers.` header
+  and a paragraph saying what the one reboot finishes (HidHide unloads at
+  boot; usbip-win2 stage B at the next logon). `autostart-disable` runs
+  before the app is deleted.
+* **One release asset.** `release.yml` builds `-Bundle` only and publishes
+  `ds5bridge-setup-<ver>-bundled.exe` + `SHA256SUMS` (no download-mode exe,
+  no zip, no scripts). `scripts/install.ps1` is a bootstrapper: release
+  lookup (404 -> "repository is private, or has no release yet"), download,
+  SHA256SUMS check (mandatory when the release has one), run (interactive;
+  `-Silent` -> `/SILENT /NORESTART /SUPPRESSMSGBOXES`; `-NoHidHide`/`-NoUsbip`
+  -> `/COMPONENTS=`, `-NoRestorePoint`/`-Autostart` -> `/MERGETASKS=`;
+  `-Setup <exe>` runs a local build; `-DryRun`). `scripts/uninstall.ps1`
+  runs the registered `unins000.exe` with the switches mapped when it
+  exists, else its own path (which now also deletes the task).
+  `update.py` downloads the bundled exe (`^ds5bridge-setup-[0-9].*-bundled\.exe$`),
+  verifies against SHA256SUMS, and its helper runs
+  `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /COMPONENTS=app
+  /MERGETASKS=!restorepoint /STARTTRAY=1 /LOG="...\updates\install-<ver>.log"`
+  after the tray exits; the .iss honours `/STARTTRAY=1` in `ssDone` (silent
+  runs only) by starting the tray; a non-zero installer exit relaunches the
+  old tray. Version 0.5.0 (`__init__.py`; the .iss/build scripts read it).
+* Docs: `README.md`, `docs/installer.md`, `docs/USER-GUIDE.md`, `NOTICE`,
+  `CONTRIBUTING.md` -- one install, the elevated tray, the task, the
+  no-reboot attach, the uninstaller's restart prompt.
+
+### Known caveats
+
+* `/COMPONENTS=app` from the updater is remembered by Inno as the previous
+  selection: the next interactive run opens with the driver boxes unticked
+  (they read "already installed" anyway). Documented, not fixed.
+* `hidhide-attach` targets the BTHENUM HIDClass nodes (the coordinator's
+  measurement); `filter_covers` accepts either the entry's or its parent's
+  stack. If HidHide turns out to attach only to the `HID\...` children on
+  some machine, the check still answers correctly (entry first), and the
+  restart target -- the parent -- rebuilds the children too.
+* `ensure_filter`'s restart re-resolves IDs via hidapi after `_wait_visible`;
+  if the pad takes longer than `REVIVE_SETTLE_S` (2 s) to come back the
+  original IDs are kept and the check says unknown/missing rather than
+  wrong.
+* `autostart-enable` in the installer registers the task for
+  `$env:USERDOMAIN\$env:USERNAME` of the elevated process -- a standard user
+  elevating with a different admin account gets the task for that admin
+  (same caveat as the install location; documented).
+* Not proven on hardware: everything above.
+
+### Post-reboot verification checklist (main agent)
+
+1. `preflight` PASS after the reboot (usbip tombstones gone), then install
+   `dist\bundle\ds5bridge-setup-0.5.0-bundled.exe` **with both pads
+   connected**. Expect in the check page/log: `[ok] HidHide installer -- ran`,
+   then `[ok] HidHide filter -- attached to 2 DualSense device(s), no reboot
+   needed (restarted 2 device(s) to make it so)` and NO `[reboot]` line;
+   `Get-PnpDeviceProperty -KeyName DEVPKEY_Device_Stack` on both BTHENUM
+   HIDClass nodes lists `\Driver\HidHide`. Tick "start at login" to get
+   `[ok] start-at-login -- scheduled task 'ds5bridge' registered ...`.
+2. `schtasks /Query /TN ds5bridge /XML ONE`: RunLevel HighestAvailable,
+   UserId = you, PT0S, IgnoreNew; log off/on: the tray starts elevated with
+   no prompt (Task Manager: elevated = yes). Tray menu "Start at login" reads
+   ticked; untick -> task gone; tick -> back.
+3. Start the tray by hand: one UAC prompt. Bridge a pad with hide on:
+   `/api/state` `controllers[serial].hide_effective == true`, `hide_note ==
+   ""`; non-whitelisted `CreateFile` on the BT pad refused. `ds5bridge doctor`
+   shows `[ok] filter <serial> (hidden now): ... effective`. "Open dashboard"
+   opens a NON-elevated browser tab.
+4. The genuine "missing filter" case: install HidHide by hand (its MSI, not
+   our installer) with a pad connected, then start the tray and bridge the
+   pad: the pre-hide should restart the device, log `HidHide's filter was not
+   attached ... restarted the device and it is now`, and `hide_effective`
+   becomes true; from a NON-elevated `ds5bridge run --hide-bluetooth` the
+   same situation must report `hide_effective false` with the "run as
+   administrator" note instead.
+5. Uninstall interactively (default, records 1/1): result dialog with the
+   bold header, then Inno's "restart now?" prompt (answer No to inspect);
+   `%TEMP%\ds5bridge-uninstall-check.txt` has `[ok] start-at-login --
+   scheduled task 'ds5bridge' removed` (if it was on) and both `[reboot]`
+   lines. Silent uninstall (`/VERYSILENT /SUPPRESSMSGBOXES`, no /NORESTART)
+   must NOT reboot.
+6. `scripts\install.ps1 -Setup dist\bundle\ds5bridge-setup-0.5.0-bundled.exe -Silent -NoHidHide`
+   (local exe path; the release path needs the repo public + a tag):
+   installer runs `/SILENT /NORESTART /SUPPRESSMSGBOXES /COMPONENTS=app,usbip`,
+   check list printed, tray started only if the shell was elevated.
+   `scripts\uninstall.ps1 -DryRun` says it would run `unins000.exe`.
+7. Updater: needs a public release; until then, test `update.py`'s helper by
+   hand: with the tray installed and stopped, run the built exe as
+   `... /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /COMPONENTS=app /MERGETASKS=!restorepoint /STARTTRAY=1`
+   from an elevated shell: the tray must be running (elevated) afterwards,
+   and `last-install-check.txt` written.

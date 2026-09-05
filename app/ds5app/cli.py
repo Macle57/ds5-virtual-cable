@@ -433,7 +433,59 @@ def _doctor_hidhide_inner(cfg, live) -> int:
                   f"{'them' if len(stale) > 1 else 'it'} back")
             problems += 1
 
+    problems += _doctor_filter(HH, hh, wanted, records)
     return problems + _doctor_visibility(HH, cfg)
+
+
+def _doctor_filter(HH, hh, wanted, records) -> int:
+    """Is HidHide's FILTER actually in the stack of each pad we hide?
+
+    The check that answers the 2026-09-05 report ("hidden" in the UI, visible
+    to every game). HidHide's class filter joins a HID device's stack only
+    when that stack is built, so a pad that was already paired when HidHide
+    was installed carries a correct hide-list entry that does nothing until
+    the device is restarted or the PC rebooted. Everything above this line
+    reads the LIST; this reads the STACK (`DEVPKEY_Device_Stack`), for every
+    pad we currently hide (the journal) and every connected pad that is set
+    to be hidden. Silent about pads that are switched off.
+    """
+    if hh is None:
+        return 0
+    problems = 0
+    seen = set()
+    rows = []
+    for r in records:
+        serial = (r.get("serial") or "").lower()
+        ids = [i for i in (r.get("instance_ids") or []) if i]
+        if not serial or not ids:
+            continue
+        seen.add(serial)
+        rows.append((serial, ids, (r.get("parent_id") or "").strip(), True))
+    for serial in wanted:
+        if serial in seen:
+            continue
+        ids = HH.resolve_serial(serial, cli=hh.cli)
+        if not ids:
+            continue                        # off, or not enumerable: not ours to judge here
+        rows.append((serial, ids, HH.bt_parent_for_serial(serial), False))
+    for serial, ids, parent, hidden_now in rows:
+        got = HH.filter_covers(ids, parent)
+        what = "hidden now" if hidden_now else "set to hide"
+        if got is True:
+            print(f"{'[ok]':7}filter     {serial} ({what}): HidHide's filter is "
+                  f"in the device stack -- the hide is effective")
+        elif got is False:
+            print(f"{'[warn]':7}filter     {serial} ({what}): HidHide's filter "
+                  f"is NOT in the device stack, so hiding it does nothing yet")
+            print(f"{'':7}           (the pad was enumerated before HidHide "
+                  f"was installed). The tray restarts the device when it")
+            print(f"{'':7}           bridges the pad; or switch the controller "
+                  f"off and on, or reboot.")
+            problems += 1
+        else:
+            print(f"{'[note]':7}filter     {serial} ({what}): the device stack "
+                  f"could not be read; whether the hide is effective is unknown")
+    return problems
 
 
 def _doctor_visibility(HH, cfg) -> int:
