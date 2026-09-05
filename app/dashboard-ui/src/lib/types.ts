@@ -31,6 +31,8 @@ export interface Telemetry {
   rps: number;
   t: number | null;
   age_s: number;
+  remote_mode?: boolean;                     // mirrored from the interceptor
+  keyboard_open?: boolean;
 }
 
 export interface Controller {
@@ -46,7 +48,11 @@ export interface Controller {
   uptime_s?: number | null;
   attached?: boolean;
   error?: string | null;
-  hide_bluetooth?: boolean;
+  hide_bluetooth?: boolean;                  // what the user ASKED for
+  hide_effective?: boolean | null;           // HidHide's filter verified attached (null = unknown)
+  hide_note?: string;                        // why hide_effective disagrees, when it does
+  remote_mode?: boolean | null;              // the pad is driving the OS, not the game
+  keyboard_open?: boolean | null;            // the on-screen keyboard is up
   last_event?: string;
   telemetry?: Telemetry;
 }
@@ -72,7 +78,8 @@ export interface ActionsMeta {
   gesture_keys: string[];
   macro_keys?: string[];          // the key vocabulary a user macro may use
   engine_actions?: { name: string; doc: string }[];   // pad power / lightbar
-  defaults: { chords: Record<string, string> };
+  remote_keys?: string[];         // keys input.remote.chords accepts (falls back to chord_keys + gesture_keys)
+  defaults: { chords: Record<string, string>; remote_chords?: Record<string, string> };
 }
 
 /* /api/config -- the document is deliberately loose: known keys get

@@ -1,5 +1,7 @@
 import { create } from "zustand";
-import type { ActionsMeta, ConfigDoc, LiveState } from "./types";
+import type { ActionsMeta, ConfigDoc, Controller, LiveState } from "./types";
+import { rgbToHex } from "../components/settings/help";
+import { mockActions, mockState } from "./devMock";
 
 export type LinkStatus = "connecting" | "live" | "snapshot" | "reconnecting";
 
@@ -21,6 +23,10 @@ interface Store {
   cfg: ConfigDoc | null;                     // the working copy the form binds to
   cfgPath: string;
   actions: ActionsMeta | null;
+  /* input.remote.lightbar_color as last seen from the server -- the remote
+     badges want the colour before (and without) the settings panel loading
+     the whole document into `cfg`. */
+  remoteColorSeed: number[] | null;
   dirty: boolean;
   loading: boolean;
   loadConfig: () => Promise<void>;
@@ -41,14 +47,32 @@ export const useStore = create<Store>((set, get) => ({
   setActive: (serial) => set({ active: serial }),
 
   connect: () => {
-    const apply = (state: LiveState) => {
+    const apply = (incoming: LiveState) => {
+      const state = mockState(incoming);
       const serials = Object.keys(state.controllers).sort();
+      const prev = get().state.controllers;
       const active = get().active;
+      // Remote mode flipping is the one lifecycle event the pad itself
+      // announces (lightbar + rumble); echo it here so a glance at the page
+      // says why the game just stopped listening.
+      for (const serial of serials) {
+        const was = remoteMode(prev[serial]);
+        const now = remoteMode(state.controllers[serial]);
+        if (was !== null && now !== null && was !== now) {
+          const c = state.controllers[serial];
+          get().toast(`${controllerName(serial, c.label)}: remote mode ${now ? "ON — the pad drives the OS" : "off — back to the game"}`);
+        }
+      }
       set({
         state,
         active: active && serials.includes(active) ? active : serials[0] ?? null,
       });
     };
+    // Seed the remote lightbar colour without opening settings (one fetch;
+    // the badges fall back to the engine default until it lands).
+    void fetch("/api/config").then((r) => r.json())
+      .then((doc) => set({ remoteColorSeed: remoteColorOf(doc?.config) }))
+      .catch(() => { /* the default colour is right for an untouched config */ });
     // ?snap: poll the one-shot endpoint instead of holding the SSE stream
     // open -- for headless screenshots (an open EventSource never lets the
     // page reach network-idle) and for tests.
@@ -82,6 +106,7 @@ export const useStore = create<Store>((set, get) => ({
   cfg: null,
   cfgPath: "",
   actions: null,
+  remoteColorSeed: null,
   dirty: false,
   loading: false,
 
@@ -92,11 +117,11 @@ export const useStore = create<Store>((set, get) => ({
         // Static per server process: one fetch per page life is plenty. If it
         // is unreachable (an older server under a newer page?) the form falls
         // back to generic by-type rendering so nothing becomes uneditable.
-        try { set({ actions: await (await fetch("/api/actions")).json() }); }
+        try { set({ actions: mockActions(await (await fetch("/api/actions")).json()) }); }
         catch { set({ actions: null }); }
       }
       const doc = await (await fetch("/api/config")).json();
-      set({ cfg: doc.config, cfgPath: doc.path || "", dirty: false });
+      set({ cfg: doc.config, cfgPath: doc.path || "", dirty: false, remoteColorSeed: remoteColorOf(doc.config) });
     } catch (e) {
       get().toast("Could not load the config: " + e, true);
     } finally {
@@ -116,7 +141,7 @@ export const useStore = create<Store>((set, get) => ({
       });
       const doc = await r.json();
       if (!r.ok || doc.error) throw new Error(doc.error || String(r.status));
-      set({ cfg: doc.config, cfgPath: doc.path || "", dirty: false });
+      set({ cfg: doc.config, cfgPath: doc.path || "", dirty: false, remoteColorSeed: remoteColorOf(doc.config) });
       get().toast("Saved to " + doc.path);
     } catch (e) {
       get().toast("Save failed: " + (e as Error).message, true);
@@ -152,6 +177,33 @@ export const short = (serial: string) =>
 
 export const controllerName = (serial: string, label?: string) =>
   label ? label : short(serial);
+
+/* ---- remote mode ------------------------------------------------------- */
+
+/* The manager's flag first (it is the authority on lifecycle), the
+   interceptor's telemetry mirror second; null while neither side has said. */
+export const remoteMode = (c: Controller | undefined): boolean | null => {
+  const v = c?.remote_mode ?? c?.telemetry?.remote_mode;
+  return typeof v === "boolean" ? v : null;
+};
+export const keyboardOpen = (c: Controller | undefined): boolean =>
+  (c?.keyboard_open ?? c?.telemetry?.keyboard_open) === true;
+
+export const DEFAULT_REMOTE_COLOR = [255, 120, 0];   // RemoteMode.lightbar_color's default
+
+function remoteColorOf(cfg: unknown): number[] | null {
+  const v = getPath(cfg, ["input", "remote", "lightbar_color"]);
+  return Array.isArray(v) && v.length === 3 ? v.map(Number) : null;
+}
+
+/* The remote-mode colour as #rrggbb: the working copy while settings are
+   open (so a colour being picked previews live), else the last saved one. */
+export const useRemoteColor = () =>
+  useStore((s) => rgbToHex((s.cfg ? remoteColorOf(s.cfg) : null) ?? s.remoteColorSeed ?? DEFAULT_REMOTE_COLOR));
+
+/* How many pads are in remote mode right now (the header HUD). */
+export const useRemoteCount = () =>
+  useStore((s) => Object.values(s.state.controllers).filter((c) => remoteMode(c) === true).length);
 
 /* Path helpers over the loose config document. */
 export function getPath(obj: unknown, path: (string | number)[]): unknown {
