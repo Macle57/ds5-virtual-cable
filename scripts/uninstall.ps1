@@ -10,7 +10,16 @@
         & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/uninstall.ps1))) -KeepHidHide
 
 .DESCRIPTION
-    What is removed, in order:
+    If ds5bridge-setup.exe put ds5bridge here (its uninstaller is registered
+    in Settings > Apps), THAT uninstaller is what runs: this script starts
+    %LOCALAPPDATA%\ds5bridge\unins000.exe with your switches mapped onto its
+    (/KEEPUSBIP=1 and friends; -Silent adds /SILENT /NORESTART
+    /SUPPRESSMSGBOXES), prints its result list, and exits with its code. It
+    does everything below and is the tested path (docs/installer.md).
+
+    Otherwise -- an install that predates the exe, or one whose uninstaller
+    is gone -- this script does the same work itself. What is removed, in
+    order:
 
         1. the running bridge is stopped and its debts repaid: the virtual
            pad is detached (`ds5bridge cleanup`, `usbip attach -X`,
@@ -22,7 +31,8 @@
                                             exe installer's uninstaller if
                                             ds5bridge-setup.exe was used
            Start Menu \ ds5bridge.lnk       the shortcut
-           HKCU Run \ "ds5bridge"           start-at-login (if enabled)
+           scheduled task "ds5bridge"       start-at-login (if enabled), and
+                                            the pre-0.5.0 HKCU Run value
            Settings > Apps entry            (if ds5bridge-setup.exe was used)
         3. HidHide                          unless kept (see below). Its whole
                                             hide list is cleared first so no
@@ -60,6 +70,10 @@
 
 .PARAMETER DryRun
     Print what would be removed; remove nothing. Never elevates.
+.PARAMETER Silent
+    No dialogs. Through the exe uninstaller: /SILENT /NORESTART
+    /SUPPRESSMSGBOXES (its result list is still printed here). Through this
+    script's own path there are no dialogs anyway.
 .PARAMETER KeepUsbip
     Leave usbip-win2 installed.
 .PARAMETER KeepHidHide
@@ -83,6 +97,7 @@
 [CmdletBinding()]
 param(
     [switch]$DryRun,
+    [switch]$Silent,
     [switch]$KeepUsbip,
     [switch]$KeepHidHide,
     [switch]$RemoveUsbip,
@@ -100,7 +115,8 @@ $ConfigDir     = Join-Path $env:APPDATA 'ds5bridge'
 $JournalDir    = Join-Path $ConfigDir 'hidden'
 $ShortcutPath  = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\ds5bridge.lnk'
 $RunKey        = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$RunValueName  = 'ds5bridge'
+$RunValueName  = 'ds5bridge'   # the pre-0.5.0 start-at-login entry
+$AutostartTask = 'ds5bridge'   # the start-at-login task (app/ds5app/autostart.py)
 # The AppId in app/packaging/ds5bridge.iss, as Inno registers it.
 $InnoUninstKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{7B6E2D6A-3C39-4E0B-9C7E-2F8B1C2D5A61}_is1'
 $UsbipServices = @('usbip2_filter', 'usbip2_ude')
@@ -343,6 +359,7 @@ function Assert-Elevation {
         try { Invoke-WebRequest -Uri $RawUrl -OutFile $self -UseBasicParsing } finally { $global:ProgressPreference = $old }
     }
     $passthru = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $self), '-Elevated')
+    if ($Silent)        { $passthru += '-Silent' }
     if ($KeepUsbip)     { $passthru += '-KeepUsbip' }
     if ($KeepHidHide)   { $passthru += '-KeepHidHide' }
     if ($RemoveUsbip)   { $passthru += '-RemoveUsbip' }
@@ -401,16 +418,25 @@ function Stop-Bridge {
 function Remove-App {
     Write-Host ''
     Write-Host '--- the app ---'
+    # Start-at-login is a scheduled task since 0.5.0 (the Run key cannot
+    # start the elevated tray); the Run value is what older installs left.
+    $task = Run "$env:SystemRoot\System32\schtasks.exe" @('/Query', '/TN', $AutostartTask) 30
+    if ($task.Code -eq 0) {
+        if (Would "remove the start-at-login task (scheduled task '$AutostartTask')") {
+            $r = Run "$env:SystemRoot\System32\schtasks.exe" @('/Delete', '/TN', $AutostartTask, '/F') 30
+            if ($r.Code -eq 0) { Good 'start-at-login task removed' } else { Warn "could not remove the task '$AutostartTask' (schtasks exit $($r.Code)); delete it in Task Scheduler" }
+        }
+    } else { Say 'no start-at-login task (nothing to remove)' }
     try { $run = (Get-ItemProperty -Path $RunKey -Name $RunValueName -ErrorAction SilentlyContinue).$RunValueName } catch { $run = $null }
     if ($run -and ("$run".IndexOf($InstallRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0)) {
-        if (Would "remove the start-at-login entry (HKCU Run \ $RunValueName)") {
+        if (Would "remove the old start-at-login entry (HKCU Run \ $RunValueName)") {
             Remove-ItemProperty -Path $RunKey -Name $RunValueName
-            Good 'start-at-login removed'
+            Good 'old Run-key entry removed'
         }
     } elseif ($run) {
-        # Somebody else's (a source checkout, a zip unpacked elsewhere): not ours to delete.
-        Say "start-at-login entry points outside $InstallRoot ($run); left alone"
-    } else { Say 'no start-at-login entry (nothing to remove)' }
+        # Somebody else's (a source checkout, a build folder elsewhere): not ours to delete.
+        Say "a Run-key entry '$RunValueName' points outside $InstallRoot ($run); left alone"
+    }
 
     if (Test-Path $ShortcutPath) {
         if (Would 'remove the Start Menu shortcut') { Remove-Item $ShortcutPath -Force; Good 'shortcut removed' }
@@ -670,6 +696,44 @@ Write-Host ''
 Write-Host '  ds5bridge uninstaller'
 if ($DryRun) { Write-Host '  DRY RUN: showing the plan; changing nothing.' -ForegroundColor Cyan }
 Write-Host ''
+
+# The exe installer's own uninstaller, when it is registered: the tested
+# path, with the options dialog (or none, with -Silent) and Inno's own
+# "restart now?" question at the end of an interactive run. Our switches map
+# onto its parameters (docs/installer.md, "Uninstall"); it elevates itself.
+$innoUninst = $null
+try { $innoUninst = (Get-ItemProperty $InnoUninstKey -ErrorAction SilentlyContinue).UninstallString } catch { }
+if ($innoUninst) { $innoUninst = "$innoUninst".Trim('"') }
+if ($innoUninst -and (Test-Path $innoUninst)) {
+    $unArgs = @()
+    if ($Silent)        { $unArgs += @('/SILENT', '/NORESTART', '/SUPPRESSMSGBOXES') }
+    if ($KeepUsbip)     { $unArgs += '/KEEPUSBIP=1' }
+    if ($KeepHidHide)   { $unArgs += '/KEEPHIDHIDE=1' }
+    if ($RemoveUsbip)   { $unArgs += '/REMOVEUSBIP=1' }
+    if ($RemoveHidHide) { $unArgs += '/REMOVEHIDHIDE=1' }
+    if ($PurgeSettings) { $unArgs += '/PURGESETTINGS=1' }
+    $log = Join-Path $env:TEMP ('ds5bridge-uninstall-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
+    $unArgs += ('/LOG="{0}"' -f $log)
+    Say "ds5bridge was installed by ds5bridge-setup.exe; its own uninstaller does the work: $innoUninst $($unArgs -join ' ')"
+    if ($DryRun) {
+        Say 'dry run: it would be started now (it shows what it will remove before doing anything; a driver removal ends in ONE reboot). Nothing was changed.'
+        exit 0
+    }
+    $p = Start-Process -FilePath $innoUninst -ArgumentList $unArgs -Wait -PassThru
+    $check = Join-Path $env:TEMP 'ds5bridge-uninstall-check.txt'
+    if (Test-Path $check) {
+        Write-Host ''
+        Write-Host '--- the uninstaller''s own checks ---'
+        Get-Content $check | ForEach-Object { Write-Host "       $_" }
+        if (@(Get-Content $check | Where-Object { $_ -like '`[reboot`]*' }).Count -gt 0) {
+            Write-Host ''
+            Warn 'A RESTART IS REQUIRED to finish removing the drivers (one reboot finishes both HidHide and the first half of usbip-win2; see the [reboot] lines). Nothing restarts on its own from here.'
+        }
+    }
+    Write-Host ''
+    if ($p.ExitCode -eq 0) { Good "the uninstaller finished (log: $log)" } else { Warn "the uninstaller exited with $($p.ExitCode) (log: $log)" }
+    exit $p.ExitCode
+}
 
 Assert-Elevation
 if (-not $DryRun) {
