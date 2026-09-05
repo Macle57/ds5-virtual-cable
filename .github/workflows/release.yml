@@ -198,8 +198,7 @@ jobs:
           Nothing is code-signed yet: Windows SmartScreen shows "Windows protected your PC" on first run (*More info* > *Run anyway*). Uninstalling removes the drivers in two halves around a reboot; **reboot twice before reinstalling** (docs/installer.md).
 
           '@
-          $notes.Replace('VERSION', $ver) | Out-File dist
-otes.md -Encoding utf8
+          $notes.Replace('VERSION', $ver) | Out-File dist\notes.md -Encoding utf8
 
       - name: Create the GitHub release
         env:
