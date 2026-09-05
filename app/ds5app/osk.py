@@ -112,7 +112,7 @@ LAYOUT: tuple = (
 )
 
 #: Where the highlight starts: the "g" key -- the middle of the home row.
-HOME = (2, 6)
+HOME = (2, 5)
 
 #: Geometry in key units. `UNIT` is one plain key's pitch in pixels.
 UNIT = 52

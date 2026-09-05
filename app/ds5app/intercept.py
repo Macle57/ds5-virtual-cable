@@ -1053,6 +1053,12 @@ class InputInterceptor:
                     continue
                 dpad_held = True
             self._remote_press_key(key, now, thunks)
+        if self.keyboard_open:
+            # A press just opened the keyboard: from here the pad is the
+            # keyboard's, so whatever remote mode still holds lets go NOW,
+            # not on the next report -- a drag must not outlive the mode.
+            self._remote_release_held(thunks)
+            return
         for key, entry in list(self._rm_held.items()):
             if entry["next"] is not None and now >= entry["next"]:
                 entry["next"] = now + (ARROW_REPEAT_S if entry["release"]
