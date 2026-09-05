@@ -295,7 +295,12 @@ class DashboardServer:
                     for _, spec in sorted(registry.items())],
                 "chord_buttons": list(K.CHORD_BUTTONS),
                 "chord_keys": list(K.CHORD_BUTTONS),
-                "remote_keys": list(K.CHORD_BUTTONS),
+                # what the remote-mode table binds: every button but the
+                # (default) arming one -- the chord button is never a remote
+                # binding -- plus the three gestures, in one list the page
+                # renders verbatim
+                "remote_keys": ([b for b in K.CHORD_BUTTONS if b != "ps"]
+                                + list(K.CHORD_GESTURES)),
                 "gesture_keys": list(K.CHORD_GESTURES),
                 # the key vocabulary a user macro may use, engine order
                 "macro_keys": list(ACT.KEY_NAMES),

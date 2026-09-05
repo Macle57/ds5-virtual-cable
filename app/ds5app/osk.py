@@ -318,6 +318,7 @@ class PadDriver:
     def __init__(self, model: KeyboardModel):
         self.model = model
         self._prev: set = set()
+        self._armed = False
         self._nav: tuple | None = None
         self._nav_next = 0.0
         self._repeat: dict = {}        # button -> next repeat due
@@ -327,7 +328,11 @@ class PadDriver:
         self._l2_down = False
 
     def reset(self) -> None:
+        """Forget every held button. The next frame ARMS rather than acts:
+        the button that opened the keyboard is usually still down on it, and
+        must not type the highlighted key on the way in."""
         self._prev = set()
+        self._armed = False
         self._nav = None
         self._repeat.clear()
         self._last_at = None
@@ -341,6 +346,13 @@ class PadDriver:
         emits: list = []
         close = False
         drag = (0, 0)
+        if not self._armed:
+            self._armed = True
+            self._prev = set(buttons)
+            self._l2_down = l2 >= TRIGGER_ON
+            self._r2_down = r2 >= TRIGGER_ON
+            self._last_at = now
+            return Step([], False, (0, 0), False)
         new = buttons - self._prev
         dt = 0.0
         if self._last_at is not None:
@@ -451,41 +463,50 @@ class OnScreenKeyboard:
         #: "where the renderer puts it by default" (bottom centre).
         self.pos: tuple | None = None
 
-    def open(self) -> None:
+    # Every method below flips state at once and returns a THUNK (or None)
+    # for the window work, because the engine calls them under its lock and
+    # nothing foreign runs there. The engine runs the thunks right after.
+
+    def open(self):
         if self.is_open:
-            return
+            return None
         self.driver.reset()
         self.model.shift_latch = False
         self.model.move_mode = False
         self.is_open = True
-        try:
-            if self._renderer is None:
-                self._renderer = self._factory()
-            self._renderer.show(self._snapshot())
-        except Exception:  # noqa: BLE001
-            log.exception("the on-screen keyboard window could not be shown")
         log.info("on-screen keyboard open")
+        snap = self._snapshot()
 
-    def close(self) -> None:
-        if not self.is_open:
-            return
-        self.is_open = False
-        if self._renderer is not None:
+        def show():
             try:
-                self._renderer.hide()
+                if self._renderer is None:
+                    self._renderer = self._factory()
+                self._renderer.show(snap)
             except Exception:  # noqa: BLE001
-                log.exception("hiding the on-screen keyboard failed")
+                log.exception("the on-screen keyboard window could not be shown")
+        return show
+
+    def close(self):
+        if not self.is_open:
+            return None
+        self.is_open = False
         log.info("on-screen keyboard closed")
 
-    def toggle(self) -> bool:
-        if self.is_open:
-            self.close()
-        else:
-            self.open()
-        return self.is_open
+        def hide():
+            r = self._renderer
+            if r is not None:
+                try:
+                    r.hide()
+                except Exception:  # noqa: BLE001
+                    log.exception("hiding the on-screen keyboard failed")
+        return hide
+
+    def toggle(self):
+        return self.close() if self.is_open else self.open()
 
     def shutdown(self) -> None:
-        """End the renderer thread. The engine's `close()`."""
+        """End the renderer thread. The engine's `close()` -- not under the
+        lock, so this one blocks until the window thread is gone."""
         self.is_open = False
         r, self._renderer = self._renderer, None
         if r is not None:
@@ -498,8 +519,9 @@ class OnScreenKeyboard:
         """One pad report while open -> thunks to run outside the engine lock.
 
         `frame` is anything with `buttons`, `lx`, `ly`, `rx`, `ry`, `l2`,
-        `r2` (the engine's `_Frame`). Typing goes through `actions.inject`
-        in the thunks; the renderer is poked here (a PostMessage, microseconds).
+        `r2` (the engine's `_Frame`). Typing goes through `actions.inject`;
+        the renderer gets a fresh snapshot when the picture changed. All of
+        it in the thunks.
         """
         if not self.is_open:
             return []
@@ -514,17 +536,31 @@ class OnScreenKeyboard:
             elif kind == "keys":
                 thunks.append(lambda vks=payload: self.actions.tap(*vks))
         moved = False
-        if step.drag != (0, 0) and self._renderer is not None:
-            base = self.pos or self._renderer.position() or (0, 0)
+        if step.drag != (0, 0):
+            base = self.pos
+            if base is None and self._renderer is not None:
+                try:
+                    base = self._renderer.position()
+                except Exception:  # noqa: BLE001
+                    base = None
+            base = base or (0, 0)
             self.pos = (base[0] + step.drag[0], base[1] + step.drag[1])
             moved = True
         if step.close:
-            self.close()
-        elif (step.changed or moved) and self._renderer is not None:
-            try:
-                self._renderer.update(self._snapshot())
-            except Exception:  # noqa: BLE001
-                log.exception("updating the on-screen keyboard failed")
+            fn = self.close()
+            if fn is not None:
+                thunks.append(fn)
+        elif step.changed or moved:
+            snap = self._snapshot()
+
+            def update():
+                r = self._renderer
+                if r is not None:
+                    try:
+                        r.update(snap)
+                    except Exception:  # noqa: BLE001
+                        log.exception("updating the on-screen keyboard failed")
+            thunks.append(update)
         return thunks
 
     def _snapshot(self) -> dict:
@@ -688,13 +724,14 @@ if sys.platform == "win32":
             with self._lock:
                 self._snap = snap
             if self._thread is None or not self._thread.is_alive():
+                # The thread shows the window itself from the snapshot just
+                # stored; nobody waits for it (`show` is called from the
+                # engine's thunks, which must not block on a window).
                 self._ready.clear()
                 self._thread = threading.Thread(target=self._run,
                                                 name="ds5-osk", daemon=True)
                 self._thread.start()
-                if not self._ready.wait(3.0):
-                    log.warning("the keyboard window did not come up in 3 s")
-                    return
+                return
             self._post(_MSG_SHOW)
 
         def update(self, snap: dict) -> None:

@@ -24,10 +24,56 @@ try:
     from ds5app import actions as A
     from ds5app import config as K
     from ds5app import intercept as I
+    from ds5app import osk as OSK
     from ds5app import service as SVC
     from ds5bridge import protocol as P
 except ImportError:  # pragma: no cover
     A = None
+
+
+class FakeRenderer:
+    """Records what the keyboard window would have been told."""
+
+    def __init__(self):
+        self.calls: list = []
+        self.snaps: list = []
+
+    def show(self, snap):
+        self.calls.append("show")
+        self.snaps.append(snap)
+
+    def update(self, snap):
+        self.calls.append("update")
+        self.snaps.append(snap)
+
+    def hide(self):
+        self.calls.append("hide")
+
+    def position(self):
+        return (100, 200)
+
+    def close(self):
+        self.calls.append("close")
+
+
+class FakeAudio:
+    """An `audio_default.AudioSystem` stand-in that never touches COM."""
+
+    def __init__(self, endpoints=(), default="mic-a"):
+        self.endpoints = list(endpoints)
+        self.defaults = {0: default, 1: default, 2: default}
+        self.set_calls: list = []
+
+    def capture_endpoints(self):
+        return list(self.endpoints)
+
+    def default_capture_id(self, role):
+        return self.defaults.get(role)
+
+    def set_default_capture(self, device_id, role):
+        self.set_calls.append((device_id, role))
+        self.defaults[role] = device_id
+        return True
 
 if A is not None:
     logging.getLogger("ds5app.intercept").addHandler(logging.NullHandler())
@@ -93,26 +139,39 @@ class EngineCase(unittest.TestCase):
     def make(self, **over):
         self.batches: list[list] = []
         self.scripts: list[str] = []
+        self.launched: list[str] = []
         self.sent: list[bytes] = []
+        self.modes: list[tuple] = []
         self.power_offs = 0
         self.clock = Clock()
+        self.audio = FakeAudio()
         self.acts = A.OsActions(inject=self.batches.append,
                                 run_ps=lambda s, timeout=10.0:
-                                (self.scripts.append(s), True)[1])
+                                (self.scripts.append(s), True)[1],
+                                launch=lambda c: (self.launched.append(c), True)[1],
+                                audio=self.audio, sleep=lambda s: None)
         cfg = K.InputConfig.from_dict(over)
 
         def power_off():
             self.power_offs += 1
 
+        self.renderer = FakeRenderer()
+        self.osk = OSK.OnScreenKeyboard(self.acts,
+                                        renderer_factory=lambda: self.renderer)
         self.eng = I.InputInterceptor(
             cfg, actions=self.acts, send_setstate=self.sent.append,
-            power_off=power_off, clock=self.clock, dispatch=lambda fn: fn())
+            power_off=power_off, clock=self.clock, dispatch=lambda fn: fn(),
+            on_mode=lambda r, k: self.modes.append((r, k)), osk=self.osk)
         return self.eng
 
     def make_remote(self, **over):
         """An engine with remote mode switched on -- it ships OFF, so every
-        test that toggles into it has to opt in the way a user would."""
-        over.setdefault("remote", {}).setdefault("enabled", True)
+        test that toggles into it has to opt in the way a user would -- and
+        on the CLASSIC remote map (`same_bindings` off): these tests pin the
+        map remote mode shipped with; `RemoteSameBindings` covers the default."""
+        rm = over.setdefault("remote", {})
+        rm.setdefault("enabled", True)
+        rm.setdefault("same_bindings", False)
         return self.make(**over)
 
     @property
