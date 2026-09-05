@@ -90,7 +90,9 @@ DefaultDirName={localappdata}\ds5bridge
 DisableDirPage=yes
 UsedUserAreasWarning=no
 DisableProgramGroupPage=yes
-; The two drivers need admin. The app never does; it is launched de-elevated.
+; The two drivers need admin. Since 0.5.0 so does the tray (ds5bridge.spec:
+; uac_admin, for the devnode restarts that make hiding and unhiding true), so
+; this elevated process may launch it directly -- see [Run].
 PrivilegesRequired=admin
 ; Windows 10 1903 (build 18362) x64 is the floor usbip-win2 documents.
 MinVersion=10.0.18362
@@ -107,8 +109,11 @@ UninstallDisplayIcon={app}\app\ds5bridge-tray.exe
 SetupLogging=yes
 ; We stop the app ourselves (PrepareToInstall), with the tray's own teardown.
 CloseApplications=no
-; Never reboot on our own. HidHide's filter driver wants one; the summary
-; page says so and leaves it to the user.
+; Never reboot on our own after an INSTALL. A fresh HidHide is attached to the
+; connected controllers by restarting their devnodes (helper: hidhide-attach),
+; so a reboot is only ever recommended, and the summary page says when. The
+; UNINSTALLER is different: removing a driver does need one, and
+; UninstallNeedRestart() below makes Inno ask (interactive runs only).
 AlwaysRestart=no
 RestartIfNeededByRun=no
 ShowComponentSizes=no
@@ -158,14 +163,19 @@ Source: "bundle\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{userprograms}\ds5bridge"; Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Comment: "ds5bridge -- a Bluetooth DualSense, presented to Windows as a wired one"; Components: app
 
-[Registry]
-; The exact value app/ds5app/autostart.py writes (quoted path, nothing else),
-; so the tray's own checkbox reads this back.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ds5bridge"; ValueData: """{app}\app\ds5bridge-tray.exe"""; Flags: uninsdeletevalue; Tasks: autostart
+; No [Registry] section any more: start-at-login is a scheduled task (the
+; helper's autostart-enable verb, run in ssPostInstall when the task is
+; ticked; autostart-disable on uninstall) -- the same task the tray's own
+; "Start at login" switch creates. The HKCU Run value the 0.4 installers
+; wrote cannot start an elevated program, and the tray is one now.
 
 [Run]
-; runasoriginaluser: this process is elevated; the tray must not be.
-Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Description: "Start ds5bridge now"; Flags: postinstall nowait runasoriginaluser skipifsilent; Components: app
+; The tray carries requireAdministrator (ds5bridge.spec), so it is launched
+; from this elevated process directly -- no runasoriginaluser, which would
+; put a UAC prompt behind the Finish button. skipifsilent: a silent install
+; does not start it unless told to with /STARTTRAY=1 (CurStepChanged/ssDone),
+; which is how the in-app updater gets its new tray back.
+Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Description: "Start ds5bridge now"; Flags: postinstall nowait skipifsilent; Components: app
 
 [UninstallDelete]
 ; Files the updater put there after us (a swapped app dir, staged updates).
@@ -406,14 +416,15 @@ begin
     else
       Text := 'All checks passed.' + #13#10#13#10 + Text;
     if RebootNote then
-      Text := Text + #13#10 + 'A REBOOT is recommended before first use (see the [reboot] line above). Nothing will restart on its own.' + #13#10;
+      Text := Text + #13#10 + 'A REBOOT is recommended before hide-while-bridged is relied on (see the [reboot] line above). Nothing will restart on its own.' + #13#10;
     SummaryPage.RichEditViewer.Lines.Text := Text;
   end
   else if CurPageID = wpFinished then
   begin
     if RebootNote then
       WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
-        'Reboot recommended: HidHide''s filter driver activates on the next start of Windows. ' +
+        'Reboot recommended: HidHide''s filter could not be attached to every connected controller ' +
+        '(see the Installation check page); a reboot, or switching the controller off and on, finishes that. ' +
         'Everything else works now.';
   end;
 end;
@@ -454,7 +465,7 @@ begin
       #else
       S := S + 'download ' + '{#HidHideUrl}';
       #endif
-      S := S + NewLine + Space + Space + '(SHA-256 verified, then run silently; needs a reboot to activate)' + NewLine;
+      S := S + NewLine + Space + Space + '(SHA-256 verified, then run silently; its filter is then attached to any connected DualSense, so usually no reboot)' + NewLine;
     end;
   end;
   if WizardIsComponentSelected('app') then
@@ -678,11 +689,16 @@ begin
       if (RC = 0) or (RC = 1641) or (RC = 3010) then
       begin
         AddSummary('[ok] HidHide installer -- ran (exit ' + IntToStr(RC) + ')');
-        // Its service starts at once, but the filter only joins HID stacks
-        // built after it was registered: pads already paired need a reboot.
-        AddSummary('[reboot] HidHide -- freshly installed; hide-while-bridged works for already-connected controllers after the next reboot');
         RecordOrigin('HidHide', True);
-        RebootNote := True;
+        // Its service starts at once, but the filter only joins HID stacks
+        // built after it was registered, so a pad that is already paired
+        // is NOT hidden until its stack is rebuilt. Instead of asking for
+        // a reboot, the helper restarts the connected DualSenses' HIDClass
+        // devnodes (only those) and proves the attachment from
+        // DEVPKEY_Device_Stack; it writes the [reboot] line only for a pad
+        // it could not fix, and RunHelper sets RebootNote from that.
+        WizardForm.StatusLabel.Caption := 'Attaching HidHide to the connected controllers ...';
+        RunHelper('hidhide-attach', '');
       end
       else
         AddSummary('[warn] HidHide installer -- exited with ' + IntToStr(RC) + '; the bridge works without it');
@@ -703,11 +719,20 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   Expect: String;
   OutFile: String;
+  RC: Integer;
 begin
   if CurStep = ssInstall then
     InstallDrivers
   else if CurStep = ssPostInstall then
   begin
+    // Start-at-login: the scheduled task, through the same helper verb the
+    // uninstaller reverses. Registered before the verification so its
+    // result line is in the summary.
+    if WizardIsTaskSelected('autostart') then
+    begin
+      WizardForm.StatusLabel.Caption := 'Registering start-at-login ...';
+      RunHelper('autostart-enable', '');
+    end;
     WizardForm.StatusLabel.Caption := 'Verifying the installation ...';
     // The app is always expected (it is a fixed component): a missing
     // ds5bridge.exe is a [FAIL], never an [info].
@@ -724,6 +749,21 @@ begin
       Log(IntToStr(FailCount) + ' verification check(s) FAILED')
     else
       Log('all verification checks passed');
+  end
+  else if CurStep = ssDone then
+  begin
+    // /STARTTRAY=1: our own parameter, for the in-app updater (update.py),
+    // which runs this installer /VERYSILENT and therefore gets no [Run]
+    // "Start ds5bridge now". This process is elevated and so is the tray,
+    // so the launch needs no prompt. Never in an interactive run: the
+    // Finish page's checkbox is the user's to tick.
+    if WizardSilent and (ExpandConstant('{param:STARTTRAY|0}') = '1') and (FailCount = 0) then
+    begin
+      Log('STARTTRAY=1: starting the tray');
+      if not Exec(ExpandConstant('{app}\app\ds5bridge-tray.exe'), '', ExpandConstant('{app}\app'),
+                  SW_SHOWNORMAL, ewNoWait, RC) then
+        Log('the tray could not be started (' + SysErrorMessage(RC) + ')');
+    end;
   end;
 end;
 
@@ -772,10 +812,10 @@ begin
     Info.Left := ScaleX(16); Info.Top := ScaleY(12); Info.Width := ScaleX(440);
     Info.WordWrap := True;
     Info.AutoSize := True;
-    Info.Caption := 'ds5bridge itself (the app, its shortcut and start-at-login entry) will be removed. ' +
+    Info.Caption := 'ds5bridge itself (the app, its shortcut and start-at-login task) will be removed. ' +
       'Before that, any bridged controller is detached and any hidden controller is made visible again.' + #13#10#13#10 +
       'The two drivers are separate products. Ticked = removed too; untick to keep one ' +
-      '(keep it if another program, such as DS4Windows, uses it):';
+      '(keep it if another program, such as DS4Windows, uses it). Removing either needs ONE restart afterwards:';
 
     CbUsbip := TNewCheckBox.Create(Form);
     CbUsbip.Parent := Form;
@@ -855,31 +895,70 @@ begin
       '), purge settings=' + BoolStr(PurgeSettings));
 end;
 
+// Inno asks "restart now?" at the end of an interactive uninstall when this
+// answers True -- after our result dialog, which is the order we want: read
+// what happened, then be asked. True whenever a [reboot] line was written
+// (HidHide removed: its filter unloads at boot; usbip-win2 stage A armed: its
+// removal proper runs at the next logon). ONE reboot finishes both.
+//
+// Never in a silent run. Inno would otherwise restart the machine on its own
+// when /NORESTART was forgotten (and reboot without asking under /VERYSILENT);
+// a silent uninstaller that reboots the PC is exactly what /NORESTART exists
+// to prevent, and this does not rely on the caller remembering it. Silent
+// callers read the [reboot] lines in %TEMP%\ds5bridge-uninstall-check.txt.
+function UninstallNeedRestart(): Boolean;
+begin
+  Result := RebootNote and not UninstallSilent;
+  Log('UninstallNeedRestart: ' + BoolStr(Result));
+end;
+
 procedure ShowUninstallSummary;
 var
   Form: TSetupForm;
   Memo: TNewMemo;
+  Head: TNewStaticText;
   Ok: TNewButton;
   Text: String;
-  I: Integer;
+  I, Top: Integer;
 begin
   Text := '';
   for I := 0 to Summary.Count - 1 do
     Text := Text + Summary[I] + #13#10;
+  if RebootNote then
+    Text := 'What the restart does: HidHide''s filter driver, if it was removed, unloads at boot; ' +
+            'usbip-win2''s driver, if it was removed, is disabled now and taken out by the ' +
+            '''ds5bridge finish usbip-win2 removal'' task at your next logon (USB 3.0 devices blink ' +
+            'out and back once; "USBip" stays in Settings > Apps until then). ' +
+            'ONE reboot finishes both halves. Windows will offer to restart when you close this window; ' +
+            'nothing restarts on its own before that.' + #13#10#13#10 + Text;
   if FailCount > 0 then
     Text := IntToStr(FailCount) + ' check(s) FAILED -- see below.' + #13#10#13#10 + Text
   else
     Text := 'ds5bridge is uninstalled. All checks passed.' + #13#10#13#10 + Text;
-  if RebootNote then
-    Text := Text + #13#10 + 'A REBOOT finishes the driver removal (see the [reboot] line). Nothing will restart on its own.' + #13#10;
 
-  Form := CreateCustomForm(ScaleX(560), ScaleY(360), False, False);
+  Form := CreateCustomForm(ScaleX(560), ScaleY(400), False, False);
   try
     Form.Caption := 'ds5bridge uninstall -- result';
+    Top := ScaleY(12);
+    if RebootNote then
+    begin
+      // The one line that must not be missed, in bold above the list: the
+      // 2026-09-05 feedback was that the [reboot] line got lost in it.
+      Head := TNewStaticText.Create(Form);
+      Head.Parent := Form;
+      Head.Left := ScaleX(12); Head.Top := Top;
+      Head.Width := Form.ClientWidth - ScaleX(24);
+      Head.WordWrap := True;
+      Head.AutoSize := True;
+      Head.Font.Style := [fsBold];
+      Head.Font.Size := Head.Font.Size + 1;
+      Head.Caption := 'A RESTART IS REQUIRED to finish removing the drivers.';
+      Top := Head.Top + Head.Height + ScaleY(8);
+    end;
     Memo := TNewMemo.Create(Form);
     Memo.Parent := Form;
-    Memo.Left := ScaleX(12); Memo.Top := ScaleY(12);
-    Memo.Width := Form.ClientWidth - ScaleX(24); Memo.Height := Form.ClientHeight - ScaleY(60);
+    Memo.Left := ScaleX(12); Memo.Top := Top;
+    Memo.Width := Form.ClientWidth - ScaleX(24); Memo.Height := Form.ClientHeight - Top - ScaleY(48);
     Memo.ReadOnly := True;
     Memo.ScrollBars := ssVertical;
     Memo.WordWrap := True;
@@ -925,6 +1004,9 @@ begin
       // each driver step only if no other installer is at work right then.
       UninstallProgressForm.StatusLabel.Caption := 'Stopping ds5bridge and detaching the virtual controller ...';
       RunHelper('teardown', '');
+      // The start-at-login task (ours, or the tray's -- same task), and the
+      // pre-0.5.0 Run value if it is still there.
+      RunHelper('autostart-disable', '');
       UninstallProgressForm.StatusLabel.Caption := 'Clearing HidHide entries ...';
       if RemoveHidHide then
         RunHelper('hidhide-clear', '-All')
@@ -975,8 +1057,8 @@ begin
     if RemoveHidHide then RegDeleteValue(HKLM, SetupKey, 'HidHideInstalledByUs');
     RegDeleteKeyIfEmpty(HKLM, SetupKey);
     RegDeleteKeyIfEmpty(HKLM, 'SOFTWARE\ds5bridge');
-    // A start-at-login entry the tray's own menu created (not our [Registry]
-    // task) would otherwise dangle.
+    // Belt to the helper's braces: a pre-0.5.0 Run value pointing at this
+    // install (the helper may have been missing).
     if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ds5bridge', RunValue) then
       if Pos(Lowercase(ExpandConstant('{app}')), Lowercase(RunValue)) > 0 then
       begin
