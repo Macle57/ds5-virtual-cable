@@ -936,6 +936,11 @@ class TestHideToggle(_Base):
         # in this process, then whatever hidhide.hide_status says. Both
         # branches of snapshot() -- a bridge, and a present-but-stopped pad.
         from ds5app import hidhide as HH
+        # hidhide.py keeps the last hide's verdict per serial in a module
+        # global; test_hidhide's hide_for_bridge tests use the same serial as
+        # A and leave theirs behind, so start from a clean slate here.
+        HH.clear_hide_status(A)
+        HH.clear_hide_status(B)
         m = self.make(hide_bluetooth={A: True, B: True}, enabled={A: True, B: False})
         m.start(A)
         m.poll_once()
