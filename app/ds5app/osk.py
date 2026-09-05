@@ -717,6 +717,12 @@ if sys.platform == "win32":
             self._font = self._hint_font = None
             self._pos: tuple | None = None
             self._size = (0, 0)
+            #: Physical pixels per model pixel. The model lays keys out at 96
+            #: DPI; the renderer thread opts into per-monitor DPI awareness
+            #: and scales, so on a 125 % screen the keyboard is 125 % big in
+            #: real pixels instead of being bitmap-stretched (and mispositioned)
+            #: by DWM's virtualisation of a DPI-unaware process.
+            self._scale = 1.0
 
         # -- the engine's side ------------------------------------------
 
@@ -760,7 +766,24 @@ if sys.platform == "win32":
 
         # -- the window's thread ---------------------------------------
 
+        def _px(self, v) -> int:
+            return int(round(v * self._scale))
+
+        def _size_of(self, snap: dict) -> tuple:
+            return self._px(snap["width"]), self._px(snap["height"])
+
         def _run(self) -> None:
+            try:
+                # Per-monitor-aware v2 for THIS thread only (Windows 10 1607+):
+                # GetSystemMetrics and the window's coordinates become real
+                # pixels, and DWM stops scaling what we draw.
+                _u32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+                _u32.SetThreadDpiAwarenessContext.argtypes = (ctypes.c_void_p,)
+                _u32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+                _u32.GetDpiForSystem.restype = ctypes.c_uint
+                self._scale = max(1.0, _u32.GetDpiForSystem() / 96.0)
+            except Exception:  # noqa: BLE001
+                self._scale = 1.0
             hinst = _k32.GetModuleHandleW(None)
             self._proc = WNDPROC(self._wndproc)
             wc = WNDCLASSW()
@@ -777,21 +800,22 @@ if sys.platform == "win32":
                 snap = self._snap or {"width": 100, "height": 50, "keys": (),
                                       "pos": None}
                 x, y = self._place(snap)
+                w, h = self._size_of(snap)
                 self._hwnd = _u32.CreateWindowExW(
                     _WS_EX_NOACTIVATE | _WS_EX_TOPMOST | _WS_EX_TOOLWINDOW
                     | _WS_EX_LAYERED,
                     self.CLASS_NAME, "ds5bridge keyboard", _WS_POPUP,
-                    x, y, snap["width"], snap["height"], None, None, hinst, None)
+                    x, y, w, h, None, None, hinst, None)
                 if not self._hwnd:
                     log.error("CreateWindowExW failed: %d", ctypes.get_last_error())
                     return
                 _u32.SetLayeredWindowAttributes(self._hwnd, 0, _ALPHA, _LWA_ALPHA)
                 self._font = _g32.CreateFontW(
-                    -int(UNIT * 0.40), 0, 0, 0, _FW_SEMIBOLD, 0, 0, 0, 1, 0, 0,
-                    _CLEARTYPE_QUALITY, 0, "Segoe UI")
+                    -self._px(UNIT * 0.40), 0, 0, 0, _FW_SEMIBOLD, 0, 0, 0, 1,
+                    0, 0, _CLEARTYPE_QUALITY, 0, "Segoe UI")
                 self._hint_font = _g32.CreateFontW(
-                    -int(UNIT * 0.24), 0, 0, 0, _FW_SEMIBOLD, 0, 0, 0, 1, 0, 0,
-                    _CLEARTYPE_QUALITY, 0, "Segoe UI Symbol")
+                    -self._px(UNIT * 0.24), 0, 0, 0, _FW_SEMIBOLD, 0, 0, 0, 1,
+                    0, 0, _CLEARTYPE_QUALITY, 0, "Segoe UI Symbol")
                 self._apply_geometry(snap, show=True)
                 self._ready.set()
                 msg = MSG()
@@ -813,10 +837,10 @@ if sys.platform == "win32":
             """Where the window goes: the user's drag position, clamped to the
             primary screen, or bottom-centre with a 48 px lift."""
             sw, sh = _u32.GetSystemMetrics(_SM_CXSCREEN), _u32.GetSystemMetrics(_SM_CYSCREEN)
-            w, h = snap["width"], snap["height"]
+            w, h = self._size_of(snap)
             pos = snap.get("pos")
             if pos is None:
-                x, y = (sw - w) // 2, sh - h - 48
+                x, y = (sw - w) // 2, sh - h - self._px(48)
             else:
                 x, y = int(pos[0]), int(pos[1])
             x = max(0, min(max(0, sw - w), x))
@@ -827,10 +851,10 @@ if sys.platform == "win32":
 
         def _apply_geometry(self, snap: dict, show: bool) -> None:
             x, y = self._place(snap)
+            w, h = self._size_of(snap)
             flags = _SWP_NOACTIVATE | (_SWP_SHOWWINDOW if show else 0)
-            _u32.SetWindowPos(self._hwnd, _HWND_TOPMOST, x, y,
-                              snap["width"], snap["height"], flags)
-            self._size = (snap["width"], snap["height"])
+            _u32.SetWindowPos(self._hwnd, _HWND_TOPMOST, x, y, w, h, flags)
+            self._size = (w, h)
             _u32.InvalidateRect(self._hwnd, None, False)
 
         def _wndproc(self, hwnd, msg, wparam, lparam):
@@ -900,11 +924,13 @@ if sys.platform == "win32":
             old_pen = _g32.SelectObject(dc, _g32.GetStockObject(_NULL_PEN))
             brushes = {c: _g32.CreateSolidBrush(c)
                        for c in (_C_KEY, _C_KEY_ON, _C_HILITE)}
+            px = self._px
             try:
                 for (x, y, w, h, label, hint, hilite, on) in snap["keys"]:
+                    x, y, w, h = px(x), px(y), px(w), px(h)
                     color = _C_HILITE if hilite else (_C_KEY_ON if on else _C_KEY)
                     old_brush = _g32.SelectObject(dc, brushes[color])
-                    _g32.RoundRect(dc, x, y, x + w, y + h, 10, 10)
+                    _g32.RoundRect(dc, x, y, x + w, y + h, px(10), px(10))
                     _g32.SelectObject(dc, old_brush)
                     # label, centred
                     r = wintypes.RECT(x, y, x + w, y + h)
@@ -916,7 +942,7 @@ if sys.platform == "win32":
                         # the pad button that is a shortcut for this key
                         _g32.SelectObject(dc, self._hint_font)
                         _g32.SetTextColor(dc, _C_HINT_DARK if hilite else _C_HINT)
-                        hr = wintypes.RECT(x, y + 3, x + w - 6, y + h)
+                        hr = wintypes.RECT(x, y + px(3), x + w - px(6), y + h)
                         _u32.DrawTextW(dc, hint, -1, ctypes.byref(hr),
                                        _DT_RIGHT | _DT_TOP | _DT_SINGLELINE)
                     _g32.SelectObject(dc, old_font)
