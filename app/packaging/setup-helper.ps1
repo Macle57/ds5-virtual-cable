@@ -321,9 +321,16 @@ function Get-UsbipDevnode {
 }
 
 function Get-BtPads {
+    # The HID collection PDOs (HID\...) of connected Bluetooth DualSenses; when
+    # none is listed -- they re-enumerate for a few seconds after their parent
+    # is restarted, and a fresh install restarts exactly those parents -- the
+    # parents themselves (the BTHENUM HID service nodes, one per pad) stand in,
+    # so the count printed is the number of pads, never a misleading zero.
     try {
-        @(Get-PnpDevice -PresentOnly -Class HIDClass -ErrorAction Stop |
-          Where-Object { $_.InstanceId -like "$BtPadPrefix*" })
+        $kids = @(Get-PnpDevice -PresentOnly -Class HIDClass -ErrorAction Stop |
+                  Where-Object { $_.InstanceId -like "$BtPadPrefix*" })
+        if ($kids.Count -gt 0) { return $kids }
+        return @(Get-BtPadHidNodes)
     } catch { @() }
 }
 
@@ -1057,7 +1064,7 @@ function Invoke-VerifyInstall {
         Emit $(if ($ExpectApp) { 'FAIL' } else { 'INFO' }) 'ds5bridge.exe' "not at $app"
     }
     $pads = Get-BtPads
-    Emit INFO 'Bluetooth DualSense' "$($pads.Count) HID devnode(s) present now"
+    Emit INFO 'Bluetooth DualSense' "$($pads.Count) connected right now"
     return $(if ($script:Fails -gt 0) { 1 } else { 0 })
 }
 
@@ -1122,7 +1129,7 @@ function Invoke-VerifyRemoved {
     $bad = @($pads | Where-Object { $_.Status -ne 'OK' })
     if ($pads.Count -eq 0) { Emit INFO 'Bluetooth DualSense' 'none connected right now' }
     elseif ($bad.Count -gt 0) { Emit WARN 'Bluetooth DualSense' ("{0} present, {1} not OK: {2}" -f $pads.Count, $bad.Count, (($bad | ForEach-Object { "$($_.InstanceId)=$($_.Status)" }) -join '; ')) }
-    else { Emit PASS 'Bluetooth DualSense' "$($pads.Count) HID devnode(s) present and OK" }
+    else { Emit PASS 'Bluetooth DualSense' "$($pads.Count) present and OK" }
     return $(if ($script:Fails -gt 0) { 1 } else { 0 })
 }
 

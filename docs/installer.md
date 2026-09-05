@@ -220,7 +220,7 @@ dialog lists what was verified:
 [ok] HidHideCLI.exe -- gone
 [ok] service HidHide -- marked for deletion (gone after a reboot)
 [reboot] HidHide -- its filter driver is unloaded on the next reboot
-[ok] Bluetooth DualSense -- 2 HID devnode(s) present and OK
+[ok] Bluetooth DualSense -- 2 present and OK
 [ok] app -- C:\Users\you\AppData\Local\ds5bridge removed
 [info] settings -- kept at C:\Users\you\AppData\Roaming\ds5bridge
 ```
