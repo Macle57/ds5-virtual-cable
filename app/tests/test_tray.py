@@ -1140,5 +1140,30 @@ class AnnounceSwitchesTests(unittest.TestCase):
         self.assertIn("bridging is OFF", said)
 
 
+class LowBatteryToastTests(unittest.TestCase):
+    """The manager's dedupe decides WHEN; the tray only words it."""
+
+    def test_a_battery_low_event_toasts_with_the_label(self):
+        app = app_with([controller()])
+        app.icon = object()
+        app.cfg.controllers = {A: types.SimpleNamespace(label="couch")}
+        app._on_event(A, "battery_low", "battery 20% -- charge soon")
+        self.assertEqual(app.notes, [("ds5bridge", "couch battery 20% -- charge soon")])
+
+    def test_without_a_label_the_short_serial_names_the_pad(self):
+        app = app_with([controller()])
+        app.icon = object()
+        app.cfg.controllers = {}
+        app._on_event(A, "battery_low", "battery 10% -- charge it now")
+        self.assertEqual(app.notes[0][1], "a0fa..d8bb battery 10% -- charge it now")
+
+    def test_plain_battery_reports_and_mode_lines_do_not_toast(self):
+        app = app_with([controller()])
+        app.icon = object()
+        app._on_event(A, "battery", "battery 18% -- LOW. Charge it soon")
+        app._on_event(A, "mode", "remote on  keyboard closed")
+        self.assertEqual(app.notes, [])
+
+
 if __name__ == "__main__":
     unittest.main()

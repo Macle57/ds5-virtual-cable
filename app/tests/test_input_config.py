@@ -235,5 +235,66 @@ class RoundTrip(unittest.TestCase):
         self.assertEqual(back.input.chords, CFG.DEFAULT_CHORDS)
 
 
+class RemoteTable(unittest.TestCase):
+    """`input.remote.chords` merges over DEFAULT_REMOTE_CHORDS exactly the way
+    `input.chords` merges over DEFAULT_CHORDS, and `same_bindings` rides
+    next to it."""
+
+    def test_defaults(self):
+        rm = CFG.RemoteMode.from_dict({})
+        self.assertTrue(rm.same_bindings)
+        self.assertEqual(rm.chords, CFG.DEFAULT_REMOTE_CHORDS)
+        self.assertEqual(CFG.DEFAULT_REMOTE_CHORDS["cross"], "left_click")
+
+    def test_merge_and_removal(self):
+        rm = CFG.RemoteMode.from_dict({"same_bindings": False,
+                                       "chords": {"cross": "none",
+                                                  "Square": "Middle_Click"}})
+        self.assertFalse(rm.same_bindings)
+        self.assertNotIn("cross", rm.chords)
+        self.assertEqual(rm.chords["square"], "middle_click")
+        self.assertEqual(rm.chords["circle"], "escape")        # untouched
+
+    def test_removal_is_written_as_none_and_survives_a_round_trip(self):
+        rm = CFG.RemoteMode.from_dict({"chords": {"cross": "none"}})
+        d = rm.to_dict()
+        self.assertEqual(d["chords"]["cross"], "none")
+        again = CFG.RemoteMode.from_dict(d)
+        self.assertNotIn("cross", again.chords)
+        self.assertEqual(again.to_dict(), d)
+
+    def test_garbage_table_keeps_the_defaults(self):
+        rm = CFG.RemoteMode.from_dict({"chords": ["cross"], "same_bindings": "no"})
+        self.assertEqual(rm.chords, CFG.DEFAULT_REMOTE_CHORDS)
+        self.assertFalse(rm.same_bindings)
+
+    def test_unknown_keys_survive_next_to_the_new_fields(self):
+        rm = CFG.RemoteMode.from_dict({"future": 1, "chords": {}})
+        d = rm.to_dict()
+        self.assertEqual(d["future"], 1)
+        self.assertIn("same_bindings", d)
+        self.assertIn("chords", d)
+
+    def test_the_whole_config_round_trips_the_remote_table(self):
+        cfg = CFG.Config.from_dict({"input": {"remote": {
+            "same_bindings": False, "chords": {"options": "volume_mute"}}}})
+        d = cfg.to_dict()
+        self.assertEqual(d["input"]["remote"]["chords"]["options"], "volume_mute")
+        self.assertFalse(d["input"]["remote"]["same_bindings"])
+        self.assertEqual(CFG.Config.from_dict(d).input.remote.chords,
+                         cfg.input.remote.chords)
+
+    def test_shared_merge_helpers(self):
+        self.assertEqual(CFG.merge_chords({"a": "x"}, {"b": "y", "a": "off"}, "t"),
+                         {"b": "y"})
+        self.assertEqual(CFG.chords_to_dict({"a": "x"}, {"b": "y"}),
+                         {"a": "none", "b": "y"})
+
+    def test_the_new_default_chords_and_engine_action(self):
+        self.assertEqual(CFG.DEFAULT_CHORDS["touchpad_click"], "keyboard")
+        self.assertEqual(CFG.DEFAULT_CHORDS["mute"], "dictation")
+        self.assertIn("keyboard", CFG.ENGINE_ACTIONS)
+
+
 if __name__ == "__main__":
     unittest.main()
