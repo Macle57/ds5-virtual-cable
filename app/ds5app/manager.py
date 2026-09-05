@@ -453,7 +453,78 @@ _STATUS_RE = re.compile(
 
 #: The prefixes `cli._log` puts in front of each event.
 _EVENT_PREFIX = {"  *  ": "ready", "  !  ": "warn", " !!! ": "error",
-                 "  ~  ": "battery", "  -  ": "info"}
+                 "  ~  ": "battery", "  -  ": "info", "  #  ": "mode"}
+
+#: `service.mode_line()`: the chord engine's remote/keyboard state.
+_MODE_RE = re.compile(r"^remote (?P<remote>on|off)\s+keyboard "
+                      r"(?P<keyboard>open|closed)\s*$")
+
+#: `controller.battery_note()` as the child prints it on its "battery" and
+#: "warn" lines: `battery 40%`, `battery 40% (charging)`, `battery 20% --
+#: LOW. ...`. Only the number and the charging state matter here.
+_BATTERY_RE = re.compile(r"^battery (?P<pct>\d+)%(?: \((?P<state>[^)]*)\))?")
+
+#: Battery levels at which the tray shows ONE notification per discharge:
+#: the same 20 % the lightbar starts flashing amber at, and the 10 % it
+#: turns red at. The pad reports in 10 % steps, so these are exact hits.
+LOW_BATTERY_TOASTS = (S.C.BATTERY_WARN_PERCENT, 10)
+
+
+class LowBatteryAlerts:
+    """Decides when a battery reading deserves a toast. Pure, per controller.
+
+    The child already warns at every NEW low reading (18, then 12, then
+    11 ...) once a minute, and the lightbar flashes on its own schedule;
+    neither is what a notification should follow, because a toast for each
+    percent lost is a toast people switch off. This fires once when the
+    level first reaches each threshold while DISCHARGING, and re-arms a
+    threshold only when the pad charges back above it or the bridge starts
+    over (`reset()`, on a reconnect). A reading that merely bounces back
+    over a threshold while still discharging does not re-arm it: the pad's
+    10 % steps flap at the boundary.
+    """
+
+    def __init__(self, thresholds=LOW_BATTERY_TOASTS):
+        self.thresholds = tuple(sorted(set(int(t) for t in thresholds),
+                                       reverse=True))
+        self._fired: set = set()
+
+    def reset(self) -> None:
+        self._fired.clear()
+
+    def observe(self, percent, charging: bool):
+        """-> the threshold to announce, or None."""
+        if percent is None:
+            return None
+        pct = int(percent)
+        if charging:
+            for t in self.thresholds:
+                if pct > t:
+                    self._fired.discard(t)
+            return None
+        due = [t for t in self.thresholds if pct <= t and t not in self._fired]
+        if not due:
+            return None
+        # Announce the LOWEST crossed threshold (a pad that comes up already
+        # at 10 % gets the 10 % toast, not the 20 % one) and mark every
+        # threshold at or above the reading as spent.
+        self._fired.update(t for t in self.thresholds if pct <= t)
+        return min(due)
+
+
+def parse_battery_event(text: str):
+    """(percent, charging) from a child's battery line, or None."""
+    m = _BATTERY_RE.match(text.strip())
+    if not m:
+        return None
+    state = (m.group("state") or "").lower()
+    return int(m.group("pct")), state.startswith("charging")
+
+
+def low_battery_text(percent: int) -> str:
+    """The toast body. Short: a notification is glanced at, not read."""
+    urgency = "charge it now" if percent <= 10 else "charge soon"
+    return f"battery {percent}% -- {urgency}"
 
 
 class ChildBridge:
@@ -489,13 +560,18 @@ class ChildBridge:
         self.error: str | None = None
         self._lock = threading.RLock()
         self._reader: threading.Thread | None = None
+        #: Low-battery toast dedupe; `start()` re-arms it (a reconnect).
+        self._battery_alerts = LowBatteryAlerts()
         self._snap = self._blank()
 
     def _blank(self) -> dict:
         return {"serial": self.serial, "port": self.port, "state": STOPPED,
                 "error": None, "pid": None, "battery_percent": None,
                 "reports_per_s": 0.0, "uptime_s": 0, "attached": False,
-                "last_event": "", "offline_since": None}
+                "last_event": "", "offline_since": None,
+                # the chord engine's modes, from the child's "mode" lines;
+                # None until the child has said (or when it never will)
+                "remote_mode": None, "keyboard_open": None}
 
     # -- state, and who is told about it -----------------------------------
 
@@ -541,6 +617,7 @@ class ChildBridge:
             self._snap = self._blank()
             self._snap["state"] = STARTING
             self.error = None
+            self._battery_alerts.reset()
             flags = _CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
             if sys.platform == "win32" and not _have_console():
                 # A tray host has no console; without this every child would
@@ -708,6 +785,10 @@ class ChildBridge:
                         self._changed()
                 elif kind == "error":
                     self._fail(text)
+                elif kind == "mode":
+                    self._note_mode(text)
+                elif kind in ("battery", "warn"):
+                    kind = self._battery_event(kind, text)
                 self._emit(kind, text)
         except Exception:  # noqa: BLE001
             log.debug("stdout reader for %s ended", self.serial, exc_info=True)
@@ -733,6 +814,33 @@ class ChildBridge:
             # news the manager must act on within a tick, and it is the one
             # transition that can arrive with the state already looking right.
             self._changed()
+
+    def _note_mode(self, text: str) -> None:
+        """A `service.mode_line()`: record the engine's two modes."""
+        m = _MODE_RE.match(text)
+        if not m:
+            return
+        with self._lock:
+            self._snap["remote_mode"] = m.group("remote") == "on"
+            self._snap["keyboard_open"] = m.group("keyboard") == "open"
+
+    def _battery_event(self, kind: str, text: str) -> str:
+        """Route a battery line: -> the kind to emit it as.
+
+        A battery "warn" from the child is re-kinded to "battery" so the tray
+        (which toasts every warn) stays quiet, and the reading goes through
+        `LowBatteryAlerts`; when a threshold is crossed a separate
+        "battery_low" event carries the toast text. A "warn" that is not
+        about the battery passes untouched.
+        """
+        parsed = parse_battery_event(text)
+        if parsed is None:
+            return kind
+        pct, charging = parsed
+        crossed = self._battery_alerts.observe(pct, charging)
+        if crossed is not None:
+            self._emit("battery_low", low_battery_text(pct))
+        return "battery"
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1737,6 +1845,7 @@ class BridgeManager:
                     "state": STOPPED, "error": errors.get(serial), "pid": None,
                     "battery_percent": None, "reports_per_s": 0.0,
                     "uptime_s": 0, "attached": False, "last_event": "",
+                    "remote_mode": None, "keyboard_open": None,
                     "enabled": enabled.get(serial, default_enabled),
                     "hide_bluetooth": hide.get(serial, hide_default),
                     "present": True}
