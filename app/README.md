@@ -42,7 +42,7 @@ Do not stop it from Task Manager.
 The commands it wraps, and everything else:
 
 ```powershell
-cd D:\Codes\dualSense\ds5-virtual-usb\app
+cd <repo>\app
 ..\prototype\.venv\Scripts\python.exe -m ds5app                 # bridge, Ctrl+C to stop
 ..\prototype\.venv\Scripts\python.exe -m ds5app devices
 ..\prototype\.venv\Scripts\python.exe -m ds5app doctor

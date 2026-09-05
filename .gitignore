@@ -16,9 +16,12 @@ README-human.md
 # Diagnostic one-offs (mouse_probe.py and friends)
 scratchpad/
 
-# Build output
+# Build output (build-onefile/ and dist-onefile/ were tracked until 2026-09-05:
+# 175 MB of PyInstaller output that build.ps1 -OneFile regenerates)
 build/
+build-onefile/
 dist/
+dist-onefile/
 target/
 
 # Dashboard UI (app/dashboard-ui): deps only -- the built page,
