@@ -86,10 +86,10 @@ implements independently. usbip-win2 is licensed under the 2-Clause BSD
 License as of release 0.9.7.0 and later (earlier releases were GPL-3.0); this
 project targets 0.9.7.7.
 
-Each release publishes two builds of the Windows installer.
+Each release publishes one Windows installer.
 
-ds5bridge-setup-<version>-bundled.exe (the recommended one) embeds, unmodified
-and byte-for-byte, the official installers USBip-0.9.7.7-x64.exe (usbip-win2,
+ds5bridge-setup-<version>-bundled.exe embeds, unmodified and byte-for-byte,
+the official installers USBip-0.9.7.7-x64.exe (usbip-win2,
 BSD-2-Clause, (c) 2021-2026 Vadym Hrynchyshyn) and HidHide_1.5.230_x64.exe
 (HidHide, MIT, (c) 2020 Eric Korff de Gidts, (c) 2021-2024 Benjamin
 Hoeglinger-Stelzer / Nefarius Software Solutions e.U.), each installed as a
@@ -99,9 +99,12 @@ that installer places next to the uninstaller in %LOCALAPPDATA%\ds5bridge, as
 the BSD-2-Clause licence requires for binary redistribution. Neither project
 endorses ds5bridge.
 
-ds5bridge-setup-<version>.exe and scripts/install.ps1 do not redistribute
-either package: they download each vendor's official installer from its own
-release page and verify its SHA-256 before running it.
+scripts/install.ps1 redistributes nothing itself: it downloads that installer
+from this project's release page and verifies its SHA-256 before running it.
+A download-mode build of the installer, ds5bridge-setup-<version>.exe (built
+locally with app/packaging/build-installer.ps1 without -Bundle; not
+published), embeds neither package and instead downloads each vendor's
+official installer from its own release page, verifying its SHA-256 first.
 
 ================================================================================
 Runtime dependencies are third-party packages installed by the user via pip and

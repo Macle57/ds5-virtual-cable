@@ -1958,5 +1958,210 @@ class TestReviveIsWiredIn(_Temp):
         self.assertEqual(len(HH.read_records()), 1, "the record must be kept")
 
 
+# ---------------------------------------------------------------------------
+# the filter -- is HidHide actually in the device stack? (2026-09-05)
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureFilter(unittest.TestCase):
+    """The decision table of `ensure_filter`, with every probe faked.
+
+    The bug this guards: a fresh install with a pad already paired -- the hide
+    list is right, the filter is not in the pad's stack, and every layer said
+    "hidden". Here `covers` is scripted per call, `restart` is recorded, and
+    nothing touches cfgmgr32 or pnputil.
+    """
+
+    PARENT = r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\7&16440032&0&D42F4BA1485D_C00000000"
+    NEW_IDS = [r"HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\9&28DA590B&11&0000"]
+
+    def run_it(self, answers, allow_restart=False, elevated=True, fresh=None):
+        answers = list(answers)
+        restarted = []
+
+        def covers(ids, parent):
+            return answers.pop(0) if answers else None
+        out = HH.ensure_filter(SERIAL, IDS, self.PARENT, allow_restart=allow_restart,
+                               log_fn=lambda t: None,
+                               covers=covers,
+                               restart=lambda t: restarted.append(t) or (0, ""),
+                               elevated=lambda: elevated,
+                               resolve=lambda s: fresh if fresh is not None else IDS,
+                               wait=lambda s, settle: True)
+        return out, restarted
+
+    def test_attached_is_effective_and_touches_nothing(self):
+        out, restarted = self.run_it([True], allow_restart=True)
+        self.assertIs(out["effective"], True)
+        self.assertEqual(out["note"], "")
+        self.assertEqual(restarted, [])
+        self.assertEqual(out["ids"], IDS)
+
+    def test_unknown_is_unknown_and_never_restarts(self):
+        # A check that could not be performed must not become a device restart.
+        out, restarted = self.run_it([None], allow_restart=True)
+        self.assertIsNone(out["effective"])
+        self.assertEqual(out["note"], HH.NOTE_FILTER_UNKNOWN)
+        self.assertEqual(restarted, [])
+
+    def test_missing_without_restart_permission_says_so(self):
+        out, restarted = self.run_it([False], allow_restart=False)
+        self.assertIs(out["effective"], False)
+        self.assertEqual(out["note"], HH.NOTE_FILTER_MISSING)
+        self.assertEqual(restarted, [])
+
+    def test_missing_unelevated_says_run_as_admin(self):
+        out, restarted = self.run_it([False], allow_restart=True, elevated=False)
+        self.assertIs(out["effective"], False)
+        self.assertEqual(out["note"], HH.NOTE_FILTER_MISSING_UNELEVATED)
+        self.assertIn("administrator", out["note"])
+        self.assertEqual(restarted, [])
+
+    def test_missing_elevated_restarts_the_parent_and_rechecks(self):
+        with mock.patch.object(HH, "parent_instance_id", return_value=self.PARENT):
+            out, restarted = self.run_it([False, True], allow_restart=True)
+        self.assertIs(out["effective"], True)
+        self.assertEqual(out["note"], HH.NOTE_FILTER_RESTARTED)
+        self.assertTrue(out["restarted"])
+        # The HIDClass node the filter belongs on, once, not each collection.
+        self.assertEqual(restarted, [self.PARENT])
+
+    def test_a_restart_that_churns_the_ids_hands_back_the_new_ones(self):
+        with mock.patch.object(HH, "parent_instance_id", return_value=self.PARENT):
+            out, _ = self.run_it([False, True], allow_restart=True,
+                                 fresh=self.NEW_IDS)
+        self.assertEqual(out["ids"], self.NEW_IDS)
+
+    def test_still_missing_after_the_restart_means_reboot(self):
+        with mock.patch.object(HH, "parent_instance_id", return_value=self.PARENT):
+            out, restarted = self.run_it([False, False], allow_restart=True)
+        self.assertIs(out["effective"], False)
+        self.assertEqual(out["note"], HH.NOTE_FILTER_STILL_MISSING)
+        self.assertIn("reboot", out["note"])
+        self.assertEqual(len(restarted), 1)
+
+    def test_no_ids_is_nothing_to_check(self):
+        out = HH.ensure_filter(SERIAL, [], allow_restart=True,
+                               covers=lambda i, p: False,
+                               restart=lambda t: (0, ""), elevated=lambda: True)
+        self.assertIsNone(out["effective"])
+        self.assertEqual(out["ids"], [])
+
+    def test_a_probe_that_explodes_is_unknown_not_a_crash(self):
+        def boom(ids, parent):
+            raise RuntimeError("cfgmgr fell over")
+        out = HH.ensure_filter(SERIAL, IDS, allow_restart=True, covers=boom,
+                               log_fn=lambda t: None)
+        self.assertIsNone(out["effective"])
+        self.assertEqual(out["note"], HH.NOTE_FILTER_UNKNOWN)
+
+
+class TestFilterCovers(unittest.TestCase):
+    """`filter_covers` over a scripted `filter_attached`: an entry counts as
+    covered when it or the node it hangs off carries the filter."""
+
+    PARENT = r"BTHENUM\{00001124-...}\7&16440032&0&D42F4BA1485D_C00000000"
+
+    def covers(self, stacks, parent_of=None, parent_id=""):
+        def attached(iid):
+            return stacks.get(iid, None)
+        with mock.patch.object(HH, "filter_attached", attached), \
+                mock.patch.object(HH, "parent_instance_id",
+                                  lambda iid: (parent_of or {}).get(iid, "")):
+            return HH.filter_covers(IDS, parent_id)
+
+    def test_entry_itself_attached(self):
+        self.assertIs(self.covers({IDS[0]: True}), True)
+
+    def test_entry_not_attached_but_its_parent_is(self):
+        self.assertIs(self.covers({IDS[0]: False, self.PARENT: True},
+                                  parent_of={IDS[0]: self.PARENT}), True)
+
+    def test_neither_attached(self):
+        self.assertIs(self.covers({IDS[0]: False, self.PARENT: False},
+                                  parent_of={IDS[0]: self.PARENT}), False)
+
+    def test_unreadable_entry_falls_back_to_the_recorded_parent(self):
+        # The child has gone phantom (unreadable); the record's parent answers.
+        self.assertIs(self.covers({self.PARENT: True}, parent_id=self.PARENT), True)
+        self.assertIs(self.covers({self.PARENT: False}, parent_id=self.PARENT), False)
+
+    def test_nothing_readable_is_none(self):
+        self.assertIsNone(self.covers({}))
+
+    def test_filter_attached_matches_the_driver_object_case_insensitively(self):
+        with mock.patch.object(HH, "device_stack",
+                               return_value=[r"\driver\hidhide", r"\Driver\HidBth"]):
+            self.assertIs(HH.filter_attached("x"), True)
+        with mock.patch.object(HH, "device_stack",
+                               return_value=[r"\Driver\HidBth", r"\Driver\steamxbox"]):
+            self.assertIs(HH.filter_attached("x"), False)
+        with mock.patch.object(HH, "device_stack", return_value=None):
+            self.assertIsNone(HH.filter_attached("x"))
+
+
+class TestHideStatus(_Temp):
+    """What `hide_for_bridge` remembers for `/api/state` and says out loud."""
+
+    def hide(self, check, allow_restart=False):
+        f = FakeIoctl()
+        hh = make(f)
+        said = []
+        with mock.patch.object(HH.HidHide, "detect", return_value=hh), \
+                mock.patch.object(HH, "resolve_serial", return_value=IDS), \
+                mock.patch.object(HH.HidHide, "whitelist_covers_us",
+                                  return_value=None), \
+                mock.patch.object(HH, "ensure_filter",
+                                  return_value=dict(check, ids=check.get("ids", IDS))) as ef:
+            ids = HH.hide_for_bridge(SERIAL, log_fn=said.append,
+                                     allow_restart=allow_restart)
+        return ids, said, f, ef
+
+    def test_effective_hide_reports_hidden(self):
+        ids, said, f, _ = self.hide({"effective": True, "note": "", "restarted": False})
+        self.assertEqual(ids, IDS)
+        self.assertEqual(HH.hide_status(SERIAL),
+                         {"hide_effective": True, "hide_note": ""})
+        self.assertTrue(any("hidden" in s and "NOT" not in s for s in said), said)
+
+    def test_ineffective_hide_says_not_hidden_and_records_the_note(self):
+        ids, said, f, _ = self.hide({"effective": False,
+                                     "note": HH.NOTE_FILTER_MISSING,
+                                     "restarted": False})
+        self.assertEqual(ids, IDS)                    # the list IS updated ...
+        self.assertEqual(f.blacklist, IDS)
+        st = HH.hide_status(SERIAL)                   # ... and the truth is told
+        self.assertIs(st["hide_effective"], False)
+        self.assertEqual(st["hide_note"], HH.NOTE_FILTER_MISSING)
+        self.assertTrue(any("NOT actually hidden" in s for s in said), said)
+
+    def test_the_restart_permission_is_passed_through(self):
+        _, _, _, ef = self.hide({"effective": True, "note": ""}, allow_restart=True)
+        self.assertTrue(ef.call_args.kwargs["allow_restart"])
+        _, _, _, ef = self.hide({"effective": True, "note": ""})
+        self.assertFalse(ef.call_args.kwargs["allow_restart"])
+
+    def test_churned_ids_from_the_check_are_what_gets_hidden(self):
+        new = [r"HID\{00001124-...}\9&28DA590B&11&0000"]
+        with mock.patch.object(HH, "parent_instance_id", return_value=""):
+            ids, _, f, _ = self.hide({"effective": True, "note": "", "ids": new})
+        self.assertEqual(ids, new)
+        self.assertEqual(f.blacklist, new)
+        self.assertEqual(HH.read_records()[0]["instance_ids"], new)
+
+    def test_unhide_forgets_the_status(self):
+        self.hide({"effective": False, "note": HH.NOTE_FILTER_MISSING})
+        f = FakeIoctl(blacklist=IDS)
+        with mock.patch.object(HH.HidHide, "detect", return_value=make(f)), \
+                mock.patch.object(HH, "entries_under_parent", return_value=[]):
+            self.assertTrue(HH.unhide_for_bridge(SERIAL))
+        self.assertEqual(HH.hide_status(SERIAL),
+                         {"hide_effective": None, "hide_note": ""})
+
+    def test_unknown_serial_is_null_and_empty(self):
+        self.assertEqual(HH.hide_status("nobody"),
+                         {"hide_effective": None, "hide_note": ""})
+
+
 if __name__ == "__main__":
     unittest.main()

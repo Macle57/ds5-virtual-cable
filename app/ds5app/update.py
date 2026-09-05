@@ -13,14 +13,19 @@ installed, which is what keeps this property from eroding.
 **A running one-dir build holds its own files open.** `ds5bridge-tray.exe` and
 every DLL under `app\\_internal` are locked by the Windows loader for as long as
 the process lives, so "download the new version and overwrite the old one" is
-impossible from inside the program being overwritten. The classic answer is the
-one used here: stage the new version NEXT TO the install, hand a tiny helper
-script the job of swapping directories, and exit. The helper waits for this
-process to die (the lock dies with it), renames `app` aside, moves the staged
-version in, relaunches the tray, and deletes the old directory. Renaming a
-directory is atomic on NTFS within a volume, and both directories live under
-the same `%LOCALAPPDATA%\\ds5bridge`, so the swap either happens or it does not
--- there is no state where half the files are new.
+impossible from inside the program being overwritten. The answer used here:
+download the release's INSTALLER (`ds5bridge-setup-<ver>-bundled.exe`, the one
+asset every release carries), verify it, hand a tiny helper script the job of
+running it, and exit. The helper waits for this process to die (the lock dies
+with it) and runs the installer silently with only the `app` component -- the
+same installer a person would run, so the update goes through the same
+stop-app / verify-install steps and leaves the same `last-install-check.txt`
+-- and the installer, told `/STARTTRAY=1`, starts the new tray itself. If the
+installer refuses (another installer running, a usbip-win2 removal waiting for
+its reboot) the helper relaunches the OLD tray, so an update never leaves the
+user with nothing. Until 0.4 this module unpacked a zip and swapped the `app`
+directory itself; the zip is no longer published, and an update that bypassed
+the installer's checks was one more code path to keep honest.
 
 What a check actually is
 ------------------------
@@ -44,10 +49,10 @@ The decision rule
 -----------------
 Offer an update when the latest release parses as a version, is strictly newer
 than `ds5app.__version__` by numeric semver comparison, is not a prerelease,
-and actually carries a `ds5bridge-*-win-x64.zip` asset. Every "cannot tell"
-answers "no update": an unparseable tag, a missing asset or a malformed JSON
-document must degrade to silence, never to a notification that leads nowhere
--- the tray has no good place to show "the update check is confused".
+and actually carries a `ds5bridge-setup-*-bundled.exe` asset. Every "cannot
+tell" answers "no update": an unparseable tag, a missing asset or a malformed
+JSON document must degrade to silence, never to a notification that leads
+nowhere -- the tray has no good place to show "the update check is confused".
 
 The tray touchpoint (for the parallel tray rework: this is the whole contract)
 ------------------------------------------------------------------------------
@@ -67,21 +72,32 @@ touches, imports or assumes anything about the tray.
 
 "Update now", start to finish
 -----------------------------
-    1. download  ds5bridge-<ver>-win-x64.zip   -> %LOCALAPPDATA%\\ds5bridge\\updates\\
+    1. download  ds5bridge-setup-<ver>-bundled.exe -> %LOCALAPPDATA%\\ds5bridge\\updates\\
     2. verify    SHA-256 against the release's SHA256SUMS asset
-    3. unpack    -> updates\\stage-<ver>\\ds5bridge\\
-    4. write     updates\\apply-update.ps1, start it DETACHED and hidden
-    5. exit the tray  (the helper is waiting on our PID)
-    6. helper:   app -> app.old, stage -> app, relaunch tray, delete app.old
+    3. write     updates\\apply-update.ps1, start it DETACHED and hidden
+    4. exit the tray  (the helper is waiting on our PID)
+    5. helper:   setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+                          /COMPONENTS="app" /MERGETASKS="!restorepoint"
+                          /LOG=updates\\install-<ver>.log /STARTTRAY=1
+                 -> exit 0: the installer has started the new tray
+                 -> anything else: relaunch the old tray, leave the log
 
-Step 2 is not optional when SHA256SUMS exists: a zip that does not match its
+Step 2 is not optional when SHA256SUMS exists: a file that does not match its
 published hash is deleted and the update is abandoned with a notification.
 When the release has no SHA256SUMS at all (a release made before the pipeline
 grew one) the download proceeds on a size check alone, and says so in the log.
 
-A source checkout has no `app` directory to swap, so `install_root()` answers
-None and "update now" degrades to opening the release page in the browser --
-the person running from source updates with `git pull` anyway.
+The tray runs elevated (ds5bridge.spec), so the installer -- which needs
+administrator rights for its own reasons -- inherits the token from the helper
+and shows no UAC prompt of its own. `/COMPONENTS="app"` is deliberate: an
+update must never install a driver the user removed in the meantime, and the
+two it would otherwise verify are not what changed. (Inno remembers that
+selection as the "previous" one, so the next interactive run of the installer
+opens with the driver boxes unticked; they read "already installed" anyway.)
+
+A source checkout has no `app` directory to update, so `install_root()`
+answers None and "update now" degrades to opening the release page in the
+browser -- the person running from source updates with `git pull` anyway.
 """
 
 from __future__ import annotations
@@ -130,10 +146,13 @@ def app_version() -> str:
 #: without editing source, mirroring DS5_CONFIG.
 REPO = os.environ.get("DS5_UPDATE_REPO", "Macle57/ds5-virtual-cable")
 
-#: The one-dir zip the release pipeline publishes, e.g.
-#: "ds5bridge-0.5.0-win-x64.zip". Anchored on both ends: a future
-#: "ds5bridge-debug-symbols-...zip" must not match.
-ASSET_RE = re.compile(r"^ds5bridge-[0-9][^/\\]*-win-x64\.zip$")
+#: The installer the release pipeline publishes -- THE release asset, e.g.
+#: "ds5bridge-setup-0.5.0-bundled.exe" (app/packaging/build-installer.ps1
+#: -Bundle; the name is ds5bridge.iss's OutputName). Anchored on both ends: a
+#: future "ds5bridge-setup-0.5.0-bundled.exe.sig" must not match, and neither
+#: may the download-mode "ds5bridge-setup-0.5.0.exe" if one is ever published
+#: again -- the updater wants the one that needs no network at install time.
+ASSET_RE = re.compile(r"^ds5bridge-setup-[0-9][^/\\]*-bundled\.exe$")
 SUMS_NAME = "SHA256SUMS"
 
 CHECK_INTERVAL_S = 24 * 3600.0     # "at startup + daily"
@@ -141,9 +160,28 @@ STARTUP_DELAY_S = 20.0             # let the tray finish coming up first
 HTTP_TIMEOUT_S = 15.0
 CACHE_NAME = "update-cache.json"
 
-#: The sanity ceiling for a download. The one-dir build measures ~120 MB
-#: zipped; ten times that is not an update, it is a mistake or an attack.
-MAX_ZIP_BYTES = 1024 * 1024 * 1024
+#: The sanity ceiling for a download. The bundled installer measures ~73 MB;
+#: ten times that is not an update, it is a mistake or an attack.
+MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
+MAX_ZIP_BYTES = MAX_DOWNLOAD_BYTES  # the pre-0.5.0 name, kept for callers
+
+#: The installer's silent switches for an in-place app update. Every one is
+#: load-bearing: VERYSILENT + SUPPRESSMSGBOXES because nobody is watching (a
+#: refusal goes to the log and the exit code), NORESTART because an app update
+#: never needs one and a silent Inno run WITHOUT it would reboot the machine
+#: on its own if anything flagged one, COMPONENTS=app so no driver is ever
+#: installed by an update, no restore point for the same reason, and
+#: STARTTRAY=1 -- our own parameter, read by ds5bridge.iss -- because Inno
+#: skips the [Run] "start now" entry in silent mode and the installer, being
+#: elevated, is the right process to start the new elevated tray without a
+#: prompt.
+#: (Unquoted forms: Inno accepts them without spaces, and a quote-free string
+#: survives the Python -> powershell.exe -> Start-Process hand-off intact.
+#: The only value that can contain a space, the log path, travels as its own
+#: parameter and is quoted by the helper.)
+INSTALLER_SWITCHES = ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                      "/COMPONENTS=app", "/MERGETASKS=!restorepoint",
+                      "/STARTTRAY=1")
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +242,8 @@ class UpdateInfo:
 
     version: str                 # "0.5.0", dots only, for display
     tag: str                     # "v0.5.0", for URLs
-    asset_name: str              # "ds5bridge-0.5.0-win-x64.zip"
-    asset_url: str               # browser_download_url of the zip
+    asset_name: str              # "ds5bridge-setup-0.5.0-bundled.exe"
+    asset_url: str               # browser_download_url of the installer
     asset_size: int              # bytes, per the API; the fallback check
     sums_url: str | None         # SHA256SUMS asset, when the release has one
     page_url: str                # the human release page
@@ -239,7 +277,7 @@ def evaluate_release(data: object,
     assets = data.get("assets")
     if not isinstance(assets, list):
         return None
-    zip_asset = None
+    setup_asset = None
     sums_url = None
     for a in assets:
         if not isinstance(a, dict):
@@ -247,27 +285,27 @@ def evaluate_release(data: object,
         name = a.get("name")
         if not isinstance(name, str):
             continue
-        if ASSET_RE.fullmatch(name) and zip_asset is None:
-            zip_asset = a
+        if ASSET_RE.fullmatch(name) and setup_asset is None:
+            setup_asset = a
         elif name == SUMS_NAME:
             u = a.get("browser_download_url")
             sums_url = u if isinstance(u, str) else None
-    if zip_asset is None:
-        # A release without the zip is a source-only or botched release;
+    if setup_asset is None:
+        # A release without the installer is a source-only or botched release;
         # notifying about it would send the user somewhere with nothing to
         # download.
         log.info("release %s has no %s asset -- not offering it",
-                 tag, "ds5bridge-*-win-x64.zip")
+                 tag, "ds5bridge-setup-*-bundled.exe")
         return None
-    url = zip_asset.get("browser_download_url")
+    url = setup_asset.get("browser_download_url")
     if not isinstance(url, str) or not url:
         return None
-    size = zip_asset.get("size")
+    size = setup_asset.get("size")
     page = data.get("html_url")
     return UpdateInfo(
         version=".".join(str(n) for n in latest),
         tag=str(tag),
-        asset_name=str(zip_asset["name"]),
+        asset_name=str(setup_asset["name"]),
         asset_url=url,
         asset_size=size if isinstance(size, int) and size > 0 else 0,
         sums_url=sums_url,
@@ -394,9 +432,13 @@ def check_now(current_version: str | None = None,
         _save_cache(path, cache)
         return evaluate_release(cache.get("release"), current_version)
     if status != 200:
-        # 403 is the rate limit, 404 is a repo with no releases yet. Both are
-        # "no news", and both keep whatever the cache already knew.
-        log.debug("update check: HTTP %s from %s", status, url)
+        # 403 is the rate limit; 404 is a repository that is private (the
+        # unauthenticated API answers 404, not 403, for those) or has no
+        # release yet. Both are "no news", and both keep whatever the cache
+        # already knew.
+        log.debug("update check: HTTP %s from %s%s", status, url,
+                  " (the repository is private, or has no release yet)"
+                  if status == 404 else "")
         return evaluate_release(cache.get("release"), current_version)
 
     try:
@@ -508,7 +550,7 @@ def menu_text(updater: Updater | None) -> str:
 
 
 def install(updater: Updater | None, notify=None, quit_cb=None) -> None:
-    """The menu item's action: stage the update, then hand off and quit.
+    """The menu item's action: download the installer, then hand off and quit.
 
     Runs the download on its own daemon thread -- this is called from a menu
     handler, and a 120 MB download on pystray's message loop would freeze the
@@ -523,7 +565,7 @@ def install(updater: Updater | None, notify=None, quit_cb=None) -> None:
     if root is None:
         # Source checkout, or an install layout this module does not own.
         # Opening the page is honest: the person who set that up updates by
-        # hand, and pretending otherwise would swap directories under a git
+        # hand, and pretending otherwise would run an installer over a git
         # checkout.
         _say(notify, "Update available",
              f"ds5bridge {info.version}: this copy is not the packaged "
@@ -540,8 +582,8 @@ def install(updater: Updater | None, notify=None, quit_cb=None) -> None:
         try:
             _say(notify, "Updating",
                  f"Downloading ds5bridge {info.version} ...")
-            staged = download_and_stage(info, root)
-            spawn_swap_helper(root, staged)
+            setup_exe = download_and_verify(info, root)
+            spawn_installer(root, setup_exe, info.version)
             _say(notify, "Updating",
                  f"Installing {info.version}; the tray will restart itself.")
         except UpdateError as e:
@@ -574,7 +616,7 @@ def _say(notify, title: str, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# applying an update: stage, verify, swap
+# applying an update: download, verify, hand the installer the job
 # ---------------------------------------------------------------------------
 
 
@@ -585,10 +627,11 @@ class UpdateError(RuntimeError):
 def install_root() -> str | None:
     """%LOCALAPPDATA%\\ds5bridge when this process is the packaged install.
 
-    The layout contract with install.ps1: the exe lives in `<root>\\app\\`, and
-    the updater owns `<root>\\updates\\`. Anything else -- source checkout,
-    a zip unpacked on the Desktop -- answers None, and the update flow opens
-    the release page instead of guessing at a directory swap it might lose.
+    The layout contract with the installer (ds5bridge.iss: `{app}\\app`): the
+    exe lives in `<root>\\app\\`, and the updater owns `<root>\\updates\\`.
+    Anything else -- a source checkout, a build folder copied somewhere --
+    answers None, and the update flow opens the release page instead of running
+    an installer over a layout it does not own.
     """
     if not getattr(sys, "frozen", False):
         return None
@@ -622,7 +665,7 @@ def file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _download(url: str, dest: str, max_bytes: int = MAX_ZIP_BYTES) -> None:
+def _download(url: str, dest: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> None:
     req = urllib.request.Request(url, headers={
         "User-Agent": f"ds5bridge/{app_version()} (update download)"})
     got = 0
@@ -639,68 +682,59 @@ def _download(url: str, dest: str, max_bytes: int = MAX_ZIP_BYTES) -> None:
             f.write(chunk)
 
 
-def download_and_stage(info: UpdateInfo, root: str) -> str:
-    """Download, verify, unpack. Returns the staged one-dir folder.
+def verify_download(path: str, info: UpdateInfo, sums_text: str | None) -> None:
+    """The decision that says a downloaded installer may be run. Raises
+    `UpdateError` (and DELETES the file) when it may not.
 
-    The verification order is deliberate: hash when the release publishes one,
-    size as the fallback, and a mismatch DELETES the download -- a zip that
-    failed its hash must not sit on disk looking like a valid update for a
-    later run to find.
+    `sums_text` is the release's SHA256SUMS, or None when the release has none
+    -- the caller fetched it, so this stays a pure function over inputs and is
+    testable without a network. The order is deliberate: hash when the release
+    publishes one (and then it MUST name this asset -- a SHA256SUMS that lists
+    everything but the installer is a broken release, not a pass), size as the
+    fallback, and a mismatch removes the download so a file that failed its
+    hash never sits on disk looking like a valid update for a later run.
     """
-    import zipfile
-
-    updates = os.path.join(root, "updates")
-    os.makedirs(updates, exist_ok=True)
-    zip_path = os.path.join(updates, info.asset_name)
-
-    _download(info.asset_url, zip_path)
-
-    if info.sums_url:
-        try:
-            status, _h, body = _http_get(info.sums_url, {
-                "User-Agent": f"ds5bridge/{app_version()} (update download)"})
-            sums = parse_sha256sums(body.decode("utf-8", "replace")) \
-                if status == 200 else {}
-        except Exception:  # noqa: BLE001
-            sums = {}
-        expected = sums.get(info.asset_name)
+    if sums_text is not None:
+        expected = parse_sha256sums(sums_text).get(info.asset_name)
         if not expected:
-            _discard(zip_path)
+            _discard(path)
             raise UpdateError(
                 "the release publishes checksums but not one for "
                 f"{info.asset_name} -- refusing the download.")
-        actual = file_sha256(zip_path)
+        actual = file_sha256(path)
         if actual != expected:
-            _discard(zip_path)
+            _discard(path)
             raise UpdateError(
                 "the downloaded update failed its checksum -- discarded it. "
                 "Try again later; if this repeats, something between you and "
                 "GitHub is rewriting downloads.")
-    elif info.asset_size and os.path.getsize(zip_path) != info.asset_size:
-        _discard(zip_path)
+        return
+    if info.asset_size and os.path.getsize(path) != info.asset_size:
+        _discard(path)
         raise UpdateError("the download was truncated -- discarded it. "
                           "Try again.")
-    else:
-        log.warning("release %s has no %s -- installed on a size check only",
-                    info.tag, SUMS_NAME)
+    log.warning("release %s has no %s -- installed on a size check only",
+                info.tag, SUMS_NAME)
 
-    stage = os.path.join(updates, f"stage-{info.version}")
-    if os.path.isdir(stage):
-        import shutil
 
-        shutil.rmtree(stage, ignore_errors=True)
-    with zipfile.ZipFile(zip_path) as z:
-        z.extractall(stage)
-    _discard(zip_path)  # verified and unpacked; the zip has done its job
+def download_and_verify(info: UpdateInfo, root: str) -> str:
+    """Download the installer into `<root>\\updates\\`, verify it, return its path."""
+    updates = os.path.join(root, "updates")
+    os.makedirs(updates, exist_ok=True)
+    setup_exe = os.path.join(updates, info.asset_name)
 
-    # The zip carries a top-level ds5bridge/ folder (the pipeline zips the
-    # dist folder itself). Find the directory that holds the tray exe rather
-    # than hardcoding one layout deep.
-    for cand in (os.path.join(stage, "ds5bridge"), stage):
-        if os.path.isfile(os.path.join(cand, "ds5bridge-tray.exe")):
-            return cand
-    raise UpdateError("the update zip does not look like a ds5bridge build "
-                      "(no ds5bridge-tray.exe inside) -- not installing it.")
+    _download(info.asset_url, setup_exe)
+
+    sums_text = None
+    if info.sums_url:
+        try:
+            status, _h, body = _http_get(info.sums_url, {
+                "User-Agent": f"ds5bridge/{app_version()} (update download)"})
+            sums_text = body.decode("utf-8", "replace") if status == 200 else ""
+        except Exception:  # noqa: BLE001
+            sums_text = ""      # published but unreachable: still not optional
+    verify_download(setup_exe, info, sums_text)
+    return setup_exe
 
 
 def _discard(path: str) -> None:
@@ -710,18 +744,29 @@ def _discard(path: str) -> None:
         pass
 
 
-#: The swap helper. PowerShell 5.1-compatible on purpose (powershell.exe is on
-#: every supported Windows; pwsh is not). Parameterised entirely by arguments
-#: so the script itself is inert -- nothing is baked in at write time except
-#: what `spawn_swap_helper` passes on the command line.
+def installer_args(root: str, version: str) -> tuple[list[str], str]:
+    """(switches, log path) for an in-place update: `INSTALLER_SWITCHES` says
+    why each switch, the log lands next to the download. Pure, for the tests."""
+    log_path = os.path.join(root, "updates", f"install-{version}.log")
+    return list(INSTALLER_SWITCHES), log_path
+
+
+#: The helper. PowerShell 5.1-compatible on purpose (powershell.exe is on every
+#: supported Windows; pwsh is not). Parameterised entirely by arguments so the
+#: script itself is inert -- nothing is baked in at write time except what
+#: `spawn_installer` passes on the command line.
 _HELPER_PS1 = r"""# ds5bridge update helper -- written and launched by ds5app/update.py.
-# Waits for the tray to exit (its exe is file-locked until then), swaps the
-# staged new version into place, relaunches the tray, cleans up. Every step
-# logs to updates\update.log, because when this goes wrong there is no UI left.
+# Waits for the tray to exit (its exe is file-locked until then), runs the
+# downloaded installer silently (app component only; it starts the new tray
+# itself via /STARTTRAY=1), and if the installer refused, relaunches the OLD
+# tray so the user is never left with nothing. Every step logs to
+# updates\update.log, because when this goes wrong there is no UI left.
 param(
     [Parameter(Mandatory)][int]$WaitPid,
     [Parameter(Mandatory)][string]$Root,
-    [Parameter(Mandatory)][string]$Staged,
+    [Parameter(Mandatory)][string]$Setup,
+    [string]$SetupArgs = '',
+    [string]$LogPath = '',
     [string]$Exe = 'ds5bridge-tray.exe'
 )
 $ErrorActionPreference = 'Stop'
@@ -729,38 +774,30 @@ $logFile = Join-Path $Root 'updates\update.log'
 function Log([string]$m) {
     try { Add-Content -Path $logFile -Value ("{0}  {1}" -f (Get-Date -Format s), $m) } catch {}
 }
+$app = Join-Path $Root 'app'
 try {
     Log "waiting for pid $WaitPid"
     try { Wait-Process -Id $WaitPid -Timeout 120 -ErrorAction Stop } catch {}
-    $app = Join-Path $Root 'app'
-    $old = Join-Path $Root ('app.old-' + [IO.Path]::GetRandomFileName().Substring(0,8))
-    # The rename is the swap's atom, and the retry loop is for the tail of the
-    # dying process: the exe can stay locked for a moment after the PID is gone.
-    $renamed = $false
-    for ($i = 0; $i -lt 15; $i++) {
-        try { Move-Item -LiteralPath $app -Destination $old -ErrorAction Stop; $renamed = $true; break }
-        catch { Start-Sleep -Seconds 2 }
-    }
-    if (-not $renamed) { Log 'could not move app aside; leaving everything as it was'; exit 1 }
-    try {
-        Move-Item -LiteralPath $Staged -Destination $app -ErrorAction Stop
-    } catch {
-        # Roll back: an install with no app directory is strictly worse than
-        # the old version.
-        Log "swap failed: $_ -- rolling back"
-        Move-Item -LiteralPath $old -Destination $app -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    $argLine = $SetupArgs
+    if ($LogPath) { $argLine = "$argLine /LOG=`"$LogPath`"" }
+    Log "running $Setup $argLine"
+    $p = Start-Process -FilePath $Setup -ArgumentList $argLine -Wait -PassThru
+    Log "installer exit $($p.ExitCode)"
+    if ($p.ExitCode -ne 0) {
+        # The installer said no (another installer running, a usbip-win2
+        # removal waiting for its reboot, ...): its log says why. The old
+        # version is untouched, so bring it back.
+        Log 'installer did not complete; relaunching the current version'
+        try { Start-Process -FilePath (Join-Path $app $Exe) -WorkingDirectory $app } catch { Log "relaunch failed: $_" }
         exit 1
     }
-    Log 'swap complete'
-    try { Start-Process -FilePath (Join-Path $app $Exe) -WorkingDirectory $app } catch { Log "relaunch failed: $_" }
-    Start-Sleep -Seconds 2
-    Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue
-    $stageParent = Split-Path -Parent $Staged
-    Get-ChildItem -LiteralPath $stageParent -Filter 'stage-*' -Directory -ErrorAction SilentlyContinue |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    # Exit 0: the installer has started the new tray (/STARTTRAY=1). Tidy up.
+    Remove-Item -LiteralPath $Setup -Force -ErrorAction SilentlyContinue
     Log 'done'
 } catch {
     Log "helper failed: $_"
+    try { Start-Process -FilePath (Join-Path $app $Exe) -WorkingDirectory $app } catch { Log "relaunch failed: $_" }
     exit 1
 }
 """
@@ -777,15 +814,18 @@ def write_helper(root: str) -> str:
     return path
 
 
-def spawn_swap_helper(root: str, staged: str) -> None:
+def spawn_installer(root: str, setup_exe: str, version: str) -> None:
     """Start the helper detached, then it is the caller's job to exit.
 
     DETACHED_PROCESS + CREATE_NO_WINDOW so the helper survives this process
     (it must -- it is waiting for this process to die) and never flashes a
     console at the user. `-ExecutionPolicy Bypass` because the helper is a
-    local unsigned script and the machine's policy is whatever it is.
+    local unsigned script and the machine's policy is whatever it is. The
+    helper inherits this process's token, which is the elevated one, so the
+    installer it starts shows no UAC prompt.
     """
     helper = write_helper(root)
+    switches, log_path = installer_args(root, version)
     flags = 0
     if os.name == "nt":
         flags = (subprocess.DETACHED_PROCESS
@@ -796,9 +836,11 @@ def spawn_swap_helper(root: str, staged: str) -> None:
          "-File", helper,
          "-WaitPid", str(os.getpid()),
          "-Root", root,
-         "-Staged", staged],
+         "-Setup", setup_exe,
+         "-SetupArgs", " ".join(switches),
+         "-LogPath", log_path],
         creationflags=flags,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True)
-    log.info("update helper started; exiting so it can swap %s", root)
+    log.info("update helper started; exiting so it can run %s", setup_exe)
