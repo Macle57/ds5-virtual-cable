@@ -43,6 +43,8 @@
   --color-square: #ff7ad9;
   --color-cyan: #38e0ff;
   --color-amber: #ffb547;
+  --color-orange: #ff8a3d;   /* picker: mouse actions */
+  --color-violet: #b18cff;   /* picker: voice & typing */
 
   --color-ok: #2ee6a6;
   --color-warn: #ffb547;

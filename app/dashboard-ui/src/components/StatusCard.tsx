@@ -1,6 +1,8 @@
-import { motion } from "framer-motion";
-import { Headphones, Mic, MicOff, EyeOff, Zap, Cable, Clock } from "lucide-react";
-import { useActiveController } from "../lib/store";
+import { AnimatePresence, motion } from "framer-motion";
+import { Headphones, Mic, MicOff, Eye, EyeOff, Zap, Cable, Clock, MousePointer2, Keyboard, AlertTriangle } from "lucide-react";
+import { keyboardOpen, remoteMode, useActiveController, useRemoteColor } from "../lib/store";
+
+const HIDE_NOTE_FALLBACK = "Hidden requested, but the controller is still visible to other apps — HidHide's filter is not attached to it (restart the device or reboot).";
 
 const STATE_TONE: Record<string, string> = {
   "running": "var(--color-ok)", "controller offline": "var(--color-warn)",
@@ -22,6 +24,13 @@ export default function StatusCard() {
   const low = pct != null && pct <= 20 && !charging;
   const rate = t?.rps ?? c.reports_per_s ?? null;
   const up = c.uptime_s ?? 0;
+  const remote = remoteMode(c) === true;
+  const kb = keyboardOpen(c);
+  const rc = useRemoteColor();
+  // hide_bluetooth is what was ASKED for; hide_effective is whether HidHide's
+  // filter is verified on the pad's HID device. Only a verified "no" against a
+  // request is a fault worth shouting about; null means nobody has checked.
+  const hideBroken = c.hide_effective === false && c.hide_bluetooth !== false;
 
   return (
     <section className="panel p-4">
@@ -41,6 +50,33 @@ export default function StatusCard() {
           </div>
         </div>
       </div>
+
+      {/* remote mode: the pad is a desktop remote, the game sees a neutral pad.
+          Wears the lightbar colour the engine paints while it is on. */}
+      <AnimatePresence initial={false}>
+        {remote && (
+          <motion.div key="remote" initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className="overflow-hidden">
+            <div className="mt-3 flex items-center gap-3 rounded-xl border px-3.5 py-2.5"
+                 style={{ borderColor: rc, background: `color-mix(in oklab, ${rc} 14%, transparent)`, boxShadow: `0 0 28px -10px ${rc}` }}>
+              <span className="grid h-9 w-9 flex-none place-items-center rounded-lg"
+                    style={{ background: `color-mix(in oklab, ${rc} 24%, transparent)`, color: rc }}>
+                <MousePointer2 size={18} />
+              </span>
+              <div className="min-w-0 flex-1 leading-tight">
+                <div className="display text-[17px] uppercase tracking-[.1em] text-glow" style={{ color: rc }}>remote mode</div>
+                <div className="mt-0.5 text-[12px] text-ink-2">the pad drives the OS — the game sees a neutral pad</div>
+              </div>
+              {kb && (
+                <span className="display inline-flex flex-none items-center gap-1.5 rounded-lg border px-2 py-1 text-[11.5px] uppercase tracking-[.08em]"
+                      style={{ borderColor: rc, color: rc, background: `color-mix(in oklab, ${rc} 12%, transparent)` }}>
+                  <Keyboard size={13} /> keyboard open
+                </span>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <div className="mt-3 grid grid-cols-2 gap-3">
         {/* battery as a segmented health bar */}
@@ -88,8 +124,20 @@ export default function StatusCard() {
         <Flag on={!!d?.headphone} icon={<Headphones size={13} />} label="headphones" />
         <Flag on={!!d?.mic} icon={<Mic size={13} />} label="mic" />
         <Flag on={!!d?.mic_muted} icon={<MicOff size={13} />} label="muted" tone="var(--color-amber)" />
-        <Flag on={!!c.hide_bluetooth} icon={<EyeOff size={13} />} label="BT pad hidden" tone="var(--color-square)" />
+        <Flag on={!!c.hide_bluetooth || hideBroken} icon={hideBroken ? <Eye size={13} /> : <EyeOff size={13} />}
+              label={hideBroken ? "BT pad NOT hidden" : "BT pad hidden"} tone={hideBroken ? "var(--color-warn)" : "var(--color-square)"} />
       </div>
+
+      {/* the requested hide is not in effect: other apps (Steam, the game) can
+          still see the Bluetooth pad -- the doubled-controller symptom */}
+      {hideBroken && (
+        <div className="mt-3 flex items-start gap-3 rounded-xl border border-warn/70 bg-warn/10 px-3.5 py-3 text-[12.5px] leading-relaxed text-ink-2">
+          <AlertTriangle size={18} className="mt-0.5 flex-none text-warn" />
+          <div>
+            <b className="text-warn">Hide requested, but not in effect.</b> {c.hide_note?.trim() || HIDE_NOTE_FALLBACK}
+          </div>
+        </div>
+      )}
     </section>
   );
 }
