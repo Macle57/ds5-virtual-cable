@@ -219,7 +219,70 @@ DEFAULT_CHORDS = {
     "touch_slide_horizontal": "alt_tab",
     "touch_swipe_up": "task_view",
     "touch_swipe_down": "minimize_all",
+    # Two buttons nothing else claimed: the touchpad click opens the pad-driven
+    # on-screen keyboard, the mute button (the one with the microphone on it)
+    # starts voice typing through the pad's own microphone.
+    "touchpad_click": "keyboard",
+    "mute": "dictation",
 }
+
+#: The REMOTE-MODE binding table's defaults -- what a button or gesture does
+#: while the pad is being an OS remote and `remote.same_bindings` is off.
+#: These reproduce the hard-coded remote map this engine shipped with, so a
+#: user who unticks "same bindings" gets exactly the mode they knew: Cross is
+#: the left mouse button (hold to drag), Circle Esc, Options Enter, the dpad
+#: the arrow keys, a 2-finger horizontal slide the Alt-Tab hold. Same
+#: vocabulary and the same merge/"none" rules as `DEFAULT_CHORDS`. The
+#: intrinsic pointer controls (touchpad = mouse, taps = clicks, sticks and
+#: triggers = pointer/scroll) are NOT bindings -- they are what remote mode IS.
+DEFAULT_REMOTE_CHORDS = {
+    "cross": "left_click",
+    "circle": "escape",
+    "options": "enter",
+    "dpad_up": "arrow_up",
+    "dpad_down": "arrow_down",
+    "dpad_left": "arrow_left",
+    "dpad_right": "arrow_right",
+    "touch_slide_horizontal": "alt_tab",
+}
+
+
+def merge_chords(defaults: dict, raw: object, where: str) -> dict:
+    """`defaults` with a user's table merged over it. Never raises.
+
+    The one merge rule both binding tables live by: naming a key changes that
+    key and keeps the rest; ""/"none"/"off" removes a default. Keys and action
+    names are lowercased so a hand-edited "Cross" still binds.
+    """
+    out = dict(defaults)
+    if raw is not None and not isinstance(raw, dict):
+        log.warning("'%s' is %s, not an object -- keeping the defaults",
+                    where, type(raw).__name__)
+        raw = None
+    for key, action in (raw or {}).items():
+        key = str(key).strip().lower()
+        if not key:
+            continue
+        name = action.strip().lower() if isinstance(action, str) else ""
+        if name in ("", "none", "off"):
+            out.pop(key, None)
+        else:
+            out[key] = name
+    return out
+
+
+def chords_to_dict(defaults: dict, chords: dict) -> dict:
+    """The table as written to disk: a REMOVED default is written as "none".
+
+    Merely absent would resurrect it on the next `merge_chords` and the
+    removal would survive exactly one session. Sorted, so the file diffs.
+    """
+    out = dict(chords)
+    for key in defaults:
+        if key not in out:
+            out[key] = "none"
+    return {k: out[k] for k in sorted(out)}
+
 
 _BATTERY_KNOWN = ("enabled", "low_percent", "critical_percent",
                   "low_interval_s", "critical_interval_s",
@@ -310,7 +373,8 @@ class LightbarPolicy:
         return out
 
 
-_REMOTE_KNOWN = ("enabled", "mouse_speed", "scroll_speed", "lightbar_color")
+_REMOTE_KNOWN = ("enabled", "mouse_speed", "scroll_speed", "lightbar_color",
+                 "same_bindings", "chords")
 
 
 @dataclass
@@ -318,8 +382,21 @@ class RemoteMode:
     """Double-press of the chord button: the pad becomes an OS remote.
 
     No input reaches the game (it sees a neutral pad); the touchpad drives the
-    mouse pointer, Cross clicks, dpad is arrow keys. The full map lives in
-    `docs/input-shortcuts.md` and `intercept.py`.
+    mouse pointer, taps click, the sticks and triggers move the pointer and
+    scroll -- those are intrinsic. Every BUTTON and touch GESTURE, on the
+    other hand, resolves through a binding table, and which table is the
+    `same_bindings` switch:
+
+        same_bindings = True (default)   the `input.chords` table: a button or
+                                         gesture means in remote mode exactly
+                                         what it means with the chord button
+                                         held -- one table to maintain.
+        same_bindings = False            this section's own `chords`, merged
+                                         over `DEFAULT_REMOTE_CHORDS` (the
+                                         classic remote map: Cross = left
+                                         mouse button, Circle = Esc, ...).
+
+    The full map lives in `docs/input-shortcuts.md` and `intercept.py`.
 
     Ships OFF: a mode the pad can fall into from a mistimed double-tap of the
     PS button reads as "my controller broke" to anyone who did not turn it on.
@@ -336,6 +413,13 @@ class RemoteMode:
     #: The lightbar while remote mode is on -- the visible "you are not in the
     #: game any more" cue, alongside the haptic pattern.
     lightbar_color: list = field(default_factory=lambda: [255, 120, 0])
+    #: Remote mode uses the `input.chords` table (True) or its own `chords`.
+    same_bindings: bool = True
+    #: The remote-mode binding table, MERGED over `DEFAULT_REMOTE_CHORDS`
+    #: exactly the way `InputConfig.chords` merges over `DEFAULT_CHORDS`.
+    #: Consulted only while `same_bindings` is False, but always parsed and
+    #: always written, so a user can flip the switch without losing the table.
+    chords: dict = field(default_factory=lambda: dict(DEFAULT_REMOTE_CHORDS))
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -347,6 +431,9 @@ class RemoteMode:
             mouse_speed=_as_float(data.get("mouse_speed"), 1.6, 0.1),
             scroll_speed=_as_float(data.get("scroll_speed"), 1.0, 0.1),
             lightbar_color=_as_color(data.get("lightbar_color"), [255, 120, 0]),
+            same_bindings=_as_bool(data.get("same_bindings"), True),
+            chords=merge_chords(DEFAULT_REMOTE_CHORDS, data.get("chords"),
+                                "input.remote.chords"),
         )
         rm.extra = {k: v for k, v in data.items() if k not in _REMOTE_KNOWN}
         return rm
@@ -356,16 +443,21 @@ class RemoteMode:
         out.update(enabled=bool(self.enabled),
                    mouse_speed=float(self.mouse_speed),
                    scroll_speed=float(self.scroll_speed),
-                   lightbar_color=list(self.lightbar_color))
+                   lightbar_color=list(self.lightbar_color),
+                   same_bindings=bool(self.same_bindings),
+                   chords=chords_to_dict(DEFAULT_REMOTE_CHORDS, self.chords))
         return out
 
 
-#: Actions the ENGINE owns -- they act on the pad, not the OS -- so they are
-#: not in `actions.OsActions.registry()`. A chord names them like any other
-#: action; /api/actions serves them as `engine_actions`.
+#: Actions the ENGINE owns -- they act on the pad or on the engine's own
+#: state, not on the desktop -- so they are not in
+#: `actions.OsActions.registry()`. A chord names them like any other action;
+#: /api/actions serves them as `engine_actions`.
 ENGINE_ACTIONS = {
     "pad_power_off": "power the pad off",
     "pad_lightbar_toggle": "lightbar off; press again to bring it back",
+    "keyboard": "on-screen keyboard driven by the pad (Steam-style); "
+                "press again, or Circle/Options on it, to close",
 }
 
 _INPUT_KNOWN = ("enabled", "chord_button", "chords", "actions", "macros",
@@ -445,20 +537,8 @@ class InputConfig:
             lightbar=LightbarPolicy.from_dict(data.get("lightbar")),
             remote=RemoteMode.from_dict(data.get("remote")),
         )
-        raw = data.get("chords")
-        if raw is not None and not isinstance(raw, dict):
-            log.warning("'input.chords' is %s, not an object -- keeping the "
-                        "defaults", type(raw).__name__)
-            raw = None
-        for key, action in (raw or {}).items():
-            key = str(key).strip().lower()
-            if not key:
-                continue
-            name = action.strip().lower() if isinstance(action, str) else ""
-            if name in ("", "none", "off"):
-                ic.chords.pop(key, None)
-            else:
-                ic.chords[key] = name
+        ic.chords = merge_chords(DEFAULT_CHORDS, data.get("chords"),
+                                 "input.chords")
         acts = data.get("actions")
         ic.actions = dict(acts) if isinstance(acts, dict) else {}
         macros = data.get("macros")
@@ -486,15 +566,11 @@ class InputConfig:
         # A default chord the user removed must be WRITTEN as "none", not
         # merely absent: `from_dict` merges the file over `DEFAULT_CHORDS`, so
         # an absent key would resurrect the default on the very next load and
-        # the removal would survive exactly one session.
-        chords = dict(self.chords)
-        for key in DEFAULT_CHORDS:
-            if key not in chords:
-                chords[key] = "none"
+        # the removal would survive exactly one session (`chords_to_dict`).
         out = dict(self.extra)
         out.update(enabled=bool(self.enabled),
                    chord_button=self.chord_button,
-                   chords={k: chords[k] for k in sorted(chords)},
+                   chords=chords_to_dict(DEFAULT_CHORDS, self.chords),
                    actions=dict(self.actions),
                    macros={k: dict(self.macros[k]) for k in sorted(self.macros)},
                    double_press_ms=int(self.double_press_ms),

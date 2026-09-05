@@ -52,36 +52,69 @@ Remote mode
 Double-press the chord button (only when `remote.enabled` -- it ships OFF and
 is switched on from the dashboard). The game is handed a neutral pad
 (centred, released, touch up, motion zeroed -- battery/status bytes intact,
-games read those); the pad drives the OS instead:
+games read those); the pad drives the OS instead. Two layers:
+
+INTRINSIC -- what remote mode IS, not configurable:
 
     touchpad 1-finger drag      move the mouse pointer
     touchpad 1-finger tap       left click
-    touchpad 2-finger slide     alt-tab hold, once the travel reads as the
-      (horizontal, decisive)    chord-held gesture -- see `_rm_two_finger`
     touchpad 2-finger tap       right click
     left stick                  move the pointer (rate)
     right stick                 scroll (rate; scrolling is the sticks' and
                                 triggers' job -- the touchpad does not scroll)
     L2 / R2                     scroll up / down (analog rate)
-    cross (hold = drag)         left mouse button down/up
-    circle                      Esc
-    options                     Enter
-    dpad                        arrow keys (repeats while held)
+
+BOUND -- every button and the three 2-finger gestures resolve through a
+binding table, `self._remote_table` (`_adopt_cfg`):
+
+    remote.same_bindings = True    the `input.chords` table. A button or a
+      (default)                    gesture means in remote mode exactly what
+                                   it means with the chord button held --
+                                   Cross = play/pause, dpad = volume/track,
+                                   2-finger slide = Alt-Tab -- so there is
+                                   one table to maintain.
+    remote.same_bindings = False   `input.remote.chords`, merged over
+                                   `config.DEFAULT_REMOTE_CHORDS`: the
+                                   classic remote map -- Cross (hold = drag)
+                                   = left mouse button, Circle = Esc, Options
+                                   = Enter, dpad = arrow keys (repeat while
+                                   held), 2-finger slide = Alt-Tab hold.
+
+A bound row fires directly, no chord button held; a row mapped to "none" does
+nothing in remote mode (the intrinsic layer above is never a row). Actions
+whose `ActionSpec.hold` is set are HELD for the press (a mouse button drags,
+Esc stays down); tap actions fire on the press and, if repeatable, again at
+`repeat_ms` while held. Remote-mode button actions carry no haptic ack --
+a click that rumbles is a click people stop making -- gestures ack as they
+do under a chord.
 
 Chords stay active in remote mode. Feedback on switch: a distinct double
 haptic pulse and the lightbar held at `remote.lightbar_color` (single pulse
 and the game's colour back on exit). Every pulse's amplitude comes from
 `haptic_strength` (0-100, mapped linearly onto the motor byte).
 
+The on-screen keyboard
+----------------------
+The `keyboard` engine action (default chord: PS + touchpad click) toggles
+`osk.OnScreenKeyboard`. While it is open the game sees the same neutral pad
+as in remote mode and every report goes to the keyboard's `PadDriver`
+instead of remote mode's map -- whether or not remote mode is on. Circle or
+Options on the pad close it, so do the engine turning off and `close()`.
+The engine reports `remote_mode` and `keyboard_open` (attributes read by
+the telemetry publisher) and calls `on_mode(remote, keyboard)` whenever
+either flips, which is how the child's status line and the dashboard learn.
+
 Threading
 ---------
 `on_input` and `tick`/`rewrite_setstate` run on two different bridge threads;
 a third -- `service.InputConfigWatcher`'s poll thread -- calls
 `update_config` when the dashboard saves new settings. One lock guards all
-mutable state and every critical section is bit-twiddling only. Nothing slow runs under the lock or on the reader thread: registry
-actions (one of which shells out to PowerShell) go through a single dispatch
-worker; only the remote-mode `SendInput` primitives -- microseconds -- run
-inline. An injectable `clock` makes every timing rule unit-testable.
+mutable state and every critical section is bit-twiddling only. Nothing slow
+runs under the lock or on the reader thread: registry actions (one of which
+shells out to PowerShell) go through a single dispatch worker; only the
+remote-mode `SendInput` primitives -- microseconds -- run inline, and the
+keyboard window is only ever poked through thunks (a `PostMessage`). An
+injectable `clock` makes every timing rule unit-testable.
 """
 
 from __future__ import annotations
@@ -93,6 +126,7 @@ from collections import deque
 
 from . import _bootstrap  # noqa: F401  (sys.path side effect)
 from . import config as K
+from . import osk as OSK
 from .actions import OsActions
 
 from ds5bridge import protocol as P  # noqa: E402  (stdlib-only module)
@@ -259,13 +293,21 @@ class InputInterceptor:
 
     def __init__(self, cfg: K.InputConfig, *, actions: OsActions,
                  send_setstate, power_off,
-                 clock=time.monotonic, dispatch=None):
+                 clock=time.monotonic, dispatch=None,
+                 on_mode=None, osk=None):
         self.actions = actions
         self.send_setstate = send_setstate
         self.power_off = power_off
         self.clock = clock
         self._dispatcher = _Dispatcher() if dispatch is None else None
         self.dispatch = dispatch or self._dispatcher
+        #: `on_mode(remote_mode, keyboard_open)`, called (outside the lock)
+        #: whenever either flips -- the child's status channel.
+        self.on_mode = on_mode
+        self._mode_sent: tuple | None = None
+        #: The on-screen keyboard. Lazy about its window: nothing is drawn
+        #: (no thread started) until the `keyboard` action first fires.
+        self._osk = osk if osk is not None else OSK.OnScreenKeyboard(actions)
 
         self._adopt_cfg(cfg)
 
@@ -300,11 +342,11 @@ class InputInterceptor:
         self._rm_touch_max_fingers = 0
         self._rm_mouse_frac = [0.0, 0.0]
         self._rm_scroll_acc = 0.0          # vertical wheel units pending
-        self._rm_left_down = False
-        self._rm_esc_down = False
-        self._rm_enter_down = False
-        self._rm_arrow: str | None = None
-        self._rm_arrow_next = 0.0
+        #: Buttons remote mode is holding something for, keyed by chord-key
+        #: name: {"release": callable|None, "next": repeat due|None,
+        #: "repeat": callable|None}. A `hold` action keeps its release here
+        #: so a mode change or a chord press can let go of it.
+        self._rm_held: dict = {}
         self._rm_needs_release = False
         #: When the remote lightbar colour is next re-asserted (tick()).
         self._rm_lightbar_next = 0.0
@@ -337,8 +379,13 @@ class InputInterceptor:
 
         self.stats = {"chords_fired": 0, "chord_repeats": 0,
                       "gestures_fired": 0, "taps_replayed": 0,
-                      "remote_toggles": 0, "battery_flashes": 0,
-                      "idle_power_off": 0, "lightbar_toggles": 0}
+                      "remote_toggles": 0, "remote_actions": 0,
+                      "battery_flashes": 0, "idle_power_off": 0,
+                      "lightbar_toggles": 0, "keyboard_toggles": 0}
+
+    @property
+    def keyboard_open(self) -> bool:
+        return bool(self._osk is not None and self._osk.is_open)
 
     def _adopt_cfg(self, cfg: K.InputConfig) -> None:
         """Every field derived from the config, recomputed as one unit.
@@ -374,6 +421,12 @@ class InputInterceptor:
             if spec is not None:
                 registry[name] = spec
         self.registry = registry
+        #: What a button or gesture does in REMOTE mode (module docstring,
+        #: "Remote mode"): the chord table itself when `same_bindings`, else
+        #: the remote section's own table. Both dicts are already merged over
+        #: their defaults by config.py; this is only a choice between them.
+        rm = cfg.remote
+        self._remote_table = cfg.chords if rm.same_bindings else rm.chords
 
     def update_config(self, new_cfg: K.InputConfig) -> None:
         """Adopt a changed config on a RUNNING engine, no bridge restart.
@@ -433,6 +486,11 @@ class InputInterceptor:
                 # config change cannot wait for one -- do it now.
                 self._rm_needs_release = False
                 self._remote_release_held(thunks)
+            if disabled and self.keyboard_open:
+                # A disabled engine processes no reports, so nothing would
+                # ever close the keyboard again -- and the game's buttons are
+                # back, so a keyboard that still typed would double every press.
+                self._keyboard_toggle(thunks)
             if disabled or chord_changed:
                 self._end_gesture(thunks)     # commits a mid-slide Alt-Tab
                 self._chord_down = False
@@ -465,6 +523,7 @@ class InputInterceptor:
                 self._dim_engaged = False
                 self._prev = None
                 self._rate_last_at = None
+            self._note_mode(thunks)
         for fn in thunks:
             try:
                 fn()
@@ -520,7 +579,15 @@ class InputInterceptor:
                 self._rm_needs_release = False
                 self._remote_release_held(thunks)
 
-            if self.remote_mode:
+            if self.keyboard_open:
+                # The keyboard owns the pad: buttons and sticks steer it,
+                # remote mode's map is suspended (anything it held is let
+                # go), and the game sees nobody touching the pad.
+                self._remote_release_held(thunks)
+                if not self._chord_down:
+                    thunks.extend(self._osk.on_frame(frame, now))
+                self._neutralize(body)
+            elif self.remote_mode:
                 if not self._chord_down:
                     self._remote_inputs(frame, now, thunks)
                 else:
@@ -534,6 +601,7 @@ class InputInterceptor:
                 # The delayed chord-button tap: hold it down for the game.
                 self._press_button(body, self.chord_button)
             self._prev = frame
+            self._note_mode(thunks)
 
         for fn in thunks:
             try:
@@ -623,12 +691,28 @@ class InputInterceptor:
             self.power_off()
 
     def close(self) -> None:
-        """Release anything held on the OS side; stop the worker."""
+        """Release anything held on the OS side (keys, the borrowed default
+        microphone), take the keyboard down, stop the worker."""
+        try:
+            if self._osk is not None:
+                self._osk.shutdown()
+        except Exception:  # noqa: BLE001
+            log.exception("closing the on-screen keyboard failed")
         try:
             self.actions.close()
         finally:
             if self._dispatcher is not None:
                 self._dispatcher.close()
+
+    def _note_mode(self, thunks: list) -> None:
+        """Queue `on_mode` if remote/keyboard state differs from what was
+        last reported. Under the lock; the call itself runs with the thunks."""
+        state = (bool(self.remote_mode), self.keyboard_open)
+        if state == self._mode_sent:
+            return
+        self._mode_sent = state
+        if self.on_mode is not None:
+            thunks.append(lambda s=state: self.on_mode(*s))
 
     # =====================================================================
     # chords
