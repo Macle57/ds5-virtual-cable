@@ -183,5 +183,69 @@ class ChildCommandFlag(unittest.TestCase):
                          MG.default_child_command("aa", 3241))
 
 
+class ModeFlags(unittest.TestCase):
+    """`remote_mode` / `keyboard_open` ride in every datagram."""
+
+    class _Backend:
+        def __init__(self):
+            self.stats = {"input_delivered": 0}
+            self.interceptor = None
+            self.report = TM.build_usb01()
+
+        def latest_input_report(self, n):
+            return self.report
+
+        def device_status(self):
+            return {"connected": True, "stale_s": 0.0, "serial": "aabbccddeeff"}
+
+    class _Engine:
+        remote_mode = False
+        keyboard_open = False
+
+    def pipe(self):
+        hub = TM.TelemetryHub()
+        hub.start()
+        self.addCleanup(hub.stop)
+        be = self._Backend()
+        pub = TM.TelemetryPublisher(be, hub.port, serial="aabbccddeeff", hz=200)
+        pub._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(pub._sock.close)
+        return hub, be, pub
+
+    def test_no_engine_means_both_false(self):
+        hub, be, pub = self.pipe()
+        pub._tick()
+        self.assertTrue(wait_for(lambda: hub.received >= 1))
+        e = hub.latest()["aabbccddeeff"]
+        self.assertFalse(e["remote_mode"])
+        self.assertFalse(e["keyboard_open"])
+
+    def test_a_mode_flip_is_a_datagram_even_with_the_pad_still(self):
+        hub, be, pub = self.pipe()
+        be.interceptor = self._Engine()
+        pub._tick()
+        self.assertEqual(pub.sent, 1)
+        pub._tick()                                    # nothing changed
+        self.assertEqual(pub.sent, 1)
+        be.interceptor.remote_mode = True
+        pub._tick()
+        self.assertEqual(pub.sent, 2)
+        self.assertTrue(wait_for(lambda: hub.received >= 2))
+        self.assertTrue(hub.latest()["aabbccddeeff"]["remote_mode"])
+        be.interceptor.keyboard_open = True
+        pub._tick()
+        self.assertTrue(wait_for(lambda: hub.received >= 3))
+        self.assertTrue(hub.latest()["aabbccddeeff"]["keyboard_open"])
+
+    def test_an_old_datagram_without_the_flags_reads_as_off(self):
+        hub = TM.TelemetryHub()
+        self.addCleanup(hub.stop)
+        hub._ingest(json.dumps({"v": 1, "serial": "0011223344aa",
+                                "report": TM.build_usb01().hex()}).encode())
+        e = hub.latest()["0011223344aa"]
+        self.assertIs(e["remote_mode"], False)
+        self.assertIs(e["keyboard_open"], False)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,17 +13,20 @@ Design constraints, in order:
    stdlib binding, and shelling out is the documented fallback.
 2. **One injectable seam.** Every synthetic event funnels through the `inject`
    callable given to `OsActions` -- a list of `("key", vk, down)` /
-   `("move", dx, dy)` / `("button", which, down)` / `("wheel", delta)` /
-   `("hwheel", delta)` tuples per call. The default sends them as ONE
-   `SendInput` array, which matters: Win+D injected as two separate calls can
-   interleave with the user's real typing; one array is atomic. Tests replace
-   `inject` with a recorder and never touch the desktop.
+   `("unicode", char, down)` / `("move", dx, dy)` / `("button", which, down)`
+   / `("wheel", delta)` / `("hwheel", delta)` tuples per call. The default
+   sends them as ONE `SendInput` array, which matters: Win+D injected as two
+   separate calls can interleave with the user's real typing; one array is
+   atomic. Tests replace `inject` with a recorder and never touch the desktop.
 3. **Hold semantics are explicit.** Alt-Tab is not a tap: the switcher stays
    open exactly as long as Alt is down, so the gesture engine needs
    `alt_tab_start` / `alt_tab_step` / `alt_tab_commit` / `alt_tab_cancel` as
    separate calls with the Alt key held across them. A stuck Alt key is the
    failure mode, which is why commit/cancel are idempotent and `close()`
-   releases anything still held.
+   releases anything still held. The same idea, generalised, is
+   `ActionSpec.hold`: an action that can be HELD (a mouse button, Esc, an
+   arrow key) carries a (press, release) pair next to its tap, so remote mode
+   can drag with Cross while a PS-chord bound to the same name simply clicks.
 
 Nothing here knows about controllers, reports or Bluetooth.
 """
@@ -31,24 +34,32 @@ Nothing here knows about controllers, reports or Bluetooth.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import sys
 import threading
 from dataclasses import dataclass
 
+from . import audio_default as AD
+
 log = logging.getLogger("ds5app.actions")
 
 # --- virtual-key codes (winuser.h) ------------------------------------------
 
+VK_BACK = 0x08
 VK_TAB = 0x09
 VK_RETURN = 0x0D
 VK_SHIFT = 0x10
+VK_CONTROL = 0x11
 VK_MENU = 0x12          # Alt
+VK_CAPITAL = 0x14
 VK_ESCAPE = 0x1B
+VK_SPACE = 0x20
 VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN = 0x25, 0x26, 0x27, 0x28
 VK_LWIN = 0x5B
-VK_D, VK_M, VK_P = 0x44, 0x4D, 0x50
+VK_D, VK_H, VK_M, VK_P, VK_V = 0x44, 0x48, 0x4D, 0x50, 0x56
+VK_OEM_PERIOD = 0xBE
 VK_VOLUME_MUTE = 0xAD
 VK_VOLUME_DOWN = 0xAE
 VK_VOLUME_UP = 0xAF
@@ -72,6 +83,7 @@ if sys.platform == "win32":
 
     _KEYEVENTF_KEYUP = 0x0002
     _KEYEVENTF_EXTENDEDKEY = 0x0001
+    _KEYEVENTF_UNICODE = 0x0004
     _MOUSEEVENTF_MOVE = 0x0001
     _MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP = 0x0002, 0x0004
     _MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP = 0x0008, 0x0010
@@ -126,6 +138,16 @@ if sys.platform == "win32":
                 if vk in _EXTENDED_VKS:
                     flags |= _KEYEVENTF_EXTENDEDKEY
                 slot.u.ki = _KEYBDINPUT(vk, 0, flags, 0, None)
+            elif kind == "unicode":
+                # One UTF-16 code unit typed as itself, layout-independent:
+                # wVk 0, wScan = the unit, KEYEVENTF_UNICODE. Astral
+                # characters arrive here already split into surrogates
+                # (`unicode_events`), one slot each, which is what the
+                # receiving app expects for an emoji.
+                _, unit, down = ev
+                slot.type = _INPUT_KEYBOARD
+                flags = _KEYEVENTF_UNICODE | (0 if down else _KEYEVENTF_KEYUP)
+                slot.u.ki = _KEYBDINPUT(0, int(unit) & 0xFFFF, flags, 0, None)
             elif kind == "move":
                 _, dx, dy = ev
                 slot.type = _INPUT_MOUSE
@@ -197,6 +219,51 @@ def launch_command(cmd: str) -> bool:
     except Exception as e:  # noqa: BLE001
         log.warning("macro command did not start (%s): %s", cmd[:80], e)
         return False
+
+
+#: Windows' projection modes, as `DisplaySwitch.exe` spells them, in the order
+#: `display_cycle` walks them. The action names are the config vocabulary.
+DISPLAY_MODES = (
+    ("display_pc_only", "/internal", "PC screen only"),
+    ("display_duplicate", "/clone", "duplicate"),
+    ("display_extend", "/extend", "extend"),
+    ("display_second_only", "/external", "second screen only"),
+)
+_DISPLAY_SWITCH = {name: flag for name, flag, _ in DISPLAY_MODES}
+
+
+def display_switch_exe() -> str:
+    """Where DisplaySwitch.exe is: %WINDIR%\\System32, or bare on PATH.
+
+    A 32-bit interpreter on 64-bit Windows sees `System32` redirected to
+    `SysWOW64`, which does not carry DisplaySwitch; `Sysnative` is the escape
+    hatch Windows provides for exactly that, so it is tried second.
+    """
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot") \
+        or r"C:\Windows"
+    for sub in ("System32", "Sysnative"):
+        p = os.path.join(windir, sub, "DisplaySwitch.exe")
+        if os.path.isfile(p):
+            return p
+    return "DisplaySwitch.exe"
+
+
+def unicode_events(text: str) -> list:
+    """`("unicode", unit, down)` pairs typing `text`, UTF-16 unit by unit.
+
+    Pure: the on-screen keyboard's model tests assert on these tuples. A
+    character outside the BMP becomes its two surrogates, each pressed and
+    released in turn -- that is the order a real IME sends them in, and the
+    order `SendInput` reassembles them from.
+    """
+    events = []
+    for ch in text:
+        units = ch.encode("utf-16-le")
+        for i in range(0, len(units), 2):
+            unit = int.from_bytes(units[i:i + 2], "little")
+            events.append(("unicode", unit, True))
+            events.append(("unicode", unit, False))
+    return events
 
 
 #: One WMI round trip that clamps and applies a relative brightness change.
@@ -274,30 +341,51 @@ MACRO_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 @dataclass(frozen=True)
 class ActionSpec:
-    """One nameable action: what to call, and whether holding repeats it."""
+    """One nameable action: what to call, and whether holding repeats it.
+
+    `hold`, when present, is a `(press, release)` pair of no-argument
+    callables for contexts that track a button's whole press -- remote mode
+    holds the left mouse button down for as long as Cross is, and re-triggers
+    a held arrow key. `run` stays the TAP form of the same action (press and
+    release in one `SendInput`), which is what a PS-chord fires.
+    """
 
     name: str
     run: object                 # callable(params: dict) -> None
     repeatable: bool = False
     doc: str = ""
+    hold: object = None         # (press(), release()) or None
 
 
 class OsActions:
-    """Every OS action, over two injectable seams (`inject`, `run_ps`).
+    """Every OS action, over injectable seams (`inject`, `run_ps`, `launch`,
+    `audio`).
 
     Thread expectations: `mouse_*`/`wheel`/`key` are called straight from the
     engine on the Bluetooth reader thread -- `SendInput` is microseconds, that
     is fine. Registry actions are dispatched through the engine's worker
-    thread because one of them (brightness) shells out.
+    thread because some of them shell out (brightness) or talk COM
+    (dictation's default-microphone switch).
     """
 
-    def __init__(self, inject=None, run_ps=None, launch=None):
+    def __init__(self, inject=None, run_ps=None, launch=None, audio=None,
+                 sleep=None):
         self.inject = inject or send_input_events
         self.run_ps = run_ps or run_powershell
         self.launch = launch or launch_command
         self._lock = threading.Lock()
         self._alt_held = False
         self._shift_held = False
+        #: `display_cycle`'s position in `DISPLAY_MODES`; -1 = nothing chosen
+        #: yet this process. The explicit `display_*` actions move it too, so
+        #: cycling after "extend" continues from extend.
+        self._display_idx = -1
+        #: Voice typing through the pad's microphone: the toggle remembers the
+        #: default capture device it displaced so `close()` can put it back.
+        self.dictation = AD.DictationToggle(
+            audio if audio is not None else AD.AudioSystem(),
+            send_win_h=lambda: self.tap(VK_LWIN, VK_H),
+            sleep=sleep)
 
     # -- primitives (also used directly by remote mode) --------------------
 
@@ -366,8 +454,12 @@ class OsActions:
         return self._alt_held
 
     def close(self) -> None:
-        """Release anything still held -- a stuck Alt key outlives the bridge."""
-        self.alt_tab_cancel()
+        """Release anything still held -- a stuck Alt key outlives the bridge --
+        and give the default microphone back if dictation borrowed it."""
+        try:
+            self.alt_tab_cancel()
+        finally:
+            self.dictation.restore()
 
     # -- registry actions ---------------------------------------------------
 
@@ -379,6 +471,34 @@ class OsActions:
     def _brightness(self, sign: int, params: dict) -> None:
         step = max(1, min(100, int(params.get("step", 10))))
         self.run_ps(_BRIGHTNESS_PS.format(step=sign * step))
+
+    def click(self, which: str) -> None:
+        """One click: button down and up in a single `SendInput`."""
+        self.inject([("button", which, True), ("button", which, False)])
+
+    def display_mode(self, name: str) -> bool:
+        """Switch projection to one of `DISPLAY_MODES` by action name.
+
+        `DisplaySwitch.exe /flag` is what Win+P runs when a tile is clicked,
+        minus the chooser -- so a chord can go straight to "extend" without a
+        UI to steer. Launched detached like a macro; the exe returns at once.
+        """
+        flag = _DISPLAY_SWITCH.get(name)
+        if flag is None:
+            return False
+        with self._lock:
+            self._display_idx = [m[0] for m in DISPLAY_MODES].index(name)
+        return self.launch(f'"{display_switch_exe()}" {flag}')
+
+    def display_cycle(self) -> str:
+        """The next mode after the one last chosen in this process --
+        PC only -> duplicate -> extend -> second only -> PC only. With nothing
+        chosen yet it starts at PC only, the safe end of the list."""
+        with self._lock:
+            idx = (self._display_idx + 1) % len(DISPLAY_MODES)
+        name = DISPLAY_MODES[idx][0]
+        self.display_mode(name)
+        return name
 
     # -- user macros --------------------------------------------------------
 
@@ -433,12 +553,24 @@ class OsActions:
         """Action name -> ActionSpec. The names are the config vocabulary.
 
         `pad_power_off` is absent on purpose: powering the pad off is the
-        ENGINE's business (it owns the bridge callback), not an OS action.
-        `alt_tab` is registered as a plain forward step so a user may bind it
-        to a *button* chord too; the touchpad gesture drives the hold
-        variants directly.
+        ENGINE's business (it owns the bridge callback), not an OS action;
+        so is `keyboard` (it toggles engine state). `alt_tab` is registered
+        as a plain forward step so a user may bind it to a *button* chord too;
+        the touchpad gesture drives the hold variants directly.
+
+        The click/key/arrow entries carry `hold` pairs: the classic remote
+        map (`config.DEFAULT_REMOTE_CHORDS`) is built from them, and remote
+        mode holds them for the length of the button press.
         """
         a = self
+
+        def held_key(vk):
+            return (lambda: a.key(vk, True), lambda: a.key(vk, False))
+
+        def held_button(which):
+            return (lambda: a.mouse_button(which, True),
+                    lambda: a.mouse_button(which, False))
+
         return {s.name: s for s in (
             ActionSpec("volume_up",
                        lambda p: a._volume(VK_VOLUME_UP, p), True,
@@ -479,4 +611,55 @@ class OsActions:
             ActionSpec("alt_tab",
                        lambda p: a.tap(VK_MENU, VK_TAB), False,
                        "one Alt+Tab step (the gesture uses hold semantics)"),
+            # -- mouse buttons and plain keys (held for the press in remote
+            #    mode, tapped from a chord) -----------------------------------
+            ActionSpec("left_click", lambda p: a.click("left"), False,
+                       "left mouse button (hold to drag in remote mode)",
+                       hold=held_button("left")),
+            ActionSpec("right_click", lambda p: a.click("right"), False,
+                       "right mouse button", hold=held_button("right")),
+            ActionSpec("middle_click", lambda p: a.click("middle"), False,
+                       "middle mouse button", hold=held_button("middle")),
+            ActionSpec("escape", lambda p: a.tap(VK_ESCAPE), False,
+                       "Esc key", hold=held_key(VK_ESCAPE)),
+            ActionSpec("enter", lambda p: a.tap(VK_RETURN), False,
+                       "Enter key", hold=held_key(VK_RETURN)),
+            ActionSpec("arrow_up", lambda p: a.tap(VK_UP), True,
+                       "up arrow key (repeats while held)",
+                       hold=held_key(VK_UP)),
+            ActionSpec("arrow_down", lambda p: a.tap(VK_DOWN), True,
+                       "down arrow key (repeats while held)",
+                       hold=held_key(VK_DOWN)),
+            ActionSpec("arrow_left", lambda p: a.tap(VK_LEFT), True,
+                       "left arrow key (repeats while held)",
+                       hold=held_key(VK_LEFT)),
+            ActionSpec("arrow_right", lambda p: a.tap(VK_RIGHT), True,
+                       "right arrow key (repeats while held)",
+                       hold=held_key(VK_RIGHT)),
+            # -- projection, without the Win+P chooser -----------------------
+            ActionSpec("display_extend",
+                       lambda p: a.display_mode("display_extend"), False,
+                       "extend the desktop across both screens "
+                       "(DisplaySwitch /extend)"),
+            ActionSpec("display_second_only",
+                       lambda p: a.display_mode("display_second_only"), False,
+                       "second screen only -- e.g. the TV "
+                       "(DisplaySwitch /external)"),
+            ActionSpec("display_pc_only",
+                       lambda p: a.display_mode("display_pc_only"), False,
+                       "PC screen only (DisplaySwitch /internal)"),
+            ActionSpec("display_duplicate",
+                       lambda p: a.display_mode("display_duplicate"), False,
+                       "duplicate the PC screen on the second one "
+                       "(DisplaySwitch /clone)"),
+            ActionSpec("display_cycle",
+                       lambda p: a.display_cycle(), False,
+                       "next projection mode: PC only -> duplicate -> extend "
+                       "-> second only (remembers where it is)"),
+            # -- voice typing through the pad's own microphone ---------------
+            ActionSpec("dictation",
+                       lambda p: a.dictation.toggle(), False,
+                       "Windows voice typing (Win+H) listening through the "
+                       "controller's microphone; press again to stop and "
+                       "give the previous microphone back"),
         )}

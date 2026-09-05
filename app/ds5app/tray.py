@@ -488,6 +488,17 @@ class TrayApp:
         print(f"  {short(serial)} {kind}: {text}", flush=True)
         if kind in ("warn", "error") and self.icon is not None:
             self._notify(f"ds5bridge -- {short(serial)}", text)
+        elif kind == "battery_low" and self.icon is not None:
+            # Once per threshold per discharge (manager.LowBatteryAlerts);
+            # the label the user gave the pad, else the short serial.
+            self._notify("ds5bridge", f"{self._name_of(serial)} {text}")
+
+    def _name_of(self, serial: str) -> str:
+        try:
+            label = self.cfg.controllers[K.norm_serial(serial)].label
+        except (KeyError, AttributeError):
+            label = ""
+        return (label or "").strip() or short(serial)
 
     def _notify(self, title: str, text: str) -> None:
         try:

@@ -93,16 +93,18 @@ class DefaultChordsResolve(RecorderCase):
 
         reg = self.a.registry()
         unresolved = {}
-        for key, name in K.DEFAULT_CHORDS.items():
-            # `pad_power_off` is the engine's own callback, deliberately not an
-            # OsAction (see registry() docstring); everything else is a name in
-            # the registry.
-            if name == "pad_power_off":
-                continue
-            if name not in reg:
-                unresolved[key] = name
+        for table in (K.DEFAULT_CHORDS, K.DEFAULT_REMOTE_CHORDS):
+            for key, name in table.items():
+                # `K.ENGINE_ACTIONS` (pad power/lightbar, the on-screen
+                # keyboard) are the engine's own, deliberately not OsActions
+                # (see registry() docstring); everything else is a name in
+                # the registry.
+                if name in K.ENGINE_ACTIONS:
+                    continue
+                if name not in reg:
+                    unresolved[key] = name
         self.assertEqual(unresolved, {},
-                         f"DEFAULT_CHORDS names not in the action registry: "
+                         f"default chord names not in the action registry: "
                          f"{unresolved}")
 
 
@@ -192,7 +194,7 @@ class Registry(RecorderCase):
 
         reg = self.a.registry()
         for key, name in K.DEFAULT_CHORDS.items():
-            if name == "pad_power_off":     # the engine's, not an OS action
+            if name in K.ENGINE_ACTIONS:    # the engine's, not OS actions
                 continue
             self.assertIn(name, reg, f"chord {key!r}")
 

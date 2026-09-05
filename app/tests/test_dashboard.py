@@ -269,9 +269,28 @@ class DashboardCase(unittest.TestCase):
         self.assertEqual(doc["macro_keys"][:4], ["ctrl", "shift", "alt", "win"])
         # Every default chord must resolve inside the served vocabulary, or
         # the page would show "(unknown)" rows on a fresh install.
-        vocab = set(names) | {"pad_power_off"}
+        vocab = set(names) | {e["name"] for e in doc["engine_actions"]}
         for key, action in K.DEFAULT_CHORDS.items():
             self.assertIn(action, vocab, f"default chord {key} -> {action}")
+        # The contract the dashboard codes against: the remote table's
+        # defaults and the keys it accepts, next to the existing fields.
+        self.assertEqual(doc["defaults"]["remote_chords"],
+                         dict(K.DEFAULT_REMOTE_CHORDS))
+        self.assertEqual(doc["remote_keys"],
+                         [b for b in K.CHORD_BUTTONS if b != "ps"]
+                         + list(K.CHORD_GESTURES))
+        for key in K.DEFAULT_REMOTE_CHORDS:
+            self.assertIn(key, doc["remote_keys"])
+        for key, action in K.DEFAULT_REMOTE_CHORDS.items():
+            self.assertIn(action, vocab, f"default remote {key} -> {action}")
+        engine_names = [e["name"] for e in doc["engine_actions"]]
+        self.assertIn("keyboard", engine_names)
+        for name in ("display_extend", "display_second_only",
+                     "display_pc_only", "display_duplicate", "display_cycle",
+                     "dictation", "left_click", "right_click", "middle_click"):
+            self.assertIn(name, names)
+        for a in doc["engine_actions"]:
+            self.assertTrue(a["doc"], f"{a['name']} has no doc for the picker")
 
     def test_api_actions_is_cached_and_guarded(self):
         # Static per process: the exact same object every call ...
