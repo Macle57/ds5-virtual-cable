@@ -930,6 +930,36 @@ class TestHideToggle(_Base):
         self.assertTrue(snap[A]["hide_bluetooth"])
         self.assertFalse(snap[B]["hide_bluetooth"])
 
+    def test_the_snapshot_carries_hide_effective_and_hide_note(self):
+        # The contract with the dashboard (docs: /api/state controllers[serial]):
+        # both keys on every controller, null/"" until a hide has been checked
+        # in this process, then whatever hidhide.hide_status says. Both
+        # branches of snapshot() -- a bridge, and a present-but-stopped pad.
+        from ds5app import hidhide as HH
+        m = self.make(hide_bluetooth={A: True, B: True}, enabled={A: True, B: False})
+        m.start(A)
+        m.poll_once()
+        snap = m.snapshot()["controllers"]
+        for s in (A, B):
+            self.assertIn("hide_effective", snap[s])
+            self.assertIn("hide_note", snap[s])
+            self.assertIsNone(snap[s]["hide_effective"])
+            self.assertEqual(snap[s]["hide_note"], "")
+        HH._set_hide_status(A, False, HH.NOTE_FILTER_MISSING)
+        HH._set_hide_status(B, True, "")
+        try:
+            snap = m.snapshot()["controllers"]
+            self.assertIs(snap[A]["hide_effective"], False)
+            self.assertEqual(snap[A]["hide_note"], HH.NOTE_FILTER_MISSING)
+            self.assertIs(snap[B]["hide_effective"], True)
+            # With hiding OFF the fields are null, whatever the module remembers.
+            m2 = self.make(hide_bluetooth={A: False}, enabled={A: True})
+            m2.start(A)
+            self.assertIsNone(m2.snapshot()["controllers"][A]["hide_effective"])
+        finally:
+            HH.clear_hide_status(A)
+            HH.clear_hide_status(B)
+
 
 # ---------------------------------------------------------------------------
 # the child's own verdict on the Bluetooth link -- what cloaking hides from us
