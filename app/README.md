@@ -17,14 +17,32 @@ ds5app/
   cli.py        `ds5bridge` -- run / devices / cleanup / doctor / tray
   tray.py       pystray front end over the same BridgeService
 tests/          hardware-free (the `usbip port` parser)
-tools/          hardware tests -- launcher lifecycle, reconnect, long soak
+tools/          dev_tray.ps1 (run the tray from source), plus the hardware
+                tests -- launcher lifecycle, reconnect, long soak
 packaging/      PyInstaller spec + build.ps1
 ```
 
 ## Run it
 
+Nothing here is installed and nothing has to be built. The tray you get from
+`dev_tray.ps1` is the same tray the packaged exe shows -- same process, same
+icon, same menu -- so the edit/run loop never has to go through PyInstaller:
+
 ```powershell
-cd D:\Codes\dualSense\ds5-virtual-usb\app
+powershell -File app\tools\dev_tray.ps1              # console window + live logs
+powershell -File app\tools\dev_tray.ps1 -Windowed    # no console, like ds5bridge-tray.exe
+powershell -File app\tools\dev_tray.ps1 -Isolated    # scratch DS5_CONFIG, not your real settings
+powershell -File app\tools\dev_tray.ps1 -Stop        # stop it, cleanly
+```
+
+Every start replaces the running one, and `-Stop` tears down through the
+service rather than killing it, which is what gives a hidden Bluetooth pad back.
+Do not stop it from Task Manager.
+
+The commands it wraps, and everything else:
+
+```powershell
+cd <repo>\app
 ..\prototype\.venv\Scripts\python.exe -m ds5app                 # bridge, Ctrl+C to stop
 ..\prototype\.venv\Scripts\python.exe -m ds5app devices
 ..\prototype\.venv\Scripts\python.exe -m ds5app doctor
@@ -35,6 +53,28 @@ cd D:\Codes\dualSense\ds5-virtual-usb\app
 
 End-user instructions are `docs/USER-GUIDE.md`. Build the exe with
 `powershell -File app\packaging\build.ps1`.
+
+### The dashboard page
+
+`ds5app/dashboard.html` -- the page the tray's *Dashboard* item opens -- is a
+build product, not a source file. Its source is the Vite + React + Tailwind
+project in `dashboard-ui/`; the build inlines everything (JS, CSS, the
+Rajdhani font) into that one file so the page fetches nothing from anywhere,
+and the built file is committed so a Python-only checkout still works.
+
+```powershell
+cd app\dashboard-ui
+npm install                      # once
+npm run dev                      # Vite on :5173, /api proxied to a feed on :8799
+npm run build                    # type-check + write ..\ds5app\dashboard.html
+```
+
+For a feed without a pad: `python -m ds5app.dashboard --fake --port 8799`
+from `app\`. The page keeps two query flags the tests and screenshots rely
+on -- `?snap` polls `/api/state` instead of holding the SSE stream, and
+`?settings` opens the settings panel on load. `build.ps1` rebuilds the page
+before PyInstaller when `dashboard-ui\node_modules` is present, and otherwise
+packages the committed file.
 
 ## The five things that are easy to get wrong
 

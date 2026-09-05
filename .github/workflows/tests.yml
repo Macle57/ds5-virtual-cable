@@ -66,13 +66,22 @@ jobs:
           python-version: "3.12"
 
       - name: Install runtime dependencies
-        run: python -m pip install --upgrade pip hidapi numpy av
+        run: python -m pip install --upgrade pip hidapi numpy av pystray pillow
 
       - name: Unit tests (nothing should skip)
         working-directory: emulator
         run: python -m unittest discover -s tests -t . -v
 
+      # The product layer: the settings file, the multi-controller manager and
+      # the tray's rendering. None of it needs a controller, a driver or a tray
+      # -- `app/tests` fakes the hardware and never opens an icon -- but until
+      # now none of it ran here either, so a broken menu or a config that
+      # cannot load would have reached a release green.
+      - name: Unit tests -- app layer
+        working-directory: app
+        run: python -m unittest discover -s tests -t . -v
+
       # The live harnesses cannot be run without a controller, but they can at
       # least be kept syntactically valid.
       - name: Byte-compile the hardware harnesses
-        run: python -m compileall -q emulator/tools prototype/ds5bridge prototype/tools
+        run: python -m compileall -q emulator/tools prototype/ds5bridge prototype/tools app/tools

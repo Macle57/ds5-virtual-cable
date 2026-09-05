@@ -1,11 +1,11 @@
 <!--
-  PROJECT NAME PLACEHOLDER: "PhantomCable".
+  PROJECT NAME PLACEHOLDER: "DS5 Virtual Dongle".
   It appears in this file, LICENSE, NOTICE, ATTRIBUTIONS.md, SECURITY.md,
   CONTRIBUTING.md, .github/ and nowhere else -- no Python package, module or
   import uses it. To rename, see the one-liner in CONTRIBUTING.md.
 -->
 
-# PhantomCable
+# DS5 Virtual Dongle
 
 **Your wireless controller, pretending to be plugged in.**
 
@@ -39,7 +39,7 @@ a Bluetooth pad has neither — even though the controller itself is perfectly
 capable of all of it over Bluetooth. The hardware can do it. The link is fine.
 The only thing missing is the shape of a USB cable.
 
-PhantomCable supplies that shape.
+DS5 Virtual Dongle supplies that shape.
 
 ## How it works
 
@@ -78,9 +78,12 @@ Four pipes run at once, in both directions:
 | plays audio to the "controller speakers" | 4-channel 48 kHz PCM → Opus at 45 kHz + 3 kHz haptic PCM → Bluetooth `0x39` |
 | records from the "controller mic" | Bluetooth Opus frames → decoded → the virtual USB capture endpoint |
 
-Channels 0/1 of that 4-channel audio device are the speaker; channels 2/3 are
-the haptic voice coils. That is not a guess — driving 2/3 alone, with the audio
-stream carrying literal digital silence, still produces a measurable tone.
+Channels 0/1 of that 4-channel audio device are a stereo pair the controller
+routes between the headphone jack and the speaker (under the routing games
+normally set, channel 0 feeds the headphones and channel 1 feeds the speaker);
+channels 2/3 are the haptic voice coils. The haptic part is not a guess —
+driving 2/3 alone, with the audio stream carrying literal digital silence,
+still produces a measurable tone.
 
 There is one design fact worth knowing, because everything else follows from it:
 **over USB/IP there is no bus clock, so the emulator *is* the audio clock.**
@@ -93,26 +96,75 @@ problems. The emulator now hands out 1 ms service intervals itself.
 - **Windows 10 x64 (1903+) or Windows 11.**
 - **A DualSense controller** paired over Bluetooth. (A second one, wired, is
   only needed if you want to reproduce the development measurements.)
-- **[usbip-win2](https://github.com/vadimgrn/usbip-win2) 0.9.7.7 or later.**
+- **[usbip-win2](https://github.com/vadimgrn/usbip-win2) 0.9.7.7**, exactly.
   Its drivers are **signed by Microsoft** — no test-signing, no unsigned-driver
-  mode, no BIOS changes. Install it from its own releases page.
+  mode, no BIOS changes. The installer below puts it there, after creating a
+  System Restore point as usbip-win2's own README asks (it installs two kernel
+  drivers and restarts every USB 3.0 hub on the machine while it does).
   **Do not install 0.9.7.8**; its own maintainer warns it can corrupt memory.
+- **[HidHide](https://github.com/nefarius/HidHide) 1.5.230**, optional: only
+  the "hide the Bluetooth pad while bridged" feature needs it. The installer
+  includes it; it needs one reboot before it does anything.
 - **Python 3.12+** if you are running from source.
-
-**Create a system restore point before installing usbip-win2.** Its own README
-says so and so do we: it installs two kernel drivers and restarts every USB 3.0
-hub on the machine while it does.
 
 ## Getting it running
 
-Two ways.
+Three ways. The first is the one to use unless you have a reason not to.
 
-**The easy way** — the packaged app, if a release is available for your
-platform: download it, install usbip-win2, run it, pick your controller.
-Step-by-step instructions with screenshots live in the user guide
-(`docs/USER-GUIDE.md`).
+**1. The installer (recommended).** Download
+**`ds5bridge-setup-<version>-bundled.exe`** from the
+[latest release](../../releases/latest) and run it. Everything is inside the
+file — the app, usbip-win2 0.9.7.7 and HidHide 1.5.230 — so nothing is
+downloaded during the install and it works offline. A checkbox per component,
+a System Restore point before the driver goes in, an *Installation check* page
+at the end, and an entry in Settings → Apps whose uninstaller takes the
+drivers back out. `ds5bridge-setup-<version>.exe` (without `-bundled`) is the
+same installer fetching the two driver packages from their vendors' release
+pages during the install, SHA-256-checked: 34 MB less to download, otherwise
+identical. Silent switches, the uninstaller's options and everything else are
+in [`docs/installer.md`](docs/installer.md).
 
-**From source:**
+Nothing is code-signed yet, so Windows shows **"Windows protected your PC"**
+the first time: *More info → Run anyway*. The two driver packages inside are
+signed by their own publishers; SmartScreen is reacting to the installer and
+the app, not to the drivers. That warning stays until the project has a
+code-signing certificate.
+
+**2. One line of PowerShell** — the same steps as the installer, scripted, for
+people who would rather read what runs:
+
+```powershell
+irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1 | iex
+```
+
+That creates the restore point, installs the pinned usbip-win2 **0.9.7.7**
+silently (SHA-256-verified, never 0.9.7.8), installs HidHide (a failure there
+is a warning, not a stop), then puts the latest ds5bridge release in
+`%LOCALAPPDATA%\ds5bridge`, checksum-verified, with a Start Menu shortcut and
+the tray running at the end. Re-running it is safe — every step checks whether
+its work is already done. To see the full plan without changing anything:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1))) -DryRun
+```
+
+Either way, the tray bridges every controller that is switched on, picks up
+ones you turn on later, and can start itself when you log in — so after setup
+the routine is "turn the controller on, start the game". A tray menu switches
+any controller (or all of them) back to plain Bluetooth when you would rather
+a game used the native stack. It also checks GitHub once a day for a newer
+release and offers it as a menu item — one click updates in place,
+checksum-verified again (`update_check: false` in the config turns the check
+off). Step-by-step instructions, options and the uninstaller live in the user
+guide (`docs/USER-GUIDE.md`).
+
+**Uninstalling:** Settings → Apps → *ds5bridge*, or the uninstall one-liner in
+the user guide. Both remove the drivers too unless told to keep them.
+usbip-win2's driver cannot be unloaded while Windows is running, so its
+removal finishes at your next logon: **uninstall → reboot → reboot again
+before any reinstall**. Why, and what to expect, is in `docs/installer.md`.
+
+**3. From source:**
 
 ```powershell
 git clone <this repo>
@@ -140,7 +192,16 @@ When you are done:
 The `attach -X` is not optional — `usbip attach` arms a background re-attach,
 and without it you quietly collect a second virtual device.
 
-**If you have paired more than one controller, pass `--bt-serial <bdaddr>`.**
+**More than one controller works.** Each gets its own virtual wired DualSense,
+its own USB audio device and its own port — `ds5bridge --all` from the packaged
+app, or the tray, which does it without being asked. Measured on two pads at
+once: **250 reports/s each**. They run one process apiece, because two bridges
+in one Python interpreter sit at the GIL ceiling and the input tail suffers
+(241/s, gaps to 52 ms); the numbers for both arrangements are in
+`app/ds5app/manager.py`.
+
+**If you are driving the emulator directly and have paired more than one
+controller, pass `--bt-serial <bdaddr>`.**
 A controller charging over a USB cable *still* enumerates over Bluetooth as a
 stale entry whose reads fail, and it can sort first. To see what is actually
 there:
@@ -183,7 +244,8 @@ hardware. Full evidence, including the failures, is in `docs/e2e-results.md`.
 | speaker output, heard back through the controller's own mic | **+64.4 dB** at the commanded frequency | detectable |
 | haptic output, same method, audio stream silent | **+27.8 dB** at the commanded frequency | detectable |
 | Bluetooth link rate, steady state | ~480 Hz | — |
-| unit tests | **173**, of which 132 need no hardware, no driver and no third-party package | — |
+| unit tests | **728** — 243 for the protocol and the emulator, 485 for the settings, the multi-controller manager and the tray. None needs hardware or a driver; a stdlib-only subset runs on bare Python (enforced in CI) | — |
+| two controllers at once | **250 reports/s each**, one process per controller | 250 |
 
 The audio tests are deliberately *frequency-selective* — they only pass if
 energy appears at the exact frequency that was commanded — so a noisy room
@@ -233,7 +295,10 @@ DualSense. This bridges Bluetooth specifically.
 **Does it modify my controller, or my games?**
 No. Feature *writes* to the controller — the reports that re-pair it or touch
 its firmware — are deliberately blocked and never forwarded, even if a host
-asks. Feature reads are served from a small cache primed at startup.
+asks. The only writes allowed through are the two transient audio test
+commands (the "play a tone" pair that tools like dualsense-tester send),
+which change nothing persistent. Feature reads are served from a small cache
+primed at startup.
 
 **Will Sony break this in a firmware update?**
 Possibly. It speaks the controller's existing Bluetooth protocol, which Sony has
@@ -249,6 +314,7 @@ twice. Read the battery level, charge it, try again.
 | | |
 |---|---|
 | `docs/USER-GUIDE.md` | how to install and use it, for people who just want it to work |
+| `docs/installer.md` | the setup exe and its uninstaller: every checkbox, the silent switches, the reboot sequence |
 | `docs/STATUS.md` | the full engineering history: what is verified, what is not, every trap |
 | `docs/e2e-results.md` | the end-to-end results, with numbers and with the defects found |
 | `docs/FINDINGS.md` | the reverse-engineered Bluetooth protocol |

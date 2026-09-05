@@ -37,6 +37,17 @@ hidden = [
     "ds5bridge.pacing", "ds5bridge.crc",
     "ds5app.tray", "ds5app.cli", "ds5app.service", "ds5app.controller",
     "ds5app.usbip",
+    #   cli.cmd_run_all -> ds5app.manager, and cli.cmd_doctor -> config/autostart,
+    # both imported inside the function bodies for the same reason.
+    "ds5app.manager", "ds5app.config", "ds5app.autostart",
+    #   service/manager/tray/cli all reach ds5app.hidhide from inside function
+    # bodies too, so that a machine with a broken hardware stack can still run
+    # `doctor` and `unhide`.
+    "ds5app.hidhide",
+    #   the dashboard and its telemetry channel are imported inside function
+    # bodies (service._start_inner, cli.cmd_run_all, tray) for the same
+    # reason: both are optional passengers a broken machine can live without.
+    "ds5app.dashboard", "ds5app.telemetry",
     # PyAV loads its codecs through the extension modules; numpy is pulled in
     # by ds5bridge.audio.
     "av", "numpy", "hid",
@@ -49,9 +60,14 @@ hidden = [
 # runtime "codec not found" three weeks later.
 binaries = collect_dynamic_libs("av") + collect_dynamic_libs("numpy")
 
+# The dashboard page is one self-contained HTML file served from next to
+# ds5app/dashboard.py; ship it at the same relative spot inside the bundle.
+datas = [(str(APP_DIR / "ds5app" / "dashboard.html"), "ds5app")]
+
 excludes = [
-    # Nothing here draws a plot, opens a notebook or serves a web page, and
-    # each of these adds tens of megabytes.
+    # Nothing here draws a plot or opens a notebook (the dashboard serves its
+    # one page with stdlib http.server), and each of these adds tens of
+    # megabytes.
     "tkinter", "matplotlib", "scipy", "pandas", "IPython", "notebook",
     "pytest", "sounddevice", "setuptools", "pip",
 ]
@@ -60,7 +76,7 @@ a = Analysis(
     [str(APP_DIR / "packaging" / "entry_cli.py")],
     pathex=[str(APP_DIR), str(REPO / "emulator"), str(REPO / "prototype")],
     binaries=binaries,
-    datas=[],
+    datas=datas,
     hiddenimports=hidden,
     hookspath=[],
     excludes=excludes,
@@ -72,7 +88,7 @@ a_tray = Analysis(
     [str(APP_DIR / "packaging" / "entry_tray.py")],
     pathex=[str(APP_DIR), str(REPO / "emulator"), str(REPO / "prototype")],
     binaries=binaries,
-    datas=[],
+    datas=datas,
     hiddenimports=hidden,
     hookspath=[],
     excludes=excludes,

@@ -1,0 +1,223 @@
+@import "tailwindcss";
+
+/* Rajdhani (OFL), latin woff2 only -- three weights, ~46 KB, inlined into
+   the built page so it fetches nothing. */
+@font-face {
+  font-family: "Rajdhani"; font-style: normal; font-weight: 500; font-display: swap;
+  src: url("@fontsource/rajdhani/files/rajdhani-latin-500-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Rajdhani"; font-style: normal; font-weight: 600; font-display: swap;
+  src: url("@fontsource/rajdhani/files/rajdhani-latin-600-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Rajdhani"; font-style: normal; font-weight: 700; font-display: swap;
+  src: url("@fontsource/rajdhani/files/rajdhani-latin-700-normal.woff2") format("woff2");
+}
+
+/* ------------------------------------------------------------------------
+   One deliberate dark look: a HUD for a thing with a lightbar. The palette
+   is PlayStation's own -- the four face-button colours carry meaning
+   everywhere (cross = blue = primary, triangle = green = good, circle = red
+   = bad, square = pink = accent) so the dashboard reads like the pad.
+   ------------------------------------------------------------------------ */
+@theme {
+  --font-display: "Rajdhani", "Bahnschrift", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+
+  --color-bg: #05070d;
+  --color-bg-2: #0a0e18;
+  --color-panel: #0f1420;
+  --color-panel-2: #151b2b;
+  --color-well: #080b13;
+  --color-line: #1e2637;
+  --color-line-2: #2a3448;
+  --color-ink: #eef1f7;
+  --color-ink-2: #98a3b8;
+  --color-ink-3: #5f6a80;
+
+  --color-cross: #4d8dff;
+  --color-triangle: #2ee6a6;
+  --color-circle: #ff5c6c;
+  --color-square: #ff7ad9;
+  --color-cyan: #38e0ff;
+  --color-amber: #ffb547;
+
+  --color-ok: #2ee6a6;
+  --color-warn: #ffb547;
+  --color-bad: #ff5c6c;
+  --color-idle: #5f6a80;
+}
+
+:root { color-scheme: dark; }
+
+html, body { min-height: 100%; }
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+::selection { background: color-mix(in oklab, var(--color-cross) 50%, transparent); }
+
+/* ---- scrollbars that belong to the theme -------------------------------- */
+* { scrollbar-width: thin; scrollbar-color: var(--color-line-2) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--color-line-2); border-radius: 8px; border: 2px solid var(--color-bg); }
+
+/* ---- the atmosphere: aurora blobs + a faint tactical grid --------------- */
+.atmosphere {
+  position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden;
+  background:
+    radial-gradient(1200px 600px at 15% -10%, color-mix(in oklab, var(--color-cross) 18%, transparent), transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, color-mix(in oklab, var(--color-square) 10%, transparent), transparent 60%),
+    radial-gradient(800px 600px at 60% 110%, color-mix(in oklab, var(--color-cyan) 9%, transparent), transparent 60%),
+    var(--color-bg);
+}
+.atmosphere::before {
+  content: ""; position: absolute; inset: 0;
+  background-image:
+    linear-gradient(to right, rgba(255,255,255,.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,.035) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse at 50% 0%, black 20%, transparent 75%);
+}
+.atmosphere .orb {
+  position: absolute; border-radius: 50%; filter: blur(70px); opacity: .55;
+  animation: drift 26s ease-in-out infinite alternate;
+}
+@keyframes drift {
+  from { transform: translate3d(0,0,0) scale(1); }
+  to   { transform: translate3d(60px, 40px, 0) scale(1.15); }
+}
+@media (prefers-reduced-motion: reduce) { .atmosphere .orb { animation: none; } }
+
+/* ---- glass panels with a HUD corner bracket ----------------------------- */
+.panel {
+  position: relative;
+  background: linear-gradient(180deg, rgba(21,27,43,.82), rgba(13,17,28,.86));
+  border: 1px solid var(--color-line);
+  border-radius: 16px;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.04),
+    0 20px 40px -24px rgba(0,0,0,.8);
+  backdrop-filter: blur(14px);
+}
+.panel::before, .panel::after {
+  content: ""; position: absolute; width: 14px; height: 14px;
+  border-color: color-mix(in oklab, var(--color-cross) 70%, transparent);
+  border-style: solid; opacity: .8; pointer-events: none;
+}
+.panel::before { top: -1px; left: -1px; border-width: 2px 0 0 2px; border-top-left-radius: 6px; }
+.panel::after  { bottom: -1px; right: -1px; border-width: 0 2px 2px 0; border-bottom-right-radius: 6px; }
+.panel.quiet::before, .panel.quiet::after { display: none; }
+
+.panel-title {
+  font-family: var(--font-display);
+  font-weight: 700; font-size: 13px; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--color-ink-3);
+  display: flex; align-items: center; gap: 8px;
+}
+.panel-title::after {
+  content: ""; flex: 1; height: 1px;
+  background: linear-gradient(90deg, var(--color-line-2), transparent);
+}
+
+/* ---- type ---------------------------------------------------------------- */
+.display { font-family: var(--font-display); font-weight: 700; letter-spacing: .02em; }
+.num { font-family: var(--font-display); font-variant-numeric: tabular-nums; font-weight: 600; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.eyebrow {
+  font-family: var(--font-display); font-weight: 600; font-size: 11px;
+  letter-spacing: .18em; text-transform: uppercase; color: var(--color-ink-3);
+}
+
+/* ---- glow helpers -------------------------------------------------------- */
+.glow-cross    { box-shadow: 0 0 18px -2px color-mix(in oklab, var(--color-cross) 70%, transparent); }
+.glow-triangle { box-shadow: 0 0 18px -2px color-mix(in oklab, var(--color-triangle) 70%, transparent); }
+.glow-circle   { box-shadow: 0 0 18px -2px color-mix(in oklab, var(--color-circle) 70%, transparent); }
+.text-glow     { text-shadow: 0 0 14px color-mix(in oklab, currentColor 60%, transparent); }
+
+/* ---- buttons ------------------------------------------------------------- */
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-family: var(--font-display); font-weight: 700; font-size: 14px; letter-spacing: .08em;
+  text-transform: uppercase; padding: 8px 16px; border-radius: 10px; cursor: pointer;
+  border: 1px solid var(--color-line-2); background: var(--color-panel-2); color: var(--color-ink);
+  transition: border-color .15s, background .15s, transform .08s, box-shadow .15s;
+}
+.btn:hover { border-color: var(--color-cross); box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-cross) 18%, transparent); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: .5; cursor: default; box-shadow: none; }
+.btn-primary {
+  background: linear-gradient(180deg, var(--color-cross), color-mix(in oklab, var(--color-cross) 75%, black));
+  border-color: color-mix(in oklab, var(--color-cross) 70%, white); color: white;
+  box-shadow: 0 6px 20px -8px var(--color-cross), inset 0 1px 0 rgba(255,255,255,.25);
+}
+.btn-primary:hover { filter: brightness(1.08); }
+
+/* ---- form controls ------------------------------------------------------- */
+.field {
+  background: var(--color-well); color: var(--color-ink);
+  border: 1px solid var(--color-line); border-radius: 9px;
+  padding: 7px 10px; font: inherit; font-size: 13.5px; width: 100%; min-width: 0;
+  transition: border-color .15s, box-shadow .15s;
+}
+.field:focus { outline: none; border-color: var(--color-cross); box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-cross) 20%, transparent); }
+select.field {
+  appearance: none; padding-right: 30px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' fill='none' stroke='%2398a3b8' stroke-width='1.8'/></svg>");
+  background-repeat: no-repeat; background-position: right 10px center;
+}
+textarea.field { font-family: var(--font-mono); font-size: 12.5px; min-height: 64px; resize: vertical; }
+input[type="color"].field { width: 46px; height: 30px; padding: 2px 3px; cursor: pointer; }
+
+/* range: a lit track */
+input[type="range"].range {
+  -webkit-appearance: none; appearance: none; width: 100%; height: 22px; background: transparent; cursor: pointer;
+  --pct: 50%;
+}
+input[type="range"].range::-webkit-slider-runnable-track {
+  height: 6px; border-radius: 6px;
+  background: linear-gradient(90deg, var(--color-cross) var(--pct), var(--color-line) var(--pct));
+}
+input[type="range"].range::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; margin-top: -6px;
+  background: white; border: 3px solid var(--color-cross);
+  box-shadow: 0 0 12px color-mix(in oklab, var(--color-cross) 70%, transparent);
+}
+
+/* toggle switch */
+.switch {
+  position: relative; width: 44px; height: 24px; border-radius: 999px; flex: none;
+  background: var(--color-line-2); border: 1px solid var(--color-line-2); cursor: pointer;
+  transition: background .18s, border-color .18s, box-shadow .18s;
+}
+.switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--color-ink-2); transition: transform .18s cubic-bezier(.3,1.4,.5,1), background .18s;
+}
+.switch[aria-checked="true"] {
+  background: var(--color-cross); border-color: var(--color-cross);
+  box-shadow: 0 0 14px -2px var(--color-cross);
+}
+.switch[aria-checked="true"]::after { transform: translateX(20px); background: white; }
+.switch:focus-visible { outline: 2px solid var(--color-cyan); outline-offset: 2px; }
+
+/* ---- keyframes shared by components -------------------------------------- */
+@keyframes pulse-dot {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklab, currentColor 55%, transparent); }
+  70% { box-shadow: 0 0 0 7px transparent; }
+}
+.pulse { animation: pulse-dot 1.8s ease-out infinite; }
+
+@keyframes scan {
+  from { transform: translateY(-100%); }
+  to   { transform: translateY(100%); }
+}

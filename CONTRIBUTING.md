@@ -25,11 +25,26 @@ emulator/          the USB/IP device emulator -- STDLIB ONLY, on purpose
     bridge.py       BridgeBackend: the live Bluetooth seam
     translate.py    BT <-> USB report translation, pure
     server.py       asyncio TCP shell, thin on purpose
-  tests/            173 unit tests
+  tests/            185 unit tests
   tools/            live end-to-end harnesses (need hardware + the driver)
 prototype/         the Bluetooth-side core
   ds5bridge/        protocol, CRC, hidapi wrapper, pacing, audio
   tools/            descriptor dumpers, closed-loop audio/haptic proofs
+app/               the product layer: what a person actually runs
+  ds5app/
+    usbip.py        finding and driving usbip.exe
+    controller.py   which Bluetooth DualSense, and is it alive
+    service.py      ONE bridge: bring-up and tear-down order. Read the docstring.
+    manager.py      N bridges, one child process each. Read the docstring for
+                    the measurements that chose processes over threads.
+    config.py       %APPDATA% settings. load() must never raise -- it runs at
+                    login, before there is anywhere to show an error.
+    autostart.py    the HKCU Run key
+    cli.py          ds5bridge
+    tray.py         the tray icon, built once over callables
+  tests/            158 unit tests, all against fakes
+  tools/            multi_soak.py and the other live harnesses
+  packaging/        PyInstaller spec and build.ps1
 docs/              see the table in README.md
 ```
 
@@ -62,17 +77,51 @@ prototype\.venv\Scripts\python.exe -m pip install hidapi numpy av sounddevice
 - `sounddevice` — only `prototype/tools/cross_mic_test.py` and the
   `emulator/tools/e2e_*` harnesses.
 
+## Running the app while you work on it
+
+Nothing has to be built or installed to get the real tray icon. `app/ds5app` is
+plain Python, and `app\tools\dev_tray.ps1` starts it the way the shipped exe
+starts it:
+
+```powershell
+powershell -File app\tools\dev_tray.ps1              # console window + live logs
+powershell -File app\tools\dev_tray.ps1 -Windowed    # no console, like ds5bridge-tray.exe
+powershell -File app\tools\dev_tray.ps1 -Isolated    # scratch DS5_CONFIG, not your real settings
+powershell -File app\tools\dev_tray.ps1 -Stop        # put it down again
+```
+
+Edit a file, run it again — each start stops the previous one first, because two
+bridges contend for the same instance mutex and port range and the resulting
+mess looks exactly like a bug in whatever you just changed.
+
+**Stop it through the script, the tray's Quit item, or Ctrl+C — not Task
+Manager.** A hard kill skips the teardown, and the teardown is what detaches the
+device and gives back a Bluetooth pad that HidHide is hiding. `-Stop` sends
+CTRL_BREAK where it can and runs `ds5bridge cleanup` where it cannot, so either
+way the debt is repaid; killing the process yourself repays neither.
+
+The underlying commands, if you would rather type them, are in `app/README.md`.
+Quit the installed build from its tray menu before starting a dev one.
+
 ## Running the tests
 
 ```powershell
 cd emulator
 python -m unittest discover -s tests -t .
+
+cd ..\app
+python -m unittest discover -s tests -t .
 ```
 
-Expect **173 tests in about 4 seconds**. On a bare Python with none of the
-packages above, **132 run and 41 skip** — the 41 are `test_bridge.py`, which
-needs numpy/PyAV/hidapi but still needs **no hardware and no driver**. CI runs
-both configurations, and both must be green.
+Expect **185 tests in about 4 seconds** from `emulator`, and **158** from `app`.
+On a bare Python with none of the packages above the emulator suite runs 137 and
+skips 48 — the 48 are `test_bridge.py`, which needs numpy/PyAV/hidapi but still
+needs **no hardware and no driver**. CI runs both configurations of the emulator
+suite and both must be green.
+
+The `app` suite needs `hidapi` importable (the `ds5app` package imports it on
+the way in) but no controller, no driver and no tray: the settings, manager and
+tray tests all run against fakes. It runs in the with-deps CI job.
 
 There is no hardware in CI and there never will be. If you add a test that needs
 a controller, put it in `emulator/tools/` as a harness, not in `tests/`.
@@ -157,6 +206,33 @@ each with the measurement that found it. The four with the widest blast radius:
 - **Never use a HID write's return value as a byte count** on Windows. It
   returns the padded buffer size — a 78-byte write reports 547.
 
+### If you work on the HidHide feature
+
+`app/ds5app/hidhide.py` hides the real Bluetooth pad while a controller is
+bridged. Three things to know before you touch it:
+
+- **Running from source whitelists your venv's `python.exe`.** `our_images()`
+  registers `prototype\.venv\Scripts\python.exe` with HidHide so the bridge and
+  the tray can still open a pad they have hidden. Say it plainly: **any script
+  run by that interpreter can then open hidden HID devices**, not just this one.
+  It is your own venv, so it is a defensible grant -- but it is a real one, and
+  it stays until HidHide's whitelist is cleaned.
+- **Hiding is a debt in the registry.** It survives your crash, `taskkill /F`, a
+  bugcheck and a reboot; nothing expires on its own. That is why the journal is
+  written *before* the hide and deleted *after* the unhide, and why `sweep()`
+  runs on every process start. If you change that ordering, you can strand
+  somebody with a controller they cannot use. The tests in
+  `app/tests/test_hidhide.py` exist to stop that and should not be relaxed.
+- **Uninstall HidHide only with its own uninstaller.** Removing the driver in
+  Device Manager leaves its `UpperFilters` entries behind and every HID device
+  on the machine then fails to start -- no keyboard, no mouse, recoverable only
+  from the Windows Recovery Environment.
+
+`docs/hidhide-scoping.md` has the design and the H0 hardware findings, including
+the two that contradict the obvious implementation: HidHide's `Parameters`
+registry key is unreadable even elevated, and its control device can stop
+answering while `HidHideCLI.exe` keeps working.
+
 ## Documentation culture
 
 This repository is written for whoever picks it up next, including you in three
@@ -185,11 +261,11 @@ months. Two conventions:
 
 ## Renaming the project
 
-The name is a placeholder and lives only in prose — no module, package or import
-uses it. To change it:
+The name lives only in prose — no module, package or import uses it, so it stays
+cheap to change. To change it:
 
 ```powershell
-$old = 'PhantomCable'; $new = 'NewName'
+$old = 'DS5 Virtual Dongle'; $new = 'NewName'
 git ls-files | ForEach-Object {
     $text = Get-Content -Raw -LiteralPath $_
     if ($text -and $text.Contains($old)) {
@@ -200,9 +276,10 @@ git ls-files | ForEach-Object {
 ```
 
 Driving it off `git ls-files` means nothing untracked or ignored is touched,
-and only files that actually contain the name get rewritten. Then check
-`git grep -i phantomcable` comes back empty, and rename the GitHub repository
-to match.
+and only files that actually contain the name get rewritten (`build*/` and
+`dist*/` are ignored, so no PyInstaller binary is read). Then check
+`git grep -i <old name>` comes back empty, and rename the GitHub repository to
+match.
 
 ## Code of conduct
 

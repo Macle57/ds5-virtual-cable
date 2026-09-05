@@ -1,0 +1,1013 @@
+; ds5bridge-setup.exe -- Inno Setup script. Build with app\packaging\build-installer.ps1.
+;
+; What this installer is, in one paragraph: a wizard around the same four
+; steps scripts\install.ps1 performs -- restore point, usbip-win2 0.9.7.7,
+; HidHide, the app -- with a checkbox for each, the two driver installers
+; DOWNLOADED at install time from their pinned URLs and verified by SHA-256
+; -- or, in the "-bundled" build, carried inside the exe unmodified, with the
+; vendors' notices (THIRD-PARTY-NOTICES.txt; see NOTICE) -- a verification
+; page at the end, an entry in Settings > Apps, and an uninstaller that takes
+; the drivers it installed back out (ones it found already there are kept
+; by default) unless told otherwise.
+;
+; Two rules learned the hard way on 2026-09-04, enforced by the helper:
+; never touch a driver while another installer (msiexec, an Inno setup,
+; devnode, nefconw, pnputil) is at work -- two at once wedged Plug and Play
+; -- and never leave HidHide registered as a class filter without its
+; service, which left the machine with no keyboard, mouse or pad.
+;
+; Division of labour: this file is the user interface and the download step.
+; Everything that looks at or changes the machine -- services, devnodes,
+; HidHide's lists, the two vendors' uninstallers -- is in setup-helper.ps1,
+; which is embedded here, run with powershell.exe, and reports one
+; "KIND|label|detail" line per fact. See that file's header.
+;
+; Bundling instead of downloading: pass /DBundleUsbip=<path to
+; USBip-0.9.7.7-x64.exe> and/or /DBundleHidHide=<path to HidHide_1.5.230_x64.exe>
+; to ISCC. The files are then carried inside the setup exe and the download
+; step is skipped for them; the SHA-256 is checked either way. Nothing else
+; changes, which is the point of the GetInstallerFile() indirection below.
+
+#ifndef AppVersion
+  #define AppVersion "0.0.0"
+#endif
+#ifndef AppBuildDir
+  #define AppBuildDir "..\..\dist\ds5bridge"
+#endif
+#ifndef OutputDir
+  #define OutputDir "..\..\dist"
+#endif
+
+; -- pinned facts: keep identical to scripts\install.ps1 and setup-helper.ps1 --
+#define UsbipVersion   "0.9.7.7"
+#define UsbipFile      "USBip-0.9.7.7-x64.exe"
+#define UsbipUrl       "https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.7.7/USBip-0.9.7.7-x64.exe"
+#define UsbipSha256    "51620fa5f9f8be5932bc9d786deee557ce06d5407a99cab490dcfac71f185fea"
+#define HidHideVersion "1.5.230"
+#define HidHideFile    "HidHide_1.5.230_x64.exe"
+#define HidHideUrl     "https://github.com/nefarius/HidHide/releases/download/v1.5.230.0/HidHide_1.5.230_x64.exe"
+#define HidHideSha256  "f4bbbcb82e6258641b887c74bc81c4c5f66e4aa811808dfc304347687b7605f6"
+#define Helper         "setup-helper.ps1"
+#define RepoUrl        "https://github.com/Macle57/ds5-virtual-cable"
+
+; A bundled build gets its own file name, so the two flavours can sit side by
+; side in dist and on a release page (build-installer.ps1 relies on this).
+#if Defined(BundleUsbip) || Defined(BundleHidHide)
+  #define OutputName   "ds5bridge-setup-" + AppVersion + "-bundled"
+#else
+  #define OutputName   "ds5bridge-setup-" + AppVersion
+#endif
+; How each driver package arrives, for the component captions. The sizes are
+; the vendors' installers as published (33 MB and 8 MB).
+#ifdef BundleUsbip
+  #define UsbipHow     "included in this setup"
+#else
+  #define UsbipHow     "downloaded, ~32 MB"
+#endif
+#ifdef BundleHidHide
+  #define HidHideHow   "included in this setup"
+#else
+  #define HidHideHow   "downloaded, ~8 MB"
+#endif
+
+[Setup]
+AppId={{7B6E2D6A-3C39-4E0B-9C7E-2F8B1C2D5A61}
+AppName=ds5bridge
+AppVersion={#AppVersion}
+AppVerName=ds5bridge {#AppVersion}
+AppPublisher=ds5bridge contributors
+AppPublisherURL={#RepoUrl}
+AppSupportURL={#RepoUrl}/issues
+AppUpdatesURL={#RepoUrl}/releases
+; %LOCALAPPDATA%\ds5bridge\app is the layout the in-app auto-updater owns
+; (app/ds5app/update.py: it swaps <root>\app as a whole). The path is fixed,
+; so there is no directory page. It is a per-user location written by an
+; elevated process, which Inno warns about; that is deliberate and the same
+; choice install.ps1 makes -- the app must be able to update itself without
+; administrator rights. If a standard user elevates with a different
+; administrator account, the app lands in that administrator's profile.
+DefaultDirName={localappdata}\ds5bridge
+DisableDirPage=yes
+UsedUserAreasWarning=no
+DisableProgramGroupPage=yes
+; The two drivers need admin. The app never does; it is launched de-elevated.
+PrivilegesRequired=admin
+; Windows 10 1903 (build 18362) x64 is the floor usbip-win2 documents.
+MinVersion=10.0.18362
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+OutputDir={#OutputDir}
+OutputBaseFilename={#OutputName}
+Compression=lzma2/max
+SolidCompression=yes
+WizardStyle=modern
+UninstallDisplayName=ds5bridge {#AppVersion}
+UninstallDisplayIcon={app}\app\ds5bridge-tray.exe
+; Always keep a log in %TEMP% (Setup Log *.txt); /LOG="file" names it.
+SetupLogging=yes
+; We stop the app ourselves (PrepareToInstall), with the tray's own teardown.
+CloseApplications=no
+; Never reboot on our own. HidHide's filter driver wants one; the summary
+; page says so and leaves it to the user.
+AlwaysRestart=no
+RestartIfNeededByRun=no
+ShowComponentSizes=no
+AllowNoIcons=yes
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Types]
+Name: "full"; Description: "Everything (recommended)"
+Name: "custom"; Description: "Custom"; Flags: iscustom
+
+[Components]
+; "fixed": the installer of ds5bridge always installs ds5bridge. Without it,
+; a mistyped /COMPONENTS selected nothing, Setup wrote that empty selection
+; into the registry as the "previous" one, and the next run without a switch
+; reused it and installed nothing (2026-09-04, run phaseA-09).
+Name: "app"; Description: "ds5bridge {#AppVersion} -- the app (tray icon and command line)"; Types: full custom; Flags: fixed
+Name: "usbip"; Description: "usbip-win2 {#UsbipVersion} -- the virtual-USB driver the bridge needs ({#UsbipHow})"; Types: full custom
+Name: "hidhide"; Description: "HidHide {#HidHideVersion} -- optional: hides the Bluetooth pad while it is bridged ({#HidHideHow})"; Types: full custom
+
+[Tasks]
+Name: "restorepoint"; Description: "Create a System Restore point before installing the driver (recommended)"; Components: usbip
+Name: "autostart"; Description: "Start ds5bridge at login"; Components: app; Flags: unchecked
+
+[Files]
+; Our own code is embedded: it is ours to redistribute, it is the thing being
+; installed, and an installer that downloads the program it installs would
+; be an installer for a download link.
+Source: "{#AppBuildDir}\*"; DestDir: "{app}\app"; Flags: recursesubdirs ignoreversion; Components: app
+; The worker, twice: once for this run ({tmp}), once for the uninstaller.
+Source: "{#Helper}"; DestDir: "{tmp}"; Flags: dontcopy
+Source: "{#Helper}"; DestDir: "{app}\installer"; Flags: ignoreversion
+#ifdef BundleUsbip
+Source: "{#BundleUsbip}"; DestDir: "{tmp}"; DestName: "{#UsbipFile}"; Flags: dontcopy
+#endif
+#ifdef BundleHidHide
+Source: "{#BundleHidHide}"; DestDir: "{tmp}"; DestName: "{#HidHideFile}"; Flags: dontcopy
+#endif
+#if Defined(BundleUsbip) || Defined(BundleHidHide)
+; A bundled build redistributes a vendor installer, and BSD-2 asks for the
+; notice "in the materials provided with the distribution". Next to the
+; uninstaller, not under app\ (the updater swaps that directory whole).
+Source: "bundle\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
+#endif
+
+[Icons]
+Name: "{userprograms}\ds5bridge"; Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Comment: "ds5bridge -- a Bluetooth DualSense, presented to Windows as a wired one"; Components: app
+
+[Registry]
+; The exact value app/ds5app/autostart.py writes (quoted path, nothing else),
+; so the tray's own checkbox reads this back.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ds5bridge"; ValueData: """{app}\app\ds5bridge-tray.exe"""; Flags: uninsdeletevalue; Tasks: autostart
+
+[Run]
+; runasoriginaluser: this process is elevated; the tray must not be.
+Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Description: "Start ds5bridge now"; Flags: postinstall nowait runasoriginaluser skipifsilent; Components: app
+
+[UninstallDelete]
+; Files the updater put there after us (a swapped app dir, staged updates).
+Type: filesandordirs; Name: "{app}\app"
+Type: filesandordirs; Name: "{app}\updates"
+Type: filesandordirs; Name: "{app}\installer"
+
+[Code]
+const
+  UsbipVersion = '{#UsbipVersion}';
+  // Where this installer records which driver packages IT installed
+  // (UsbipInstalledByUs / HidHideInstalledByUs = 1) as opposed to found
+  // already there (0). The uninstaller defaults to removing the former and
+  // keeping the latter; a value survives an uninstall that keeps its driver.
+  SetupKey = 'SOFTWARE\ds5bridge\Setup';
+
+var
+  // machine state at wizard start
+  HaveUsbipVer: String;     // '' when not installed
+  HaveHidHideCli: String;   // '' when not installed
+  // what this run will actually do
+  NeedUsbip, NeedHidHide: Boolean;
+  UsbipInstaller, HidHideInstaller: String;
+  // results
+  Summary: TStringList;
+  RebootNote: Boolean;
+  FailCount: Integer;
+  DownloadPage: TDownloadWizardPage;
+  SummaryPage: TOutputMsgMemoWizardPage;
+  HelperPath: String;
+
+// ---------------------------------------------------------------------------
+// looking at the machine (the cheap checks the wizard needs before the helper
+// is even extracted)
+// ---------------------------------------------------------------------------
+
+// First line of a program's stdout, or '' -- and -1 when it could not run.
+function RunCapture(const Exe, Args: String; var Output: String): Integer;
+var
+  RC: Integer;
+  Res: TExecOutput;
+begin
+  Output := '';
+  RC := -1;
+  try
+    if ExecAndCaptureOutput(Exe, Args, '', SW_HIDE, ewWaitUntilTerminated, RC, Res) then
+      if GetArrayLength(Res.StdOut) > 0 then
+        Output := Res.StdOut[0];
+  except
+    Log('RunCapture ' + Exe + ': ' + GetExceptionMessage);
+    RC := -1;
+  end;
+  Result := RC;
+end;
+
+function UsbipExePath(): String;
+var
+  Loc: String;
+begin
+  Result := '';
+  // The Inno uninstall key usbip-win2 writes; narrow so usbipd-win never matches.
+  if RegQueryStringValue(HKLM, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{199505b0-b93d-4521-a8c7-897818e0205a}_is1',
+                         'InstallLocation', Loc) then
+    if FileExists(AddBackslash(Loc) + 'usbip.exe') then
+      Result := AddBackslash(Loc) + 'usbip.exe';
+  if Result = '' then
+    if FileExists(ExpandConstant('{commonpf64}\USBip\usbip.exe')) then
+      Result := ExpandConstant('{commonpf64}\USBip\usbip.exe');
+end;
+
+function InstalledUsbipVersion(): String;
+var
+  Exe, Txt: String;
+begin
+  Result := '';
+  Exe := UsbipExePath();
+  if Exe = '' then Exit;
+  if RunCapture(Exe, '--version', Txt) = 0 then
+    Result := Trim(Txt)
+  else
+    Result := '?';
+end;
+
+function HidHideCliPath(): String;
+var
+  P: String;
+begin
+  Result := '';
+  P := ExpandConstant('{commonpf64}\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe');
+  if FileExists(P) then begin Result := P; Exit; end;
+  P := ExpandConstant('{commonpf64}\Nefarius Software Solutions e.U\HidHide\x64\HidHideCLI.exe');
+  if FileExists(P) then begin Result := P; Exit; end;
+  P := ExpandConstant('{commonpf64}\Nefarius Software Solutions\HidHide\HidHideCLI.exe');
+  if FileExists(P) then begin Result := P; Exit; end;
+end;
+
+// Adoption bookkeeping. Name is 'Usbip' or 'HidHide'. "Installed by us"
+// is written unconditionally; "found already there" only when nothing is
+// recorded yet, so a package we installed on a previous run stays ours.
+procedure RecordOrigin(const Name: String; InstalledByUs: Boolean);
+var
+  D: Cardinal;
+begin
+  if InstalledByUs then
+    RegWriteDWordValue(HKLM, SetupKey, Name + 'InstalledByUs', 1)
+  else if not RegQueryDWordValue(HKLM, SetupKey, Name + 'InstalledByUs', D) then
+    RegWriteDWordValue(HKLM, SetupKey, Name + 'InstalledByUs', 0);
+end;
+
+// 1 = ours, 0 = adopted, -1 = no record (installed before this bookkeeping
+// existed, or by scripts\install.ps1).
+function RecordedOrigin(const Name: String): Integer;
+var
+  D: Cardinal;
+begin
+  if RegQueryDWordValue(HKLM, SetupKey, Name + 'InstalledByUs', D) then
+    Result := Integer(D)
+  else
+    Result := -1;
+end;
+
+// ---------------------------------------------------------------------------
+// the helper
+// ---------------------------------------------------------------------------
+
+procedure AddSummary(const Line: String);
+begin
+  Summary.Add(Line);
+  Log('summary: ' + Line);
+end;
+
+// Run one helper verb, fold its result lines into the summary. Returns the
+// helper's exit code (1 when it wrote a FAIL line).
+function RunHelper(const Verb, ExtraArgs: String): Integer;
+var
+  ResFile, Args, Line, Kind, Rest, Tag: String;
+  Lines: TArrayOfString;
+  I, P, RC: Integer;
+begin
+  ResFile := ExpandConstant('{tmp}\helper-' + Verb + '.txt');
+  DeleteFile(ResFile);
+  Args := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + HelperPath + '" ' + Verb +
+          ' -Out "' + ResFile + '" -AppDir "' + ExpandConstant('{app}\app') + '" ' + ExtraArgs;
+  Log('helper: powershell.exe ' + Args);
+  RC := -1;
+  try
+    // Its stdout goes to the setup log line by line as it happens.
+    if not ExecAndLogOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Args, '',
+                            SW_HIDE, ewWaitUntilTerminated, RC, nil) then
+      RC := -1;
+  except
+    Log('helper: ' + GetExceptionMessage);
+    RC := -1;
+  end;
+  if RC = -1 then
+  begin
+    AddSummary('[FAIL] ' + Verb + ' -- could not start powershell.exe');
+    Result := 1;
+    Exit;
+  end;
+  Log('helper ' + Verb + ' exit ' + IntToStr(RC));
+  if LoadStringsFromFile(ResFile, Lines) then
+    for I := 0 to GetArrayLength(Lines) - 1 do
+    begin
+      Line := Lines[I];
+      P := Pos('|', Line);
+      if P = 0 then Continue;
+      Kind := Copy(Line, 1, P - 1);
+      Rest := Copy(Line, P + 1, Length(Line));
+      P := Pos('|', Rest);
+      if P > 0 then Rest := Copy(Rest, 1, P - 1) + ' -- ' + Copy(Rest, P + 1, Length(Rest));
+      if Kind = 'REBOOT' then
+      begin
+        RebootNote := True;
+        Tag := '[reboot]';
+      end
+      else if Kind = 'PASS' then Tag := '[ok]'
+      else if Kind = 'FAIL' then begin Tag := '[FAIL]'; FailCount := FailCount + 1; end
+      else if Kind = 'WARN' then Tag := '[warn]'
+      else Tag := '[' + Lowercase(Kind) + ']';
+      AddSummary(Tag + ' ' + Rest);
+    end
+  else
+    AddSummary('[warn] ' + Verb + ' -- wrote no report (exit ' + IntToStr(RC) + ')');
+  Result := RC;
+end;
+
+// ---------------------------------------------------------------------------
+// wizard
+// ---------------------------------------------------------------------------
+
+function OnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
+begin
+  if Progress = ProgressMax then
+    Log('downloaded ' + FileName + ' (' + IntToStr(ProgressMax) + ' bytes)');
+  Result := True;
+end;
+
+procedure InitializeWizard;
+begin
+  Summary := TStringList.Create;
+  HaveUsbipVer := InstalledUsbipVersion();
+  HaveHidHideCli := HidHideCliPath();
+  Log('found usbip-win2: "' + HaveUsbipVer + '"; HidHideCLI: "' + HaveHidHideCli + '"');
+  DownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing),
+                                     SetupMessage(msgPreparingDesc), @OnDownloadProgress);
+  DownloadPage.ShowBaseNameInsteadOfUrl := True;
+  SummaryPage := CreateOutputMsgMemoPage(wpInfoAfter, 'Installation check',
+    'What was verified on this machine after installing',
+    'Each line is one check the installer ran. A copy is in the setup log.', '');
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+var
+  Text: String;
+  I: Integer;
+begin
+  if CurPageID = wpSelectComponents then
+  begin
+    // Say what is already there. The box stays ticked -- "I want usbip-win2"
+    // is still the right answer -- but the work is skipped.
+    if HaveUsbipVer = UsbipVersion then
+      WizardForm.ComponentsList.ItemCaption[1] := 'usbip-win2 ' + UsbipVersion + ' -- already installed (will be verified, not reinstalled)'
+    else if HaveUsbipVer = '0.9.7.8' then
+      WizardForm.ComponentsList.ItemCaption[1] := 'usbip-win2 ' + UsbipVersion + ' -- REPLACES the installed 0.9.7.8, which its maintainer warns can corrupt memory'
+    else if HaveUsbipVer <> '' then
+      WizardForm.ComponentsList.ItemCaption[1] := 'usbip-win2 ' + UsbipVersion + ' -- replaces the installed ' + HaveUsbipVer + ' ({#UsbipHow})';
+    if HaveHidHideCli <> '' then
+      WizardForm.ComponentsList.ItemCaption[2] := 'HidHide -- already installed (will be verified, not reinstalled)';
+  end
+  else if CurPageID = SummaryPage.ID then
+  begin
+    Text := '';
+    for I := 0 to Summary.Count - 1 do
+      Text := Text + Summary[I] + #13#10;
+    if FailCount > 0 then
+      Text := IntToStr(FailCount) + ' check(s) FAILED. Run "ds5bridge.exe doctor" for more detail, or re-run this installer.' + #13#10#13#10 + Text
+    else
+      Text := 'All checks passed.' + #13#10#13#10 + Text;
+    if RebootNote then
+      Text := Text + #13#10 + 'A REBOOT is recommended before first use (see the [reboot] line above). Nothing will restart on its own.' + #13#10;
+    SummaryPage.RichEditViewer.Lines.Text := Text;
+  end
+  else if CurPageID = wpFinished then
+  begin
+    if RebootNote then
+      WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+        'Reboot recommended: HidHide''s filter driver activates on the next start of Windows. ' +
+        'Everything else works now.';
+  end;
+end;
+
+function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo,
+                         MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
+var
+  S: String;
+begin
+  S := '';
+  if MemoComponentsInfo <> '' then S := S + MemoComponentsInfo + NewLine + NewLine;
+  if MemoTasksInfo <> '' then S := S + MemoTasksInfo + NewLine + NewLine;
+  S := S + 'Plan:' + NewLine;
+  if WizardIsComponentSelected('usbip') then
+  begin
+    if HaveUsbipVer = UsbipVersion then
+      S := S + Space + 'usbip-win2 ' + UsbipVersion + ': already installed, skip' + NewLine
+    else
+    begin
+      S := S + Space + 'usbip-win2 ' + UsbipVersion + ': ';
+      #ifdef BundleUsbip
+      S := S + 'install the bundled copy';
+      #else
+      S := S + 'download ' + '{#UsbipUrl}';
+      #endif
+      S := S + NewLine + Space + Space + '(SHA-256 verified, then run silently; your USB 3.0 hubs restart briefly)' + NewLine;
+    end;
+  end;
+  if WizardIsComponentSelected('hidhide') then
+  begin
+    if HaveHidHideCli <> '' then
+      S := S + Space + 'HidHide: already installed, skip' + NewLine
+    else
+    begin
+      S := S + Space + 'HidHide {#HidHideVersion}: ';
+      #ifdef BundleHidHide
+      S := S + 'install the bundled copy';
+      #else
+      S := S + 'download ' + '{#HidHideUrl}';
+      #endif
+      S := S + NewLine + Space + Space + '(SHA-256 verified, then run silently; needs a reboot to activate)' + NewLine;
+    end;
+  end;
+  if WizardIsComponentSelected('app') then
+    S := S + Space + 'ds5bridge {#AppVersion}: install to ' + ExpandConstant('{app}\app') + NewLine;
+  S := S + Space + 'then verify everything and show the result' + NewLine;
+  Result := S;
+end;
+
+// The download step. After the Ready page, before installing. This is the
+// ONLY place that knows whether an installer is downloaded or bundled.
+function GetInstallerFile(const BaseName, Url, Sha256: String; Bundled: Boolean; var Path: String): Boolean;
+var
+  Actual: String;
+begin
+  Result := False;
+  Path := ExpandConstant('{tmp}\') + BaseName;
+  if Bundled then
+  begin
+    ExtractTemporaryFile(BaseName);
+  end
+  else
+  begin
+    DownloadPage.Clear;
+    DownloadPage.Add(Url, BaseName, Sha256);
+    DownloadPage.Show;
+    try
+      try
+        DownloadPage.Download;   // raises on failure, including a hash mismatch
+      except
+        Log('download failed: ' + GetExceptionMessage);
+        DeleteFile(Path);
+        Exit;
+      end;
+    finally
+      DownloadPage.Hide;
+    end;
+  end;
+  // Trust nothing until the file on disk answers for itself.
+  Actual := Lowercase(GetSHA256OfFile(Path));
+  if Actual <> Lowercase(Sha256) then
+  begin
+    Log(BaseName + ': SHA-256 mismatch (got ' + Actual + ', expected ' + Sha256 + '); discarded');
+    DeleteFile(Path);
+    Exit;
+  end;
+  Log(BaseName + ': SHA-256 verified');
+  Result := True;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Bundled: Boolean;
+begin
+  Result := True;
+  if CurPageID <> wpReady then Exit;
+
+  // On the record, for silent runs especially: what was actually selected.
+  Log('components selected: ' + WizardSelectedComponents(False) +
+      '; tasks selected: ' + WizardSelectedTasks(False));
+  // Belt to the "fixed" braces above: an install that installs nothing must
+  // not end with "all checks passed".
+  if not WizardIsComponentSelected('app') then
+  begin
+    Log('the app component is not selected -- refusing to continue (check /COMPONENTS)');
+    SuppressibleMsgBox('Nothing is selected to install. The ds5bridge app is always required; ' +
+      'check the /COMPONENTS switch (names: app, usbip, hidhide).', mbError, MB_OK, IDOK);
+    Result := False;
+    Exit;
+  end;
+  NeedUsbip := WizardIsComponentSelected('usbip') and (HaveUsbipVer <> UsbipVersion);
+  NeedHidHide := WizardIsComponentSelected('hidhide') and (HaveHidHideCli = '');
+
+  if NeedUsbip then
+  begin
+    #ifdef BundleUsbip
+    Bundled := True;
+    #else
+    Bundled := False;
+    #endif
+    if not GetInstallerFile('{#UsbipFile}', '{#UsbipUrl}', '{#UsbipSha256}', Bundled, UsbipInstaller) then
+    begin
+      SuppressibleMsgBox('usbip-win2 ' + UsbipVersion + ' could not be downloaded and verified. ' +
+        'Without it there is nothing for the virtual controller to attach to, so the install stops here. ' +
+        'Check your connection and try again, or untick usbip-win2 to install only the rest.' + #13#10#13#10 +
+        '{#UsbipUrl}', mbError, MB_OK, IDOK);
+      Result := False;
+      Exit;
+    end;
+  end;
+
+  if NeedHidHide then
+  begin
+    #ifdef BundleHidHide
+    Bundled := True;
+    #else
+    Bundled := False;
+    #endif
+    if not GetInstallerFile('{#HidHideFile}', '{#HidHideUrl}', '{#HidHideSha256}', Bundled, HidHideInstaller) then
+    begin
+      // A failure here is a warning, not a stop: the bridge works without it.
+      AddSummary('[warn] HidHide -- could not be downloaded and verified; skipped. Everything else still works; ' +
+                 'only hide-while-bridged needs it. Install it later from https://github.com/nefarius/HidHide/releases');
+      NeedHidHide := False;
+    end;
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  RC: Integer;
+begin
+  Result := '';
+  ExtractTemporaryFile('{#Helper}');
+  HelperPath := ExpandConstant('{tmp}\{#Helper}');
+  // Before anything changes: is another installer at work (two driver
+  // installers at once can wedge Plug and Play), and is there an orphaned
+  // HidHide filter entry to repair (the helper does that on its own). A
+  // busy machine stops a driver install here; an app-only run goes on.
+  RC := RunHelper('preflight', '');
+  if (RC <> 0) and (NeedUsbip or NeedHidHide) then
+  begin
+    Result := 'A driver cannot be installed right now: either another installer is running on this PC, ' +
+              'or a removal of usbip-win2 is waiting for a reboot (see the setup log for which). ' +
+              'Installing a driver in that state could leave Windows unable to enumerate devices. ' +
+              'Let it finish (reboot if asked), then run this setup again.';
+    Exit;
+  end;
+  // A running tray holds locks on the app dir and, if usbip-win2 is about to
+  // be replaced, an attachment on the driver being replaced. Its own
+  // teardown (detach, unhide) runs when it is asked to close.
+  if NeedUsbip then
+    RC := RunHelper('teardown', '')
+  else
+    RC := RunHelper('stop-app', '');
+  if RC <> 0 then
+    Result := 'ds5bridge is still running and could not be stopped. Quit it from its tray icon (right-click > Quit) and run this installer again.';
+end;
+
+procedure InstallDrivers;
+var
+  RC: Integer;
+  DoUsbip: Boolean;
+begin
+  if NeedUsbip then
+  begin
+    DoUsbip := True;
+    if WizardIsTaskSelected('restorepoint') then
+    begin
+      WizardForm.StatusLabel.Caption := 'Creating a System Restore point (this can take a minute) ...';
+      // The helper has already written a [warn] line when this fails. A
+      // silent install goes on (there is nobody to ask); a person is asked.
+      if RunHelper('restore-point', '') <> 0 then
+        if not WizardSilent then
+          if SuppressibleMsgBox('A System Restore point could not be created (System Restore may be disabled). ' +
+               'usbip-win2 installs two kernel drivers and its own README recommends one first.' + #13#10#13#10 +
+               'Install the driver anyway?', mbConfirmation, MB_YESNO, IDNO) <> IDYES then
+          begin
+            AddSummary('[FAIL] usbip-win2 -- not installed: you chose to stop when no restore point could be made');
+            FailCount := FailCount + 1;
+            DoUsbip := False;
+          end;
+    end;
+    // Checked again right before the driver goes in: the preflight was a
+    // download and a restore point ago.
+    if DoUsbip and (RunHelper('check-busy', '') <> 0) then
+    begin
+      AddSummary('[FAIL] usbip-win2 -- not installed: another installer is running; run this setup again when it is done');
+      DoUsbip := False;
+    end;
+    if DoUsbip then
+    begin
+    WizardForm.StatusLabel.Caption := 'Installing usbip-win2 ' + UsbipVersion + ' (USB 3.0 devices will blink out and come back) ...';
+    if Exec(UsbipInstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_SHOW, ewWaitUntilTerminated, RC) then
+    begin
+      Log('usbip-win2 installer exit ' + IntToStr(RC));
+      if RC = 0 then
+      begin
+        AddSummary('[ok] usbip-win2 installer -- ran (exit 0)');
+        RecordOrigin('Usbip', True);
+      end
+      else if RC = 3010 then
+      begin
+        AddSummary('[ok] usbip-win2 installer -- ran (exit 3010: reboot flagged)');
+        RecordOrigin('Usbip', True);
+        RebootNote := True;
+      end
+      else
+      begin
+        AddSummary('[FAIL] usbip-win2 installer -- exited with ' + IntToStr(RC));
+        FailCount := FailCount + 1;
+      end;
+    end
+    else
+    begin
+      AddSummary('[FAIL] usbip-win2 installer -- could not be started');
+      FailCount := FailCount + 1;
+    end;
+    end;
+  end
+  else if WizardIsComponentSelected('usbip') then
+  begin
+    AddSummary('[ok] usbip-win2 ' + UsbipVersion + ' -- was already installed');
+    RecordOrigin('Usbip', False);
+  end;
+
+  if NeedHidHide then
+  begin
+    if RunHelper('check-busy', '') <> 0 then
+    begin
+      AddSummary('[warn] HidHide -- not installed: another installer is running; the bridge works without it, install it later');
+      NeedHidHide := False;
+    end;
+  end;
+  if NeedHidHide then
+  begin
+    WizardForm.StatusLabel.Caption := 'Installing HidHide {#HidHideVersion} ...';
+    // Silent switches per winget's manifest for this exact package.
+    if Exec(HidHideInstaller, '/exenoui /qn /norestart', '', SW_SHOW, ewWaitUntilTerminated, RC) then
+    begin
+      Log('HidHide installer exit ' + IntToStr(RC));
+      if (RC = 0) or (RC = 1641) or (RC = 3010) then
+      begin
+        AddSummary('[ok] HidHide installer -- ran (exit ' + IntToStr(RC) + ')');
+        // Its service starts at once, but the filter only joins HID stacks
+        // built after it was registered: pads already paired need a reboot.
+        AddSummary('[reboot] HidHide -- freshly installed; hide-while-bridged works for already-connected controllers after the next reboot');
+        RecordOrigin('HidHide', True);
+        RebootNote := True;
+      end
+      else
+        AddSummary('[warn] HidHide installer -- exited with ' + IntToStr(RC) + '; the bridge works without it');
+    end
+    else
+      AddSummary('[warn] HidHide installer -- could not be started; the bridge works without it');
+  end
+  else if WizardIsComponentSelected('hidhide') and (HaveHidHideCli <> '') then
+  begin
+    AddSummary('[ok] HidHide -- was already installed');
+    RecordOrigin('HidHide', False);
+  end
+  else if not WizardIsComponentSelected('hidhide') then
+    AddSummary('[info] HidHide -- not selected; hide-while-bridged will be unavailable');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Expect: String;
+  OutFile: String;
+begin
+  if CurStep = ssInstall then
+    InstallDrivers
+  else if CurStep = ssPostInstall then
+  begin
+    WizardForm.StatusLabel.Caption := 'Verifying the installation ...';
+    // The app is always expected (it is a fixed component): a missing
+    // ds5bridge.exe is a [FAIL], never an [info].
+    Expect := ' -ExpectApp';
+    if WizardIsComponentSelected('usbip') then Expect := Expect + ' -ExpectUsbip';
+    if WizardIsComponentSelected('hidhide') and ((HaveHidHideCli <> '') or NeedHidHide) then Expect := Expect + ' -ExpectHidHide';
+    RunHelper('verify-install', Expect);
+    // A machine-readable copy next to the app, for people who installed
+    // silently and for bug reports.
+    OutFile := ExpandConstant('{app}\installer\last-install-check.txt');
+    ForceDirectories(ExtractFileDir(OutFile));
+    Summary.SaveToFile(OutFile);
+    if FailCount > 0 then
+      Log(IntToStr(FailCount) + ' verification check(s) FAILED')
+    else
+      Log('all verification checks passed');
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// uninstaller
+// ---------------------------------------------------------------------------
+
+var
+  RemoveUsbip, RemoveHidHide, PurgeSettings: Boolean;
+  UsbipOrigin, HidHideOrigin: Integer;   // RecordedOrigin(): 1 ours, 0 adopted, -1 unknown
+  UsbipPendingReboot: Boolean;            // remove-usbip returned 3
+
+function UninstallParam(const Name: String): Boolean;
+begin
+  Result := ExpandConstant('{param:' + Name + '|0}') = '1';
+end;
+
+function BoolStr(B: Boolean): String;
+begin
+  if B then Result := 'yes' else Result := 'no';
+end;
+
+function OriginText(Origin: Integer): String;
+begin
+  case Origin of
+    1: Result := 'installed by ds5bridge setup';
+    0: Result := 'was already installed before ds5bridge; kept unless ticked';
+  else
+    Result := 'origin unknown';
+  end;
+end;
+
+function AskUninstallOptions(): Boolean;
+var
+  Form: TSetupForm;
+  Info: TNewStaticText;
+  CbUsbip, CbHidHide, CbPurge: TNewCheckBox;
+  Ok, Cancel: TNewButton;
+begin
+  Form := CreateCustomForm(ScaleX(470), ScaleY(230), False, True);
+  try
+    Form.Caption := 'Uninstall ds5bridge';
+
+    Info := TNewStaticText.Create(Form);
+    Info.Parent := Form;
+    Info.Left := ScaleX(16); Info.Top := ScaleY(12); Info.Width := ScaleX(440);
+    Info.WordWrap := True;
+    Info.AutoSize := True;
+    Info.Caption := 'ds5bridge itself (the app, its shortcut and start-at-login entry) will be removed. ' +
+      'Before that, any bridged controller is detached and any hidden controller is made visible again.' + #13#10#13#10 +
+      'The two drivers are separate products. Ticked = removed too; untick to keep one ' +
+      '(keep it if another program, such as DS4Windows, uses it):';
+
+    CbUsbip := TNewCheckBox.Create(Form);
+    CbUsbip.Parent := Form;
+    CbUsbip.Left := ScaleX(24); CbUsbip.Top := ScaleY(112); CbUsbip.Width := ScaleX(430);
+    CbUsbip.Caption := 'Also remove usbip-win2 (' + OriginText(UsbipOrigin) + ')';
+    CbUsbip.Checked := RemoveUsbip;
+    CbUsbip.Enabled := UsbipExePath() <> '';
+    if not CbUsbip.Enabled then CbUsbip.Caption := 'Also remove usbip-win2 -- not installed';
+
+    CbHidHide := TNewCheckBox.Create(Form);
+    CbHidHide.Parent := Form;
+    CbHidHide.Left := ScaleX(24); CbHidHide.Top := ScaleY(136); CbHidHide.Width := ScaleX(430);
+    CbHidHide.Caption := 'Also remove HidHide (' + OriginText(HidHideOrigin) + '; asks for a reboot)';
+    CbHidHide.Checked := RemoveHidHide;
+    CbHidHide.Enabled := HidHideCliPath() <> '';
+    if not CbHidHide.Enabled then CbHidHide.Caption := 'Also remove HidHide -- not installed';
+
+    CbPurge := TNewCheckBox.Create(Form);
+    CbPurge.Parent := Form;
+    CbPurge.Left := ScaleX(24); CbPurge.Top := ScaleY(160); CbPurge.Width := ScaleX(430);
+    CbPurge.Caption := 'Delete my settings too (' + ExpandConstant('{userappdata}\ds5bridge') + ')';
+    CbPurge.Checked := PurgeSettings;
+
+    Ok := TNewButton.Create(Form);
+    Ok.Parent := Form;
+    Ok.Width := ScaleX(90); Ok.Height := ScaleY(25);
+    Ok.Left := Form.ClientWidth - ScaleX(200); Ok.Top := Form.ClientHeight - ScaleY(36);
+    Ok.Caption := 'Uninstall';
+    Ok.ModalResult := mrOk;
+    Ok.Default := True;
+
+    Cancel := TNewButton.Create(Form);
+    Cancel.Parent := Form;
+    Cancel.Width := ScaleX(90); Cancel.Height := ScaleY(25);
+    Cancel.Left := Form.ClientWidth - ScaleX(104); Cancel.Top := Form.ClientHeight - ScaleY(36);
+    Cancel.Caption := 'Cancel';
+    Cancel.ModalResult := mrCancel;
+    Cancel.Cancel := True;
+
+    Result := Form.ShowModal = mrOk;
+    if Result then
+    begin
+      RemoveUsbip := CbUsbip.Checked and CbUsbip.Enabled;
+      RemoveHidHide := CbHidHide.Checked and CbHidHide.Enabled;
+      PurgeSettings := CbPurge.Checked;
+    end;
+  finally
+    Form.Free;
+  end;
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  Summary := TStringList.Create;
+  // Defaults: a driver this setup installed goes; one that was already on
+  // the machine (adopted, recorded as 0) stays; no record at all (an install
+  // older than the bookkeeping, or scripts\install.ps1) counts as ours.
+  // Silent switches: /KEEPUSBIP=1 /KEEPHIDHIDE=1 force keep, /REMOVEUSBIP=1
+  // /REMOVEHIDHIDE=1 force remove (keep wins), /PURGESETTINGS=1. The dialog
+  // offers the same boxes with the origin spelled out.
+  UsbipOrigin := RecordedOrigin('Usbip');
+  HidHideOrigin := RecordedOrigin('HidHide');
+  RemoveUsbip := UsbipOrigin <> 0;
+  RemoveHidHide := HidHideOrigin <> 0;
+  if UninstallParam('REMOVEUSBIP') then RemoveUsbip := True;
+  if UninstallParam('REMOVEHIDHIDE') then RemoveHidHide := True;
+  if UninstallParam('KEEPUSBIP') then RemoveUsbip := False;
+  if UninstallParam('KEEPHIDHIDE') then RemoveHidHide := False;
+  PurgeSettings := UninstallParam('PURGESETTINGS');
+  if UsbipExePath() = '' then RemoveUsbip := False;
+  if HidHideCliPath() = '' then RemoveHidHide := False;
+  Result := True;
+  if not UninstallSilent then
+    Result := AskUninstallOptions();
+  Log('uninstall options: remove usbip-win2=' + BoolStr(RemoveUsbip) + ' (origin ' + IntToStr(UsbipOrigin) +
+      '), remove HidHide=' + BoolStr(RemoveHidHide) + ' (origin ' + IntToStr(HidHideOrigin) +
+      '), purge settings=' + BoolStr(PurgeSettings));
+end;
+
+procedure ShowUninstallSummary;
+var
+  Form: TSetupForm;
+  Memo: TNewMemo;
+  Ok: TNewButton;
+  Text: String;
+  I: Integer;
+begin
+  Text := '';
+  for I := 0 to Summary.Count - 1 do
+    Text := Text + Summary[I] + #13#10;
+  if FailCount > 0 then
+    Text := IntToStr(FailCount) + ' check(s) FAILED -- see below.' + #13#10#13#10 + Text
+  else
+    Text := 'ds5bridge is uninstalled. All checks passed.' + #13#10#13#10 + Text;
+  if RebootNote then
+    Text := Text + #13#10 + 'A REBOOT finishes the driver removal (see the [reboot] line). Nothing will restart on its own.' + #13#10;
+
+  Form := CreateCustomForm(ScaleX(560), ScaleY(360), False, False);
+  try
+    Form.Caption := 'ds5bridge uninstall -- result';
+    Memo := TNewMemo.Create(Form);
+    Memo.Parent := Form;
+    Memo.Left := ScaleX(12); Memo.Top := ScaleY(12);
+    Memo.Width := Form.ClientWidth - ScaleX(24); Memo.Height := Form.ClientHeight - ScaleY(60);
+    Memo.ReadOnly := True;
+    Memo.ScrollBars := ssVertical;
+    Memo.WordWrap := True;
+    // The memo has focus; without this it swallows Enter instead of letting
+    // the default button close the form (seen 2026-09-05).
+    Memo.WantReturns := False;
+    Memo.Text := Text;
+    Ok := TNewButton.Create(Form);
+    Ok.Parent := Form;
+    Ok.Width := ScaleX(90); Ok.Height := ScaleY(25);
+    Ok.Left := Form.ClientWidth - ScaleX(104); Ok.Top := Form.ClientHeight - ScaleY(36);
+    Ok.Caption := 'Close';
+    Ok.ModalResult := mrOk;
+    Ok.Default := True;
+    Ok.Cancel := True;
+    Form.ActiveControl := Ok;
+    Form.ShowModal;
+  finally
+    Form.Free;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Expect, RunValue, OutFile: String;
+  RC: Integer;
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    // Before a single file goes: the teardown verbs live in the exe that is
+    // about to be deleted, and the helper lives next to it.
+    HelperPath := ExpandConstant('{app}\installer\{#Helper}');
+    if not FileExists(HelperPath) then
+    begin
+      AddSummary('[warn] helper -- ' + HelperPath + ' is missing; the drivers were left in place. Remove them from Settings > Apps (USBip, HidHide).');
+      RemoveUsbip := False;
+      RemoveHidHide := False;
+    end
+    else
+    begin
+      // Order (docs/bundle-handoff.md section 4): stop the bridge and
+      // detach, clear HidHide's lists, HidHide's MSI, usbip-win2 last --
+      // each driver step only if no other installer is at work right then.
+      UninstallProgressForm.StatusLabel.Caption := 'Stopping ds5bridge and detaching the virtual controller ...';
+      RunHelper('teardown', '');
+      UninstallProgressForm.StatusLabel.Caption := 'Clearing HidHide entries ...';
+      if RemoveHidHide then
+        RunHelper('hidhide-clear', '-All')
+      else
+        RunHelper('hidhide-clear', '');
+      if RemoveHidHide then
+      begin
+        UninstallProgressForm.StatusLabel.Caption := 'Uninstalling HidHide ...';
+        if RunHelper('check-busy', '') <> 0 then
+        begin
+          AddSummary('[warn] HidHide -- left installed: another installer is running. Remove it later from Settings > Apps');
+          RemoveHidHide := False;
+        end
+        else
+          RunHelper('remove-hidhide', '');
+      end;
+      if RemoveUsbip then
+      begin
+        UninstallProgressForm.StatusLabel.Caption := 'Uninstalling usbip-win2 (USB 3.0 devices will blink out and come back) ...';
+        if RunHelper('check-busy', '') <> 0 then
+        begin
+          AddSummary('[warn] usbip-win2 -- left installed: another installer is running. Remove it later from Settings > Apps (USBip)');
+          RemoveUsbip := False;
+        end
+        else
+        begin
+          RC := RunHelper('remove-usbip', '');
+          // 3: the driver was loaded, so the helper only disabled it and
+          // scheduled the removal proper for the next logon (usbip2_ude
+          // 0.9.7.7 hangs Windows if unloaded while running -- see the
+          // helper). Verify the rest without expecting usbip gone.
+          if RC = 3 then UsbipPendingReboot := True;
+        end;
+      end;
+      UninstallProgressForm.StatusLabel.Caption := 'Verifying ...';
+      Expect := '';
+      if UsbipPendingReboot then Expect := Expect + ' -UsbipPendingReboot'
+      else if RemoveUsbip then Expect := Expect + ' -ExpectNoUsbip';
+      if RemoveHidHide then Expect := Expect + ' -ExpectNoHidHide';
+      RunHelper('verify-removed', Expect);
+    end;
+  end
+  else if CurUninstallStep = usPostUninstall then
+  begin
+    // The origin records: gone for a driver that was removed, kept for one
+    // that stays (so a later reinstall still knows whose it is).
+    if RemoveUsbip then RegDeleteValue(HKLM, SetupKey, 'UsbipInstalledByUs');
+    if RemoveHidHide then RegDeleteValue(HKLM, SetupKey, 'HidHideInstalledByUs');
+    RegDeleteKeyIfEmpty(HKLM, SetupKey);
+    RegDeleteKeyIfEmpty(HKLM, 'SOFTWARE\ds5bridge');
+    // A start-at-login entry the tray's own menu created (not our [Registry]
+    // task) would otherwise dangle.
+    if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ds5bridge', RunValue) then
+      if Pos(Lowercase(ExpandConstant('{app}')), Lowercase(RunValue)) > 0 then
+      begin
+        RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ds5bridge');
+        AddSummary('[ok] start-at-login -- entry removed');
+      end;
+    // Everything under {app} is ours (the app, staged updates, this helper);
+    // settings live in %APPDATA% and go only when asked.
+    DelTree(ExpandConstant('{app}'), True, True, True);
+    if DirExists(ExpandConstant('{app}\app')) then
+    begin
+      AddSummary('[FAIL] app -- ' + ExpandConstant('{app}\app') + ' could not be removed completely');
+      FailCount := FailCount + 1;
+    end
+    else
+      AddSummary('[ok] app -- ' + ExpandConstant('{app}') + ' removed');
+    if PurgeSettings then
+    begin
+      DelTree(ExpandConstant('{userappdata}\ds5bridge'), True, True, True);
+      if DirExists(ExpandConstant('{userappdata}\ds5bridge')) then
+        AddSummary('[warn] settings -- ' + ExpandConstant('{userappdata}\ds5bridge') + ' could not be removed completely')
+      else
+        AddSummary('[ok] settings -- ' + ExpandConstant('{userappdata}\ds5bridge') + ' removed');
+    end
+    else if DirExists(ExpandConstant('{userappdata}\ds5bridge')) then
+      AddSummary('[info] settings -- kept at ' + ExpandConstant('{userappdata}\ds5bridge') + ' (run with /PURGESETTINGS=1 or tick the box to remove them)');
+
+    OutFile := ExpandConstant('{%TEMP}\ds5bridge-uninstall-check.txt');
+    Summary.SaveToFile(OutFile);
+    Log('summary written to ' + OutFile);
+    if not UninstallSilent then
+      ShowUninstallSummary;
+  end;
+end;
