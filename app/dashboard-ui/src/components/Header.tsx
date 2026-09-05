@@ -1,6 +1,6 @@
 import { motion } from "framer-motion";
-import { Settings2, Activity, Radio } from "lucide-react";
-import { useStore } from "../lib/store";
+import { Settings2, Activity, Radio, MousePointer2 } from "lucide-react";
+import { useRemoteColor, useRemoteCount, useStore } from "../lib/store";
 
 const LINK_LABEL = {
   connecting: "connecting…", live: "live", snapshot: "snapshot", reconnecting: "reconnecting…",
@@ -12,6 +12,8 @@ export default function Header() {
   const count = useStore((s) => Object.keys(s.state.controllers).length);
   const settingsOpen = useStore((s) => s.settingsOpen);
   const toggleSettings = useStore((s) => s.toggleSettings);
+  const remoteCount = useRemoteCount();
+  const rc = useRemoteColor();
   const on = link === "live" || link === "snapshot";
 
   return (
@@ -37,6 +39,10 @@ export default function Header() {
             {agg.master_enabled === false && (
               <Hud label="bridging" value="OFF" tone="bad" />
             )}
+            {remoteCount > 0 && (
+              <Hud label={remoteCount === 1 ? "remote mode" : "in remote mode"} value={String(remoteCount)}
+                   icon={<MousePointer2 size={13} />} color={rc} />
+            )}
           </motion.div>
         )}
 
@@ -61,15 +67,19 @@ export default function Header() {
   );
 }
 
-function Hud({ label, value, icon, tone }: { label: string; value: string; icon?: React.ReactNode; tone?: "bad" }) {
+/* `color` paints the tile in an arbitrary colour (the remote lightbar's);
+   `tone` is the fixed bad state. */
+function Hud({ label, value, icon, tone, color }:
+  { label: string; value: string; icon?: React.ReactNode; tone?: "bad"; color?: string }) {
   return (
     <div className={
       "flex items-center gap-2 rounded-lg border px-2.5 py-1 " +
-      (tone === "bad" ? "border-bad/60 bg-bad/10 text-bad" : "border-line bg-panel/60 text-ink")
-    }>
+      (tone === "bad" ? "border-bad/60 bg-bad/10 text-bad" : color ? "" : "border-line bg-panel/60 text-ink")
+    } style={color ? { borderColor: `color-mix(in oklab, ${color} 65%, transparent)`, color,
+                       background: `color-mix(in oklab, ${color} 12%, transparent)`, boxShadow: `0 0 14px -5px ${color}` } : undefined}>
       {icon ?? <Radio size={13} className="text-ink-3" />}
       <span className="num text-[15px] leading-none">{value}</span>
-      <span className="eyebrow text-[9.5px]">{label}</span>
+      <span className="eyebrow text-[9.5px]" style={color ? { color } : undefined}>{label}</span>
     </div>
   );
 }

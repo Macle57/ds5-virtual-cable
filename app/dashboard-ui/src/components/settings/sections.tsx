@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle } from "lucide-react";
-import { getPath, useStore } from "../../lib/store";
+import { AlertTriangle, ArrowRight, MousePointer2 } from "lucide-react";
+import { getPath, setPath, useRemoteColor, useStore } from "../../lib/store";
 import type { ActionsMeta, ConfigDoc, Json } from "../../lib/types";
 import {
   CTRL_FIELDS, GLOBAL_FIELDS, HELP, KNOWN_BATTERY, KNOWN_CTRL, KNOWN_GLOBAL, KNOWN_INPUT,
@@ -64,30 +64,41 @@ export function ShortcutsSection({ actions }: { actions: ActionsMeta }) {
 
 /* ---- Chords: a binding grid ---------------------------------------------- */
 
+/* Which binding table a card edits: `input.chords` (while chording) or
+   `input.remote.chords` (remote mode, no chord button). Both share the
+   key vocabulary and the "none" tombstone. A row the document has not
+   written yet shows `defaults[key]` -- the chord table is stored merged over
+   its defaults so it never needs that, the remote table (a newer key) does.
+   `accent` is the colour a bound card wears. */
+interface Table { path: string[]; defaults: Record<string, string>; accent?: string }
+const CHORD_TABLE: Table = { path: ["input", "chords"], defaults: {} };
+
+const boundName = (raw: unknown, dflt?: string) =>
+  typeof raw === "string" ? (raw.trim().toLowerCase() || "none") : (dflt?.trim().toLowerCase() || "none");
+
 /* "(none)" serializes as the string "none" -- InputConfig.to_dict's contract
    for a removed default binding (absent would resurrect the default on the
    next load). */
-function ActionPicker({ chordKey, actions }: { chordKey: string; actions: ActionsMeta }) {
-  const bound = useStore((s) => getPath(s.cfg, ["input", "chords", chordKey]));
+function ActionPicker({ chordKey, actions, table }: { chordKey: string; actions: ActionsMeta; table: Table }) {
+  const bound = useStore((s) => getPath(s.cfg, [...table.path, chordKey]));
   const macros = useStore((s) => getPath(s.cfg, ["input", "macros"]));
   const patch = useStore((s) => s.patchConfig);
-  const current = typeof bound === "string" && bound.trim() ? bound.trim().toLowerCase() : "none";
   return (
-    <ActionPickerUI value={current} meta={actions} macros={macros}
-                    onChange={(name) => patch((cfg) => {
-                      const inp = asObj(cfg.input); cfg.input = inp;
-                      const chords = asObj(inp.chords); inp.chords = chords;
-                      chords[chordKey] = name;
-                    })} />
+    <ActionPickerUI value={boundName(bound, table.defaults[chordKey])} meta={actions} macros={macros}
+                    onChange={(name) => patch((cfg) => setPath(cfg, [...table.path, chordKey], name))} />
   );
 }
 
-function BindingCard({ chordKey, actions, help }: { chordKey: string; actions: ActionsMeta; help?: string }) {
-  const bound = useStore((s) => getPath(s.cfg, ["input", "chords", chordKey]));
-  const isBound = typeof bound === "string" && bound.trim() && bound.trim().toLowerCase() !== "none";
+function BindingCard({ chordKey, actions, help, table = CHORD_TABLE }:
+  { chordKey: string; actions: ActionsMeta; help?: string; table?: Table }) {
+  const bound = useStore((s) => getPath(s.cfg, [...table.path, chordKey]));
+  const isBound = boundName(bound, table.defaults[chordKey]) !== "none";
+  const accent = table.accent;
   return (
     <motion.div layout className={"rounded-xl border p-3 transition-colors " +
-        (isBound ? "border-cross/40 bg-cross/[.06]" : "border-line bg-well/50")}>
+        (!isBound ? "border-line bg-well/50" : accent ? "" : "border-cross/40 bg-cross/[.06]")}
+        style={isBound && accent ? { borderColor: `color-mix(in oklab, ${accent} 40%, transparent)`,
+                                     background: `color-mix(in oklab, ${accent} 6%, transparent)` } : undefined}>
       <div className="mb-2 flex items-center gap-2.5">
         <ButtonGlyph name={chordKey} />
         <div className="min-w-0 leading-tight">
@@ -95,7 +106,7 @@ function BindingCard({ chordKey, actions, help }: { chordKey: string; actions: A
           <div className="mono text-[10.5px] text-ink-3">{chordKey}</div>
         </div>
       </div>
-      <ActionPicker chordKey={chordKey} actions={actions} />
+      <ActionPicker chordKey={chordKey} actions={actions} table={table} />
       {help && <p className="mt-2 text-[11.5px] leading-relaxed text-ink-3">{help}</p>}
     </motion.div>
   );
@@ -118,20 +129,83 @@ export function ChordsSection({ actions }: { actions: ActionsMeta }) {
     keys.push(key);
   }
   return (
-    <Card title={`Chords — hold ${keyLabel(chordButton)} + …`} hint={HELP.chords}>
-      <div className="grid gap-3 pt-2 sm:grid-cols-2 xl:grid-cols-3">
-        {keys.map((k) => <BindingCard key={k} chordKey={k} actions={actions} />)}
-      </div>
+    <div className="grid gap-4">
+      <Card title={`Chords — hold ${keyLabel(chordButton)} + …`} hint={HELP.chords}>
+        <div className="grid gap-3 pt-2 sm:grid-cols-2 xl:grid-cols-3">
+          {keys.map((k) => <BindingCard key={k} chordKey={k} actions={actions} />)}
+        </div>
+      </Card>
+      <RemoteBindingsSection actions={actions} />
+    </div>
+  );
+}
+
+/* Whether remote mode reuses the chord table. Absent = true (the engine's
+   default), so an older config reads exactly as it behaves. */
+const useSameBindings = () =>
+  useStore((s) => getPath(s.cfg, ["input", "remote", "same_bindings"]) !== false);
+
+/* ---- Remote mode bindings: the second table ------------------------------ */
+export function RemoteBindingsSection({ actions }: { actions: ActionsMeta }) {
+  const cfg = useCfg();
+  const inp = asObj(cfg.input);
+  const same = useSameBindings();
+  const color = useRemoteColor();
+  // Until the engine serves the remote vocabulary, the chord vocabulary
+  // (minus the arming button -- a double-press of it is the mode toggle)
+  // plus the gestures is the best description of what remote mode can bind.
+  const chordButton = actions.chord_buttons.includes(String(inp.chord_button)) ? String(inp.chord_button) : "ps";
+  const vocab = actions.remote_keys ?? [...actions.chord_keys.filter((k) => k !== chordButton), ...actions.gesture_keys];
+  const table: Table = { path: ["input", "remote", "chords"], accent: color,
+                         defaults: actions.defaults.remote_chords ?? actions.defaults.chords };
+  const written = asObj(asObj(inp.remote).chords);
+  const keys = [...vocab];
+  for (const key of Object.keys(written).sort()) if (!vocab.includes(key)) keys.push(key);   // a newer build's key: keep it editable
+  return (
+    <Card title="Remote mode bindings"
+          hint="What a button or gesture does while the pad is in remote mode (double-press the chord button). Saved as input.remote.same_bindings and input.remote.chords.">
+      <Row label="Remote mode uses the same bindings" keyName="remote.same_bindings" help={HELP.same_bindings}>
+        <Toggle path={["input", "remote", "same_bindings"]} dflt />
+      </Row>
+      <AnimatePresence initial={false}>
+        {!same && (
+          <motion.div key="remote-table" initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className="overflow-hidden !border-t-0">
+            <div className="my-2 flex items-start gap-3 rounded-xl border px-3.5 py-3 text-[12.5px] leading-relaxed text-ink-2"
+                 style={{ borderColor: `color-mix(in oklab, ${color} 55%, transparent)`, background: `color-mix(in oklab, ${color} 8%, transparent)` }}>
+              <MousePointer2 size={18} className="mt-0.5 flex-none" style={{ color }} />
+              <div>
+                <b style={{ color }}>No chord button in remote mode.</b> Nothing reaches the game while remote mode is on, so
+                each button or gesture below fires its action <b className="text-ink">directly, on its own</b> — no button held
+                first. A binding here overrides that button's built-in remote job (Cross clicks, d-pad arrows, Circle is Esc,
+                Options is Enter); a row left unbound keeps it.
+              </div>
+            </div>
+            <div className="grid gap-3 pb-2 pt-1 sm:grid-cols-2 xl:grid-cols-3">
+              {keys.map((k) => <BindingCard key={k} chordKey={k} actions={actions} table={table}
+                                            help={actions.gesture_keys.includes(k) ? HELP[k] : undefined} />)}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </Card>
   );
 }
 
 export function GesturesSection({ actions }: { actions: ActionsMeta }) {
+  const same = useSameBindings();
+  const setTab = useStore((s) => s.setSettingsTab);
   return (
     <Card title="Touch gestures — while chording" hint="Two-finger touchpad gestures, active while the chord button is held.">
       <div className="grid gap-3 pt-2 sm:grid-cols-2 xl:grid-cols-3">
         {actions.gesture_keys.map((k) => <BindingCard key={k} chordKey={k} actions={actions} help={HELP[k]} />)}
       </div>
+      {!same && (
+        <button type="button" onClick={() => setTab("chords")}
+                className="mt-3 flex items-center gap-1.5 text-[12.5px] text-ink-2 hover:text-cross">
+          Remote mode has its own gesture bindings — edit them under Chords <ArrowRight size={13} />
+        </button>
+      )}
     </Card>
   );
 }
@@ -144,6 +218,8 @@ export function RemoteSection() {
   // dismissable, inline -- never an alert(). Doubled input from Steam's own
   // desktop translation is a real, observed confusion.
   const [warn, setWarn] = useState(false);
+  const same = useSameBindings();
+  const setTab = useStore((s) => s.setSettingsTab);
   return (
     <Card title="Remote mode">
       <Row label="Remote mode" keyName="remote.enabled" help={HELP.remote_enabled}>
@@ -169,6 +245,12 @@ export function RemoteSection() {
       <Row label="Pointer speed" keyName="remote.mouse_speed" unit="×" help={HELP.mouse_speed}><NumberField path={["input", "remote", "mouse_speed"]} dflt={1.6} step={0.1} /></Row>
       <Row label="Scroll speed" keyName="remote.scroll_speed" unit="×" help={HELP.scroll_speed}><NumberField path={["input", "remote", "scroll_speed"]} dflt={1.0} step={0.1} /></Row>
       <Row label="Lightbar colour in remote mode" keyName="remote.lightbar_color" help={HELP.remote_lightbar}><ColorField path={["input", "remote", "lightbar_color"]} dflt={[255, 120, 0]} /></Row>
+      <Row label="Remote mode uses the same bindings" keyName="remote.same_bindings" help={HELP.same_bindings}>
+        <button type="button" className="btn !px-3 !py-1 !text-[12px]" onClick={() => setTab("chords")}>
+          {same ? "Bindings" : "Remote bindings"} <ArrowRight size={13} />
+        </button>
+        <Toggle path={["input", "remote", "same_bindings"]} dflt />
+      </Row>
       <GenericRows path={["input", "remote"]} obj={asObj(inp.remote)} known={KNOWN_REMOTE} />
     </Card>
   );
