@@ -725,3 +725,33 @@ installer, `pnputil`, `schtasks /Create`, or the tray.
    `... /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /COMPONENTS=app /MERGETASKS=!restorepoint /STARTTRAY=1`
    from an elevated shell: the tray must be running (elevated) afterwards,
    and `last-install-check.txt` written.
+
+## 2026-09-06 00:20-01:30 -- post-reboot verification of build 0.5.0 (main agent)
+
+Machine before: HidHide service tombstone cleared by the reboot (key absent,
+UpperFilters empty, stray HidHide.sys), usbip-win2 0.9.7.7 intact and running
+(its armed stage-A removal had been cancelled: Start 4->3, finishing task
+deleted), ds5bridge not installed, both pads paired and connected.
+
+| step | result |
+|---|---|
+| `ds5bridge-setup-0.5.0-bundled.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /TASKS=autostart` (via `sudo`) | exit 0. Check list: `[ok] HidHide installer -- ran (exit 0)`, **`[ok] HidHide filter -- attached to 2 DualSense device(s), no reboot needed (restarted 2 device(s) to make it so)`**, `[ok] start-at-login -- scheduled task 'ds5bridge' registered (... highest privileges, no prompt)`, `Need to restart Windows? No`. **The HidHide install no longer needs a reboot.** |
+| device stacks after the install | both `BTHENUM\{00001124-...}_VID&0002054C_PID&0CE6\...` HIDClass nodes: `\Driver\HidHide \Driver\HidBth \Driver\steamxbox \Driver\BthEnum` (were without HidHide before the install) |
+| `schtasks /Run /TN ds5bridge` | tray started elevated (UserId = the user's SID, InteractiveToken, HighestAvailable, PT0S, IgnoreNew); both pads bridged within ~60 s; `/api/state` carries `remote_mode`, `keyboard_open`, `hide_effective`, `hide_note` |
+| hide, seen from a NON-whitelisted process (pyenv base python + venv site-packages, `hid.enumerate(0x054c, 0x0ce6)`) | only the two virtual wired pads (bus_type 1); no Bluetooth interface -- the hide bites. NB the HidHide reinstall reset the whitelist: only HidHideCLI, ds5bridge.exe, ds5bridge-tray.exe are registered now (the dev venv python is not any more). |
+| **BUG found and fixed**: `hide_effective` was `null` with "could not read the device's driver stack" | `DEVPKEY_Device_Stack` was keyed under `{3ab22e31-...}` (the DEVPKEY_PciDevice_* set) -- CM_Get_DevNode_PropertyW answers CR_NO_SUCH_VALUE for it on every devnode, elevated or not; WMI maps that key to `DEVPKEY_PciDevice_InterruptSupport`. Correct key `{540b947e-8b40-45bc-a8a2-6a0b894cbda2}` pid 14 (commit `ea43e2f`). After the fix `device_stack()` reads the BTHENUM node from an unelevated process; the `HID\...` collection child still reads None from a non-whitelisted process (`filter_covers` falls back to the parent, which is what carries the filter). |
+| app-only reinstall the way the updater does it: `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /COMPONENTS=app /MERGETASKS=!restorepoint /STARTTRAY=1` | exit 0, 12 s, tray relaunched by Setup (`STARTTRAY=1: starting the tray`), both pads re-bridged; `/api/state` now `hide_effective: true`, `hide_note: ""` for both. (Harness note: PowerShell `Start-Process -Wait` on Setup never returns because it waits for the tray Setup spawned -- wait on the Setup pid only.) |
+| `ds5bridge doctor` (installed) | `[ok] filter <serial> (hidden now): HidHide's filter is in the device stack -- the hide is effective` x2; `[ok] at login yes -- "...ds5bridge-tray.exe"` |
+| `scripts\install.ps1 -Setup <exe> -Silent -NoHidHide -DryRun` | composes `/SILENT /NORESTART /SUPPRESSMSGBOXES /COMPONENTS=app,usbip /LOG=...`; warns there is no release hash for a local exe |
+| dashboard (headless Chrome, `?snap&settings=chords`) | live pads, "BT PAD HIDDEN" pill, new default chords visible (Touchpad click -> On-screen keyboard, Mute -> Voice typing), "Remote mode uses the same bindings" toggle; screenshots in scratchpad\reboot\ |
+| on-screen keyboard renderer (driven with fake frames, self-captured with PrintWindow) | 994x344 px at 125 %, five rows as specified, shifted glyphs while L2 is held, highlight tracking, glyph hints. NB windows created from Claude's sandboxed Bash tool live on a separate desktop and are invisible to other processes -- capture from inside the process. |
+| audio endpoints with both pads bridged | `select_pad_mic` picks an ACTIVE "Headset Microphone (N- DualSense Wireless Controller)"; Windows had already made one of them the default capture device when the virtual pad appeared |
+| `[info] Bluetooth DualSense -- 0 HID devnode(s) present now` at the end of the check list | the `HID\...` children were still re-enumerating after the restart; `Get-BtPads` now falls back to the BTHENUM HID nodes and the line reads "N connected right now" (commit `68ebec3`) |
+| pads switched off by the user mid-session and back on | both bridges recovered on their own, hides still effective |
+
+Not exercised this run (needs the user's hands or a destructive step): remote
+mode from the pad (double-press PS), PS+touchpad-click keyboard and PS+Mute
+dictation from the pad, `display_*` actions on a real second screen, a real
+discharge through 20 %/10 % for the toast, the interactive uninstaller's bold
+restart dialog + Inno restart prompt, log-off/log-on autostart of the task,
+install.ps1 against a real GitHub release (repo still private).
