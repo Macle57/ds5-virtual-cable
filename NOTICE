@@ -80,11 +80,25 @@ SOFTWARE.
 ================================================================================
 usbip-win2 -- https://github.com/vadimgrn/usbip-win2
 
-No usbip-win2 code, header or binary is redistributed with this project; users
-install it themselves from its own releases. Its public headers documented the
-USB/IP wire format that emulator/ds5emu/wire.py implements independently.
-usbip-win2 is licensed under the 2-Clause BSD License as of release 0.9.7.0 and
-later (earlier releases were GPL-3.0); this project targets 0.9.7.7.
+No usbip-win2 code or header is part of this project's source; its public
+headers documented the USB/IP wire format that emulator/ds5emu/wire.py
+implements independently. usbip-win2 is licensed under the 2-Clause BSD
+License as of release 0.9.7.0 and later (earlier releases were GPL-3.0); this
+project targets 0.9.7.7.
+
+The standard installer (ds5bridge-setup-<version>.exe) and scripts/install.ps1
+do not redistribute usbip-win2 or HidHide: they download each vendor's official
+installer from its own release page and verify its SHA-256 before running it.
+
+A "bundled" build of the installer (file name ending in -bundled.exe) may also
+be published. It embeds, unmodified and byte-for-byte, the official installers
+USBip-0.9.7.7-x64.exe (usbip-win2, BSD-2-Clause, (c) 2021-2026 Vadym
+Hrynchyshyn) and HidHide_1.5.230_x64.exe (HidHide, (c) Nefarius Software
+Solutions e.U.), each installed as a separate product under its own licence.
+For that build the vendors' copyright and licence notices are reproduced in
+app/packaging/bundle/THIRD-PARTY-NOTICES.txt, which the bundled installer
+places next to the uninstaller in %LOCALAPPDATA%\ds5bridge, as the BSD-2-Clause
+licence requires for binary redistribution. Neither project endorses ds5bridge.
 
 ================================================================================
 Runtime dependencies are third-party packages installed by the user via pip and
