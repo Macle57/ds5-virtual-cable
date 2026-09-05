@@ -4,7 +4,8 @@
 ; steps scripts\install.ps1 performs -- restore point, usbip-win2 0.9.7.7,
 ; HidHide, the app -- with a checkbox for each, the two driver installers
 ; DOWNLOADED at install time from their pinned URLs and verified by SHA-256
-; (no third-party binaries are redistributed; see NOTICE), a verification
+; -- or, in the "-bundled" build, carried inside the exe unmodified, with the
+; vendors' notices (THIRD-PARTY-NOTICES.txt; see NOTICE) -- a verification
 ; page at the end, an entry in Settings > Apps, and an uninstaller that takes
 ; the drivers it installed back out (ones it found already there are kept
 ; by default) unless told otherwise.
@@ -49,6 +50,26 @@
 #define Helper         "setup-helper.ps1"
 #define RepoUrl        "https://github.com/Macle57/ds5-virtual-cable"
 
+; A bundled build gets its own file name, so the two flavours can sit side by
+; side in dist and on a release page (build-installer.ps1 relies on this).
+#if Defined(BundleUsbip) || Defined(BundleHidHide)
+  #define OutputName   "ds5bridge-setup-" + AppVersion + "-bundled"
+#else
+  #define OutputName   "ds5bridge-setup-" + AppVersion
+#endif
+; How each driver package arrives, for the component captions. The sizes are
+; the vendors' installers as published (33 MB and 8 MB).
+#ifdef BundleUsbip
+  #define UsbipHow     "included in this setup"
+#else
+  #define UsbipHow     "downloaded, ~32 MB"
+#endif
+#ifdef BundleHidHide
+  #define HidHideHow   "included in this setup"
+#else
+  #define HidHideHow   "downloaded, ~8 MB"
+#endif
+
 [Setup]
 AppId={{7B6E2D6A-3C39-4E0B-9C7E-2F8B1C2D5A61}
 AppName=ds5bridge
@@ -76,7 +97,7 @@ MinVersion=10.0.18362
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#OutputDir}
-OutputBaseFilename=ds5bridge-setup-{#AppVersion}
+OutputBaseFilename={#OutputName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -106,8 +127,8 @@ Name: "custom"; Description: "Custom"; Flags: iscustom
 ; into the registry as the "previous" one, and the next run without a switch
 ; reused it and installed nothing (2026-09-04, run phaseA-09).
 Name: "app"; Description: "ds5bridge {#AppVersion} -- the app (tray icon and command line)"; Types: full custom; Flags: fixed
-Name: "usbip"; Description: "usbip-win2 {#UsbipVersion} -- the virtual-USB driver the bridge needs (downloaded, ~2 MB)"; Types: full custom
-Name: "hidhide"; Description: "HidHide {#HidHideVersion} -- optional: hides the Bluetooth pad while it is bridged (downloaded, ~5 MB)"; Types: full custom
+Name: "usbip"; Description: "usbip-win2 {#UsbipVersion} -- the virtual-USB driver the bridge needs ({#UsbipHow})"; Types: full custom
+Name: "hidhide"; Description: "HidHide {#HidHideVersion} -- optional: hides the Bluetooth pad while it is bridged ({#HidHideHow})"; Types: full custom
 
 [Tasks]
 Name: "restorepoint"; Description: "Create a System Restore point before installing the driver (recommended)"; Components: usbip
@@ -371,7 +392,7 @@ begin
     else if HaveUsbipVer = '0.9.7.8' then
       WizardForm.ComponentsList.ItemCaption[1] := 'usbip-win2 ' + UsbipVersion + ' -- REPLACES the installed 0.9.7.8, which its maintainer warns can corrupt memory'
     else if HaveUsbipVer <> '' then
-      WizardForm.ComponentsList.ItemCaption[1] := 'usbip-win2 ' + UsbipVersion + ' -- replaces the installed ' + HaveUsbipVer + ' (downloaded, ~2 MB)';
+      WizardForm.ComponentsList.ItemCaption[1] := 'usbip-win2 ' + UsbipVersion + ' -- replaces the installed ' + HaveUsbipVer + ' ({#UsbipHow})';
     if HaveHidHideCli <> '' then
       WizardForm.ComponentsList.ItemCaption[2] := 'HidHide -- already installed (will be verified, not reinstalled)';
   end
