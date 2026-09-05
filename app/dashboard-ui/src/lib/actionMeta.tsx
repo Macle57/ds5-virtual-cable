@@ -5,12 +5,13 @@
    document and are described from their definition. */
 import type { LucideIcon } from "lucide-react";
 import {
-  ArrowLeftRight, CircleOff, HelpCircle, Keyboard, LayoutGrid, LightbulbOff, Minimize2, MonitorDown,
-  PanelsTopLeft, Play, Power, SkipBack, SkipForward, Sun, SunDim, Terminal, Volume1, Volume2, VolumeX,
+  ArrowLeftRight, CircleOff, Copy, HelpCircle, Keyboard, LayoutGrid, LightbulbOff, Mic, Minimize2, Monitor,
+  MonitorDown, MonitorSpeaker, Mouse, MousePointer, MousePointerClick, PanelsTopLeft, Play, Power, Projector,
+  RefreshCw, SkipBack, SkipForward, Sun, SunDim, Terminal, Volume1, Volume2, VolumeX,
 } from "lucide-react";
 import type { ActionsMeta, Json } from "./types";
 
-export type Group = "none" | "media" | "volume" | "display" | "windows" | "pad" | "macro" | "other";
+export type Group = "none" | "media" | "volume" | "display" | "windows" | "mouse" | "voice" | "pad" | "macro" | "other";
 export type IconType = LucideIcon;
 
 export interface MacroDef { keys?: string[]; run?: string; label?: string; repeat?: boolean }
@@ -33,6 +34,8 @@ export const GROUPS: { id: Group; title: string; color: string }[] = [
   { id: "volume", title: "Volume", color: "var(--color-cyan)" },
   { id: "display", title: "Display", color: "var(--color-amber)" },
   { id: "windows", title: "Windows", color: "var(--color-cross)" },
+  { id: "mouse", title: "Mouse", color: "var(--color-orange)" },
+  { id: "voice", title: "Voice & typing", color: "var(--color-violet)" },
   { id: "pad", title: "Controller", color: "var(--color-circle)" },
   { id: "macro", title: "Your macros", color: "var(--color-triangle)" },
   { id: "other", title: "Other", color: "var(--color-ink-2)" },
@@ -52,16 +55,38 @@ const BUILTIN: Record<string, { label: string; group: Group; Icon: IconType }> =
   brightness_up:    { label: "Brightness up",      group: "display", Icon: Sun },
   brightness_down:  { label: "Brightness down",    group: "display", Icon: SunDim },
   projection_cycle: { label: "Projection",         group: "display", Icon: MonitorDown },
+  display_cycle:    { label: "Next display mode",  group: "display", Icon: RefreshCw },
+  display_extend:   { label: "Extend displays",    group: "display", Icon: MonitorSpeaker },
+  display_duplicate: { label: "Duplicate displays", group: "display", Icon: Copy },
+  display_pc_only:  { label: "PC screen only",     group: "display", Icon: Monitor },
+  display_second_only: { label: "Second screen only", group: "display", Icon: Projector },
   show_desktop:     { label: "Show desktop",       group: "windows", Icon: PanelsTopLeft },
   minimize_all:     { label: "Minimize all",       group: "windows", Icon: Minimize2 },
   task_view:        { label: "Task View",          group: "windows", Icon: LayoutGrid },
   alt_tab:          { label: "Alt+Tab step",       group: "windows", Icon: ArrowLeftRight },
+  left_click:       { label: "Left click",         group: "mouse",   Icon: MousePointerClick },
+  right_click:      { label: "Right click",        group: "mouse",   Icon: MousePointer },
+  middle_click:     { label: "Middle click",       group: "mouse",   Icon: Mouse },
+  dictation:        { label: "Voice typing",       group: "voice",   Icon: Mic },
+  keyboard:         { label: "On-screen keyboard", group: "voice",   Icon: Keyboard },
 };
 
+/* Docs for when /api/actions has not served one (an older server, or the
+   engine's own actions). The server's line wins whenever it exists. */
 const BUILTIN_DOC: Record<string, string> = {
   none: "the game keeps this button",
   pad_power_off: "power the pad off",
   pad_lightbar_toggle: "lightbar off; press again to bring it back",
+  display_cycle: "Win+P: step to the next projection mode",
+  display_extend: "Win+P: extend the desktop across every display",
+  display_duplicate: "Win+P: the same picture on every display",
+  display_pc_only: "Win+P: PC screen only",
+  display_second_only: "Win+P: second screen only",
+  left_click: "click the mouse where the pointer is",
+  right_click: "right-click where the pointer is",
+  middle_click: "middle-click where the pointer is",
+  dictation: "Win+H: start / stop voice typing",
+  keyboard: "show / hide the on-screen keyboard",
 };
 
 /* The engine's own actions: served by /api/actions when the server knows

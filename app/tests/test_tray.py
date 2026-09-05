@@ -635,17 +635,39 @@ class DashboardTests(unittest.TestCase):
     """The `Open dashboard` row: one URL, from the config, in the default
     browser."""
 
-    def open_with(self, app, result=True):
+    def open_with(self, app, result=True, elevated=False):
         import webbrowser
         opened = []
         saved = webbrowser.open
+        saved_elev = T._is_elevated
         webbrowser.open = lambda url: opened.append(url) or result
+        # Pinned, not read from the machine: the suite may itself be running
+        # from an elevated shell, and these tests are about the URL.
+        T._is_elevated = lambda: elevated
         try:
             app._open_dashboard()
             settle()
         finally:
             webbrowser.open = saved
+            T._is_elevated = saved_elev
         return opened
+
+    def test_an_elevated_tray_hands_the_url_to_explorer(self):
+        # The tray runs as administrator now; a browser started with our token
+        # would be an administrator browser. explorer.exe opens it with the
+        # desktop's ordinary token, and webbrowser.open is not used at all.
+        import subprocess
+        launched = []
+        saved = subprocess.Popen
+        subprocess.Popen = lambda argv, **kw: launched.append(list(argv))
+        try:
+            app = app_with([controller(A)])
+            opened = self.open_with(app, elevated=True)
+        finally:
+            subprocess.Popen = saved
+        self.assertEqual(opened, [])
+        self.assertEqual(launched, [["explorer.exe", "http://127.0.0.1:8765"]])
+        self.assertEqual(app.notes, [])
 
     def test_it_opens_the_configured_port_on_loopback(self):
         app = app_with([controller(A)])
@@ -1138,6 +1160,31 @@ class AnnounceSwitchesTests(unittest.TestCase):
                                  master=False, enabled=False))
         self.assertEqual(said.count("switched off"), 0)
         self.assertIn("bridging is OFF", said)
+
+
+class LowBatteryToastTests(unittest.TestCase):
+    """The manager's dedupe decides WHEN; the tray only words it."""
+
+    def test_a_battery_low_event_toasts_with_the_label(self):
+        app = app_with([controller()])
+        app.icon = object()
+        app.cfg.controllers = {A: types.SimpleNamespace(label="couch")}
+        app._on_event(A, "battery_low", "battery 20% -- charge soon")
+        self.assertEqual(app.notes, [("ds5bridge", "couch battery 20% -- charge soon")])
+
+    def test_without_a_label_the_short_serial_names_the_pad(self):
+        app = app_with([controller()])
+        app.icon = object()
+        app.cfg.controllers = {}
+        app._on_event(A, "battery_low", "battery 10% -- charge it now")
+        self.assertEqual(app.notes[0][1], "a0fa..d8bb battery 10% -- charge it now")
+
+    def test_plain_battery_reports_and_mode_lines_do_not_toast(self):
+        app = app_with([controller()])
+        app.icon = object()
+        app._on_event(A, "battery", "battery 18% -- LOW. Charge it soon")
+        app._on_event(A, "mode", "remote on  keyboard closed")
+        self.assertEqual(app.notes, [])
 
 
 if __name__ == "__main__":

@@ -24,10 +24,56 @@ try:
     from ds5app import actions as A
     from ds5app import config as K
     from ds5app import intercept as I
+    from ds5app import osk as OSK
     from ds5app import service as SVC
     from ds5bridge import protocol as P
 except ImportError:  # pragma: no cover
     A = None
+
+
+class FakeRenderer:
+    """Records what the keyboard window would have been told."""
+
+    def __init__(self):
+        self.calls: list = []
+        self.snaps: list = []
+
+    def show(self, snap):
+        self.calls.append("show")
+        self.snaps.append(snap)
+
+    def update(self, snap):
+        self.calls.append("update")
+        self.snaps.append(snap)
+
+    def hide(self):
+        self.calls.append("hide")
+
+    def position(self):
+        return (100, 200)
+
+    def close(self):
+        self.calls.append("close")
+
+
+class FakeAudio:
+    """An `audio_default.AudioSystem` stand-in that never touches COM."""
+
+    def __init__(self, endpoints=(), default="mic-a"):
+        self.endpoints = list(endpoints)
+        self.defaults = {0: default, 1: default, 2: default}
+        self.set_calls: list = []
+
+    def capture_endpoints(self):
+        return list(self.endpoints)
+
+    def default_capture_id(self, role):
+        return self.defaults.get(role)
+
+    def set_default_capture(self, device_id, role):
+        self.set_calls.append((device_id, role))
+        self.defaults[role] = device_id
+        return True
 
 if A is not None:
     logging.getLogger("ds5app.intercept").addHandler(logging.NullHandler())
@@ -93,26 +139,39 @@ class EngineCase(unittest.TestCase):
     def make(self, **over):
         self.batches: list[list] = []
         self.scripts: list[str] = []
+        self.launched: list[str] = []
         self.sent: list[bytes] = []
+        self.modes: list[tuple] = []
         self.power_offs = 0
         self.clock = Clock()
+        self.audio = FakeAudio()
         self.acts = A.OsActions(inject=self.batches.append,
                                 run_ps=lambda s, timeout=10.0:
-                                (self.scripts.append(s), True)[1])
+                                (self.scripts.append(s), True)[1],
+                                launch=lambda c: (self.launched.append(c), True)[1],
+                                audio=self.audio, sleep=lambda s: None)
         cfg = K.InputConfig.from_dict(over)
 
         def power_off():
             self.power_offs += 1
 
+        self.renderer = FakeRenderer()
+        self.osk = OSK.OnScreenKeyboard(self.acts,
+                                        renderer_factory=lambda: self.renderer)
         self.eng = I.InputInterceptor(
             cfg, actions=self.acts, send_setstate=self.sent.append,
-            power_off=power_off, clock=self.clock, dispatch=lambda fn: fn())
+            power_off=power_off, clock=self.clock, dispatch=lambda fn: fn(),
+            on_mode=lambda r, k: self.modes.append((r, k)), osk=self.osk)
         return self.eng
 
     def make_remote(self, **over):
         """An engine with remote mode switched on -- it ships OFF, so every
-        test that toggles into it has to opt in the way a user would."""
-        over.setdefault("remote", {}).setdefault("enabled", True)
+        test that toggles into it has to opt in the way a user would -- and
+        on the CLASSIC remote map (`same_bindings` off): these tests pin the
+        map remote mode shipped with; `RemoteSameBindings` covers the default."""
+        rm = over.setdefault("remote", {})
+        rm.setdefault("enabled", True)
+        rm.setdefault("same_bindings", False)
         return self.make(**over)
 
     @property
@@ -1326,6 +1385,368 @@ class LiveSettingsWatcher(unittest.TestCase):
         svc._apply_input_config(new)
         self.assertIs(svc.input_config, new)
         self.assertEqual(got, [new])
+
+
+# ---------------------------------------------------------------------------
+# table-driven remote mode, the on-screen keyboard, mode reporting
+# ---------------------------------------------------------------------------
+
+
+class RemoteBindings(EngineCase):
+    """Remote mode's buttons and gestures resolve through a table."""
+
+    def enter(self):
+        self.feed(report(buttons=("ps",)), report())
+        self.clock.advance(0.15)
+        self.feed(report(buttons=("ps",)), report())
+        self.batches.clear()
+
+    def test_the_classic_table_reproduces_the_shipped_map(self):
+        # DEFAULT_REMOTE_CHORDS is today's remote mode, spelt out.
+        d = K.DEFAULT_REMOTE_CHORDS
+        self.assertEqual(d["cross"], "left_click")
+        self.assertEqual(d["circle"], "escape")
+        self.assertEqual(d["options"], "enter")
+        self.assertEqual((d["dpad_up"], d["dpad_down"], d["dpad_left"],
+                          d["dpad_right"]),
+                         ("arrow_up", "arrow_down", "arrow_left", "arrow_right"))
+        self.assertEqual(d["touch_slide_horizontal"], "alt_tab")
+        self.assertNotIn("touch_swipe_up", d)
+
+    def test_a_rebound_button_fires_the_new_action_directly(self):
+        self.make_remote(remote={"chords": {"cross": "media_play_pause"}})
+        self.enter()
+        self.feed(report(buttons=("cross",)), report())
+        self.assertIn(("key", A.VK_MEDIA_PLAY_PAUSE, True), self.events)
+        self.assertNotIn(("button", "left", True), self.events)
+
+    def test_none_removes_a_default_and_the_button_does_nothing(self):
+        self.make_remote(remote={"chords": {"cross": "none"}})
+        self.enter()
+        self.feed(report(buttons=("cross",)), report())
+        self.assertEqual(self.events, [])
+
+    def test_a_hold_action_is_held_for_the_press(self):
+        self.make_remote(remote={"chords": {"square": "right_click"}})
+        self.enter()
+        self.feed(report(buttons=("square",)))
+        self.assertEqual(self.events[-1], ("button", "right", True))
+        self.feed(report(buttons=("square",)))
+        self.assertEqual(len(self.events), 1)               # held, not repeated
+        self.feed(report())
+        self.assertEqual(self.events[-1], ("button", "right", False))
+
+    def test_a_repeatable_tap_action_repeats_at_repeat_ms(self):
+        self.make_remote(remote={"chords": {"square": "volume_up"}},
+                         repeat_ms=300)
+        self.enter()
+        self.feed(report(buttons=("square",)))
+        for _ in range(4):
+            self.clock.advance(0.31)
+            self.feed(report(buttons=("square",)))
+        ups = [e for e in self.events if e == ("key", A.VK_VOLUME_UP, True)]
+        self.assertGreaterEqual(len(ups), 4)
+        self.feed(report())
+        n = len(ups)
+        self.clock.advance(1.0)
+        self.feed(report())
+        self.assertEqual(len([e for e in self.events
+                              if e == ("key", A.VK_VOLUME_UP, True)]), n)
+
+    def test_a_diagonal_dpad_fires_one_arrow(self):
+        self.make_remote()
+        self.enter()
+        self.feed(report(buttons=("dpad_up", "dpad_right")))
+        downs = [e for e in self.events if e[0] == "key" and e[2]]
+        self.assertEqual(len(downs), 1)
+
+    def test_remote_buttons_do_not_rumble(self):
+        self.make_remote()
+        self.enter()
+        for _ in range(20):
+            self.clock.advance(0.05)
+            self.eng.tick()
+        self.sent.clear()
+        self.feed(report(buttons=("cross",)), report())
+        self.eng.tick()
+        self.assertFalse([b for b in self.sent
+                          if b[P.VALID_FLAG0] & P.F0_COMPATIBLE_VIBRATION
+                          and b[P.BC_VIBRATION_RIGHT]])
+
+    def test_a_remote_swipe_fires_when_bound(self):
+        self.make_remote(remote={"chords": {"touch_swipe_up": "task_view"}})
+        self.enter()
+        self.feed(report(touches=((450, 800), (550, 800))))
+        for y in (740, 680, 620, 560, 500):
+            self.feed(report(touches=((450, y), (550, y))))
+        self.assertIn(("key", A.VK_TAB, True), self.events)
+        self.assertIn(("key", A.VK_LWIN, True), self.events)
+        self.assertFalse(self.acts.alt_tab_open)
+
+    def test_a_pad_action_from_remote_mode(self):
+        self.make_remote(remote={"chords": {"triangle": "pad_power_off"}})
+        self.enter()
+        self.feed(report(buttons=("triangle",)))
+        self.assertEqual(self.power_offs, 1)
+
+    def test_an_unknown_action_is_ignored_once_with_a_log_line(self):
+        self.make_remote(remote={"chords": {"cross": "no_such_thing"}})
+        self.enter()
+        with self.assertLogs("ds5app.intercept", level="WARNING") as cm:
+            self.feed(report(buttons=("cross",)), report(),
+                      report(buttons=("cross",)), report())
+        self.assertEqual(len(cm.output), 1)
+        self.assertEqual(self.events, [])
+
+    def test_a_config_change_swaps_the_table_live(self):
+        self.make_remote()
+        self.enter()
+        new = K.InputConfig.from_dict(
+            {"remote": {"enabled": True, "same_bindings": False,
+                        "chords": {"cross": "volume_mute"}}})
+        self.eng.update_config(new)
+        self.feed(report(buttons=("cross",)), report())
+        self.assertIn(("key", A.VK_VOLUME_MUTE, True), self.events)
+        self.assertNotIn(("button", "left", True), self.events)
+
+    def test_leaving_the_mode_releases_a_held_binding(self):
+        self.make_remote()
+        self.enter()
+        self.feed(report(buttons=("circle",)))                  # Esc held
+        self.assertEqual(self.events[-1], ("key", A.VK_ESCAPE, True))
+        new = K.InputConfig.from_dict({"remote": {"enabled": False}})
+        self.eng.update_config(new)
+        self.assertIn(("key", A.VK_ESCAPE, False), self.events)
+
+
+class RemoteSameBindings(EngineCase):
+    """`same_bindings` (the default): remote mode uses the chord table."""
+
+    def enter(self):
+        self.feed(report(buttons=("ps",)), report())
+        self.clock.advance(0.15)
+        self.feed(report(buttons=("ps",)), report())
+        self.batches.clear()
+
+    def test_same_bindings_is_the_default(self):
+        self.assertTrue(K.RemoteMode().same_bindings)
+        self.assertTrue(K.InputConfig.from_dict({}).remote.same_bindings)
+
+    def test_buttons_mean_what_the_chord_means(self):
+        self.make(remote={"enabled": True})
+        self.enter()
+        self.feed(report(buttons=("cross",)), report())
+        self.assertIn(("key", A.VK_MEDIA_PLAY_PAUSE, True), self.events)
+        self.assertNotIn(("button", "left", True), self.events)
+        self.feed(report(buttons=("dpad_up",)), report())
+        self.assertIn(("key", A.VK_VOLUME_UP, True), self.events)
+
+    def test_gestures_mean_what_the_chord_gesture_means(self):
+        self.make(remote={"enabled": True})
+        self.enter()
+        self.feed(report(touches=((450, 300), (550, 300))))
+        for y in (360, 420, 480, 540, 600):
+            self.feed(report(touches=((450, y), (550, y))))
+        self.assertIn(("key", A.VK_M, True), self.events)          # minimize_all
+
+    def test_the_intrinsic_pointer_controls_stay(self):
+        self.make(remote={"enabled": True})
+        self.enter()
+        self.feed(report(touches=((500, 500),)))
+        self.clock.advance(0.1)
+        self.feed(report())
+        self.assertIn(("button", "left", True), self.events)       # tap = click
+        self.feed(report(touches=((500, 500),)), report(touches=((540, 520),)))
+        self.assertTrue([e for e in self.events if e[0] == "move"])
+
+    def test_the_remote_table_is_ignored_while_same_bindings(self):
+        self.make(remote={"enabled": True, "chords": {"cross": "volume_mute"}})
+        self.enter()
+        self.feed(report(buttons=("cross",)), report())
+        self.assertNotIn(("key", A.VK_VOLUME_MUTE, True), self.events)
+        self.assertIn(("key", A.VK_MEDIA_PLAY_PAUSE, True), self.events)
+
+    def test_the_chord_table_still_binds_through_a_live_flip(self):
+        self.make_remote()                                          # classic
+        self.enter()
+        self.eng.update_config(K.InputConfig.from_dict(
+            {"remote": {"enabled": True, "same_bindings": True}}))
+        self.feed(report(buttons=("cross",)), report())
+        self.assertIn(("key", A.VK_MEDIA_PLAY_PAUSE, True), self.events)
+
+
+class Keyboard(EngineCase):
+    """The `keyboard` engine action and what the game sees meanwhile."""
+
+    def open_by_chord(self):
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps", "touchpad_click")),
+                  report(buttons=("ps",)), report())
+        self.batches.clear()
+
+    def test_the_default_chord_opens_it_and_the_window_is_shown(self):
+        self.make()
+        self.open_by_chord()
+        self.assertTrue(self.eng.keyboard_open)
+        self.assertEqual(self.renderer.calls[0], "show")
+        self.assertEqual(self.eng.stats["keyboard_toggles"], 1)
+
+    def test_the_game_sees_a_neutral_pad_while_open(self):
+        self.make()
+        self.open_by_chord()
+        out = self.feed(report(buttons=("cross", "dpad_up"), lx=0x00, r2=255,
+                               touches=((500, 500),)))
+        st = P.decode_input(out[1:], usb=True)
+        self.assertEqual(buttons_of(out), set())
+        self.assertEqual((st.lx, st.r2), (0x80, 0))
+        self.assertFalse(st.touch[0].active)
+
+    def test_cross_types_the_highlighted_key(self):
+        self.make()
+        self.open_by_chord()
+        self.feed(report())                                   # arming frame
+        self.feed(report(buttons=("cross",)))
+        self.assertEqual(self.events[-2:], [("unicode", ord("g"), True),
+                                            ("unicode", ord("g"), False)])
+
+    def test_navigation_repaints_and_square_backspaces(self):
+        self.make()
+        self.open_by_chord()
+        self.feed(report(), report(buttons=("dpad_right",)))
+        self.assertEqual(self.renderer.calls[-1], "update")
+        self.assertTrue(self.renderer.snaps[-1]["keys"])
+        self.feed(report(), report(buttons=("square",)))
+        self.assertIn(("key", A.VK_BACK, True), self.events)
+
+    def test_circle_closes_it_and_the_press_never_reaches_the_game(self):
+        self.make()
+        self.open_by_chord()
+        self.feed(report())
+        out = self.feed(report(buttons=("circle",)))
+        self.assertEqual(buttons_of(out), set())
+        self.assertFalse(self.eng.keyboard_open)
+        self.assertEqual(self.renderer.calls[-1], "hide")
+        out = self.feed(report(), report(buttons=("cross",)))
+        self.assertIn("x", buttons_of(out))                   # game has the pad back
+
+    def test_the_chord_toggles_it_closed_again(self):
+        self.make()
+        self.open_by_chord()
+        self.open_by_chord()
+        self.assertFalse(self.eng.keyboard_open)
+
+    def test_it_works_on_top_of_remote_mode_and_suspends_its_map(self):
+        self.make_remote(remote={"chords": {"square": "keyboard"}})
+        self.feed(report(buttons=("ps",)), report())
+        self.clock.advance(0.15)
+        self.feed(report(buttons=("ps",)), report())
+        self.feed(report(buttons=("cross",)))                 # left button held
+        self.assertEqual(self.events[-1], ("button", "left", True))
+        self.feed(report(buttons=("cross", "square")))        # opens the keyboard
+        self.assertTrue(self.eng.keyboard_open)
+        self.assertIn(("button", "left", False), self.events) # released
+        self.batches.clear()
+        self.feed(report())                                   # arming
+        self.feed(report(buttons=("triangle",)))
+        self.assertEqual(self.events[-2][0], "unicode")       # Space typed
+        self.assertTrue(self.eng.remote_mode)
+
+    def test_chords_still_fire_while_open(self):
+        self.make()
+        self.open_by_chord()
+        self.feed(report(buttons=("ps",)), report(buttons=("ps", "dpad_up")))
+        self.assertIn(("key", A.VK_VOLUME_UP, True), self.events)
+        self.assertTrue(self.eng.keyboard_open)
+
+    def test_disabling_the_engine_closes_it(self):
+        self.make()
+        self.open_by_chord()
+        self.eng.update_config(K.InputConfig.from_dict({"enabled": False}))
+        self.assertFalse(self.eng.keyboard_open)
+        self.assertEqual(self.renderer.calls[-1], "hide")
+
+    def test_close_shuts_the_window_down(self):
+        self.make()
+        self.open_by_chord()
+        self.eng.close()
+        self.assertEqual(self.renderer.calls[-1], "close")
+        self.assertFalse(self.eng.keyboard_open)
+
+    def test_the_keyboard_action_is_an_engine_action_for_the_pickers(self):
+        self.assertIn("keyboard", K.ENGINE_ACTIONS)
+        self.assertEqual(K.DEFAULT_CHORDS["touchpad_click"], "keyboard")
+        self.assertEqual(K.DEFAULT_CHORDS["mute"], "dictation")
+
+
+class ModeReporting(EngineCase):
+    def enter(self):
+        self.feed(report(buttons=("ps",)), report())
+        self.clock.advance(0.15)
+        self.feed(report(buttons=("ps",)), report())
+
+    def test_on_mode_fires_on_every_flip_only(self):
+        self.make_remote()
+        self.feed(report(), report(), report())
+        self.assertEqual(self.modes, [(False, False)])
+        self.enter()
+        self.assertEqual(self.modes[-1], (True, False))
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps", "touchpad_click")),
+                  report(buttons=("ps",)), report())
+        self.assertEqual(self.modes[-1], (True, True))
+        self.assertEqual(len(self.modes), 3)
+        self.eng.update_config(K.InputConfig.from_dict({"enabled": False}))
+        self.assertEqual(self.modes[-1], (False, False))
+
+    def test_the_attributes_the_telemetry_publisher_reads(self):
+        self.make_remote()
+        self.assertFalse(self.eng.remote_mode)
+        self.assertFalse(self.eng.keyboard_open)
+        self.enter()
+        self.assertTrue(self.eng.remote_mode)
+
+    def test_attach_passes_on_mode_through(self):
+        class Backend:
+            interceptor = None
+
+            def push_setstate_body(self, b):
+                pass
+
+            def power_off_pad(self):
+                pass
+
+        seen = []
+        acts = A.OsActions(inject=lambda e: None, audio=object(),
+                           sleep=lambda s: None)
+        eng = I.attach_to_backend(Backend(), K.InputConfig(), actions=acts,
+                                  on_mode=lambda r, k: seen.append((r, k)))
+        try:
+            eng.on_input(report())
+            self.assertEqual(seen, [(False, False)])
+        finally:
+            eng.close()
+
+
+class DisplayAndDictationChords(EngineCase):
+    def test_display_actions_launch_displayswitch(self):
+        self.make(chords={"square": "display_extend", "cross": "display_cycle"})
+        self.feed(report(buttons=("ps",)), report(buttons=("ps", "square")))
+        self.assertEqual(len(self.launched), 1)
+        self.assertIn("DisplaySwitch.exe", self.launched[0])
+        self.assertTrue(self.launched[0].endswith("/extend"))
+        self.feed(report(buttons=("ps",)), report(buttons=("ps", "cross")))
+        self.assertTrue(self.launched[-1].endswith("/external"))  # after extend
+
+    def test_dictation_chord_borrows_the_pad_mic_and_close_restores(self):
+        from ds5app import audio_default as AD
+        self.make()
+        self.audio.endpoints = [AD.Endpoint(
+            "pad", "Headset Microphone (2- DualSense Wireless Controller)")]
+        self.feed(report(buttons=("ps",)), report(buttons=("ps", "mute")))
+        self.assertEqual(self.audio.defaults[0], "pad")
+        self.assertIn(("key", A.VK_H, True), self.events)
+        self.eng.close()
+        self.assertEqual(self.audio.defaults[0], "mic-a")
 
 
 if __name__ == "__main__":

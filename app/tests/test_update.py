@@ -54,8 +54,8 @@ def release(tag="v0.5.0", assets=None, **extra):
     if assets is None:
         ver = tag.lstrip("v").lstrip(".")
         assets = [
-            {"name": f"ds5bridge-{ver}-win-x64.zip",
-             "browser_download_url": f"https://example.invalid/{ver}.zip",
+            {"name": f"ds5bridge-setup-{ver}-bundled.exe",
+             "browser_download_url": f"https://example.invalid/{ver}.exe",
              "size": 123456789},
             {"name": "SHA256SUMS",
              "browser_download_url": "https://example.invalid/SHA256SUMS",
@@ -145,8 +145,8 @@ class TestEvaluateRelease(unittest.TestCase):
         self.assertIsNotNone(info)
         self.assertEqual(info.version, "0.5.0")
         self.assertEqual(info.tag, "v0.5.0")
-        self.assertEqual(info.asset_name, "ds5bridge-0.5.0-win-x64.zip")
-        self.assertEqual(info.asset_url, "https://example.invalid/0.5.0.zip")
+        self.assertEqual(info.asset_name, "ds5bridge-setup-0.5.0-bundled.exe")
+        self.assertEqual(info.asset_url, "https://example.invalid/0.5.0.exe")
         self.assertEqual(info.asset_size, 123456789)
         self.assertEqual(info.sums_url, "https://example.invalid/SHA256SUMS")
         self.assertEqual(info.page_url, "https://example.invalid/rel/v0.5.0")
@@ -162,20 +162,31 @@ class TestEvaluateRelease(unittest.TestCase):
             release("v9.9.9", draft=True), "0.4.0"))
         self.assertIsNone(U.evaluate_release(release("v9.9.9-rc1"), "0.4.0"))
 
-    def test_release_without_the_zip_is_not_offered(self):
+    def test_release_without_the_installer_is_not_offered(self):
         doc = release("v0.5.0", assets=[
             {"name": "SHA256SUMS", "browser_download_url": "u", "size": 1},
             {"name": "install.ps1", "browser_download_url": "u", "size": 1}])
         self.assertIsNone(U.evaluate_release(doc, "0.4.0"))
 
     def test_asset_name_must_match_exactly(self):
-        # Similar-but-wrong names must not be picked up as the app.
+        # Similar-but-wrong names must not be picked up as the installer: not
+        # the old zip, not the download-mode exe, not a signature file.
         doc = release("v0.5.0", assets=[
-            {"name": "ds5bridge-symbols-0.5.0-win-x64.zip",
+            {"name": "ds5bridge-0.5.0-win-x64.zip",
              "browser_download_url": "u", "size": 1},
-            {"name": "ds5bridge-0.5.0-win-x64.zip.asc",
+            {"name": "ds5bridge-setup-0.5.0.exe",
+             "browser_download_url": "u", "size": 1},
+            {"name": "ds5bridge-setup-0.5.0-bundled.exe.asc",
              "browser_download_url": "u", "size": 1}])
         self.assertIsNone(U.evaluate_release(doc, "0.4.0"))
+
+    def test_the_bundled_installer_is_the_asset(self):
+        doc = release("v0.5.0", assets=[
+            {"name": "ds5bridge-setup-0.5.0.exe",
+             "browser_download_url": "plain", "size": 1},
+            {"name": "ds5bridge-setup-0.5.0-bundled.exe",
+             "browser_download_url": "bundled", "size": 1}])
+        self.assertEqual(U.evaluate_release(doc, "0.4.0").asset_url, "bundled")
 
     def test_missing_sums_is_allowed_but_recorded_as_none(self):
         doc = release("v0.5.0")
@@ -194,7 +205,7 @@ class TestEvaluateRelease(unittest.TestCase):
 
     def test_asset_entry_with_missing_url_is_skipped(self):
         doc = release("v0.5.0", assets=[
-            {"name": "ds5bridge-0.5.0-win-x64.zip", "size": 5}])
+            {"name": "ds5bridge-setup-0.5.0-bundled.exe", "size": 5}])
         self.assertIsNone(U.evaluate_release(doc, "0.4.0"))
 
     def test_missing_page_url_falls_back_to_the_releases_page(self):
@@ -378,7 +389,7 @@ class TestHelperScript(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 text = f.read()
             self.assertIn("Wait-Process", text)
-            self.assertIn("Move-Item", text)
+            self.assertIn("Start-Process", text)
             self.assertIn("param(", text)
             self.assertNotIn("old junk", text)
 
@@ -393,48 +404,118 @@ class TestHelperScript(unittest.TestCase):
             self.assertNotIn(os.environ.get("USERNAME", "\x00nope"), text)
 
 
-class TestStaging(unittest.TestCase):
-    def _zip(self, path, names):
-        import zipfile
+class TestVerifyDownload(unittest.TestCase):
+    """The decision that lets a downloaded installer run -- with no network:
+    the SHA256SUMS text is an input, the file is a tempfile."""
 
-        with zipfile.ZipFile(path, "w") as z:
-            for n in names:
-                z.writestr(n, b"x" * 10)
+    NAME = "ds5bridge-setup-0.5.0-bundled.exe"
 
-    def _info(self, root, zip_name="ds5bridge-0.5.0-win-x64.zip", sums=True):
-        return U.UpdateInfo(version="0.5.0", tag="v0.5.0",
-                            asset_name=zip_name,
-                            asset_url="file-local", asset_size=0,
-                            sums_url="sums-local" if sums else None,
-                            page_url="p")
+    def _info(self, size=0, sums=True):
+        return U.UpdateInfo(version="0.5.0", tag="v0.5.0", asset_name=self.NAME,
+                            asset_url="u", asset_size=size,
+                            sums_url="s" if sums else None, page_url="p")
 
-    def test_stage_finds_the_inner_folder_and_rejects_impostors(self):
-        # Exercised through the internals rather than the network: build the
-        # zip check_now would have downloaded, then run the unpack+locate step.
-        import shutil
-        import zipfile
+    def _file(self, root, data=b"MZ" + b"x" * 100):
+        path = os.path.join(root, self.NAME)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
 
+    def test_matching_hash_passes_and_keeps_the_file(self):
         with tempfile.TemporaryDirectory() as root:
-            zpath = os.path.join(root, "u.zip")
-            self._zip(zpath, ["ds5bridge/ds5bridge-tray.exe",
-                              "ds5bridge/ds5bridge.exe",
-                              "ds5bridge/_internal/python312.dll"])
-            stage = os.path.join(root, "stage")
-            with zipfile.ZipFile(zpath) as z:
-                z.extractall(stage)
-            inner = os.path.join(stage, "ds5bridge")
-            self.assertTrue(os.path.isfile(
-                os.path.join(inner, "ds5bridge-tray.exe")))
-            shutil.rmtree(stage)
+            path = self._file(root)
+            sums = f"{U.file_sha256(path)}  {self.NAME}\n"
+            U.verify_download(path, self._info(), sums)
+            self.assertTrue(os.path.exists(path))
 
-            # And a zip with no tray exe anywhere is the impostor case that
-            # download_and_stage refuses with UpdateError.
-            self._zip(zpath, ["readme.txt"])
-            with zipfile.ZipFile(zpath) as z:
-                z.extractall(stage)
-            for cand in (os.path.join(stage, "ds5bridge"), stage):
-                self.assertFalse(os.path.isfile(
-                    os.path.join(cand, "ds5bridge-tray.exe")))
+    def test_wrong_hash_deletes_the_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self._file(root)
+            sums = f"{'0' * 64}  {self.NAME}\n"
+            with self.assertRaises(U.UpdateError) as cm:
+                U.verify_download(path, self._info(), sums)
+            self.assertIn("checksum", str(cm.exception))
+            self.assertFalse(os.path.exists(path))
+
+    def test_sums_without_our_line_is_a_refusal_not_a_pass(self):
+        # A SHA256SUMS that lists everything except the installer is a broken
+        # release; it must not degrade to "no hash, so fine".
+        with tempfile.TemporaryDirectory() as root:
+            path = self._file(root)
+            sums = f"{'a' * 64}  ds5bridge-setup-0.5.0.exe\n"
+            with self.assertRaises(U.UpdateError):
+                U.verify_download(path, self._info(), sums)
+            self.assertFalse(os.path.exists(path))
+
+    def test_unreachable_sums_is_a_refusal_too(self):
+        # The release HAS a SHA256SUMS (sums_url set) but it could not be
+        # fetched: download_and_verify passes "" -- and "" names no asset.
+        with tempfile.TemporaryDirectory() as root:
+            path = self._file(root)
+            with self.assertRaises(U.UpdateError):
+                U.verify_download(path, self._info(), "")
+
+    def test_no_sums_at_all_falls_back_to_the_size(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self._file(root)
+            U.verify_download(path, self._info(size=102, sums=False), None)
+            self.assertTrue(os.path.exists(path))
+            with self.assertRaises(U.UpdateError) as cm:
+                U.verify_download(path, self._info(size=999, sums=False), None)
+            self.assertIn("truncated", str(cm.exception))
+            self.assertFalse(os.path.exists(path))
+
+    def test_download_and_verify_uses_the_fetched_sums(self):
+        # End to end through download_and_verify with the two network calls
+        # replaced: the file lands in <root>\updates\ and is checked against
+        # the SHA256SUMS the fake served.
+        with tempfile.TemporaryDirectory() as root:
+            payload = b"installer bytes"
+            import hashlib
+            digest = hashlib.sha256(payload).hexdigest()
+            saved = (U._download, U._http_get)
+
+            def fake_download(url, dest, max_bytes=0):
+                with open(dest, "wb") as f:
+                    f.write(payload)
+            U._download = fake_download
+            U._http_get = lambda url, headers, timeout=None: (
+                200, {}, f"{digest}  {self.NAME}\n".encode())
+            try:
+                path = U.download_and_verify(self._info(), root)
+            finally:
+                U._download, U._http_get = saved
+            self.assertEqual(path, os.path.join(root, "updates", self.NAME))
+            self.assertTrue(os.path.exists(path))
+
+
+class TestInstallerHandOff(unittest.TestCase):
+    def test_switches_are_the_documented_ones(self):
+        switches, log_path = U.installer_args(r"C:\u\ds5bridge", "0.5.0")
+        for s in ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                  "/COMPONENTS=app", "/MERGETASKS=!restorepoint", "/STARTTRAY=1"):
+            self.assertIn(s, switches)
+        # Never a driver, never a restore point, never a reboot.
+        self.assertFalse(any("usbip" in s or "hidhide" in s for s in switches))
+        self.assertEqual(log_path, os.path.join(r"C:\u\ds5bridge", "updates",
+                                                "install-0.5.0.log"))
+        # No quotes inside any switch: they would not survive the
+        # Python -> powershell.exe -> Start-Process hand-off intact.
+        self.assertFalse(any('"' in s for s in switches))
+
+    def test_helper_runs_the_installer_and_falls_back_to_the_old_tray(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = U.write_helper(root)
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("Wait-Process", text)
+            self.assertIn("Start-Process -FilePath $Setup", text)
+            self.assertIn("/LOG=", text)
+            # A refused install relaunches what is still there.
+            self.assertIn("relaunching the current version", text)
+            self.assertIn("ds5bridge-tray.exe", text)
+            # And nothing of the old zip swap remains.
+            self.assertNotIn("Move-Item", text)
 
 
 if __name__ == "__main__":

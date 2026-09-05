@@ -47,6 +47,19 @@
                                  uninstaller, leftovers -- every PnP call under
                                  a timeout and never killed
         remove-hidhide           run HidHide's MSI uninstall silently
+        hidhide-attach           after a fresh HidHide install: restart the
+                                 HIDClass devnode of every connected Bluetooth
+                                 DualSense (only those -- never a keyboard or
+                                 mouse) so HidHide's class filter joins their
+                                 stacks now, then PROVE it from
+                                 DEVPKEY_Device_Stack; the [reboot] line is
+                                 written only when a pad still lacks it
+        autostart-enable         register the start-at-login task (the same
+                                 scheduled task app/ds5app/autostart.py
+                                 writes: `ds5bridge`, logon of this user,
+                                 RunLevel HighestAvailable, no time limit)
+        autostart-disable        delete that task, and the pre-0.5.0 HKCU
+                                 Run value if it points at this install
         verify-install           the post-install checks
         verify-removed           the post-uninstall checks
 
@@ -71,7 +84,8 @@
 param(
     [Parameter(Mandatory = $true, Position = 0)]
     [ValidateSet('preflight', 'check-busy', 'restore-point', 'stop-app', 'teardown', 'hidhide-clear',
-                 'remove-usbip', 'remove-hidhide', 'verify-install', 'verify-removed')]
+                 'remove-usbip', 'remove-hidhide', 'hidhide-attach', 'autostart-enable', 'autostart-disable',
+                 'verify-install', 'verify-removed')]
     [string]$Verb,
     # Results file (appended). Optional: without it, lines go to stdout only.
     [string]$Out = '',
@@ -116,6 +130,18 @@ $HidHideCliPaths = @(
 # A Bluetooth DualSense's HID devnode, the thing HidHide hides and the thing
 # that must be visible again after an uninstall.
 $BtPadPrefix     = 'HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6'
+# The HIDClass node above it -- the BTHENUM HID service node, where HidHide's
+# class filter actually sits (measured 2026-09-05: its DEVPKEY_Device_Stack
+# reads \Driver\HidHide \Driver\HidBth \Driver\steamxbox \Driver\BthEnum once
+# the filter is attached, and without the first entry when it is not). This
+# is the devnode `hidhide-attach` restarts; restarting it rebuilds the HID\
+# children under it too.
+$BtPadHidNodePrefix = 'BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6'
+$HidHideDriverObject = '\Driver\HidHide'
+# The start-at-login task -- name and shape identical to app/ds5app/autostart.py.
+$AutostartTask   = 'ds5bridge'
+$LegacyRunKey    = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$LegacyRunValue  = 'ds5bridge'
 # The virtual (usbip-attached) pad, as Windows enumerates it. One present
 # means something is still attached, and usbip-win2 must not be removed.
 $VirtualPadPrefix = 'USB\VID_054C&PID_0CE6\'
@@ -295,9 +321,16 @@ function Get-UsbipDevnode {
 }
 
 function Get-BtPads {
+    # The HID collection PDOs (HID\...) of connected Bluetooth DualSenses; when
+    # none is listed -- they re-enumerate for a few seconds after their parent
+    # is restarted, and a fresh install restarts exactly those parents -- the
+    # parents themselves (the BTHENUM HID service nodes, one per pad) stand in,
+    # so the count printed is the number of pads, never a misleading zero.
     try {
-        @(Get-PnpDevice -PresentOnly -Class HIDClass -ErrorAction Stop |
-          Where-Object { $_.InstanceId -like "$BtPadPrefix*" })
+        $kids = @(Get-PnpDevice -PresentOnly -Class HIDClass -ErrorAction Stop |
+                  Where-Object { $_.InstanceId -like "$BtPadPrefix*" })
+        if ($kids.Count -gt 0) { return $kids }
+        return @(Get-BtPadHidNodes)
     } catch { @() }
 }
 
@@ -306,6 +339,63 @@ function Get-VirtualPads {
         @(Get-PnpDevice -PresentOnly -ErrorAction Stop |
           Where-Object { $_.InstanceId -like "$VirtualPadPrefix*" })
     } catch { @() }
+}
+
+function Get-BtPadHidNodes {
+    # The HIDClass nodes of connected Bluetooth DualSenses -- and nothing
+    # else in HIDClass. Keyboards and mice are never restarted by anything
+    # in this file.
+    try {
+        @(Get-PnpDevice -PresentOnly -Class HIDClass -ErrorAction Stop |
+          Where-Object { $_.InstanceId -like "$BtPadHidNodePrefix*" })
+    } catch { @() }
+}
+
+function Test-HidHideInStack([string]$InstanceId) {
+    # $true / $false from DEVPKEY_Device_Stack; $null when it cannot be read.
+    try {
+        $stack = @((Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName 'DEVPKEY_Device_Stack' -ErrorAction Stop).Data)
+        if ($stack.Count -eq 0) { return $null }
+        return [bool]($stack | Where-Object { "$_".Trim() -ieq $HidHideDriverObject })
+    } catch { return $null }
+}
+
+function Report-HidHideFilter([bool]$Restart) {
+    # Is HidHide's filter actually IN the stack of every connected DualSense?
+    # HidHide's class filter joins a HID device's stack only when that stack
+    # is built, so a pad already paired when HidHide was installed carries a
+    # correct hide-list entry that does nothing until the device is restarted
+    # or the PC rebooted (the 2026-09-05 "UI says hidden, games see the pad"
+    # report). With -Restart, the pads that lack it are restarted here --
+    # pnputil under a timeout, never killed -- and checked again; the REBOOT
+    # line is written only for a pad that still lacks it afterwards.
+    $nodes = Get-BtPadHidNodes
+    if ($nodes.Count -eq 0) {
+        Emit INFO 'HidHide filter' "no Bluetooth DualSense connected right now; HidHide joins a controller's device stack when it connects, so no reboot should be needed"
+        return
+    }
+    $missing = @($nodes | Where-Object { (Test-HidHideInStack $_.InstanceId) -eq $false })
+    if ($Restart -and $missing.Count -gt 0) {
+        foreach ($d in $missing) {
+            $r = Run "$env:SystemRoot\System32\pnputil.exe" @('/restart-device', $d.InstanceId) 60 -NoKill
+            if ($r.Code -eq -2) { Emit WARN 'HidHide filter' "pnputil /restart-device $($d.InstanceId) still running after 60 s (pid $($r.Pid)); left running -- do not end it" }
+            elseif ($r.Code -ne 0) { Emit WARN 'HidHide filter' ("could not restart $($d.InstanceId) (pnputil exit $($r.Code)): " + ($r.Out -replace '\s+', ' ').Trim()) }
+        }
+        Start-Sleep -Seconds 2
+        $nodes = Get-BtPadHidNodes
+    }
+    $attached = @($nodes | Where-Object { (Test-HidHideInStack $_.InstanceId) -eq $true })
+    $still = @($nodes | Where-Object { (Test-HidHideInStack $_.InstanceId) -eq $false })
+    $unknown = $nodes.Count - $attached.Count - $still.Count
+    if ($still.Count -eq 0 -and $unknown -eq 0) {
+        Emit PASS 'HidHide filter' ("attached to {0} DualSense device(s), no reboot needed{1}" -f $attached.Count,
+            $(if ($Restart -and $missing.Count -gt 0) { " (restarted $($missing.Count) device(s) to make it so)" } else { '' }))
+    } elseif ($still.Count -eq 0) {
+        Emit WARN 'HidHide filter' "attached to $($attached.Count) DualSense device(s); the stack of $unknown could not be read"
+    } else {
+        Emit REBOOT 'HidHide' ("its filter is not attached to {0} of {1} connected DualSense device(s) ({2}); hide-while-bridged works for them after the next reboot, or after switching the controller off and on" -f
+            $still.Count, $nodes.Count, (($still | ForEach-Object { $_.InstanceId }) -join '; '))
+    }
 }
 
 function Test-MsiexecClient([string]$CommandLine) {
@@ -812,6 +902,113 @@ function Invoke-RemoveHidHide {
     return 0
 }
 
+function Invoke-HidHideAttach {
+    if ((Get-ServiceState $HidHideService) -ne 'RUNNING') {
+        Emit REBOOT 'HidHide' "its service is $(Get-ServiceState $HidHideService); the filter driver activates after the next reboot"
+        return 0
+    }
+    Report-HidHideFilter $true
+    return 0
+}
+
+function Get-AutostartTaskXml([string]$Command, [string]$WorkingDir, [string]$User) {
+    # Byte-for-byte the shape app/ds5app/autostart.py writes (task_xml):
+    # keep the two in step. Element order is the schema's.
+    $esc = { param($s) [System.Security.SecurityElement]::Escape($s) }
+    @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>ds5bridge</Author>
+    <Description>Starts the ds5bridge tray when you log in, with administrator rights and no prompt. Written by ds5bridge (the tray menu's "Start at login" switch, or its installer); ds5bridge removes it when that switch is turned off or it is uninstalled.</Description>
+    <URI>\$AutostartTask</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>$(& $esc $User)</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$(& $esc $User)</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>$(& $esc $Command)</Command>
+      <WorkingDirectory>$(& $esc $WorkingDir)</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"@
+}
+
+function Remove-LegacyRunValue {
+    # The pre-0.5.0 HKCU Run entry. Windows silently refuses to start an
+    # elevated program from it, so it is dead weight next to the task.
+    try { $run = (Get-ItemProperty -Path $LegacyRunKey -Name $LegacyRunValue -ErrorAction SilentlyContinue).$LegacyRunValue } catch { $run = $null }
+    if (-not $run) { return }
+    if ("$run".IndexOf($InstallRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or "$run" -match 'ds5bridge') {
+        Remove-ItemProperty -Path $LegacyRunKey -Name $LegacyRunValue -ErrorAction SilentlyContinue
+        Emit PASS 'start-at-login' 'old Run-key entry removed (the task replaces it)'
+    } else {
+        Emit INFO 'start-at-login' "a Run-key entry named '$LegacyRunValue' points elsewhere ($run); left alone"
+    }
+}
+
+function Invoke-AutostartEnable {
+    $tray = Join-Path $AppDir 'ds5bridge-tray.exe'
+    if (-not (Test-Path $tray)) { Emit WARN 'start-at-login' "not registered: $tray is missing"; return 0 }
+    $user = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
+    $xml = Join-Path $env:TEMP ('ds5bridge-task-' + [IO.Path]::GetRandomFileName() + '.xml')
+    try {
+        [IO.File]::WriteAllText($xml, (Get-AutostartTaskXml $tray $AppDir $user), [Text.Encoding]::Unicode)
+        $r = Run "$env:SystemRoot\System32\schtasks.exe" @('/Create', '/TN', $AutostartTask, '/XML', $xml, '/F') 60
+        if ($r.Code -eq 0) {
+            Emit PASS 'start-at-login' "scheduled task '$AutostartTask' registered (at logon of $user, highest privileges, no prompt)"
+            Remove-LegacyRunValue
+        } else {
+            Emit WARN 'start-at-login' ("could not register the task (schtasks exit $($r.Code)): " + ($r.Out -replace '\s+', ' ').Trim() + ". The tray menu's 'Start at login' switch can do it later")
+        }
+    } finally { Remove-Item $xml -Force -ErrorAction SilentlyContinue }
+    return 0
+}
+
+function Invoke-AutostartDisable {
+    $q = Run "$env:SystemRoot\System32\schtasks.exe" @('/Query', '/TN', $AutostartTask) 30
+    if ($q.Code -eq 0) {
+        $r = Run "$env:SystemRoot\System32\schtasks.exe" @('/Delete', '/TN', $AutostartTask, '/F') 30
+        if ($r.Code -eq 0) { Emit PASS 'start-at-login' "scheduled task '$AutostartTask' removed" }
+        else { Emit WARN 'start-at-login' ("could not remove the task '$AutostartTask' (schtasks exit $($r.Code)): " + ($r.Out -replace '\s+', ' ').Trim() + "; delete it in Task Scheduler") }
+    } else {
+        Emit INFO 'start-at-login' 'no scheduled task registered'
+    }
+    Remove-LegacyRunValue
+    return 0
+}
+
 function Invoke-VerifyInstall {
     Repair-OrphanHidHideFilter
     # usbip-win2
@@ -839,7 +1036,13 @@ function Invoke-VerifyInstall {
     if ($cli) {
         $v = (Run $cli @('--version') 15).Out.Trim()
         Emit PASS 'HidHideCLI.exe' "$v ($cli)"
-        if ($st -eq 'RUNNING') { Emit PASS "service $HidHideService" 'running' }
+        if ($st -eq 'RUNNING') {
+            Emit PASS "service $HidHideService" 'running'
+            # Running is not attached: the stack of each connected pad is
+            # the proof (no restart here; hidhide-attach did that when the
+            # driver was installed in this run).
+            Report-HidHideFilter $false
+        }
         else {
             Emit WARN "service $HidHideService" "$st -- the filter driver activates after a reboot"
             Emit REBOOT 'HidHide' 'its filter driver activates after the next reboot; hide-while-bridged works from then on'
@@ -861,7 +1064,7 @@ function Invoke-VerifyInstall {
         Emit $(if ($ExpectApp) { 'FAIL' } else { 'INFO' }) 'ds5bridge.exe' "not at $app"
     }
     $pads = Get-BtPads
-    Emit INFO 'Bluetooth DualSense' "$($pads.Count) HID devnode(s) present now"
+    Emit INFO 'Bluetooth DualSense' "$($pads.Count) connected right now"
     return $(if ($script:Fails -gt 0) { 1 } else { 0 })
 }
 
@@ -926,7 +1129,7 @@ function Invoke-VerifyRemoved {
     $bad = @($pads | Where-Object { $_.Status -ne 'OK' })
     if ($pads.Count -eq 0) { Emit INFO 'Bluetooth DualSense' 'none connected right now' }
     elseif ($bad.Count -gt 0) { Emit WARN 'Bluetooth DualSense' ("{0} present, {1} not OK: {2}" -f $pads.Count, $bad.Count, (($bad | ForEach-Object { "$($_.InstanceId)=$($_.Status)" }) -join '; ')) }
-    else { Emit PASS 'Bluetooth DualSense' "$($pads.Count) HID devnode(s) present and OK" }
+    else { Emit PASS 'Bluetooth DualSense' "$($pads.Count) present and OK" }
     return $(if ($script:Fails -gt 0) { 1 } else { 0 })
 }
 
@@ -941,6 +1144,9 @@ $rc = switch ($Verb) {
     'hidhide-clear'  { Invoke-HidHideClear }
     'remove-usbip'   { Invoke-RemoveUsbip }
     'remove-hidhide' { Invoke-RemoveHidHide }
+    'hidhide-attach' { Invoke-HidHideAttach }
+    'autostart-enable'  { Invoke-AutostartEnable }
+    'autostart-disable' { Invoke-AutostartDisable }
     'verify-install' { Invoke-VerifyInstall }
     'verify-removed' { Invoke-VerifyRemoved }
 }

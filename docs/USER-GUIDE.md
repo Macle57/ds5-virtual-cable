@@ -26,9 +26,11 @@ feature worked immediately, with no configuration.
 | HidHide | optional, also free and signed — only "hide the Bluetooth pad while bridged" needs it; the installer includes it |
 | Charge | keep the controller above ~20 %. Below 15 % it gets unreliable in ways that look like software bugs. |
 
-You do **not** need to turn on test signing or disable Secure Boot. One reboot
-after the install is needed before HidHide's optional hiding works; everything
-else works at once.
+You do **not** need to turn on test signing or disable Secure Boot, and
+normally no reboot after the install either: the installer attaches HidHide
+to the controllers that are connected, and the tray (which runs as
+administrator for exactly this) does the same for a pad it bridges. Only the
+uninstaller needs a reboot, to unload the drivers — and it asks for one.
 
 ---
 
@@ -38,74 +40,69 @@ else works at once.
 
 1. Download **`ds5bridge-setup-<version>-bundled.exe`** from the
    [releases page](https://github.com/Macle57/ds5-virtual-cable/releases/latest).
-   Everything is inside it — the app, usbip-win2 0.9.7.7 and HidHide 1.5.230 —
-   so nothing is downloaded during the install and it works offline.
-   (`ds5bridge-setup-<version>.exe` without `-bundled` is the same installer
-   that downloads the two driver packages from their vendors as it goes,
-   SHA-256-checked: 34 MB smaller, otherwise identical.)
+   It is the only file there besides its checksum. Everything is inside it —
+   the app, usbip-win2 0.9.7.7 and HidHide 1.5.230 — so nothing is downloaded
+   during the install and it works offline.
 2. Run it. Windows will probably show **"Windows protected your PC"**. That is
    SmartScreen reacting to a program it has never seen, not a virus warning —
    nothing here is code-signed yet. Click **More info → Run anyway**.
-3. One UAC prompt (the drivers need it; the app never does). Leave every box
-   ticked. It creates a System Restore point, installs usbip-win2 (**your USB
-   3.0 devices blink out and come back** — do not run it while something is
-   writing to a USB drive), installs HidHide, installs ds5bridge to
-   `%LOCALAPPDATA%\ds5bridge` with a Start Menu shortcut, and ends on an
-   *Installation check* page listing what it verified.
-4. **Reboot once** when it is done: HidHide's driver only starts hiding after
-   the next start of Windows. Everything else works immediately.
+3. One UAC prompt (the drivers need it). Leave every box ticked. It creates a
+   System Restore point, installs usbip-win2 (**your USB 3.0 devices blink out
+   and come back** — do not run it while something is writing to a USB
+   drive), installs HidHide and attaches it to any controller that is
+   connected right now (the controller's device restarts for a moment),
+   installs ds5bridge to `%LOCALAPPDATA%\ds5bridge` with a Start Menu
+   shortcut, and ends on an *Installation check* page listing what it
+   verified — including `HidHide filter -- attached to N DualSense
+   device(s), no reboot needed`.
+4. Tick **Start ds5bridge now** on the last page, or start it from the Start
+   Menu later. The tray runs as administrator (it needs to be able to restart
+   a controller's device), so a manual start is one UAC prompt; **Start at
+   login** in its menu registers a scheduled task that starts it without one.
 
-Re-running the installer on a machine that already has it all only refreshes
-the app. What each checkbox does, the silent switches and the uninstaller's
-options are in [docs/installer.md](installer.md).
+You only need a reboot if the check page says so (a `[reboot]` line, for a
+controller whose device could not be restarted). Everything else works
+immediately. Re-running the installer on a machine that already has it all
+only refreshes the app. What each checkbox does, the silent switches and the
+uninstaller's options are in [docs/installer.md](installer.md).
 
 ### Or: one line of PowerShell
 
-The same steps, scripted, for people who would rather read what runs. Open
-**PowerShell** (Start menu, type "powershell", Enter) and paste:
+The same installer, fetched and started for you. Open **PowerShell** (Start
+menu, type "powershell", Enter) and paste:
 
 ```powershell
 irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1 | iex
 ```
 
-It will ask for administrator rights once (the driver needs them; the app never
-does), and then does, in order, telling you as it goes:
+It looks up the latest release, downloads
+`ds5bridge-setup-<version>-bundled.exe`, refuses to run it unless its SHA-256
+matches the release's `SHA256SUMS`, and then runs it — the same wizard as
+above, with the same single UAC prompt. The script itself never needs
+administrator rights and installs nothing on its own.
 
-1. **Creates a System Restore point.** usbip-win2's own README asks for one
-   before installing, because the next step installs two kernel drivers.
-2. **Installs usbip-win2 0.9.7.7** — exactly that version, verified by
-   checksum. (Its maintainer warns 0.9.7.8 can corrupt memory, so the
-   installer will never "helpfully" take the latest.) **All your USB 3.0 hubs
-   restart during this** — devices blink out and come back; do not run it
-   while something is writing to a USB drive.
-3. **Installs HidHide** — optional; it only powers the "hide the Bluetooth pad
-   while bridged" feature. If this step fails you get a warning and everything
-   else still works. HidHide's driver activates after the next reboot.
-4. **Installs ds5bridge** itself to `%LOCALAPPDATA%\ds5bridge`, verified
-   against the release's published checksums, adds a Start Menu shortcut, and
-   starts the tray.
-
-Safe to re-run any time — each step notices when its work is already done and
-skips itself. If you want to see the plan first without changing anything:
+To see what it would do without changing anything:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/install.ps1))) -DryRun
 ```
 
-Other switches, same pattern: `-NoHidHide` (skip step 3), `-Autostart` (also
-register start-at-login — the tray menu has the same switch), `-NoLaunch`.
+Other switches, same pattern: `-Silent` (no wizard; it prints the installer's
+own check list when done), `-NoHidHide` / `-NoUsbip` (untick a driver),
+`-NoRestorePoint`, `-Autostart` (tick start-at-login — the tray menu has the
+same switch), `-AppVersion v0.5.0` (a particular release).
 
 If you have `usbipd` installed for WSL, the installer will mention it and move
 on: it owns port 3240, ds5bridge deliberately uses 3241, and nothing conflicts.
 
 ### Or: by hand
 
-The steps above are exactly the manual procedure:
-usbip-win2 0.9.7.7 from
-https://github.com/vadimgrn/usbip-win2/releases/tag/v.0.9.7.7 (create a
+The installer's steps are exactly the manual procedure: usbip-win2 0.9.7.7
+from https://github.com/vadimgrn/usbip-win2/releases/tag/v.0.9.7.7 (create a
 restore point first; do **not** use 0.9.7.8), optionally HidHide
-(`winget install Nefarius.HidHide`), then unzip the
-`ds5bridge-*-win-x64.zip` from this project's releases page anywhere you like.
+(`winget install Nefarius.HidHide`), then the app — which is only published
+inside the installer; run it with usbip-win2 and HidHide unticked, or build
+the app yourself (`app\packaging\build.ps1`, see `app/README.md`).
 
 ### What is in the ds5bridge folder
 
@@ -208,7 +205,7 @@ Right-click for the menu:
 | **Hide Bluetooth pads while bridged** | optional, off by default — sets *every* controller at once; see below |
 | **Hide per controller >** | the same choice, one pad at a time |
 | **Rescan for controllers** | look again now instead of waiting for the next sweep |
-| **Start at login** | run the tray when you log in |
+| **Start at login** | run the tray when you log in — a scheduled task named `ds5bridge` that starts it with administrator rights and no prompt |
 | **Quit** | stop everything and put it all back |
 
 Every one of those is remembered, in
@@ -237,13 +234,22 @@ If that is happening to you, ds5bridge can hide the Bluetooth pad from
 everything except itself for as long as the bridge is up. It needs one more
 free, Microsoft-signed driver:
 
-**[HidHide](https://github.com/nefarius/HidHide/releases)** -- download
-`HidHide_1.5.230_x64.exe` from that page, run it, and **reboot**.
+**[HidHide](https://github.com/nefarius/HidHide/releases)** -- the ds5bridge
+installer includes it (re-run the installer with only the HidHide box ticked
+if you skipped it), or download `HidHide_1.5.230_x64.exe` from that page and
+run it.
 
-> **The reboot is not optional.** HidHide filters HID devices by attaching to
-> them as they are created, so until you restart, it has no effect on any
-> device that already existed -- including your controller. Skipping it makes the
-> feature look silently broken.
+> **HidHide only affects devices whose driver stack was built after it was
+> installed.** A controller that was already paired and connected keeps its
+> old stack, and hiding it does nothing -- the hide list says "hidden", every
+> game still sees the pad. That used to mean "reboot, not optional". Now the
+> installer restarts each connected controller's device on the spot and
+> proves the filter is attached (`HidHide filter -- attached to N DualSense
+> device(s)`), and the tray -- which runs as administrator for exactly this --
+> does the same the first time it bridges a pad, and says **"NOT hidden yet"**
+> in its balloon, in the dashboard (`hide_effective`) and in `ds5bridge
+> doctor` (`[warn] filter ...`) whenever the filter is still missing. If you
+> installed HidHide by hand, switch the controller off and on (or reboot).
 
 > ### Uninstall HidHide only with its own uninstaller
 >
@@ -253,7 +259,7 @@ free, Microsoft-signed driver:
 > registry edit from the Windows Recovery Environment to undo. This is HidHide's
 > own documented hazard, not something ds5bridge does.
 
-After the reboot, check it actually works before you rely on it:
+Then check it actually works before you rely on it:
 
 ```
 ds5bridge doctor
@@ -458,9 +464,13 @@ everything below. Details in [docs/installer.md](installer.md).
 irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/uninstall.ps1 | iex
 ```
 
-Either way it quits the tray, detaches the virtual pad, un-hides anything
-HidHide was hiding, removes the app, its shortcut and its start-at-login entry
-— and then **removes the two drivers too**, verifying each removal. The
+(The one-liner runs the same Settings → Apps uninstaller when it is there,
+passing your switches on, so the two are one path.) Either way it quits the
+tray, detaches the virtual pad, un-hides anything HidHide was hiding, removes
+the app, its shortcut and its start-at-login task — and then **removes the
+two drivers too**, verifying each removal, and ends with a bold **"A RESTART
+IS REQUIRED to finish removing the drivers"** followed by Windows' own
+"restart now?" question. The
 exception: a driver that was already on the machine before the installer put
 ds5bridge there is kept (the installer remembers which was which; the script
 says "kept: it was already installed before ..." and `-RemoveUsbip` /
@@ -478,15 +488,17 @@ so neither uninstaller asks Windows to do it:
 1. **Uninstall.** The app and HidHide go at once; usbip-win2's driver is
    disabled and its removal scheduled. "USBip" stays listed in Settings → Apps
    for now — that is expected.
-2. **Reboot.** At your next logon a one-shot task finishes the removal (USB
-   devices blink out and back once; its log is
-   `%ProgramData%\ds5bridge\usbip-removal.txt`).
+2. **Reboot** (the uninstaller offers to; one reboot covers both drivers:
+   HidHide's filter unloads at boot). At your next logon a one-shot task
+   finishes the usbip-win2 removal (USB devices blink out and back once; its
+   log is `%ProgramData%\ds5bridge\usbip-removal.txt`).
 3. **Reboot again before reinstalling.** Windows keeps the two driver service
    names reserved until it boots; the installer refuses to install usbip-win2
    in between and tells you why.
 
-Nothing reboots on its own. Your settings in `%APPDATA%\ds5bridge` are kept
-(add `-PurgeSettings`, or tick the box, to remove them too).
+Nothing reboots without asking you first. Your settings in
+`%APPDATA%\ds5bridge` are kept (add `-PurgeSettings`, or tick the box, to
+remove them too).
 
 ---
 

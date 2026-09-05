@@ -15,13 +15,16 @@ import Toasts from "./components/Toasts";
 export default function App() {
   const connect = useStore((s) => s.connect);
   const toggleSettings = useStore((s) => s.toggleSettings);
+  const setSettingsTab = useStore((s) => s.setSettingsTab);
   const hasPads = useStore((s) => Object.keys(s.state.controllers).length > 0);
   const settingsOpen = useStore((s) => s.settingsOpen);
 
   useEffect(() => {
     connect();
-    // ?settings: open the panel on load (deep link + screenshot tests).
-    if (new URLSearchParams(location.search).has("settings")) toggleSettings(true);
+    // ?settings: open the panel on load (deep link + screenshot tests);
+    // ?settings=chords lands on that tab.
+    const q = new URLSearchParams(location.search);
+    if (q.has("settings")) { const tab = q.get("settings"); tab ? setSettingsTab(tab) : toggleSettings(true); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

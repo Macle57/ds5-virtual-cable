@@ -96,16 +96,34 @@ a_tray = Analysis(
 )
 pyz_tray = PYZ(a_tray.pure)
 
+# THE TRAY RUNS AS ADMINISTRATOR (uac_admin=True -> a requireAdministrator
+# manifest), THE CONSOLE EXE DOES NOT. Two things the tray has to do need an
+# elevated token and cannot be done any other way: restart a device node
+# (`pnputil /restart-device`), which is how a controller whose HID child went
+# phantom after an unhide is brought back, and how HidHide's filter is made to
+# join a pad that was already paired when HidHide was installed (its class
+# filter only attaches to device stacks built after it was registered; see
+# hidhide.ensure_filter). Both used to fail silently from an ordinary token and
+# the program then reported success. One UAC prompt per manual launch is the
+# price; start-at-login goes through a scheduled task with RunLevel Highest
+# (autostart.py) precisely because the Run key cannot start an elevated app.
+#
+# ds5bridge.exe stays asInvoker: `doctor`, `devices`, `unhide` and `run` all
+# work unelevated (unhide simply cannot restart a devnode without it, and says
+# so), and a console tool that demanded UAC to print a diagnosis would be a
+# console tool people cannot paste into an issue.
 if ONEFILE:
     exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="ds5bridge",
               console=True, upx=False, strip=False)
     exe_tray = EXE(pyz_tray, a_tray.scripts, a_tray.binaries, a_tray.datas, [],
-                   name="ds5bridge-tray", console=False, upx=False, strip=False)
+                   name="ds5bridge-tray", console=False, upx=False, strip=False,
+                   uac_admin=True)
 else:
     exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="ds5bridge",
               console=True, upx=False, strip=False)
     exe_tray = EXE(pyz_tray, a_tray.scripts, [], exclude_binaries=True,
-                   name="ds5bridge-tray", console=False, upx=False, strip=False)
+                   name="ds5bridge-tray", console=False, upx=False, strip=False,
+                   uac_admin=True)
     COLLECT(exe, a.binaries, a.datas,
             exe_tray, a_tray.binaries, a_tray.datas,
             strip=False, upx=False, name="ds5bridge")

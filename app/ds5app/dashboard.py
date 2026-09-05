@@ -282,7 +282,9 @@ class DashboardServer:
         `chord_keys` is the button vocabulary a chord binding may use --
         today identical to `chord_buttons` (any chordable button can also BE
         the chord button), but served separately so the two can diverge
-        without a page change.
+        without a page change. `remote_keys` is the same for the remote-mode
+        table (`input.remote.chords`, defaults in `defaults.remote_chords`);
+        both tables also accept `gesture_keys`.
         """
         if self._actions_meta is None:
             registry = ACT.OsActions().registry()
@@ -293,6 +295,12 @@ class DashboardServer:
                     for _, spec in sorted(registry.items())],
                 "chord_buttons": list(K.CHORD_BUTTONS),
                 "chord_keys": list(K.CHORD_BUTTONS),
+                # what the remote-mode table binds: every button but the
+                # (default) arming one -- the chord button is never a remote
+                # binding -- plus the three gestures, in one list the page
+                # renders verbatim
+                "remote_keys": ([b for b in K.CHORD_BUTTONS if b != "ps"]
+                                + list(K.CHORD_GESTURES)),
                 "gesture_keys": list(K.CHORD_GESTURES),
                 # the key vocabulary a user macro may use, engine order
                 "macro_keys": list(ACT.KEY_NAMES),
@@ -300,7 +308,8 @@ class DashboardServer:
                 # OS registry deliberately does not contain
                 "engine_actions": [{"name": n, "doc": d}
                                    for n, d in K.ENGINE_ACTIONS.items()],
-                "defaults": {"chords": dict(K.DEFAULT_CHORDS)},
+                "defaults": {"chords": dict(K.DEFAULT_CHORDS),
+                             "remote_chords": dict(K.DEFAULT_REMOTE_CHORDS)},
             }
         return self._actions_meta
 

@@ -1,6 +1,6 @@
 import { motion } from "framer-motion";
-import { BatteryMedium } from "lucide-react";
-import { useStore, short } from "../lib/store";
+import { BatteryMedium, Keyboard, MousePointer2 } from "lucide-react";
+import { keyboardOpen, remoteMode, short, useRemoteColor, useStore } from "../lib/store";
 import type { Controller } from "../lib/types";
 
 /* One "player card" per controller, PS-style P1/P2 slots. */
@@ -34,6 +34,8 @@ function PlayerTab({ index, serial, c, active, onSelect }:
   { index: number; serial: string; c: Controller; active: boolean; onSelect: () => void }) {
   const t = tone(c);
   const pct = c.telemetry?.decoded?.battery_percent ?? c.battery_percent;
+  const remote = remoteMode(c) === true;
+  const rc = useRemoteColor();
   return (
     <button role="tab" aria-selected={active} onClick={onSelect}
       className={
@@ -55,6 +57,13 @@ function PlayerTab({ index, serial, c, active, onSelect }:
         <span className="mono block text-[10.5px] text-ink-3">{c.label ? short(serial) : c.state ?? "telemetry"}</span>
       </span>
       <span className="ml-1 flex items-center gap-2">
+        {remote && (
+          <span className="display inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10.5px] uppercase tracking-[.12em]"
+                style={{ borderColor: rc, color: rc, background: `color-mix(in oklab, ${rc} 16%, transparent)` }}
+                title="remote mode: this pad is driving the OS">
+            {keyboardOpen(c) ? <Keyboard size={11} /> : <MousePointer2 size={11} />} remote
+          </span>
+        )}
         {pct != null && (
           <span className="flex items-center gap-1 text-[11px] text-ink-2">
             <BatteryMedium size={13} />

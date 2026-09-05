@@ -1076,9 +1076,17 @@ def is_elevated() -> bool:
     Asked before `pnputil` is reached for, not after it fails: unelevated it
     fails with a message about administrator rights, and a failure we could have
     predicted is one we should be explaining to the user instead of surfacing as
-    a mystery. Nothing else this program does needs elevation -- both hiding and
-    unhiding were measured working from a normal process -- so this must never
-    become a requirement, only an opportunity.
+    a mystery.
+
+    Since 0.5.0 the TRAY runs elevated by design (`ds5bridge-tray.exe` carries a
+    requireAdministrator manifest, and start-at-login is a scheduled task with
+    RunLevel Highest for exactly that reason): restarting a devnode is the only
+    fix for both "unhide does not unhide" and "hide does not hide on a fresh
+    install", and neither can be done from an ordinary token. The console
+    `ds5bridge.exe` and a source checkout still run unelevated, and everything
+    here still works without elevation -- hiding and unhiding were measured
+    working from a normal process -- so for THEM this stays an opportunity,
+    never a requirement: the restart is skipped and the message says why.
     """
     if sys.platform != "win32":
         return False
@@ -1127,6 +1135,276 @@ def _pnputil_restart(instance_id: str) -> tuple[int, str]:
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except Exception as e:  # noqa: BLE001
         return (1, str(e))
+
+
+# ---------------------------------------------------------------------------
+# the filter -- is HidHide actually IN this device's stack?
+# ---------------------------------------------------------------------------
+#
+# Reported from a fresh install on a new machine, 2026-09-05: "hide controller"
+# ticked, the tray says the pad is hidden, and every other program still sees
+# it. HidHide's hide list is honoured by a class UPPER FILTER on the HID
+# classes, and a class filter is attached to a device stack when that stack is
+# BUILT -- at device start. A pad that was already paired and connected when
+# HidHide was installed has a stack that was built without it, so its entry in
+# the hide list is correct and does nothing, until the device is restarted or
+# the machine rebooted. Every layer of this module said "hidden" on that
+# machine because every layer was checking the LIST, and the list was right.
+#
+# The list is not the truth; the stack is. `DEVPKEY_Device_Stack` on a devnode
+# is the ordered list of driver objects in its stack. Measured 2026-09-05 on a
+# paired DualSense's HIDClass node under BTHENUM, after HidHide's reboot:
+#
+#     \Driver\HidHide  \Driver\HidBth  \Driver\steamxbox  \Driver\BthEnum
+#
+# and before that reboot the same node reads without the first entry. So a hide
+# is EFFECTIVE only when `\Driver\HidHide` is in the stack of the device the
+# entry names -- or of the HIDClass node it hangs off: HidHide sits where
+# hidclass sits, and a Bluetooth pad's collection PDOs (`HID\...`, what the hide
+# list names) hang under the BTHENUM HID service node that carries the filter.
+# (The pad's other BTHENUM nodes -- `DEV_<mac>` and the non-HID service GUIDs --
+# read `\Driver\BthEnum` alone and are not HID; they are never checked.)
+#
+# When the filter is missing and this process is elevated, `pnputil
+# /restart-device` on that node rebuilds the stack with the filter in it -- the
+# same call that revives a phantom child -- and on the machine where everything
+# is fine the whole thing costs one property read per hide.
+
+#: {540b947e-8b40-45bc-a8a2-6a0b894cbda2}, 14 -- DEVPKEY_Device_Stack, the
+#: driver objects in a devnode's stack, top first. DEVPROP_TYPE_STRING_LIST.
+#: (Not {3ab22e31-...}: that GUID is the DEVPKEY_PciDevice_* set, and asking
+#: it for pid 14 answers CR_NO_SUCH_VALUE on every devnode -- measured
+#: 2026-09-06, the reason the first 0.5.0 build reported every hide as
+#: "unknown".)
+DEVPKEY_Device_Stack = _DEVPROPKEY(
+    _guid(0x540B947E, 0x8B40, 0x45BC,
+          0xA8, 0xA2, 0x6A, 0x0B, 0x89, 0x4C, 0xBD, 0xA2), 14)
+
+#: The driver object name HidHide's filter shows up under. Compared casefolded.
+HIDHIDE_DRIVER_OBJECT = r"\Driver\HidHide"
+
+#: The notes a hide can end with. `hide_note` in `/api/state` and `doctor`
+#: carry exactly one of these (or ""), so the dashboard can say the truth
+#: without knowing anything about device stacks.
+NOTE_FILTER_UNKNOWN = ("could not read the device's driver stack, so whether "
+                       "HidHide's filter is attached is unknown -- if games "
+                       "still see the pad, restart the device or reboot")
+NOTE_FILTER_MISSING = ("HidHide is on the hide list but its filter is not "
+                       "attached to this device -- restart the device or "
+                       "reboot")
+NOTE_FILTER_MISSING_UNELEVATED = (
+    NOTE_FILTER_MISSING + " (run ds5bridge as administrator and it restarts "
+    "the device for you)")
+NOTE_FILTER_STILL_MISSING = ("HidHide is on the hide list but its filter is "
+                             "not attached to this device even after "
+                             "restarting it -- reboot")
+NOTE_FILTER_RESTARTED = ("HidHide's filter was not attached to this device; "
+                         "ds5bridge restarted the device and it is now")
+
+
+def device_stack(instance_id: str) -> list[str] | None:
+    """DEVPKEY_Device_Stack for a PRESENT devnode, top driver first. None if it
+    cannot be read -- which includes a devnode that is phantom or gone, because
+    a stack that does not exist has nothing attached to it either way."""
+    devinst = _locate_devnode(instance_id, phantom=False)
+    if devinst is None:
+        return None
+    try:
+        cm = _cfgmgr()
+        ptype = ctypes.c_ulong(0)
+        size = ctypes.c_ulong(0)
+        cr = cm.CM_Get_DevNode_PropertyW(devinst, ctypes.byref(DEVPKEY_Device_Stack),
+                                         ctypes.byref(ptype), None,
+                                         ctypes.byref(size), 0)
+        if cr != _CR_BUFFER_SMALL or not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        cr = cm.CM_Get_DevNode_PropertyW(devinst, ctypes.byref(DEVPKEY_Device_Stack),
+                                         ctypes.byref(ptype), buf,
+                                         ctypes.byref(size), 0)
+        if cr != _CR_SUCCESS:
+            return None
+        return unpack_multi_sz(buf.raw[:size.value])
+    except Exception:  # noqa: BLE001
+        log.debug("could not read the device stack of %s", instance_id,
+                  exc_info=True)
+        return None
+
+
+def filter_attached(instance_id: str) -> bool | None:
+    """Is `\\Driver\\HidHide` in this devnode's stack? None = could not be read.
+
+    The one question that decides whether a hide-list entry does anything. A
+    None is a third answer and is never rounded: "unknown" is reported as
+    unknown, because rounding it to True is the exact bug this exists to fix.
+    """
+    stack = device_stack(instance_id)
+    if stack is None:
+        return None
+    want = HIDHIDE_DRIVER_OBJECT.casefold()
+    return any((s or "").strip().casefold() == want for s in stack)
+
+
+def filter_covers(instance_ids, parent_id: str = "") -> bool | None:
+    """Does the filter cover every one of these hide-list entries?
+
+    An entry is covered when HidHide is in its own stack OR in the stack of the
+    devnode it hangs off (`parent_instance_id`; for a Bluetooth pad that is the
+    BTHENUM HID service node the filter actually lives on). `parent_id` is
+    consulted when an entry itself cannot be read -- the record's parent is
+    exactly what is left when the child has gone phantom.
+
+    False if any entry is verifiably uncovered, True if every readable entry is
+    covered, None if nothing could be read at all.
+    """
+    answers = []
+    for iid in [i for i in (instance_ids or []) if i]:
+        got = filter_attached(iid)
+        if got is not True:
+            up = parent_instance_id(iid) or parent_id
+            if up:
+                above = filter_attached(up)
+                if above is not None:
+                    got = above if got is None else (got or above)
+        answers.append(got)
+    if parent_id and all(a is None for a in answers):
+        answers.append(filter_attached(parent_id))
+    known = [a for a in answers if a is not None]
+    if not known:
+        return None
+    return all(known)
+
+
+def ensure_filter(serial: str, instance_ids, parent_id: str = "",
+                  allow_restart: bool = False, log_fn=None,
+                  settle: float = REVIVE_SETTLE_S, *,
+                  covers=None, restart=None, elevated=None, resolve=None,
+                  wait=None) -> dict:
+    """Check that a hide will actually bite, and make it bite if we can.
+
+    -> `{"effective": True|False|None, "note": str, "restarted": bool, "ids": [...]}`
+
+    `effective` is the answer `hide_effective` carries to the dashboard and
+    `doctor`; `note` is the sentence that goes with it (one of the `NOTE_*`
+    constants, or "" when there is nothing to say); `ids` are the instance IDs
+    the caller should hide -- the same ones it passed in unless a restart made
+    the pad re-enumerate under new ones, which is why this runs BEFORE the hide
+    and not after it: an entry written for an ID that a restart then churns is
+    a stale entry with a journal record pointing at nothing.
+
+    The escalation, and where it stops:
+
+        covered                   -> effective True, no note, nothing touched
+        not covered, no restart   -> False + "restart the device or reboot"
+          allowed (a bridge is holding the pad open, or a bare `ds5bridge run`
+          whose own handle a restart would sever)
+        not covered, unelevated   -> False + the same, plus "run as admin"
+        not covered, elevated     -> pnputil /restart-device on the HIDClass
+          node the filter belongs on, wait for the pad to come back, resolve
+          the serial afresh, check again: True + "restarted" or False + "even
+          after restarting it -- reboot"
+        unreadable                -> None + "unknown"; a restart is NEVER made
+          on the strength of a check that could not be performed
+
+    The keyword arguments are the seams the unit tests use to run this decision
+    table with no cfgmgr32, no pnputil and no controller.
+    """
+    say = log_fn or (lambda t: log.info("%s", t))
+    covers = covers or filter_covers
+    restart = restart or _pnputil_restart
+    elevated = elevated or is_elevated
+    resolve = resolve or (lambda s: resolve_serial(s))
+    wait = wait or _wait_visible
+    ids = [i for i in (instance_ids or []) if i]
+    out = {"effective": None, "note": "", "restarted": False, "ids": list(ids)}
+    if not ids:
+        return out
+    try:
+        got = covers(ids, parent_id)
+        if got is True:
+            out["effective"] = True
+            return out
+        if got is None:
+            out["note"] = NOTE_FILTER_UNKNOWN
+            return out
+        # Verifiably not attached. The filter joins the stack when the stack is
+        # rebuilt, and only a devnode restart (or a reboot) rebuilds it.
+        if not allow_restart:
+            out["effective"] = False
+            out["note"] = NOTE_FILTER_MISSING
+            return out
+        if not elevated():
+            out["effective"] = False
+            out["note"] = NOTE_FILTER_MISSING_UNELEVATED
+            return out
+        # The HIDClass node the filter belongs on is the entries' parent (the
+        # BTHENUM HID service node); failing that, each entry itself.
+        targets = []
+        for iid in ids:
+            up = parent_instance_id(iid) or parent_id
+            t = up or iid
+            if t and t not in targets:
+                targets.append(t)
+        say(f"HidHide's filter is not attached to {serial}'s device yet "
+            f"(the pad was enumerated before HidHide was installed); "
+            f"restarting the device so it joins ...")
+        for t in targets:
+            code, text = restart(t)
+            log.debug("pnputil /restart-device %s -> %s %s", t, code,
+                      (text or "").strip())
+        out["restarted"] = True
+        wait(serial, settle)
+        fresh = [i for i in (resolve(serial) or []) if i]
+        if fresh:
+            out["ids"] = fresh
+        again = covers(out["ids"], parent_id)
+        if again is True:
+            out["effective"] = True
+            out["note"] = NOTE_FILTER_RESTARTED
+        elif again is None:
+            out["note"] = NOTE_FILTER_UNKNOWN
+        else:
+            out["effective"] = False
+            out["note"] = NOTE_FILTER_STILL_MISSING
+        return out
+    except Exception:  # noqa: BLE001
+        log.exception("checking HidHide's filter for %s failed", serial)
+        out["note"] = NOTE_FILTER_UNKNOWN
+        return out
+
+
+# -- what the last hide of each serial found ---------------------------------
+#
+# In-process memory, deliberately not on disk: it describes THIS process's
+# last attempt, the manager that pre-hides a pad is the process whose
+# `/api/state` reports it, and a value that outlived a reboot would be wrong
+# after the reboot that fixes it. `unhide_for_bridge` forgets the serial.
+
+_HIDE_STATUS: dict[str, dict] = {}
+
+
+def _set_hide_status(serial: str, effective, note: str) -> None:
+    _HIDE_STATUS[(serial or "").strip().lower()] = {
+        "hide_effective": effective, "hide_note": note or ""}
+
+
+def clear_hide_status(serial: str) -> None:
+    _HIDE_STATUS.pop((serial or "").strip().lower(), None)
+
+
+def hide_status(serial: str) -> dict:
+    """`{"hide_effective": True|False|None, "hide_note": str}` for a serial.
+
+    None / "" when this process has not hidden that controller -- the fields
+    the manager adds to every controller in its snapshot, and the contract
+    with the dashboard: `hide_effective` is null until a hide has been checked,
+    true when HidHide's filter is verifiably in the pad's stack, false when it
+    verifiably is not, and `hide_note` says what to do about it.
+    """
+    got = _HIDE_STATUS.get((serial or "").strip().lower())
+    if not got:
+        return {"hide_effective": None, "hide_note": ""}
+    return dict(got)
 
 
 def pad_visible(serial: str) -> bool | None:
@@ -2099,23 +2377,35 @@ def sweep(hh: "HidHide | None" = None, force: bool = False, log_fn=None) -> int:
 
 
 def hide_for_bridge(serial: str, cli_override: str | None = None,
-                    log_fn=None) -> list[str]:
+                    log_fn=None, allow_restart: bool = False) -> list[str]:
     """Hide one controller for the duration of a bridge. -> the IDs hidden.
 
     Returns [] for every failure, including "HidHide is not installed", and
     never raises. Hiding is a convenience; bridging is the product, and a
     HidHide problem must never be why a bridge fails.
 
-    Ordering, which is the whole of section 7 of the scoping document:
+    Ordering, which is the whole of section 7 of the scoping document plus the
+    2026-09-05 lesson (the filter section above):
 
         1. resolve the serial FRESH (instance IDs are not identity)
         2. whitelist our exes -- before any hide, or the tray blinds itself
-        3. WRITE THE JOURNAL
-        4. hide
-        5. enable the cloak if it is off, recording that we did
+        3. check that HidHide's FILTER is in the pad's device stack, and if it
+           is not and `allow_restart` says we may, restart the device so it is
+           (`ensure_filter`) -- before the hide, so that an ID a restart
+           churns is never the one written to the list and the journal
+        4. WRITE THE JOURNAL
+        5. hide
+        6. enable the cloak if it is off, recording that we did
+        7. remember what step 3 found (`hide_status`) and SAY IT: "hidden"
+           only when the filter is verifiably attached, otherwise the note
 
-    A failure at step 3 aborts before step 4. That is deliberate: hiding
+    A failure at step 4 aborts before step 5. That is deliberate: hiding
     something we failed to record is the one outcome that strands the user.
+
+    `allow_restart` is False by default because a restart severs every open
+    handle on the device: the manager passes True from its pre-hide (no child
+    exists yet), and False when a running bridge already holds the pad. A
+    bare `ds5bridge run` never restarts -- its own handle is on the line.
     """
     say = log_fn or (lambda t: log.info("%s", t))
     serial = (serial or "").strip().lower()
@@ -2159,20 +2449,45 @@ def hide_for_bridge(serial: str, cli_override: str | None = None,
         # of the HID child, and after the hide nothing can look it up any more.
         parent = parent_instance_id(ids[0]) or bt_parent_for_serial(serial)
 
+        # IS THE FILTER ACTUALLY THERE? The list can be right and the hide still
+        # do nothing (the section above). Checked -- and, when allowed and
+        # elevated, repaired by a device restart -- BEFORE the list is written,
+        # so the IDs that go into the list and the journal are the ones the
+        # pad has after any restart. A restart can churn them.
+        check = ensure_filter(serial, ids, parent, allow_restart=allow_restart,
+                              log_fn=say)
+        if check["ids"] and check["ids"] != ids:
+            ids = check["ids"]
+            parent = parent_instance_id(ids[0]) or parent
+
         if not write_record(serial, ids, cloak_enabled_by_us=need_cloak,
                             parent_id=parent):
             return []
 
         if not hh.hide(ids):
             remove_record(serial)
+            _set_hide_status(serial, False,
+                             "HidHide would not accept the hide")
             say("HidHide would not accept the hide; the pad stays visible")
             return []
 
         if need_cloak:
             hh.set_active(True)
 
-        say(f"Bluetooth pad hidden ({len(ids)} HID interface(s)). Games started "
-            f"from now on will not see it.")
+        _set_hide_status(serial, check["effective"], check["note"])
+        n = len(ids)
+        if check["effective"] is True:
+            say(f"Bluetooth pad hidden ({n} HID interface(s)). Games started "
+                f"from now on will not see it."
+                + (f" ({check['note']})" if check["note"] else ""))
+        elif check["effective"] is False:
+            # The old message here was "hidden", and it was a lie on the
+            # machine that produced this code. Say what is true instead.
+            say(f"Bluetooth pad is on HidHide's hide list ({n} HID "
+                f"interface(s)) but is NOT actually hidden yet: {check['note']}")
+        else:
+            say(f"Bluetooth pad hidden ({n} HID interface(s)), unverified: "
+                f"{check['note']}")
         return ids
     except Exception:  # noqa: BLE001
         log.exception("hiding %s failed", serial)
@@ -2216,7 +2531,10 @@ def unhide_for_bridge(serial: str, cli_override: str | None = None,
 
         hh = HidHide.detect(cli_override)
         if rec is None:
-            return _unhide_unrecorded(hh, serial, say, revive=revive)
+            ok = _unhide_unrecorded(hh, serial, say, revive=revive)
+            if ok:
+                clear_hide_status(serial)
+            return ok
 
         ids = [i for i in (rec.get("instance_ids") or []) if i]
         parent = (rec.get("parent_id") or "").strip()
@@ -2261,6 +2579,7 @@ def unhide_for_bridge(serial: str, cli_override: str | None = None,
         # AFTER the verified removal, never before: the record is the only
         # thing that will bring anybody back here if this went wrong.
         remove_record(rec.get("_path") or serial)
+        clear_hide_status(serial)
         if rec.get("cloak_enabled_by_us") and hh is not None and not read_records():
             hh.set_active(False)
         if ids and revive:

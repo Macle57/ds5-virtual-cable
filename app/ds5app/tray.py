@@ -168,6 +168,37 @@ def _icon_image(rgb, battery: int | None, count: int = 0, size: int = 64):
     return img
 
 
+def _is_elevated() -> bool:
+    """Module-level seam over `hidhide.is_elevated`, so tests can pin it."""
+    try:
+        from . import hidhide as HH
+
+        return HH.is_elevated()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _open_url_deelevated(url: str) -> bool:
+    """Open a URL in the default browser WITHOUT passing our token on.
+
+    Elevated on Windows: `explorer.exe <url>` -- the shell opens it with the
+    desktop's ordinary token (`_open_dashboard` says why that matters).
+    Otherwise `webbrowser.open`, which is the right call when there is no
+    elevation to shed. Returns whether a launch was attempted successfully.
+    """
+    if sys.platform == "win32" and _is_elevated():
+        try:
+            import subprocess
+
+            subprocess.Popen(["explorer.exe", url], close_fds=True)
+            return True
+        except Exception:  # noqa: BLE001
+            log.debug("explorer.exe could not open %s", url, exc_info=True)
+    import webbrowser
+
+    return bool(webbrowser.open(url))
+
+
 def short(serial: str) -> str:
     """A bdaddr shortened for a menu. Keeps both ends -- the middle is noise."""
     s = (serial or "").strip()
@@ -324,23 +355,35 @@ class TrayApp:
     # -- settings ----------------------------------------------------------
 
     def _reconcile_autostart(self) -> None:
-        """THE REGISTRY WINS. `config.autostart_on_login` only mirrors it.
+        """THE MACHINE WINS. `config.autostart_on_login` only mirrors it.
 
         Two places can say whether this program starts at login, and they can
-        disagree for reasons that have nothing to do with each other: the Run
-        key is edited by Task Manager's Startup tab, by `autostart.enable()`
+        disagree for reasons that have nothing to do with each other: the
+        scheduled task is edited in Task Scheduler, by `autostart.enable()`
         called directly, by a profile migration, or by a security product
-        clearing it; the config file is edited by hand and copied between
-        machines. Observed straight away in practice -- the Run key was set
-        from outside the tray and `autostart_on_login` stayed false.
+        deleting it; the config file is edited by hand and copied between
+        machines. Observed straight away in practice (with the Run key this
+        used to be) -- the entry was set from outside the tray and
+        `autostart_on_login` stayed false.
 
         Only one can be the answer, and it has to be the mechanism Windows
         actually obeys. So the checkbox reads `autostart.is_enabled()` and this
         drags the config field into line at startup, which keeps the field
         honest for anything that reads it later without making it load-bearing.
+
+        First, though, the migration: an install older than 0.5.0 registered
+        start-at-login as an HKCU Run value, and Windows silently refuses to
+        start an elevated program from there -- which the tray now is. The
+        value is turned into the task once (`autostart.migrate_legacy`), and
+        only when this process can (it is elevated as the tray; a source
+        checkout that is not simply leaves the value alone).
         """
         if not A.available():
             return
+        try:
+            A.migrate_legacy()
+        except Exception:  # noqa: BLE001  -- best effort, and logged there
+            pass
         live = A.is_enabled()
         if live != self.cfg.autostart_on_login:
             self.cfg.autostart_on_login = live
@@ -445,6 +488,17 @@ class TrayApp:
         print(f"  {short(serial)} {kind}: {text}", flush=True)
         if kind in ("warn", "error") and self.icon is not None:
             self._notify(f"ds5bridge -- {short(serial)}", text)
+        elif kind == "battery_low" and self.icon is not None:
+            # Once per threshold per discharge (manager.LowBatteryAlerts);
+            # the label the user gave the pad, else the short serial.
+            self._notify("ds5bridge", f"{self._name_of(serial)} {text}")
+
+    def _name_of(self, serial: str) -> str:
+        try:
+            label = self.cfg.controllers[K.norm_serial(serial)].label
+        except (KeyError, AttributeError):
+            label = ""
+        return (label or "").strip() or short(serial)
 
     def _notify(self, title: str, text: str) -> None:
         try:
@@ -598,6 +652,22 @@ class TrayApp:
         """
         if not self._has_hidhide or not (hid or shown):
             return
+        # THE TRUTH, NOT THE LIST. `hide_effective` is what the manager's hide
+        # found in the pad's device stack (hidhide.ensure_filter): False means
+        # HidHide has the entry and the filter is not attached to that device,
+        # which is exactly the fresh-install case where this balloon used to
+        # say "hidden" while every game still saw the pad.
+        controllers = self.mgr.snapshot().get("controllers", {})
+        ineffective = [(s, (controllers.get(s) or {}).get("hide_note") or "")
+                       for s in hid
+                       if (controllers.get(s) or {}).get("hide_effective") is False]
+        if ineffective:
+            s, note = ineffective[0]
+            more = (f" (and {len(ineffective) - 1} more)"
+                    if len(ineffective) > 1 else "")
+            self._notify("Hide Bluetooth pad -- NOT hidden yet",
+                         f"{short(s)}{more}: {note}")
+            return
         if len(hid) == 1 and not shown:
             # HidHide gates IRP_MJ_CREATE, so an already-open handle is
             # untouched: a game that is running right now keeps seeing the
@@ -722,13 +792,21 @@ class TrayApp:
         through `_work` like everything else slow. The port comes from the
         config so the menu item and the server (which lives elsewhere) can
         never disagree about the address.
+
+        FROM AN ELEVATED TRAY THE BROWSER MUST NOT INHERIT THE TOKEN. The tray
+        runs as administrator since 0.5.0 (see ds5bridge.spec), and a child
+        started with `ShellExecute`/`webbrowser` from an elevated process is
+        elevated too: an administrator Chrome that refuses to start because
+        the ordinary one is running, or worse, one that runs and browses with
+        admin rights. Handing the URL to `explorer.exe` instead makes the
+        desktop shell -- which runs with the user's ordinary token -- open it,
+        so the browser comes up de-elevated. The standard trick, and the same
+        one install.ps1 used to launch the tray.
         """
         url = f"http://127.0.0.1:{getattr(self.cfg, 'dashboard_port', K.DEFAULT_DASHBOARD_PORT)}"
 
         def go():
-            import webbrowser
-
-            if not webbrowser.open(url):
+            if not _open_url_deelevated(url):
                 self._notify("Open dashboard",
                              f"Could not open a browser. The dashboard is at "
                              f"{url}.")
