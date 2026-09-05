@@ -47,8 +47,11 @@ BANNER = r"""
 
 
 def _log(kind: str, text: str) -> None:
+    # Each prefix is a 5-character tag `manager._EVENT_PREFIX` parses back
+    # into the kind -- "mode" carries the chord engine's remote/keyboard
+    # state, which the tray needs even with telemetry off.
     prefix = {"warn": "  !  ", "error": " !!! ", "ready": "  *  ",
-              "battery": "  ~  "}.get(kind, "  -  ")
+              "battery": "  ~  ", "mode": "  #  "}.get(kind, "  -  ")
     print(prefix + text, flush=True)
 
 

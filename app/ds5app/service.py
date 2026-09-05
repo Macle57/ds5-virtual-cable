@@ -533,6 +533,17 @@ class InputConfigWatcher:
 # ---------------------------------------------------------------------------
 
 
+def mode_line(remote: bool, keyboard: bool) -> str:
+    """The chord engine's mode as one status line: `remote on  keyboard closed`.
+
+    Printed by the child under `cli._log`'s "mode" prefix and parsed back by
+    `manager._MODE_RE`; the two must agree, which is why the words live in
+    one function.
+    """
+    return (f"remote {'on' if remote else 'off'}  "
+            f"keyboard {'open' if keyboard else 'closed'}")
+
+
 class BridgeService:
     def __init__(self, serial: str | None = None, port: int = DEFAULT_PORT,
                  host: str = "127.0.0.1", busid: str = "1-1",
@@ -863,14 +874,19 @@ class BridgeService:
         try:
             from . import intercept as I
 
-            self._interceptor = I.attach_to_backend(self._backend,
-                                                    self.input_config,
-                                                    allow_disabled=True)
+            self._interceptor = I.attach_to_backend(
+                self._backend, self.input_config, allow_disabled=True,
+                on_mode=lambda remote, keyboard: self._emit(
+                    "mode", mode_line(remote, keyboard)))
             if self._interceptor is not None and self.input_config.enabled:
                 self._emit("info",
                            f"chord engine armed (chord button: "
                            f"{self.input_config.chord_button}, idle off-timer: "
                            f"{self.input_config.off_timer_minutes:g} min)")
+            if self._interceptor is not None:
+                # The starting state, so a parent's "remote_mode" is False
+                # rather than unknown from the first second.
+                self._emit("mode", mode_line(False, False))
         except Exception:  # noqa: BLE001
             log.exception("the chord engine could not be attached")
             self._interceptor = None
