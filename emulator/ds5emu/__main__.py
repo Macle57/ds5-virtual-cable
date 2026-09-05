@@ -234,6 +234,12 @@ def cmd_serve(args) -> int:
         backend = BridgeBackend(target=args.audio_target,
                                 mic_always_on=args.mic_always_on,
                                 serial=args.bt_serial)
+        if args.capture:
+            from .capture import BlackBox
+
+            backend.blackbox = BlackBox(args.capture)
+            print(f"black-box capture armed: {args.capture}-NN-<reason>.txt "
+                  f"(auto-dumped on link death and at shutdown)", flush=True)
         if args.record_out:
             backend = _wrap_recording(backend, args.record_out)
     elif args.record_out:
@@ -337,6 +343,12 @@ def main(argv=None) -> int:
                         "waiting for the host to SET_INTERFACE alt 1")
     s.add_argument("--tone", type=float, default=1000.0,
                    help="synthetic microphone tone in Hz")
+    s.add_argument("--capture", default=None, metavar="PREFIX",
+                   help="bridge backend: arm the black-box flight recorder. "
+                        "Every host->device request and every Bluetooth write "
+                        "is kept in a bounded ring and dumped to "
+                        "PREFIX-NN-<reason>.txt when the Bluetooth link dies "
+                        "(and once at shutdown). See ds5emu/capture.py")
     s.add_argument("--record-out", default=None, metavar="PATH",
                    help="dump the received speaker stream as raw 4ch s16le 48 kHz")
     s.add_argument("--stats-json", default=None,

@@ -1105,7 +1105,33 @@ Numbered continuing from §8.
   a DualSense is re-paired (`0x09`) and how its firmware is touched. Nothing
   here needs one, so a stray host-issued write must not reach the physical
   controller. Feature *reads* are served from a cache primed at `start()`
-  (`0x05` calibration, `0x20` firmware info — the two Phase 1 proved safe).
+  (`0x05` calibration, `0x20` firmware info — the two Phase 1 proved safe,
+  plus `0x22` BT patch info added in Phase 4c).
+- **Phase 4c carved out ONE exception, and it is an allowlist, not a hole.**
+  Feature report `0x80` is the query half of the factory-diagnostics channel
+  (`0x80` asks, `0x81` answers); without forwarding it there is no way to read
+  Factory Info or the usage/button counters at all. Only the read-only
+  `(deviceId, actionId)` pairs in `bridge.TEST_COMMAND_ALLOWLIST` are
+  translated to Bluetooth (`0x53`-seeded CRC) and forwarded. Every other pair,
+  and every other report id — `0x09`, the `0x84`/`0x85` individual-data
+  channel, every `WRITE_*`/`ERASE_*`/`AGING_*`/bootloader action — keeps the
+  record-and-drop behaviour and is logged at WARNING. See
+  `docs/FINDINGS.md` "Factory-test feature reports 0x80 / 0x81".
+
+  **Verified on hardware 2026-08-25.** The one extrapolated assumption — that
+  `0x80`/`0x81` are 63 data bytes on Bluetooth with the CRC *inside* the buffer
+  at `[59:63]` rather than appended — is now measured and correct. The BT
+  report descriptor declares both as `count=63`, a CRC-signed `0x80` is
+  accepted and answered, and the identical unsigned body is refused. Both the
+  direct probe (`tools/factory_probe.py`) and the same reads through
+  `BridgeBackend` (`tools/bridge_factory_test.py`, 17/17 checks) returned
+  identical data on a live Bluetooth pad, including **four distinct** telemetry
+  pages — the multi-page design risk is closed. A non-allowlisted command
+  (`device 1 action 3`, `WRITE_PCBAID`) was counted, logged at WARNING, never
+  written to the controller, and left `0x81` stalling. One defect was found and
+  fixed in the process: hidapi returns `-1` instead of raising when the HID
+  stack refuses a feature write, so a malformed `0x80` used to look sent;
+  `_bt_send_test_command` now checks the return value.
 
 ## 16.8 Known gaps — be honest about these
 
@@ -1113,11 +1139,19 @@ Numbered continuing from §8.
    request path in-process. The `usbip.exe attach` half was Phase 3a's and is
    not covered by any evidence here. Experiment E1 (isochronous timing under the
    real driver, risk R1) remains the go/no-go.
-2. **Feature reports other than `0x05` and `0x20` STALL.** `get_feature_report`
-   counts the misses in `feature_misses`, so a future run can see exactly which
-   ids a real host asks for and extend the prefetch list. Nothing is read
-   lazily, because a blocking feature read from the request path would stall
-   isochronous traffic.
+2. **Feature reports other than `0x05`, `0x20`, `0x22` and `0x81` STALL.**
+   `get_feature_report` counts the misses in `feature_misses`, so a future run
+   can see exactly which ids a real host asks for and extend the prefetch list.
+   Plain reads are never done lazily, because a blocking feature read from the
+   request path would stall isochronous traffic; `0x81` is the one id that must
+   be, because each GET is a different 56-byte page of the same answer, and it
+   is bounded by `bridge.FEATURE_BT_TIMEOUT` (60 ms) with a STALL fallback.
+   Measured 2026-08-25 on a live BT pad: 56 `0x81` reads, **zero**
+   `feature_bt_timeouts` — but that run had no SetState traffic. The writer
+   thread can sit in the `SETSTATE_MIN_INTERVAL` pacing wait, so a game
+   streaming rumble at 250 Hz could push a `0x81` past 60 ms and cost the host
+   a poll. Not observed, not reproduced, and a STALL is retried — but it is the
+   one path where Phase 4c's read shares a thread with the output pacing.
 3. **`on_uac_control`'s volume mapping is a heuristic** (`_uac_db_to_byte`:
    amplitude = 10^(dB/20), scaled). It cannot be better than `uac.py`'s
    MIN/MAX/RES, which are themselves assumed values — risk R7. Untested against
@@ -1146,6 +1180,13 @@ cd <repo>\emulator
 ..\prototype\.venv\Scripts\python.exe tools\bridge_audio_loopback.py --mode speaker
 ..\prototype\.venv\Scripts\python.exe tools\bridge_audio_loopback.py --mode haptics
 ..\prototype\.venv\Scripts\python.exe tools\bridge_e2e.py --seconds 6
+
+# Phase 4c factory-test channel (added 2026-08-25). The first talks straight to
+# the pad over hidapi, the second runs the same reads through BridgeBackend and
+# prints PASS/FAIL per check. --framing proves the Bluetooth CRC is mandatory.
+..\prototype\.venv\Scripts\python.exe tools\factory_probe.py --framing
+..\prototype\.venv\Scripts\python.exe tools\factory_probe.py --transport USB
+..\prototype\.venv\Scripts\python.exe tools\bridge_factory_test.py --serial <bdaddr>
 ```
 
 Each live tool prints `RESULT: PASS` or `FAIL` and exits accordingly, so they
@@ -1400,10 +1441,11 @@ The concept is proven end to end. What remains is breadth, not feasibility.
 4. Capture the real UAC1 volume ranges with USBPcap on the physical wired unit
    and replace the assumed constants in `uac.py` (risk R7, still open). The
    `on_uac_control` mapping cannot be better than those constants are.
-5. Extend the feature-report prefetch list. Only `0x05` and `0x20` are cached;
-   everything else STALLs and is counted in `feature_misses`. Both sessions
-   recorded **no** misses, so Windows itself asks for nothing else — but a game
-   may.
+5. ~~Extend the feature-report prefetch list.~~ **Done in Phase 4c**: `0x22`
+   (BT patch info) joined `0x05`/`0x20` in the prefetch, and `0x80`/`0x81` are
+   now an allowlisted live channel rather than a stall. Everything else still
+   STALLs and is counted in `feature_misses`; both earlier sessions recorded
+   **no** misses, so Windows itself asks for nothing else — but a game may.
 6. Force a Bluetooth disconnect/reconnect. Implemented, never tested;
    `reconnects` stayed 0 throughout.
 7. Headphone routing is still unverified — nothing has ever been plugged into
@@ -1930,24 +1972,29 @@ and with its scope stated: the adaptive-trigger effect vocabulary in
 `cli.TRIGGER_MODES` is the community naming most commonly traced to that work,
 and no code was taken.
 
-## 19.3 The name is a placeholder — **PhantomCable**
+## 19.3 The name — **DS5 Virtual Dongle**
 
 The project must not carry "DualSense", "PlayStation" or "Sony" in its *name*,
-so it does not. **`PhantomCable` is a placeholder, chosen to be trivially
-renameable**: it appears only in prose — `README.md`, `LICENSE`, `NOTICE`,
-`ATTRIBUTIONS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `.github/` — and in **no**
-Python package, module, import or CLI name. `ds5emu` and `ds5bridge` are
-untouched and should stay untouched; internal identifiers naming the device you
-interoperate with are normal and are not the trademark problem.
+so it does not. The earlier working placeholder has been replaced by
+**`DS5 Virtual Dongle`**, the name now used everywhere. It still lives only in
+prose — `README.md`, `LICENSE`, `NOTICE`, `CONTRIBUTING.md` and this file — and
+in **no** Python package, module, import or CLI name. `ds5emu` and `ds5bridge`
+are untouched and should stay untouched; internal identifiers naming the device
+you interoperate with are normal and are not the trademark problem. Keeping the
+name out of the code is what made this rename a one-liner, and is worth
+preserving.
 
-The rename one-liner is in `CONTRIBUTING.md` §"Renaming the project". After it,
-`git grep -i phantomcable` must come back empty.
+The rename one-liner is in `CONTRIBUTING.md` §"Renaming the project". After any
+future rename, `git grep -i <old name>` must come back empty. Note that
+`build*/` and `dist*/` hold tracked PyInstaller binaries and must be excluded
+from that one-liner.
 
-Shortlist, with GitHub/PyPI collision checks done by search:
+Shortlist as it stood when the name was chosen, with GitHub/PyPI collision
+checks done by search:
 
 | candidate | collisions found | note |
 |---|---|---|
-| **PhantomCable** ← used | none on GitHub/PyPI | `phantomcables.com` is a physical-cable retailer — different field, low risk, but it exists |
+| **DS5 Virtual Dongle** ← used | none on GitHub/PyPI | descriptive; "DS5" is an internal-style abbreviation, not a Sony mark |
 | NullCable | none found | developer-flavoured, cleanest clearance |
 | FauxWire | none found | short, clear |
 | WireFeint | none found | obscure word, ages badly |
@@ -2026,16 +2073,16 @@ Nothing in the code looked version-sensitive, but watch the first CI run.
 
 In order. None of it was done here.
 
-1. **Pick the final name**, run the rename one-liner in `CONTRIBUTING.md`, and
-   verify with `git grep -i phantomcable`. Use the same name for the GitHub
-   repository itself — the working directory is still called
+1. **The name is settled: DS5 Virtual Dongle** (§19.3), and the rename has been
+   run. What remains is to use it for the GitHub repository itself — as the slug
+   `ds5-virtual-dongle`. The working directory is still called
    `ds5-virtual-usb`, which is a fine local name but a poor public one.
 2. **Fix the one placeholder URL**: `OWNER/REPO` in
    `.github/ISSUE_TEMPLATE/config.yml`. GitHub requires an absolute URL there;
    it is the only placeholder of its kind and it is commented in the file.
 3. **Decide on the copyright line** in `LICENSE` and `NOTICE`. It currently
-   reads "PhantomCable contributors", which is valid as-is. Substitute a legal
-   name only if that is wanted.
+   reads "DS5 Virtual Dongle contributors", which is valid as-is. Substitute a
+   legal name only if that is wanted.
 4. **Decide about the git history's author identity.** All 29 commits carry a
    real name and a personal email address, and publishing makes them public.
    That is normal for open source and is entirely the author's call — but it is
@@ -2061,7 +2108,9 @@ Short list, and none of it is a blocker if step 5 above happens first:
   "easy way" paragraph.
 - **`.github/ISSUE_TEMPLATE/config.yml` contains `OWNER/REPO`.** It renders as a
   broken link in the new-issue chooser.
-- **The name `PhantomCable`** should be a decision, not a default.
+- **The GitHub repository slug.** The name `DS5 Virtual Dongle` is settled
+  (§19.3), but the repo is still `ds5-virtual-usb`; publish it as
+  `ds5-virtual-dongle`.
 - Nothing else. There is no secret, no credential, no private path and no
   third-party code in this tree.
 

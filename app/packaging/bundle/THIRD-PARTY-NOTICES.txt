@@ -1,0 +1,87 @@
+ds5bridge bundled installer -- third-party notices
+====================================================
+
+The ds5bridge installer embeds, unmodified and byte-for-byte as published by
+their authors, the official installers of two independent driver packages.
+They are installed as separate products under their own licences; ds5bridge
+neither modifies nor re-signs them. Their original copyright and licence
+notices are reproduced below, as those licences require.
+
+Neither project endorses ds5bridge. Support questions about the bundled
+copies should go to the ds5bridge issue tracker, not to the upstream authors.
+
+
+--------------------------------------------------------------------------------
+usbip-win2 (USBip) 0.9.7.7 -- https://github.com/vadimgrn/usbip-win2
+Embedded file: USBip-0.9.7.7-x64.exe
+SHA-256: 51620FA5F9F8BE5932BC9D786DEEE557CE06D5407A99CAB490DCFAC71F185FEA
+Installer and userspace binaries Authenticode-signed by Cloudyne Systems
+(Scheibling Consulting AB) on behalf of the Open Source Codesigning Initiative
+(https://github.com/OSSign); drivers usbip2_filter.sys and usbip2_ude.sys are
+Microsoft WHLK-certified (signed by "Microsoft Windows Hardware Compatibility
+Publisher").
+--------------------------------------------------------------------------------
+
+BSD 2-Clause License
+
+Copyright (c) 2021-2026, Vadym Hrynchyshyn <vadimgrn@gmail.com>
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+(The usbip-win2 installer additionally installs the Microsoft Visual C++
+Redistributable, which is governed by Microsoft's own licence terms.)
+
+
+--------------------------------------------------------------------------------
+HidHide 1.5.230 -- https://github.com/nefarius/HidHide
+Embedded file: HidHide_1.5.230_x64.exe
+SHA-256: F4BBBCB82E6258641B887C74BC81C4C5F66E4AA811808DFC304347687B7605F6
+Installer and tools Authenticode-signed by Nefarius Software Solutions e.U.;
+driver HidHide.sys is Microsoft attestation-signed ("Microsoft Windows Hardware
+Compatibility Publisher").
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2020 Eric Korff de Gidts
+Copyright (c) 2021-2024 Benjamin Höglinger-Stelzer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+(The LICENSE.rtf shipped inside the HidHide package itself carries only the
+2020 Eric Korff de Gidts line; the repository LICENSE at nefarius/HidHide adds
+the 2021-2024 Benjamin Höglinger-Stelzer line. Both are reproduced here.)

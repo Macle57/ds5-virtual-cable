@@ -176,10 +176,7 @@ def usb02_body(data: bytes) -> bytes:
     """
     if data and data[0] == USB_OUTPUT_ID and len(data) >= SETSTATE_BODY_LEN + 1:
         data = data[1:]
-    body = bytearray(SETSTATE_BODY_LEN)
-    n = min(len(data), SETSTATE_BODY_LEN)
-    body[:n] = data[:n]
-    return bytes(body)
+    return bytes(_setstate_body(data))
 
 
 def usb02_to_bt31(data: bytes, seq: int) -> bytes:
@@ -190,6 +187,118 @@ def usb02_to_bt31(data: bytes, seq: int) -> bytes:
     clobber state the host did not ask to change.
     """
     return P.build_bt_setstate(usb02_body(data), seq)
+
+
+# --- output: merging two unsent SetState bodies ------------------------------
+#
+# WHY THIS EXISTS. `BridgeBackend` coalesces SetState passthroughs so a host
+# re-sending an unchanged body at 250 Hz costs no Bluetooth airtime. Until Phase
+# 4c that coalescing *replaced* the pending body, and that quietly lost data:
+# games set the player-LED bits ONCE, in an early output report, and then stream
+# rumble/trigger reports that do not carry the player-indicator valid flag at
+# all. If the LED report was still pending when the next one arrived it was
+# overwritten and the LEDs never lit. A real wired DualSense drops nothing.
+#
+# Merging is exact rather than a heuristic, because the SetState body is
+# valid-flag driven: the firmware applies a field only when its gating bit is
+# present in validFlag0/1/2 (bytes 0, 1 and 38). So "the controller saw A then
+# B" and "the controller saw merge(A, B)" differ only in fields that BOTH
+# reports claimed -- and there the newer value is the right one.
+#
+# The map below is FINDINGS.md "Output 0x31 ... MERGEABLE", which is
+# `ds5bridge.protocol`'s own constants cross-checked against Linux
+# `hid-playstation` and the tester's OutputPanel.
+
+#: `validFlag2`: bit 1 gates the lightbar-setup byte (Linux hid-playstation,
+#: VERIFIED on hardware 2026-09-03), the tester uses bit 0 for ledBrightness.
+#: Treat either as gating bytes 41/42 -- over-gating is harmless here, because
+#: a gate only ever decides whether an older byte is *carried forward*, never
+#: whether it is applied.
+F2_LIGHTBAR_SETUP_EITHER = P.F2_LIGHTBAR_SETUP | P.F2_LED_BRIGHTNESS
+
+#: (valid-flag byte, bit mask, the body offsets that bit gates).
+FLAG_GATES = (
+    (P.VALID_FLAG0, P.F0_COMPATIBLE_VIBRATION,
+     (P.BC_VIBRATION_RIGHT, P.BC_VIBRATION_LEFT)),
+    (P.VALID_FLAG0, P.F0_RIGHT_TRIGGER_FFB,
+     tuple(range(P.AT_RIGHT_MODE, P.AT_RIGHT_MODE + 11))),
+    (P.VALID_FLAG0, P.F0_LEFT_TRIGGER_FFB,
+     tuple(range(P.AT_LEFT_MODE, P.AT_LEFT_MODE + 11))),
+    (P.VALID_FLAG0, P.F0_HEADPHONE_VOLUME, (P.HEADPHONE_VOLUME,)),
+    (P.VALID_FLAG0, P.F0_SPEAKER_VOLUME, (P.SPEAKER_VOLUME,)),
+    (P.VALID_FLAG0, P.F0_MIC_VOLUME, (P.MIC_VOLUME,)),
+    (P.VALID_FLAG0, P.F0_AUDIO_CONTROL, (P.AUDIO_CONTROL,)),
+    (P.VALID_FLAG1, P.F1_MIC_MUTE_LED, (P.MUTE_LED_CONTROL,)),
+    (P.VALID_FLAG1, P.F1_POWER_SAVE_MUTE, (P.POWER_SAVE_MUTE_CONTROL,)),
+    (P.VALID_FLAG1, P.F1_LIGHTBAR_CONTROL, (P.LED_R, P.LED_G, P.LED_B)),
+    (P.VALID_FLAG1, P.F1_PLAYER_INDICATOR, (P.PLAYER_INDICATOR,)),
+    (P.VALID_FLAG1, P.F1_OVERALL_EFFECT_POWER | P.F1_AUDIO_CONTROL2,
+     (P.HAPTIC_VOLUME, P.AUDIO_CONTROL2)),
+    (P.VALID_FLAG2, F2_LIGHTBAR_SETUP_EITHER,
+     (P.LIGHTBAR_SETUP, P.LED_BRIGHTNESS)),
+)
+
+#: body offset -> the (flag byte, mask) pairs that gate it. Offsets absent from
+#: this map (the three flag bytes themselves and the reserved runs) are not
+#: gated by anything, so the newer report simply wins.
+GATES_BY_OFFSET: dict[int, tuple[tuple[int, int], ...]] = {}
+for _flag_off, _mask, _offsets in FLAG_GATES:
+    for _off in _offsets:
+        GATES_BY_OFFSET[_off] = GATES_BY_OFFSET.get(_off, ()) + ((_flag_off, _mask),)
+del _flag_off, _mask, _offsets, _off
+
+#: The three LED-controlling bits of validFlag1, i.e. the ones "release LEDs"
+#: takes back.
+F1_LED_BITS = P.F1_MIC_MUTE_LED | P.F1_LIGHTBAR_CONTROL | P.F1_PLAYER_INDICATOR
+
+
+def _setstate_body(data: bytes) -> bytearray:
+    body = bytearray(SETSTATE_BODY_LEN)
+    n = min(len(data), SETSTATE_BODY_LEN)
+    body[:n] = data[:n]
+    return body
+
+
+def merge_setstate(older: bytes, newer: bytes) -> bytes:
+    """Fold two *unsent* SetState bodies into one the controller can apply once.
+
+    Both arguments are 47-byte bodies (short input is zero-padded). The result
+    carries every field either report asked for; where both asked for the same
+    field the newer value wins, and where neither did the newer bytes are kept
+    verbatim so reserved/undocumented bytes still track the freshest report.
+
+    `validFlag1` bit 3, "release LEDs", is the one bit that is NOT OR-ed:
+    releasing is an instruction to stop driving the LEDs, so the newest report
+    decides it. If the newer report releases them, the older report's LED
+    control bits are dropped too rather than being resurrected alongside the
+    release -- "apply then release" and "release" have the same end state, and
+    a single report that claims both is undefined behaviour.
+    """
+    a = _setstate_body(older)
+    b = _setstate_body(newer)
+    out = bytearray(b)
+
+    for off, gates in GATES_BY_OFFSET.items():
+        if any(b[flag] & mask for flag, mask in gates):
+            continue                      # the newer report set this field
+        if any(a[flag] & mask for flag, mask in gates):
+            out[off] = a[off]             # only the older one did: carry it
+
+    out[P.VALID_FLAG0] = a[P.VALID_FLAG0] | b[P.VALID_FLAG0]
+    out[P.VALID_FLAG2] = a[P.VALID_FLAG2] | b[P.VALID_FLAG2]
+    f1 = (a[P.VALID_FLAG1] | b[P.VALID_FLAG1]) & ~P.F1_RELEASE_LEDS & 0xFF
+    f1 |= b[P.VALID_FLAG1] & P.F1_RELEASE_LEDS
+    if b[P.VALID_FLAG1] & P.F1_RELEASE_LEDS:
+        f1 = (f1 & ~F1_LED_BITS & 0xFF) | (b[P.VALID_FLAG1] & F1_LED_BITS)
+        out[P.VALID_FLAG2] = b[P.VALID_FLAG2]
+    out[P.VALID_FLAG1] = f1
+    return bytes(out)
+
+
+def setstate_flags(body: bytes) -> tuple[int, int, int]:
+    """(validFlag0, validFlag1, validFlag2) of a SetState body -- for tests/logs."""
+    b = _setstate_body(body)
+    return b[P.VALID_FLAG0], b[P.VALID_FLAG1], b[P.VALID_FLAG2]
 
 
 def bt31_output_body(report: bytes) -> bytes:

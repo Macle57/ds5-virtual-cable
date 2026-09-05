@@ -9,6 +9,15 @@ both present on the machine at the same time. Run 2026-08-24.
 > which any known controller-detection path reads.** Risk R2 is narrowed to a
 > single unproven case: a Sony PC SDK title, which was not available to test.
 
+> **2026-08-31 amendment:** there is now one *deliberate* content difference
+> on the bridge backend: the controller MAC served in feature reports
+> `0x09`/`0x0b` is the real pad's address with the locally-administered bit
+> set, not the address itself. Serving the identical address made libScePad
+> titles treat the physical Bluetooth pad as a redundant twin of the virtual
+> wired one and power it off (feature 0x08 Bluetooth-control, the PS5
+> cable-plug behaviour). A title that displays or logs the MAC shows the
+> derived value. Full story: `docs/wired-gap-findings.md`, symptom 3.
+
 The two instances compared:
 
 | | virtual | physical |
