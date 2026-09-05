@@ -29,11 +29,14 @@ Nothing here is licence-incompatible and nothing has to be removed or rewritten.
 
 **The pre-0.9.7.0 GPL-3.0 detail matters and is worth stating explicitly**: this
 project targets **0.9.7.7**, which is BSD-2-Clause. Nothing in this repository is
-derived from a GPL-era usbip-win2 source file, and no usbip-win2 code, header or
-binary is redistributed here at all — users install it themselves from its own
-releases page. BSD-2-Clause's notice condition attaches to redistribution of
-*their* code, which this project does not do; the credit in `NOTICE` is
-correctness and courtesy, not an obligation being discharged.
+derived from a GPL-era usbip-win2 source file, and no usbip-win2 code or header
+is part of this repository. Since the installer work (2026-09), the *bundled*
+build of the setup exe does redistribute usbip-win2's official installer as a
+binary, unmodified; BSD-2-Clause's notice condition therefore applies to that
+build and is discharged by `app/packaging/bundle/THIRD-PARTY-NOTICES.txt`,
+which the bundled installer ships next to the uninstaller (`NOTICE` describes
+both builds). The download build and `scripts/install.ps1` still fetch it
+from its own releases page and redistribute nothing.
 
 ## 2. Method
 
@@ -290,6 +293,8 @@ oversight, and it cannot be undone after a push without rewriting history.
   reproduced in `NOTICE`. Obligation discharged.
 - The USB descriptors are this project's own hardware measurements, proven by a
   byte-level difference from the nearest published table.
-- No third-party source is vendored, and no driver or binary is redistributed.
+- No third-party source is vendored. The only third-party binaries
+  redistributed are the two vendors' own installers inside the bundled setup
+  exe, unmodified, with their notices (§1).
 - The trademark position is handled by naming (§ `README`) rather than by
   pretending the device is not a Sony device.
