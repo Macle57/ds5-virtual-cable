@@ -276,10 +276,10 @@ git ls-files | ForEach-Object {
 ```
 
 Driving it off `git ls-files` means nothing untracked or ignored is touched,
-and only files that actually contain the name get rewritten. Skip `build*/` and
-`dist*/`: the tracked PyInstaller artefacts there are binaries, and reading them
-with `Get-Content -Raw` is not safe. Then check `git grep -i <old name>` comes
-back empty, and rename the GitHub repository to match.
+and only files that actually contain the name get rewritten (`build*/` and
+`dist*/` are ignored, so no PyInstaller binary is read). Then check
+`git grep -i <old name>` comes back empty, and rename the GitHub repository to
+match.
 
 ## Code of conduct
 
