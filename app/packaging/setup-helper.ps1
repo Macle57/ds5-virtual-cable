@@ -23,12 +23,26 @@
     Verbs:
 
         preflight                what runs before anything is changed:
-                                 check-busy, then the orphan-filter repair
+                                 check-busy, then a usbip-win2 removal that
+                                 was left half-done is finished (see
+                                 Resolve-UsbipRemovalPending), then the
+                                 orphan-filter repair. Exit 4 = "reboot,
+                                 then run this setup again": the installer
+                                 turns that into a restart prompt and
+                                 relaunches itself after the restart.
         check-busy               FAIL if another installer is at work
                                  (msiexec, an Inno setup/uninstall, devnode,
                                  nefconw, pnputil, or an MSI transaction in
                                  progress). Two driver installers at once
                                  wedged PnP on 2026-09-04; never again.
+                                 A busy installer is WAITED for (-BusyWaitSec,
+                                 default 60 s, polling) before that is a FAIL:
+                                 an OEM updater's pnputil at logon or a
+                                 finishing MSI takes seconds, and a person
+                                 should not have to click Back and Next for
+                                 that. A stale Windows Installer InProgress
+                                 flag (no msiexec alive) is removed, not
+                                 obeyed.
         restore-point            System Restore point before the driver install
         stop-app                 quit the running tray/CLI (politely, then not)
         teardown                 stop-app, then repay every debt the bridge
@@ -103,10 +117,20 @@ param(
     # verify-removed: remove-usbip timed out (exit 3); the uninstaller is
     # still at work and a reboot finishes it, so its absence is not a FAIL.
     [switch]$UsbipPendingReboot,
+    # check-busy / preflight: how long to wait for another installer to
+    # finish before giving up on it (0 = look once).
+    [int]$BusyWaitSec = 60,
     # check-busy, tests only: pretend these process names are running
     # (comma-separated, e.g. "devnode,msiexec"), so the guard can be
     # exercised without starting a real installer.
-    [string]$MockBusy = ''
+    [string]$MockBusy = '',
+    # preflight: usbip-win2 is not being installed this run, so a half-done
+    # removal of it is left alone (nothing of it may be touched then).
+    [switch]$NoUsbip,
+    # preflight, tests only: pretend usbip-win2 is in one of the
+    # removal-pending states ('disabled', 'disabled-loaded', 'deleting') so
+    # the installer's restart path can be walked without touching a driver.
+    [string]$MockPending = ''
 )
 
 # Every step is best-effort and reported, never thrown: a half-broken machine
@@ -182,6 +206,10 @@ $UsbipFinishDir  = Join-Path $env:ProgramData 'ds5bridge'
 $UsbipFinishTask = 'ds5bridge finish usbip-win2 removal'
 $UsbipUdeService = 'usbip2_ude'
 $UsbipDevnodeId  = 'ROOT\USB\0000'
+# How long preflight waits for a running logon task (stage B) to finish
+# before giving up on it: the vendor uninstaller plus two pnputil calls, all
+# under their own timeouts, come to less than this.
+$UsbipFinishWaitSec = 480
 
 if (-not $AppDir) { $AppDir = Join-Path $InstallRoot 'app' }
 
@@ -446,15 +474,48 @@ function Get-BusyInstallers {
         if (($base -ieq 'msiexec') -and -not (Test-MsiexecClient $p.CommandLine)) { continue }
         $busy += ('{0} (pid {1})' -f $p.Name, $p.ProcessId)
     }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress') {
-        $busy += 'a Windows Installer transaction (HKLM\...\Installer\InProgress)'
+    $inProgress = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress'
+    if (Test-Path $inProgress) {
+        # The key means "an MSI transaction is open" only while the Windows
+        # Installer service that wrote it is alive. One left behind by a
+        # crashed or killed msiexec survives reboots and makes every MSI
+        # (HidHide's included) fail with 1618 until it is deleted -- which is
+        # what Microsoft's own guidance for that error says to do.
+        $anyMsi = @($procs | Where-Object { $_.Name -ieq 'msiexec.exe' }).Count -gt 0
+        if ($anyMsi) {
+            $busy += 'a Windows Installer transaction (HKLM\...\Installer\InProgress)'
+        } elseif (-not $script:StaleInProgressReported) {
+            $script:StaleInProgressReported = $true
+            try {
+                Remove-Item $inProgress -Recurse -Force -ErrorAction Stop
+                Emit WARN 'Windows Installer' 'a stale "installation in progress" flag was left behind by an earlier installer (no msiexec is running); removed, or every MSI would fail with error 1618'
+            } catch {
+                Emit WARN 'Windows Installer' "a stale 'installation in progress' flag (Installer\InProgress) exists with no msiexec running and could not be removed ($($_.Exception.Message.Trim())); ignored"
+            }
+        }
+    }
+    return $busy
+}
+
+function Wait-NotBusy([int]$TimeoutSec) {
+    # The busy list after waiting up to $TimeoutSec for it to empty (an OEM
+    # updater's pnputil, a finishing MSI: seconds, not minutes). A mock list
+    # never changes, so it is not waited for.
+    $busy = @(Get-BusyInstallers)
+    if ($busy.Count -eq 0 -or $MockBusy -or $TimeoutSec -le 0) { return $busy }
+    Emit INFO 'other installers' ("waiting up to $TimeoutSec s for: " + ($busy -join ', '))
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+        $busy = @(Get-BusyInstallers)
+        if ($busy.Count -eq 0) { Emit PASS 'other installers' 'finished; going on'; break }
     }
     return $busy
 }
 
 function Assert-NotBusy([string]$What) {
     # Returns $true when it is safe to go on. Emits the FAIL line otherwise.
-    $busy = @(Get-BusyInstallers)
+    $busy = @(Wait-NotBusy $BusyWaitSec)
     if ($busy.Count -eq 0) { return $true }
     Emit FAIL $What ("not started: another installer is running -- " + ($busy -join ', ') +
         ". Two driver installers at once can hang Plug and Play. Wait for it to finish and try again")
@@ -520,34 +581,162 @@ function Parse-HidHideList([string]$Text, [string]$Flag) {
 # ---------------------------------------------------------------------------
 
 function Invoke-CheckBusy {
-    $busy = @(Get-BusyInstallers)
+    $busy = @(Wait-NotBusy $BusyWaitSec)
     if ($busy.Count -eq 0) { Emit PASS 'other installers' 'none running'; return 0 }
-    Emit FAIL 'other installers' ("running: " + ($busy -join ', ') +
-        ". Two driver installers at once can hang Plug and Play; wait for it to finish, then run this again")
+    Emit FAIL 'other installers' ("still running after waiting $BusyWaitSec s: " + ($busy -join ', ') +
+        ". Two driver installers at once can hang Plug and Play; let it finish, then click Back and Next to try again")
     return 1
 }
 
+function Resolve-UsbipRemovalPending {
+    # A usbip-win2 removal that was left half-done must not be installed
+    # over (the driver would come back half-alive) -- but neither should the
+    # person be sent away to "reboot and run this again" when the machine
+    # can be put right from here. Returns 0 (nothing pending, or finished
+    # now), 4 (a reboot must come first; the installer offers it and
+    # relaunches itself after it) or 1 (stuck; the FAIL line says on what).
+    #
+    # The states, and what happened on the other machine that made this
+    # necessary (2026-09-06: "setup refuses despite rebooting, and USBip is
+    # not in Settings > Apps any more"): the uninstaller's stage A had
+    # disabled the driver and asked for a reboot; the logon task then ran
+    # stage B, which took the vendor's package and Apps entry out and left
+    # the two service names as DeleteFlag=1 tombstones that only the NEXT
+    # boot clears -- a second reboot nobody had been told about, with the
+    # same refusal in between. Now that refusal is a restart prompt, and
+    # stage B itself runs from here when the logon task did not get to it.
+    $state = Get-UsbipRemovalPending
+    if (-not $state) { return 0 }
+    if ($state -eq 'disabled') {
+        if (Test-UsbipDriverLoaded) {
+            Emit FAIL 'usbip-win2' ("a removal of usbip-win2 is waiting for a reboot: its driver is set not to start, but is still loaded from before. " +
+                "Restart Windows; the removal finishes at logon (log: $UsbipFinishDir\usbip-removal.txt) and this setup then continues on its own")
+            return 4
+        }
+        # Not loaded: this is after the reboot stage A asked for (or the
+        # driver never came up). The logon task may be doing stage B right
+        # now, may be about to, or may be gone (a different user logged in,
+        # the task was refused, the copy of this script was deleted). Do
+        # not run two removals at once: wait for a running task, take over
+        # from one that has not started.
+        $task = $null
+        if (-not $MockPending) { try { $task = Get-ScheduledTask -TaskName $UsbipFinishTask -ErrorAction Stop } catch { } }
+        if ($task -and $task.State -eq 'Running') {
+            Emit INFO 'usbip-win2' "the logon task that finishes its removal is running; waiting up to $UsbipFinishWaitSec s for it"
+            $deadline = (Get-Date).AddSeconds($UsbipFinishWaitSec)
+            while ((Get-Date) -lt $deadline) {
+                Start-Sleep -Seconds 5
+                try { $task = Get-ScheduledTask -TaskName $UsbipFinishTask -ErrorAction Stop } catch { $task = $null }
+                if (-not $task -or $task.State -ne 'Running') { break }
+            }
+            if ($task -and $task.State -eq 'Running') {
+                Emit FAIL 'usbip-win2' "the logon task that finishes its removal ('$UsbipFinishTask') is still running after $UsbipFinishWaitSec s; let it finish (its log: $UsbipFinishDir\usbip-removal.txt), then click Back and Next"
+                return 1
+            }
+            $state = Get-UsbipRemovalPending
+        }
+        if ($state -eq 'disabled') {
+            if ($task) {
+                try { Unregister-ScheduledTask -TaskName $UsbipFinishTask -Confirm:$false -ErrorAction Stop; Emit PASS 'usbip-win2 removal task' 'taken over by this setup' }
+                catch { Emit WARN 'usbip-win2 removal task' "could not be removed ($($_.Exception.Message.Trim())); it is removed again once the removal is done" }
+            }
+            if ($MockPending) { Emit INFO 'usbip-win2' 'mock: stage B skipped'; $state = 'deleting' }
+            else {
+                Emit INFO 'usbip-win2' 'a previous removal was left half-done (driver disabled, not loaded); finishing it now'
+                if ((Invoke-UsbipRemovalStageB -Uninstaller (Get-UsbipUninstaller)) -eq 3) {
+                    Emit FAIL 'usbip-win2' 'a step of its removal is blocked inside Windows (see above); restart Windows, and this setup then continues on its own'
+                    return 4
+                }
+                $state = Get-UsbipRemovalPending
+                if (-not $state) { Emit PASS 'usbip-win2' 'the previous install is gone; a fresh one can go in'; return 0 }
+                if ($state -eq 'disabled') { Emit FAIL 'usbip-win2' 'its disabled driver service could not be removed (see above)'; return 1 }
+            }
+        }
+        if (-not $state) { return 0 }
+    }
+    # 'deleting': the names are reserved until Windows boots. Unless that
+    # boot already happened -- a tombstone older than the last boot is one
+    # the Service Control Manager did not clear, and waits for nothing.
+    if (Remove-StaleUsbipTombstones) { return 0 }
+    Emit FAIL 'usbip-win2' ("the driver services of a previous install are marked for deletion (usbip2_ude / usbip2_filter); Windows lets go of the names only when it boots, " +
+        "and installing before that fails half-way. Restart Windows, and this setup then continues on its own")
+    return 4
+}
+
 function Test-UsbipRemovalPendingFail {
-    # A usbip-win2 removal that is waiting for its reboot must not be
-    # installed over: the driver would come back half-alive.
+    # verify-install's read-only view of the same states: report, never
+    # resolve (that is the preflight's job). $true when one was reported.
     switch (Get-UsbipRemovalPending) {
-        'disabled' {
-            Emit FAIL 'usbip-win2' ("a removal of usbip-win2 is waiting for a reboot (its driver service is disabled). " +
-                "Reboot, let it finish (it runs at logon; log in $UsbipFinishDir\usbip-removal.txt), then run this setup again")
-            return $true
-        }
-        'deleting' {
-            Emit FAIL 'usbip-win2' ("its driver services from a previous install are still marked for deletion (usbip2_ude / usbip2_filter, DeleteFlag=1); " +
-                "Windows lets go of the names only at boot, and installing now would fail half-way. Reboot, then run this setup again")
-            return $true
-        }
+        'disabled' { Emit FAIL 'usbip-win2' 'its driver service is disabled: a removal is waiting for a reboot; restart Windows, then run this setup again'; return $true }
+        'deleting' { Emit FAIL 'usbip-win2' 'its driver services are marked for deletion; restart Windows, then run this setup again'; return $true }
     }
     return $false
 }
 
+function Remove-StaleUsbipTombstones {
+    # $true when every DeleteFlag=1 usbip service key predated the last boot
+    # and is now gone. Never touches a tombstone made since the boot: the
+    # Service Control Manager still holds that one in memory and only a
+    # boot lets the name go.
+    if ($MockPending) { return $false }
+    $boot = $null
+    try { $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { return $false }
+    if (-not $boot) { return $false }
+    $stale = @()
+    foreach ($svc in $UsbipServices) {
+        $key = Join-Path $ServicesKeyRoot $svc
+        if (-not (Test-Path $key)) { continue }
+        if ((Get-ItemProperty $key -ErrorAction SilentlyContinue).DeleteFlag -ne 1) { continue }
+        $written = Get-RegKeyLastWrite $key
+        if (-not $written -or $written -ge $boot) { return $false }
+        $stale += $svc
+    }
+    if ($stale.Count -eq 0) { return $false }
+    $gone = @()
+    foreach ($svc in $stale) {
+        $key = Join-Path $ServicesKeyRoot $svc
+        try { Remove-Item $key -Recurse -Force -ErrorAction Stop; $gone += $svc }
+        catch { Emit WARN "service $svc" "left marked for deletion since before the last boot and could not be removed: $($_.Exception.Message.Trim())" }
+    }
+    if ($gone.Count -eq $stale.Count) {
+        Emit PASS 'usbip-win2' ("service key(s) " + ($gone -join ', ') + " had been marked for deletion since before the last boot and were never cleared; removed")
+        return ((Get-UsbipRemovalPending) -eq '')
+    }
+    return $false
+}
+
+function Get-RegKeyLastWrite([string]$PsPath) {
+    # .NET's RegistryKey has no LastWriteTime; RegQueryInfoKey does. Only
+    # HKLM:\ and HKCU:\ paths (the tests use HKCU).
+    if (-not ('Ds5.Ds5Reg' -as [type])) {
+        Add-Type -Name Ds5Reg -Namespace Ds5 -MemberDefinition @'
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+public static extern int RegQueryInfoKey(IntPtr hKey, System.Text.StringBuilder lpClass, ref uint lpcbClass, IntPtr lpReserved,
+    ref uint lpcSubKeys, ref uint lpcbMaxSubKeyLen, ref uint lpcbMaxClassLen, ref uint lpcValues, ref uint lpcbMaxValueNameLen,
+    ref uint lpcbMaxValueLen, ref uint lpcbSecurityDescriptor, out long lpftLastWriteTime);
+'@ -ErrorAction SilentlyContinue
+    }
+    try {
+        if ($PsPath -match '^HKLM:\\(.*)$') { $hive = [Microsoft.Win32.Registry]::LocalMachine; $rel = $Matches[1] }
+        elseif ($PsPath -match '^HKCU:\\(.*)$') { $hive = [Microsoft.Win32.Registry]::CurrentUser; $rel = $Matches[1] }
+        else { return $null }
+        $k = $hive.OpenSubKey($rel, $false)
+        if (-not $k) { return $null }
+        $z = [uint32]0; $ft = [long]0
+        $rc = [Ds5.Ds5Reg]::RegQueryInfoKey($k.Handle.DangerousGetHandle(), $null, [ref]$z, [IntPtr]::Zero, [ref]$z, [ref]$z, [ref]$z, [ref]$z, [ref]$z, [ref]$z, [ref]$z, [ref]$ft)
+        $k.Close()
+        if ($rc -ne 0) { return $null }
+        return [DateTime]::FromFileTime($ft)
+    } catch { return $null }
+}
+
 function Invoke-Preflight {
+    # Order matters: nothing that touches a driver runs while another
+    # installer is at work, so a busy machine stops here (1) before any
+    # half-done removal is finished. The orphan-filter repair is registry
+    # only and always runs.
     $rc = Invoke-CheckBusy
-    if (Test-UsbipRemovalPendingFail) { $rc = 1 }
+    if ($rc -eq 0 -and -not $NoUsbip) { $rc = Resolve-UsbipRemovalPending }
     Repair-OrphanHidHideFilter
     return $rc
 }
@@ -731,6 +920,7 @@ function Invoke-RemoveUsbip {
 function Test-UsbipDriverLoaded {
     # sc.exe reports RUNNING for a loaded kernel driver; the devnode being
     # started (no problem code) means the same from the PnP side.
+    if ($MockPending) { return ($MockPending -eq 'disabled-loaded') }
     if ((Get-ServiceState $UsbipUdeService) -eq 'RUNNING') { return $true }
     try {
         $d = Get-PnpDevice -InstanceId $UsbipDevnodeId -ErrorAction Stop
@@ -749,6 +939,7 @@ function Get-UsbipRemovalPending {
     #                CreateService for the names still answers 1073 and the
     #                vendor installer's AddService would fail (2026-09-05,
     #                phaseC-09b-createservice-probe.txt).
+    if ($MockPending) { return ($MockPending -replace '-loaded$', '') }
     foreach ($svc in $UsbipServices) {
         $key = Join-Path $ServicesKeyRoot $svc
         if (-not (Test-Path $key)) { continue }
@@ -858,6 +1049,24 @@ function Invoke-UsbipRemovalStageB([string]$Uninstaller) {
         Get-ChildItem $root -ErrorAction SilentlyContinue | Where-Object {
             (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DisplayName -like 'USBip version*'
         } | ForEach-Object { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue; Emit PASS 'usbip-win2 Apps entry' 'removed' }
+    }
+    # The service keys, when the vendor uninstaller was missing or gave up
+    # before its pnputil /delete-driver /uninstall (which is what normally
+    # deletes them). A key left at Start=4 would otherwise keep every later
+    # install refused as "a removal is waiting for a reboot". sc delete on
+    # a driver that is not running deletes the key at once; on one that is
+    # (usbip2_filter sits on the physical USB 3.0 hubs) it leaves the same
+    # DeleteFlag=1 tombstone the vendor uninstaller leaves, cleared at boot.
+    foreach ($svc in $UsbipServices) {
+        $key = Join-Path $ServicesKeyRoot $svc
+        if (-not (Test-Path $key)) { continue }
+        if ((Get-ItemProperty $key -ErrorAction SilentlyContinue).DeleteFlag -eq 1) { continue }
+        $r = Run "$env:SystemRoot\System32\sc.exe" @('delete', $svc) 30
+        if ($r.Code -eq 0) {
+            $after = Get-ServiceState $svc
+            if ($after -eq 'absent') { Emit PASS "service $svc" 'removed' }
+            else { Emit PASS "service $svc" $after; Emit REBOOT 'usbip-win2' "the $svc service name is released at the next boot" }
+        } else { Emit WARN "service $svc" ("sc delete exit $($r.Code): " + ($r.Out -replace '\s+', ' ').Trim()) }
     }
     # The one-shot task and the script copy stage A left behind.
     try {
@@ -1152,6 +1361,8 @@ $rc = switch ($Verb) {
 }
 # 3 (remove-usbip: uninstaller still running, reboot finishes it) is kept
 # distinct from 1 so the caller can verify the rest without expecting usbip
-# gone. A FAIL line always wins.
-if ($script:Fails -gt 0) { $rc = 1 }
+# gone, and 4 (preflight: reboot first, then this setup resumes) is what
+# the installer's restart prompt keys on; both are written together with a
+# FAIL line that names the reason. Any other FAIL line wins.
+if ($script:Fails -gt 0 -and $rc -ne 4) { $rc = 1 }
 exit [int]$rc

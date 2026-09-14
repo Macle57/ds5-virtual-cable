@@ -16,6 +16,15 @@
 ; -- and never leave HidHide registered as a class filter without its
 ; service, which left the machine with no keyboard, mouse or pad.
 ;
+; And one learned on 2026-09-06 on a second machine: a refusal that says
+; "reboot and run this again" is not enough. usbip-win2's removal needs TWO
+; reboots (docs/installer.md), and between them this setup refused with a
+; message the person had already obeyed. So the preflight now finishes a
+; half-done removal itself where it can, waits for a busy installer instead
+; of failing on sight, and when a reboot really must come first it says so
+; with a "restart now" prompt and relaunches itself after the restart
+; (RegisterResume, a RunOnce value pointing at a copy of this exe).
+;
 ; Division of labour: this file is the user interface and the download step.
 ; Everything that looks at or changes the machine -- services, devnodes,
 ; HidHide's lists, the two vendors' uninstallers -- is in setup-helper.ps1,
@@ -122,6 +131,12 @@ AllowNoIcons=yes
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+; Shown under PrepareToInstall's own text when it sets NeedsRestart (the
+; preflight's exit 4), with Inno's yes/no restart radios. Inno never re-runs
+; Setup on its own; RegisterResume below does.
+PrepareToInstallNeedsRestart=After the restart, Setup starts again on its own to finish installing [name]; approve its User Account Control prompt when it does.%n%nWould you like to restart now?
+
 [Types]
 Name: "full"; Description: "Everything (recommended)"
 Name: "custom"; Description: "Custom"; Flags: iscustom
@@ -182,6 +197,8 @@ Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Description: 
 Type: filesandordirs; Name: "{app}\app"
 Type: filesandordirs; Name: "{app}\updates"
 Type: filesandordirs; Name: "{app}\installer"
+; The copy of this setup a restart-and-resume left behind (RegisterResume).
+Type: filesandordirs; Name: "{commonappdata}\ds5bridge\resume"
 
 [Code]
 const
@@ -191,6 +208,11 @@ const
   // already there (0). The uninstaller defaults to removing the former and
   // keeping the latter; a value survives an uninstall that keeps its driver.
   SetupKey = 'SOFTWARE\ds5bridge\Setup';
+  // Where RegisterResume asks Windows to start this setup again after the
+  // restart the preflight found necessary, and the copy of the exe it runs.
+  ResumeRunOnceKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce';
+  ResumeRunOnceValue = 'ds5bridge-setup';
+  ResumeDir = '{commonappdata}\ds5bridge\resume';
 
 var
   // machine state at wizard start
@@ -206,6 +228,7 @@ var
   DownloadPage: TDownloadWizardPage;
   SummaryPage: TOutputMsgMemoWizardPage;
   HelperPath: String;
+  LastFail: String;         // the last FAIL line a helper wrote ('label -- detail')
 
 // ---------------------------------------------------------------------------
 // looking at the machine (the cheap checks the wizard needs before the helper
@@ -246,13 +269,37 @@ begin
       Result := ExpandConstant('{commonpf64}\USBip\usbip.exe');
 end;
 
+// '' when usbip-win2's driver is usable; otherwise why an install found on
+// disk must not be adopted: its service was set not to start (an uninstall's
+// stage A, waiting for its reboot) or is marked for deletion (stage B ran,
+// the name is released at boot). The preflight puts both right (helper:
+// Resolve-UsbipRemovalPending); the wizard only has to want a fresh install.
+function UsbipDriverUnusable(): String;
+var
+  D: Cardinal;
+begin
+  Result := '';
+  if RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Services\usbip2_ude', 'DeleteFlag', D) and (D = 1) then
+    Result := 'service usbip2_ude is marked for deletion'
+  else if RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Services\usbip2_filter', 'DeleteFlag', D) and (D = 1) then
+    Result := 'service usbip2_filter is marked for deletion'
+  else if RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Services\usbip2_ude', 'Start', D) and (D = 4) then
+    Result := 'service usbip2_ude is disabled (a removal waiting for its reboot)';
+end;
+
 function InstalledUsbipVersion(): String;
 var
-  Exe, Txt: String;
+  Exe, Txt, Why: String;
 begin
   Result := '';
   Exe := UsbipExePath();
   if Exe = '' then Exit;
+  Why := UsbipDriverUnusable();
+  if Why <> '' then
+  begin
+    Log('usbip-win2 found at ' + Exe + ' but not counted as installed: ' + Why);
+    Exit;
+  end;
   if RunCapture(Exe, '--version', Txt) = 0 then
     Result := Trim(Txt)
   else
@@ -317,8 +364,12 @@ var
 begin
   ResFile := ExpandConstant('{tmp}\helper-' + Verb + '.txt');
   DeleteFile(ResFile);
+  // /HELPERARGS="..." on the setup command line goes to every helper call:
+  // how the tests walk the refusal and restart paths on a healthy machine
+  // (-MockBusy, -MockPending, -BusyWaitSec). Not for real installs.
   Args := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + HelperPath + '" ' + Verb +
-          ' -Out "' + ResFile + '" -AppDir "' + ExpandConstant('{app}\app') + '" ' + ExtraArgs;
+          ' -Out "' + ResFile + '" -AppDir "' + ExpandConstant('{app}\app') + '" ' + ExtraArgs +
+          ' ' + ExpandConstant('{param:HELPERARGS|}');
   Log('helper: powershell.exe ' + Args);
   RC := -1;
   try
@@ -353,7 +404,7 @@ begin
         Tag := '[reboot]';
       end
       else if Kind = 'PASS' then Tag := '[ok]'
-      else if Kind = 'FAIL' then begin Tag := '[FAIL]'; FailCount := FailCount + 1; end
+      else if Kind = 'FAIL' then begin Tag := '[FAIL]'; FailCount := FailCount + 1; LastFail := Rest; end
       else if Kind = 'WARN' then Tag := '[warn]'
       else Tag := '[' + Lowercase(Kind) + ']';
       AddSummary(Tag + ' ' + Rest);
@@ -372,6 +423,61 @@ begin
   if Progress = ProgressMax then
     Log('downloaded ' + FileName + ' (' + IntToStr(ProgressMax) + ' bytes)');
   Result := True;
+end;
+
+// Ask Windows to run this setup again at the next logon (a RunOnce value,
+// which Windows deletes as it fires), from a copy of the exe under
+// ProgramData: the original may be in a Downloads folder that is cleaned, or
+// on a drive that is not there after the restart. Silent runs are not
+// resumed -- whoever scripted one reruns it, and a window at logon is not
+// what a scripted install expects.
+procedure RegisterResume();
+var
+  Src, Dir, Dst, Cmd: String;
+  RC: Integer;
+begin
+  if WizardSilent then
+  begin
+    Log('resume after restart: not registered in a silent run; run this setup again after the restart');
+    Exit;
+  end;
+  Src := ExpandConstant('{srcexe}');
+  Dir := ExpandConstant(ResumeDir);
+  Dst := AddBackslash(Dir) + ExtractFileName(Src);
+  if CompareText(Src, Dst) <> 0 then
+  begin
+    ForceDirectories(Dir);
+    // FileCopy returns False for the running setup exe (measured with
+    // Inno 6.7.3: no Windows error behind it); cmd's copy does it fine.
+    if not FileCopy(Src, Dst, False) then
+      Exec(ExpandConstant('{cmd}'), '/C copy /Y "' + Src + '" "' + Dst + '"', '', SW_HIDE, ewWaitUntilTerminated, RC);
+    if not FileExists(Dst) then
+    begin
+      Log('resume after restart: could not copy ' + Src + ' to ' + Dst + '; the original path is used');
+      Dst := Src;
+    end;
+  end;
+  Cmd := '"' + Dst + '" /RESUMEAFTERRESTART=1';
+  if RegWriteStringValue(HKLM, ResumeRunOnceKey, ResumeRunOnceValue, Cmd) then
+    Log('resume after restart: registered RunOnce ' + ResumeRunOnceValue + ' = ' + Cmd)
+  else
+    Log('resume after restart: could not write RunOnce ' + ResumeRunOnceValue + '; run this setup again after the restart');
+end;
+
+function InitializeSetup(): Boolean;
+var
+  Dir: String;
+begin
+  Result := True;
+  if ExpandConstant('{param:RESUMEAFTERRESTART|0}') = '1' then
+    Log('resumed after a restart (RunOnce)');
+  // Whatever run registered a relaunch, this run supersedes it: a RunOnce
+  // deletes its value as it fires, this covers a manual rerun before the
+  // restart. The copy it points at is removed once nothing runs from it.
+  RegDeleteValue(HKLM, ResumeRunOnceKey, ResumeRunOnceValue);
+  Dir := ExpandConstant(ResumeDir);
+  if DirExists(Dir) and (Pos(Lowercase(AddBackslash(Dir)), Lowercase(ExpandConstant('{srcexe}'))) = 0) then
+    DelTree(Dir, True, True, True);
 end;
 
 procedure InitializeWizard;
@@ -581,16 +687,36 @@ begin
   ExtractTemporaryFile('{#Helper}');
   HelperPath := ExpandConstant('{tmp}\{#Helper}');
   // Before anything changes: is another installer at work (two driver
-  // installers at once can wedge Plug and Play), and is there an orphaned
-  // HidHide filter entry to repair (the helper does that on its own). A
-  // busy machine stops a driver install here; an app-only run goes on.
-  RC := RunHelper('preflight', '');
+  // installers at once can wedge Plug and Play; the helper waits a minute
+  // for it first), was a usbip-win2 removal left half-done (the helper
+  // finishes it, or says a restart must come first: exit 4), and is there
+  // an orphaned HidHide filter entry to repair (done on its own). A busy
+  // machine stops a driver install here; an app-only run goes on. The
+  // usbip-win2 part is skipped when usbip-win2 is not being installed:
+  // nothing of it may be touched then.
+  LastFail := '';
+  if NeedUsbip then
+    RC := RunHelper('preflight', '')
+  else
+    RC := RunHelper('preflight', '-NoUsbip');
   if (RC <> 0) and (NeedUsbip or NeedHidHide) then
   begin
-    Result := 'A driver cannot be installed right now: either another installer is running on this PC, ' +
-              'or a removal of usbip-win2 is waiting for a reboot (see the setup log for which). ' +
-              'Installing a driver in that state could leave Windows unable to enumerate devices. ' +
-              'Let it finish (reboot if asked), then run this setup again.';
+    if LastFail = '' then LastFail := 'see the setup log';
+    if RC = 4 then
+    begin
+      // The helper's FAIL line says why and that Setup continues after the
+      // restart; RegisterResume makes that true (interactive runs). The
+      // wizard shows this text, then [Messages] PrepareToInstallNeedsRestart
+      // with the restart-now radios; a silent run exits with Inno's code
+      // for "restart required" (or restarts, unless /NORESTART).
+      NeedsRestart := True;
+      Result := 'Windows must restart before the driver can be installed: ' + LastFail;
+      RegisterResume();
+    end
+    else
+      Result := 'A driver cannot be installed right now: ' + LastFail + #13#10#13#10 +
+                'Installing a driver in that state could leave Windows unable to enumerate devices. ' +
+                'Once it is done, click Back, then Next to try again.';
     Exit;
   end;
   // A running tray holds locks on the app dir and, if usbip-win2 is about to
@@ -870,6 +996,9 @@ end;
 function InitializeUninstall(): Boolean;
 begin
   Summary := TStringList.Create;
+  // An install that stopped for a restart and was never resumed must not
+  // pop up after this uninstall's own reboot.
+  RegDeleteValue(HKLM, ResumeRunOnceKey, ResumeRunOnceValue);
   // Defaults: a driver this setup installed goes; one that was already on
   // the machine (adopted, recorded as 0) stays; no record at all (an install
   // older than the bookkeeping, or scripts\install.ps1) counts as ours.

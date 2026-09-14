@@ -108,8 +108,8 @@ Standard Inno Setup switches apply. The ones that matter here:
 | switch | meaning |
 |---|---|
 | `/SILENT` or `/VERYSILENT` | no wizard (`/SILENT` still shows a progress bar). A silent install never starts the tray (see `/STARTTRAY`). |
-| `/NORESTART` | never reboot. **Always pass it in silent mode.** The installer itself never asks Windows to restart, but it is the safe habit with any Inno installer. |
-| `/VERYSILENT /SUPPRESSMSGBOXES` | fully unattended. With plain `/SILENT`, a refusal (another installer running, a usbip-win2 removal waiting for a reboot) is shown as a message box that waits for OK; with these two it goes to the log only (exit code 7). |
+| `/NORESTART` | never reboot. **Always pass it in silent mode.** The installer never restarts after an install, but its preflight can find that a restart must come *first* (a usbip-win2 removal left half-done, see below): interactive runs ask; a silent run without this switch restarts on its own, with it Setup exits with code 8 and must be run again after the restart (a silent run does not relaunch itself). |
+| `/VERYSILENT /SUPPRESSMSGBOXES` | fully unattended. With plain `/SILENT`, a refusal (another installer still running after a minute's wait) is shown as a message box that waits for OK; with these two it goes to the log only (exit code 7; 8 when a restart must come first). |
 | `/COMPONENTS="app,usbip"` | choose the checkboxes; names are `app`, `usbip`, `hidhide` (`app` is always installed, whatever the list says). Without the switch, Inno Setup reuses the selection of the previous run on that machine. |
 | `/TASKS="autostart"` / `/MERGETASKS="!restorepoint"` | tick / untick the two tasks (`restorepoint` is on by default, `autostart` off) |
 | `/STARTTRAY=1` | ds5bridge's own: start the tray at the end of a **silent** run (the installer is elevated, and so is the tray, so no prompt). What the in-app updater passes. Ignored in an interactive run, where the Finish page's checkbox decides. |
@@ -197,14 +197,43 @@ Settings → Apps → USBip → Uninstall (that works once the driver is not
 loaded). Every Plug and Play call in that second half runs under a timeout
 and is never killed; if one blocks, the log says so and asks for a reboot.
 
-The installer refuses to install a driver while such a removal is waiting
-for its reboot (`[FAIL] usbip-win2 -- a removal of usbip-win2 is waiting
-for a reboot ...`), and again right after the removal has run, until the
-next boot (`[FAIL] usbip-win2 -- its driver services from a previous
-install are still marked for deletion ...`): Windows keeps the two service
-names reserved (`DeleteFlag=1`) until it boots, and a reinstall in between
-would fail half-way. So **uninstall → reboot → (removal runs at logon) →
-reboot → reinstall** is the sequence for a fresh usbip-win2. A result
+A driver must not be installed over such a removal (the driver would come
+back half-alive), and Windows keeps the two service names reserved
+(`DeleteFlag=1`) from the moment the removal proper has run until it next
+boots, so a reinstall in between would fail half-way. **The installer
+handles both itself** (helper: `Resolve-UsbipRemovalPending`, run by the
+preflight whenever usbip-win2 is being installed; a usbip-win2 found on disk
+with its driver disabled or marked for deletion counts as *not* installed,
+so the wizard wants a fresh one):
+
+- **Driver disabled, still loaded** — the uninstall's reboot has not
+  happened yet. Setup stops with *Windows must restart before the driver can
+  be installed* and Inno's *restart now?* choice. It registers a relaunch of
+  itself for the next logon (a `RunOnce` value, pointing at a copy of the exe
+  in `%ProgramData%\ds5bridge\resume`), so after the restart it comes back on
+  its own and continues; approve its UAC prompt.
+- **Driver disabled, not loaded** — after that reboot. If the logon task is
+  running the removal, Setup waits for it (up to 8 minutes); if the task
+  never ran (another user logged in, the task was refused), Setup removes
+  the task and does the removal itself, right there. What is left is the two
+  reserved names, so:
+- **Services marked for deletion** — Setup stops with the same restart
+  prompt and relaunches itself after the restart, then installs. A
+  tombstone that is *older than the last boot* (Windows failed to clear it)
+  is deleted instead, no restart.
+
+So **uninstall → reboot → run setup → "restart now" → setup continues on
+its own** is what a person sees when reinstalling a fresh usbip-win2, one
+prompt instead of a refusal they had already obeyed (which is what happened
+on 2026-09-06: *"a removal of usbip-win2 is waiting for a reboot" despite
+rebooting, and USBip gone from Settings > Apps* — that was the second,
+unannounced reboot). Two other refusals of the old preflight are gone with
+it: another installer at work is now *waited for* (a minute, polling; an OEM
+updater's `pnputil` at logon takes seconds) before Setup says so and asks
+for Back, then Next; and a Windows Installer "installation in progress"
+flag left behind by a crashed `msiexec` (it survives reboots and fails every
+MSI with error 1618) is removed when no `msiexec` is alive. Silent runs get
+the exit codes in the table above and never relaunch themselves. A result
 dialog lists what was verified:
 
 ```
