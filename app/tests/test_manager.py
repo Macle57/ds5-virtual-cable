@@ -176,6 +176,9 @@ class _Base(unittest.TestCase):
         # machine than in CI -- and, since every stop repays its hide debt,
         # would have their own controller unhidden by a green test run.
         kw.setdefault("hidden_serials", lambda: [])
+        # Never the real PnP tree either: A and B are the developer's actual
+        # pads, and whether they are switched on must not decide a test.
+        kw.setdefault("devnode_present", lambda s: None)
         kw.setdefault("unhide_serial", lambda s: self.unhidden.append(s))
         # Same reasoning: a disconnect teardown re-owns the real journal
         # record, and a pre-hide would cloak the developer's own controller.
@@ -1223,11 +1226,11 @@ class TestDisconnectKeepsTheCloak(_Base):
     def test_a_kept_cloak_does_not_retry_a_pad_that_is_not_enumerable(self):
         """The journal vouches for presence, not for bridgeability.
 
-        After a keep-cloak teardown the serial stays in the vouched-for union
-        (rule 3 needs that), but a start attempt against a pad that is not
-        enumerable fails -- and `_record_failure` unhides, which would hand the
-        game the raw device the kept cloak exists to withhold. So the start
-        loop only ever starts serials the raw enumeration can see.
+        After a keep-cloak teardown the journal record outlives the bridge,
+        and a start attempt against a pad that is not enumerable fails -- and
+        `_record_failure` unhides, which would hand the game the raw device
+        the kept cloak exists to withhold. So the start loop only ever starts
+        serials the raw enumeration can see, whatever the journal says.
         """
         m = self.make(offline_grace=0.0, retry_after=0.0,
                       hidden_serials=lambda: [A])
@@ -1326,6 +1329,217 @@ class TestKeptCloakRelease(_Base):
         self.assertEqual(self.unhidden, [A],
                          "B's cloak belongs to another process and was "
                          "unhidden anyway")
+
+
+class TestBridgedCountAfterAHiddenPadGoesOff(_Base):
+    """The 2026-09-15 report: "shows 1 out of 2 controllers bridged, even
+    though last controller was connected like yesterday ... it just stays on
+    1/2 like forever, unless I unhide the controller, in that case it updates
+    instantly."
+
+    The offline teardown keeps the cloak (symptom 4), so the journal record
+    outlives the bridge -- and with no child left to say DEGRADED, rule 3's
+    union vouched for the dead pad on every pass from then on. The stale
+    journal is modelled by `hidden_serials` still answering [A] after the
+    teardown, which is exactly what the on-disk journal does.
+    """
+
+    def keep_hidden(self, m, present_after=()):
+        """Bridge hidden A (and whatever else `self.present` lists), then
+        switch A off: offline teardown, cloak kept, journal still says A."""
+        m.start(A)
+        m._bridges[A].go_offline()
+        self.present = list(present_after)     # A is off: not enumerable
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+        self.assertEqual(self.adopted, [A])
+        self.assertEqual(self.unhidden, [])
+
+    def test_the_stuck_state_is_reproduced_without_the_fix(self):
+        """Pin the failure mode: a kept cloak plus a vouching journal used
+        to read as present. The fix is the kept-cloak rule; this test drives
+        the same situation through the OLD arithmetic by clearing the
+        manager's memory of the kept cloak, and expects the bug back."""
+        self.present = [A, B]
+        m = self.make(offline_grace=0.0, hidden_serials=lambda: [A],
+                      hide_bluetooth={A: True, B: True})
+        m.start(B)
+        self.keep_hidden(m, present_after=[B])
+        with m._lock:
+            m._kept_cloaks.clear()             # forget that we saw A go
+        m.poll_once()
+        self.assertEqual(m.snapshot()["aggregate"]["present"], 2,
+                         "the stale journal no longer vouches on its own -- "
+                         "if this fails the rule-3 union has changed shape")
+
+    def test_one_of_two_becomes_one_of_one(self):
+        self.present = [A, B]
+        m = self.make(offline_grace=0.0, hidden_serials=lambda: [A],
+                      hide_bluetooth={A: True, B: True})
+        m.start(B)
+        self.keep_hidden(m, present_after=[B])
+        for _ in range(3):                     # it must STAY right
+            m.poll_once()
+            snap = m.snapshot()
+            agg = snap["aggregate"]
+            self.assertEqual((agg["running"], agg["present"]), (1, 1),
+                             "the tray would read '1 of 2 bridged' for ever")
+            self.assertFalse(snap["controllers"][A]["present"])
+            self.assertTrue(snap["controllers"][B]["present"])
+
+    def test_the_last_pad_going_off_reads_zero_of_zero(self):
+        self.present = [A]
+        m = self.make(offline_grace=0.0, hidden_serials=lambda: [A],
+                      hide_bluetooth={A: True})
+        self.keep_hidden(m)
+        m.poll_once()
+        snap = m.snapshot()
+        self.assertEqual(snap["aggregate"]["present"], 0)
+        self.assertEqual(snap["aggregate"]["running"], 0)
+        # The row survives for the dashboard's "disconnected" tab, with its
+        # settings intact, but it is not counted.
+        self.assertIn(A, snap["controllers"])
+        self.assertFalse(snap["controllers"][A]["present"])
+        self.assertTrue(snap["controllers"][A]["hide_bluetooth"])
+        self.assertEqual(snap["controllers"][A]["state"], M.STOPPED)
+
+    def test_the_count_is_right_within_the_offline_grace(self):
+        """The whole path, on the clock: link dies -> grace -> teardown, and
+        the count is right the moment the teardown lands, not a poll later."""
+        self.present = [A]
+        m = self.make(offline_grace=0.3, gone_grace=0.3,
+                      hidden_serials=lambda: [A], hide_bluetooth={A: True})
+        m.start(A)
+        m._bridges[A].go_offline()
+        self.present = []
+        m.poll_once()                          # inside the grace: still held
+        self.assertEqual(m.snapshot()["aggregate"]["present"], 1)
+        time.sleep(0.35)
+        m.poll_once()                          # grace over: torn down
+        self.assertEqual(m.snapshot()["aggregate"]["present"], 0)
+
+    def test_the_cloak_is_still_kept_and_the_return_is_still_bridged(self):
+        """Fixing the count must not undo symptom 4: the cloak stays on for
+        the pad's return, and the return -- seen by the whitelisted
+        enumeration -- is bridged and pre-hidden as before."""
+        self.present = [A]
+        m = self.make(offline_grace=0.0, retry_after=999.0,
+                      hidden_serials=lambda: [A], hide_bluetooth={A: True})
+        self.keep_hidden(m)
+        m.poll_once()
+        self.assertEqual(self.unhidden, [], "the fix unhid the pad")
+        self.present = [A]                     # switched back on
+        m.poll_once()
+        self.assertIn(A, m._bridges, "the returning pad was not re-bridged")
+        self.assertEqual(self.prehidden, [A, A])
+        snap = m.snapshot()
+        self.assertEqual((snap["aggregate"]["running"],
+                          snap["aggregate"]["present"]), (1, 1))
+        self.assertTrue(snap["controllers"][A]["present"])
+
+    def test_a_healthy_hidden_pad_is_still_vouched_for(self):
+        """Rule 3 must survive: a hidden pad whose child is RUNNING and whose
+        cloak was never kept is present even when enumeration cannot see it
+        (the whitelist is one moved folder away from failing)."""
+        m = self.make(vanish_grace=0.0, hidden_serials=lambda: [A])
+        m.start(A)
+        self.present = []
+        for _ in range(3):
+            m.poll_once()
+        self.assertIn(A, m._bridges)
+        self.assertEqual(m.snapshot()["aggregate"]["present"], 1)
+
+
+class TestDevnodeWitness(_Base):
+    """Rule 7's third witness: the PnP tree, which HidHide does not filter."""
+
+    def test_an_absent_devnode_overrules_the_journal(self):
+        """A journal record with no bridge behind it (a record adopted by a
+        previous incarnation, say) vouches for nothing if Windows says the
+        pad's Bluetooth node is not present."""
+        self.present = []
+        m = self.make(hidden_serials=lambda: [A],
+                      devnode_present=lambda s: False)
+        m.poll_once()
+        self.assertEqual(m.snapshot()["aggregate"]["present"], 0)
+
+    def test_a_present_devnode_vouches_for_a_kept_cloak(self):
+        """The pad came back but enumeration cannot see it (a broken
+        whitelist): it is present -- truthfully -- and unbridged, which is
+        the honest picture rather than a pad that has vanished."""
+        self.present = [A]
+        m = self.make(offline_grace=0.0, hidden_serials=lambda: [A],
+                      hide_bluetooth={A: True},
+                      devnode_present=lambda s: True)
+        m.start(A)
+        m._bridges[A].go_offline()
+        self.present = []
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+        m.poll_once()
+        snap = m.snapshot()
+        self.assertTrue(snap["controllers"][A]["present"])
+        self.assertEqual(snap["aggregate"]["present"], 1)
+        self.assertEqual(snap["aggregate"]["running"], 0)
+
+    def test_unknown_falls_back_to_the_kept_cloak_rule(self):
+        self.present = [A]
+        m = self.make(offline_grace=0.0, hidden_serials=lambda: [A],
+                      devnode_present=lambda s: None)
+        m.start(A)
+        m._bridges[A].go_offline()
+        self.present = []
+        m.poll_once()
+        m.poll_once()
+        self.assertEqual(m.snapshot()["aggregate"]["present"], 0)
+
+    def test_it_is_only_asked_about_hidden_pads_that_did_not_enumerate(self):
+        asked = []
+
+        def witness(serial):
+            asked.append(serial)
+            return None
+        m = self.make(hidden_serials=lambda: [A], devnode_present=witness)
+        m.start(A)
+        m.start(B)
+        m.poll_once()                          # both enumerated
+        self.assertEqual(asked, [])
+        self.present = [B]
+        m.poll_once()                          # A cloaked and not listed
+        self.assertEqual(asked, [A])
+
+    def test_a_witness_that_throws_reads_as_cannot_say(self):
+        def boom(serial):
+            raise OSError("cfgmgr32 is unwell")
+        m = self.make(vanish_grace=0.0, hidden_serials=lambda: [A],
+                      devnode_present=boom)
+        m.start(A)
+        self.present = []
+        m.poll_once()
+        m.poll_once()
+        self.assertIn(A, m._bridges, "an exception in the witness tore down "
+                                     "a healthy hidden pad")
+
+    def test_it_is_the_second_witness_for_a_pad_that_still_enumerates(self):
+        """A DualSense charging on a cable enumerates with its radio dead.
+        The child says DEGRADED, enumeration says present -- and the PnP tree
+        saying the Bluetooth node is gone is the second voice rule 5 needs
+        for the short grace."""
+        self.present = [A]
+        m = self.make(offline_grace=60.0, gone_grace=0.0,
+                      devnode_present=lambda s: False)
+        m.start(A)
+        m._bridges[A].go_offline()
+        m.poll_once()
+        self.assertNotIn(A, m._bridges,
+                         "two witnesses agreed and the long grace was waited")
+
+    def test_the_real_witness_says_nothing_about_a_serial_windows_never_saw(self):
+        # No address to look for, so no BTHENUM node to ask: "cannot say",
+        # never a False that would tear a bridge down. (Not an all-zero
+        # address: Windows really has zero-address BTHENUM service nodes.)
+        self.assertIsNone(M._devnode_present(""))
+        self.assertIsNone(M._devnode_present("not-a-bdaddr"))
 
 
 class TestPrehide(_Base):
