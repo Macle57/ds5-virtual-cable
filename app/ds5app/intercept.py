@@ -58,35 +58,44 @@ INTRINSIC -- what remote mode IS, not configurable:
 
     touchpad 1-finger drag      move the mouse pointer
     touchpad 1-finger tap       left click
-    touchpad 2-finger tap       right click
+    touchpad 1-finger click     left mouse button, held for the press (drag)
     left stick                  move the pointer (rate)
-    right stick                 scroll (rate; scrolling is the sticks' and
-                                triggers' job -- the touchpad does not scroll)
+    right stick                 scroll (rate)
     L2 / R2                     scroll up / down (analog rate)
 
-BOUND -- every button and the three 2-finger gestures resolve through a
-binding table, `self._remote_table` (`_adopt_cfg`):
+BOUND -- every button and every 2-finger gesture (the section "the 2-finger
+touchpad gestures" below) resolves through a binding table, chosen in
+`_adopt_cfg`:
 
-    remote.same_bindings = True    the `input.chords` table. A button or a
-      (default)                    gesture means in remote mode exactly what
+    remote.same_bindings = True    BUTTON rows from the `input.chords` table:
+      (default)                    a button means in remote mode exactly what
                                    it means with the chord button held --
-                                   Cross = play/pause, dpad = volume/track,
-                                   2-finger slide = Alt-Tab -- so there is
-                                   one table to maintain.
-    remote.same_bindings = False   `input.remote.chords`, merged over
-                                   `config.DEFAULT_REMOTE_CHORDS`: the
-                                   classic remote map -- Cross (hold = drag)
-                                   = left mouse button, Circle = Esc, Options
-                                   = Enter, dpad = arrow keys (repeat while
-                                   held), 2-finger slide = Alt-Tab hold.
+                                   Cross = play/pause, dpad = volume/track.
+    remote.same_bindings = False   button rows from `input.remote.chords`
+                                   (merged over `config.DEFAULT_REMOTE_CHORDS`:
+                                   the classic remote map -- Cross (hold =
+                                   drag) = left mouse button, Circle = Esc,
+                                   Options = Enter, dpad = arrow keys).
+    remote.same_gestures           the same choice for the GESTURE rows,
+      (default True)               independently (`self._remote_gestures`).
 
 A bound row fires directly, no chord button held; a row mapped to "none" does
 nothing in remote mode (the intrinsic layer above is never a row). Actions
 whose `ActionSpec.hold` is set are HELD for the press (a mouse button drags,
 Esc stays down); tap actions fire on the press and, if repeatable, again at
-`repeat_ms` while held. Remote-mode button actions carry no haptic ack --
-a click that rumbles is a click people stop making -- gestures ack as they
-do under a chord.
+`repeat_ms` (or a hold macro's own interval) while held; a "toggle" macro
+runs on `tick()` until its next press (`_toggles`). Remote-mode button
+actions carry no haptic ack -- a click that rumbles is a click people stop
+making -- and neither do the 2-finger taps or the continuous gestures; the
+one-shot shell gestures ack as they do under a chord.
+
+Toasts
+------
+`on_toast(category, title, body)` is the engine's voice toward the tray:
+`show_battery` (an engine action), the remote-mode flips and the keyboard
+opening/closing. Queued under the lock, delivered with the thunks; the
+bridge prints it as one child status line and the tray gates it by the
+`notifications` config (docs/input-shortcuts.md, "Notifications").
 
 Chords stay active in remote mode. Feedback on switch: a distinct double
 haptic pulse and the lightbar held at `remote.lightbar_color` (single pulse
