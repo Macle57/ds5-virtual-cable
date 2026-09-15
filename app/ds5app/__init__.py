@@ -11,4 +11,4 @@ Deliberately thin. The tray and the CLI are two front ends over one
 
 from .service import BridgeService, cleanup  # noqa: F401
 
-__version__ = "0.5.0"
+__version__ = "1.0.0"

@@ -180,7 +180,7 @@ jobs:
           | `ds5bridge-setup-VERSION-bundled.exe` | The installer. Also what the app's in-place updater downloads. |
           | `SHA256SUMS` | Its SHA-256. Nothing here is code-signed, so this is how to check the download. |
 
-          Nothing is code-signed yet: Windows SmartScreen shows "Windows protected your PC" on first run (*More info* > *Run anyway*). The tray runs as administrator (one UAC prompt when you start it by hand; none at login). Uninstalling removes the drivers in two halves around **one reboot**; reboot **twice** before reinstalling usbip-win2 (docs/installer.md).
+          Nothing is code-signed yet: Windows SmartScreen shows "Windows protected your PC" on first run (*More info* > *Run anyway*). By default ds5bridge installs as a **Windows service** that bridges your pads at boot, before anyone signs in (or pick "at sign-in" in the installer); the tray icon appears once you are signed in. The app updates itself from these releases automatically (switch it off in the dashboard). Uninstalling removes the drivers in two halves around **one reboot**; reboot **twice** before reinstalling usbip-win2 (docs/installer.md).
 
           '@
           $notes.Replace('VERSION', $ver) | Out-File dist\notes.md -Encoding utf8
