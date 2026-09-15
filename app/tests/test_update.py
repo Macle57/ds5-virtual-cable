@@ -317,7 +317,8 @@ class TestTrayHelpers(unittest.TestCase):
         U.check_now("0.4.0", cache, http_get=http)
         seen = []
         up = U.Updater(current_version="0.4.0", cache_file=cache,
-                       notify=lambda title, text: seen.append((title, text)))
+                       notify=lambda title, text: seen.append((title, text)),
+                       http_get=FakeHttp(ok(release("v0.5.0"))))
         up.check_once()
         up.check_once()
         self.assertEqual(len(seen), 1)
@@ -334,7 +335,8 @@ class TestTrayHelpers(unittest.TestCase):
             raise RuntimeError("balloon burst")
 
         up = U.Updater(current_version="0.4.0", cache_file=cache,
-                       notify=bad_notify)
+                       notify=bad_notify,
+                       http_get=FakeHttp(ok(release("v0.5.0"))))
         self.assertEqual(up.check_once().version, "0.5.0")
 
 
@@ -476,7 +478,7 @@ class TestVerifyDownload(unittest.TestCase):
             digest = hashlib.sha256(payload).hexdigest()
             saved = (U._download, U._http_get)
 
-            def fake_download(url, dest, max_bytes=0):
+            def fake_download(url, dest, max_bytes=0, **kw):
                 with open(dest, "wb") as f:
                     f.write(payload)
             U._download = fake_download
@@ -560,18 +562,49 @@ class TestAutoInstall(unittest.TestCase):
         self.assertFalse(U.Updater(current_version="0.4.0", auto_install=True)
                          .should_auto_install(self.info()))
 
-    def test_installs_once_per_version(self):
+    def test_installs_a_bounded_number_of_times_per_version(self):
+        # Each attempt here "fails" (the install thread would clear
+        # `installing`; the fake never sets it), so the counter is what
+        # limits the retries: AUTO_INSTALL_ATTEMPTS, then no more.
         calls = []
         up = U.Updater(current_version="0.4.0", auto_install=True,
                        install_fn=lambda: calls.append(1))
         info = self.info()
-        self.assertTrue(up.should_auto_install(info))
-        self.assertTrue(up.run_auto_install(info))
-        self.assertEqual(calls, [1])
-        # The daily check finds the same version again: no second attempt.
+        for _ in range(U.AUTO_INSTALL_ATTEMPTS):
+            self.assertTrue(up.should_auto_install(info))
+            self.assertTrue(up.run_auto_install(info))
+        self.assertEqual(calls, [1] * U.AUTO_INSTALL_ATTEMPTS)
         self.assertFalse(up.should_auto_install(info))
         self.assertFalse(up.run_auto_install(info))
-        self.assertEqual(calls, [1])
+        self.assertEqual(len(calls), U.AUTO_INSTALL_ATTEMPTS)
+
+    def test_the_loop_retries_a_failed_install_then_falls_back_to_daily(self):
+        # A stalled download: `install()` clears `installing` on failure.
+        # The loop must try again after `auto_retry_s`, up to the limit, and
+        # keep waiting (not retry) while an attempt is still running.
+        import threading
+        calls = []
+        up = U.Updater(current_version="0.4.0", auto_install=True,
+                       install_fn=lambda: calls.append(1),
+                       auto_delay_s=0.01)
+        up.auto_retry_s = 0.01
+        up.auto_attempts = 3
+        info = self.info()
+        up.check_once = lambda: info
+        saved = (U.STARTUP_DELAY_S, U.CHECK_INTERVAL_S)
+        U.STARTUP_DELAY_S, U.CHECK_INTERVAL_S = 0.0, 3600.0
+        try:
+            t = threading.Thread(target=up._loop, daemon=True)
+            t.start()
+            deadline = __import__("time").time() + 5
+            while len(calls) < 3 and __import__("time").time() < deadline:
+                __import__("time").sleep(0.01)
+            __import__("time").sleep(0.1)
+        finally:
+            up.stop()
+            U.STARTUP_DELAY_S, U.CHECK_INTERVAL_S = saved
+            t.join(2)
+        self.assertEqual(calls, [1, 1, 1])
 
     def test_an_install_already_under_way_is_not_started_twice(self):
         up = U.Updater(current_version="0.4.0", auto_install=True,
@@ -579,13 +612,14 @@ class TestAutoInstall(unittest.TestCase):
         up.installing = True
         self.assertFalse(up.should_auto_install(self.info()))
 
-    def test_a_failing_install_is_reported_and_not_retried(self):
+    def test_a_failing_install_is_reported_and_counts_as_an_attempt(self):
         seen = []
 
         def boom():
             raise RuntimeError("no disk")
         up = U.Updater(current_version="0.4.0", auto_install=True, install_fn=boom,
                        notify=lambda t, b: seen.append((t, b)))
+        up.auto_attempts = 1
         self.assertFalse(up.run_auto_install(self.info()))
         self.assertEqual(seen[0][0], "Update failed")
         self.assertFalse(up.should_auto_install(self.info()))
@@ -608,6 +642,126 @@ class TestAutoInstall(unittest.TestCase):
         finally:
             up.stop()
         self.assertEqual(up.auto_delay_s, U.AUTO_INSTALL_DELAY_S)
+
+
+class _Resp:
+    """A fake urlopen response: `data` served in `chunk` pieces; raises
+    `stall_after` bytes in (a read timeout) when asked to."""
+
+    def __init__(self, data, status=200, stall_after=None):
+        self.data, self.status, self.stall_after = data, status, stall_after
+        self.pos = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n):
+        if self.stall_after is not None and self.pos >= self.stall_after:
+            raise TimeoutError("The read operation timed out")
+        end = min(len(self.data), self.pos + n)
+        if self.stall_after is not None:
+            end = min(end, self.stall_after)
+        chunk = self.data[self.pos:end]
+        self.pos = end
+        return chunk
+
+
+class TestDownloadResume(unittest.TestCase):
+    """`_download` after 2026-09-15: a stalled read is an attempt, not the
+    end; the next attempt asks for the rest with a Range header."""
+
+    BODY = bytes(range(256)) * 400          # 102 400 bytes
+
+    def setUp(self):
+        self.saved = (U._urlopen, U._sleep)
+        self.requests = []
+        U._sleep = lambda s: None
+
+    def tearDown(self):
+        U._urlopen, U._sleep = self.saved
+
+    def _serve(self, plan):
+        """`plan` is a list of callables (req -> _Resp | exception) consumed
+        one per attempt."""
+        def urlopen(req, timeout=None):
+            self.requests.append(req)
+            step = plan.pop(0)
+            out = step(req)
+            if isinstance(out, Exception):
+                raise out
+            return out
+        U._urlopen = urlopen
+
+    def _ranged(self, req):
+        rng = req.get_header("Range")
+        if rng:
+            start = int(rng.split("=")[1].rstrip("-"))
+            return _Resp(self.BODY[start:], status=206)
+        return _Resp(self.BODY)
+
+    def test_a_stall_is_resumed_with_a_range_request(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "x.exe")
+            self._serve([lambda r: _Resp(self.BODY, stall_after=40_000),
+                         self._ranged])
+            U._download("https://example.invalid/x.exe", dest, expected_size=len(self.BODY))
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), self.BODY)
+            self.assertIsNone(self.requests[0].get_header("Range"))
+            self.assertEqual(self.requests[1].get_header("Range"),
+                             "bytes=40000-")
+
+    def test_a_server_that_ignores_the_range_restarts_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "x.exe")
+            self._serve([lambda r: _Resp(self.BODY, stall_after=40_000),
+                         lambda r: _Resp(self.BODY, status=200)])
+            U._download("https://example.invalid/x.exe", dest, expected_size=len(self.BODY))
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), self.BODY)
+
+    def test_giving_up_removes_the_partial_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "x.exe")
+            self._serve([lambda r: _Resp(self.BODY, stall_after=10_000)] * 3)
+            with self.assertRaises(U.UpdateError) as cm:
+                U._download("https://example.invalid/x.exe", dest, expected_size=len(self.BODY), attempts=3)
+            self.assertIn("kept failing", str(cm.exception))
+            self.assertFalse(os.path.exists(dest))
+            self.assertEqual(len(self.requests), 3)
+
+    def test_a_short_body_counts_as_a_failed_attempt(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "x.exe")
+            self._serve([lambda r: _Resp(self.BODY[:5000]),   # closed early
+                         self._ranged])
+            U._download("https://example.invalid/x.exe", dest, expected_size=len(self.BODY))
+            self.assertEqual(os.path.getsize(dest), len(self.BODY))
+            self.assertEqual(self.requests[1].get_header("Range"),
+                             "bytes=5000-")
+
+    def test_a_client_error_is_final(self):
+        import urllib.error
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "x.exe")
+            self._serve([lambda r: urllib.error.HTTPError(
+                "https://example.invalid/x.exe", 404, "gone", {}, None)])
+            with self.assertRaises(U.UpdateError) as cm:
+                U._download("https://example.invalid/x.exe", dest, expected_size=len(self.BODY))
+            self.assertIn("refused", str(cm.exception))
+            self.assertEqual(len(self.requests), 1)
+
+    def test_a_complete_file_from_before_is_not_fetched_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "x.exe")
+            with open(dest, "wb") as f:
+                f.write(self.BODY)
+            self._serve([])
+            U._download("https://example.invalid/x.exe", dest, expected_size=len(self.BODY))
+            self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":

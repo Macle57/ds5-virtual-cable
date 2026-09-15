@@ -441,8 +441,10 @@ When a newer version exists you get a balloon notification, and — by default
 verified against the release's published SHA-256 checksums and run silently
 (app only, no driver, no reboot); the tray, or the service, restarts on the
 new version. Bridging stops for the few seconds that takes and comes back on
-its own. If a download ever fails its checksum it is deleted and nothing
-changes. The tray's right-click menu also grows a row, **Install update
+its own. A download that stalls on a slow connection is resumed where it
+stopped (a few attempts, minutes apart) rather than started over, and a
+failed automatic install is tried again later that day. If a download
+ever fails its checksum it is deleted and nothing changes. The tray's right-click menu also grows a row, **Install update
 x.y.z**, for doing it right now.
 
 Prefer to decide yourself? Put `"update_auto_install": false` in your

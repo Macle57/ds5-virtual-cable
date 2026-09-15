@@ -185,7 +185,22 @@ STARTUP_DELAY_S = 20.0             # let the tray finish coming up first
 #: a person mid-game to notice; short enough that "it updates itself" is
 #: true the same day.
 AUTO_INSTALL_DELAY_S = 60.0
+#: An automatic install that failed (a download that kept stalling, an
+#: installer that refused) is tried again this much later, up to
+#: AUTO_INSTALL_ATTEMPTS times per version per process. Measured 2026-09-15:
+#: a home connection at 36 KB/s stalled the 76 MB download once and the
+#: one-shot attempt gave up for the day, which is not "it updates itself".
+AUTO_RETRY_S = 10 * 60.0
+AUTO_INSTALL_ATTEMPTS = 3
 HTTP_TIMEOUT_S = 15.0
+#: A download is resumed (HTTP Range) after a stalled read rather than
+#: restarted, and given up only after this many consecutive failed
+#: attempts, with a growing pause between them (DOWNLOAD_BACKOFF_S * 2**n).
+DOWNLOAD_ATTEMPTS = 6
+DOWNLOAD_BACKOFF_S = 5.0
+#: One stalled read this long ends an attempt (not the download): GitHub's
+#: CDN closes idle connections well before this.
+DOWNLOAD_READ_TIMEOUT_S = 60.0
 CACHE_NAME = "update-cache.json"
 
 #: The sanity ceiling for a download. The bundled installer measures ~73 MB;
@@ -504,9 +519,11 @@ class Updater:
     def __init__(self, current_version: str | None = None,
                  cache_file: str | None = None,
                  notify=None, auto_install: bool = False, install_fn=None,
-                 auto_delay_s: float = AUTO_INSTALL_DELAY_S):
+                 auto_delay_s: float = AUTO_INSTALL_DELAY_S, http_get=None):
         self._current = current_version or app_version()
         self._cache_file = cache_file
+        #: The tests' seam: `check_now`'s `http_get`. None = the real one.
+        self._http_get = http_get
         self._notify = notify
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -518,24 +535,33 @@ class Updater:
         self.auto_install = bool(auto_install)
         self._install_fn = install_fn
         self.auto_delay_s = float(auto_delay_s)
-        self._auto_tried: set[str] = set()
+        #: version -> automatic attempts made in this process (each one a
+        #: failed install; a successful one ends the process).
+        self._auto_tried: dict[str, int] = {}
+        self.auto_attempts = int(AUTO_INSTALL_ATTEMPTS)
+        self.auto_retry_s = float(AUTO_RETRY_S)
         #: True from the moment an install (manual or automatic) has started
-        #: until the process exits; a second start is refused.
+        #: until the process exits; a second start is refused. `install()`
+        #: clears it again when its download or hand-off fails, which is how
+        #: the loop knows an attempt is over.
         self.installing = False
 
     def should_auto_install(self, info: "UpdateInfo | None") -> bool:
         """The decision, pure: on, an update in hand, something to call, not
-        already started, and this version not tried before in this process."""
+        already started, and attempts left for this version in this process."""
         return bool(self.auto_install and info is not None
                     and self._install_fn is not None and not self.installing
-                    and info.version not in self._auto_tried)
+                    and self._auto_tried.get(info.version, 0)
+                    < self.auto_attempts)
 
     def run_auto_install(self, info: "UpdateInfo") -> bool:
-        """The act: once per version. True when `install_fn` was called."""
+        """The act, one attempt. True when `install_fn` was called."""
         with self._lock:
-            if info.version in self._auto_tried or self.installing:
+            if (self._auto_tried.get(info.version, 0) >= self.auto_attempts
+                    or self.installing):
                 return False
-            self._auto_tried.add(info.version)
+            self._auto_tried[info.version] = \
+                self._auto_tried.get(info.version, 0) + 1
         log.info("installing %s automatically (update_auto_install)", info.version)
         try:
             self._install_fn()
@@ -568,7 +594,9 @@ class Updater:
 
     def check_once(self) -> UpdateInfo | None:
         """One synchronous check. The loop's body, callable from tests."""
-        info = check_now(self._current, self._cache_file)
+        info = (check_now(self._current, self._cache_file, http_get=self._http_get)
+                if self._http_get is not None
+                else check_now(self._current, self._cache_file))
         with self._lock:
             self._info = info
             fresh = info is not None and info.version not in self._told
@@ -597,6 +625,18 @@ class Updater:
                 if self._stop.wait(self.auto_delay_s):
                     return
                 self.run_auto_install(info)
+                # The install runs on its own thread and, when it works, ends
+                # this process. So: while it is still going, keep waiting;
+                # once it has given up (`installing` cleared), try again after
+                # a pause, up to the attempt limit; then fall back to daily.
+                while True:
+                    if self._stop.wait(self.auto_retry_s):
+                        return
+                    if self.installing:
+                        continue
+                    if not self.should_auto_install(info):
+                        break
+                    self.run_auto_install(info)
             if self._stop.wait(CHECK_INTERVAL_S):
                 return
 
@@ -751,21 +791,89 @@ def file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _download(url: str, dest: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> None:
-    req = urllib.request.Request(url, headers={
-        "User-Agent": f"ds5bridge/{app_version()} (update download)"})
-    got = 0
-    with urllib.request.urlopen(req, timeout=60) as resp, \
-            open(dest, "wb") as f:  # noqa: S310
-        while True:
-            chunk = resp.read(1 << 20)
-            if not chunk:
-                break
-            got += len(chunk)
-            if got > max_bytes:
-                raise UpdateError("the download is implausibly large -- "
-                                  "stopping rather than filling the disk.")
-            f.write(chunk)
+#: Seams for the tests: the opener and the pause between attempts.
+_urlopen = urllib.request.urlopen
+_sleep = time.sleep
+
+
+def _download(url: str, dest: str, max_bytes: int = MAX_DOWNLOAD_BYTES,
+              expected_size: int = 0, attempts: int = DOWNLOAD_ATTEMPTS) -> None:
+    """Fetch `url` into `dest`, resuming and retrying; raises `UpdateError`
+    (with `dest` removed) when it cannot.
+
+    The first version of this read the whole body in one go and treated one
+    stalled read as the end of the update: on 2026-09-15 a 36 KB/s connection
+    stalled 22 MB into the 76 MB installer, the read timed out, the partial
+    file stayed behind and the automatic path did not try again that day.
+    Now a stalled read ends an ATTEMPT; the next one asks for the rest of the
+    file (`Range: bytes=<have>-`, which GitHub's CDN honours with 206) and
+    appends to it, so bytes already paid for are kept. A server that answers
+    a range request with a plain 200 gets the file rewritten from its start.
+    `expected_size` (the release's `size` field) is what makes "the rest of
+    the file" a meaningful phrase; without it every attempt starts over.
+    """
+    headers = {"User-Agent": f"ds5bridge/{app_version()} (update download)"}
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        have = os.path.getsize(dest) if os.path.exists(dest) else 0
+        if expected_size and have >= expected_size:
+            if have == expected_size:
+                return          # a previous attempt finished; verify decides
+            _discard(dest)      # bigger than the release says: not ours
+            have = 0
+        resume = bool(expected_size) and have > 0
+        h = dict(headers)
+        if resume:
+            h["Range"] = f"bytes={have}-"
+        req = urllib.request.Request(url, headers=h)
+        try:
+            with _urlopen(req, timeout=DOWNLOAD_READ_TIMEOUT_S) as resp:  # noqa: S310
+                status = getattr(resp, "status", 200)
+                if resume and status == 206:
+                    mode, got = "ab", have
+                else:
+                    mode, got = "wb", 0       # 200: the whole thing again
+                with open(dest, mode) as f:
+                    while True:
+                        chunk = resp.read(1 << 20)
+                        if not chunk:
+                            break
+                        got += len(chunk)
+                        if got > max_bytes:
+                            _discard(dest)
+                            raise UpdateError(
+                                "the download is implausibly large -- "
+                                "stopping rather than filling the disk.")
+                        f.write(chunk)
+            if expected_size and got != expected_size:
+                # Short: the connection closed early. Resumable, so retry.
+                raise OSError(f"the download ended at {got} of "
+                              f"{expected_size} bytes")
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 416 and resume:
+                _discard(dest)    # the server disagrees about what we have
+                last_error = e
+            elif 400 <= e.code < 500:
+                _discard(dest)
+                raise UpdateError(f"the download was refused ({e.code}); "
+                                  f"the release may have changed -- the next "
+                                  f"check will pick up the current one.") from e
+            else:
+                last_error = e
+        except (OSError, urllib.error.URLError, TimeoutError,
+                ConnectionError) as e:    # a stall, a reset, a DNS blip
+            last_error = e
+        except UpdateError:
+            raise
+        log.warning("download attempt %d of %d failed (%s); %s",
+                    attempt, attempts, last_error,
+                    "resuming" if expected_size else "restarting")
+        if attempt < attempts:
+            _sleep(DOWNLOAD_BACKOFF_S * (2 ** (attempt - 1)))
+    _discard(dest)
+    raise UpdateError(f"the download kept failing ({last_error}); nothing "
+                      f"was changed. It is tried again later.")
 
 
 def verify_download(path: str, info: UpdateInfo, sums_text: str | None) -> None:
@@ -809,7 +917,7 @@ def download_and_verify(info: UpdateInfo, root: str) -> str:
     os.makedirs(updates, exist_ok=True)
     setup_exe = os.path.join(updates, info.asset_name)
 
-    _download(info.asset_url, setup_exe)
+    _download(info.asset_url, setup_exe, expected_size=info.asset_size)
 
     sums_text = None
     if info.sums_url:
