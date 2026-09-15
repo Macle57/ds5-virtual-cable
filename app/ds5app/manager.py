@@ -273,6 +273,31 @@ def _hidden_serials() -> list[str]:
         return []
 
 
+def _devnode_present(serial: str):
+    """Is this pad's Bluetooth link up, as the PnP tree sees it? True/False/None.
+
+    The third witness of `poll_once` rule 7, and the only one that owes
+    nothing to HidHide: it asks the Plug and Play manager rather than the HID
+    device set that HidHide filters. A cloak stops `hid_enumerate` from
+    listing a pad; it cannot stop the PnP tree from knowing whether the pad's
+    HID child devnode exists -- and that child exists exactly while the
+    Bluetooth link is up (`hidhide.hid_child_present`, measured 2026-09-15
+    on both pads: the BTHENUM nodes of a paired pad never leave, the HID
+    child under the 00001124 service node comes and goes with the link).
+
+    None -- "cannot say" -- whenever the answer would be a guess: not Windows,
+    no such node (never paired, or the enumerator listing failed), or any
+    exception. Never raises; ~1 ms.
+    """
+    try:
+        from . import hidhide as HH
+
+        return HH.hid_child_present(serial)
+    except Exception:  # noqa: BLE001
+        log.debug("devnode witness for %s failed", serial, exc_info=True)
+        return None
+
+
 def _hide_status(serial: str) -> dict:
     """`{"hide_effective", "hide_note"}` for a serial -- what THIS process's
     last hide of it found (hidhide.hide_status). Never raises, never touches
@@ -906,6 +931,7 @@ class BridgeManager:
                  bridge_factory=None,
                  port_free=None,
                  hidden_serials=None,
+                 devnode_present=None,
                  unhide_serial=None,
                  adopt_record=None,
                  prehide_serial=None,
@@ -989,6 +1015,10 @@ class BridgeManager:
         #: Injected so the oscillation guard in `poll_once` is testable without
         #: a driver. Returns the serials WE currently have hidden.
         self._hidden_serials = hidden_serials or _hidden_serials
+        #: The HidHide-independent presence witness (`_devnode_present`):
+        #: True / False / None for "is this pad's Bluetooth devnode present".
+        #: Injected so the presence rules are testable with no PnP tree.
+        self._devnode_present = devnode_present or _devnode_present
         #: The other half of that seam: a test must never unhide a controller
         #: its developer genuinely had hidden.
         self._unhide_serial = unhide_serial or (
@@ -1067,6 +1097,13 @@ class BridgeManager:
         #: controller and the second dies on the port's named mutex.
         self._inflight: set = set()
         self._present: list[str] = []
+        #: Every serial this manager has ever bridged or enumerated, in first-
+        #: seen order. `snapshot()` lists the ones that are not present any
+        #: more with `present: False`, so a pad that was switched off keeps a
+        #: row (its settings, its last error) instead of vanishing from the
+        #: dashboard and the menu -- while the aggregate counts only what is
+        #: actually there.
+        self._known: dict[str, None] = {}
         #: Set once teardown has begun. Nothing may start a bridge after this,
         #: including the watcher thread, which is otherwise perfectly capable of
         #: spawning a child while `close()` is stopping its siblings -- and a
@@ -1259,6 +1296,7 @@ class BridgeManager:
                                      on_change=self._child_changed)
             with self._lock:
                 self._bridges[serial] = b
+                self._known.setdefault(serial, None)
                 # The new child re-hides and re-owns the journal record; the
                 # cloak is no longer this manager's to keep or release.
                 self._kept_cloaks.discard(serial)
@@ -1445,6 +1483,19 @@ class BridgeManager:
             self._held.discard(serial)
             self._retry_at[serial] = now + self.retry_after
 
+    def _devnode_witness(self, serial: str):
+        """`_devnode_present` through the seam, and never an exception.
+
+        A witness that throws must read as "cannot say", not as a hotplug pass
+        that died halfway through its decisions.
+        """
+        try:
+            answer = self._devnode_present(serial)
+        except Exception:  # noqa: BLE001
+            log.debug("devnode witness for %s failed", serial, exc_info=True)
+            return None
+        return None if answer is None else bool(answer)
+
     def _would_rebridge(self, serial: str) -> bool:
         """Would a returning `serial` be bridged again without user action?
 
@@ -1516,6 +1567,8 @@ class BridgeManager:
             self._present = present
             returned = seen - self._seen_last
             self._seen_last = seen
+            for serial in present:
+                self._known.setdefault(serial, None)
             for serial in returned:
                 self._retry_at.pop(serial, None)
                 self._errors.pop(serial, None)
@@ -1595,6 +1648,36 @@ class BridgeManager:
            controller off and on again, which is the most explicit "try again"
            a user can give without opening a menu. So the absent -> present edge
            clears the backoff and the error with it.
+        7. **The journal cannot vouch for a pad this manager watched go.**
+           Rule 4 withdraws the journal's word while a child says DEGRADED --
+           and the moment that child is torn down there is no child to say it.
+           With the cloak KEPT across the disconnect (symptom 4) the journal
+           record outlives the bridge, so the union in rule 3 went straight
+           back to vouching for a pad that was just declared gone: the tray
+           read "1 of 2 bridged" for as long as the pad stayed off, and only
+           unhiding -- deleting the record -- made it say 1 of 1. (Reported
+           2026-09-15: "it just stays on 1/2 like forever, unless I unhide the
+           controller, in that case it updates instantly.")
+
+           Two things close that. First, a serial whose cloak this manager
+           KEPT (`_kept_cloaks`) is one it saw switched off, so the journal is
+           not asked about it: only enumeration -- which sees a cloaked pad,
+           because the tray is whitelisted -- brings it back, exactly as the
+           start loop below already required. Second, a third witness that
+           owes nothing to HidHide: the pad's HID child devnode under its
+           BTHENUM service node (`_devnode_present`), which the PnP tree has
+           exactly while the Bluetooth link is up. No child is a pad that is
+           off, whatever the journal says; a child vouches for a cloaked pad
+           on its own, whitelist or no whitelist; and "cannot say" falls back
+           to the rules above. The same witness also counts as the second
+           voice of rule 5 for a pad that enumerates while its radio is dead.
+
+           Measured 2026-09-15 on hardware, in this order: the first cut of
+           this witness asked whether the BTHENUM node itself was present,
+           and a switched-off pad's node is -- all three of a paired pad's
+           BTHENUM nodes stay present and started -- so the pad stayed at
+           "1 of 2" through the very fix meant to end that. The HID child
+           is what leaves.
         """
         now = time.monotonic()
         with self._lock:
@@ -1620,8 +1703,19 @@ class BridgeManager:
         except Exception:  # noqa: BLE001
             log.debug("hidden-serial union failed", exc_info=True)
             hidden = []
-        vouched = [s for s in hidden
-                   if s not in seen and snaps.get(s, {}).get("state") != DEGRADED]
+        with self._lock:
+            kept = set(self._kept_cloaks)
+        vouched = []
+        for s in hidden:
+            if s in seen or snaps.get(s, {}).get("state") == DEGRADED:
+                continue
+            # Rule 7. The devnode is asked first because it is first-hand:
+            # a definite answer either way outranks both the journal and the
+            # kept-cloak memory, and only "cannot say" falls through to them.
+            devnode = self._devnode_witness(s)
+            if devnode is False or (devnode is None and s in kept):
+                continue
+            vouched.append(s)
         # What the tray counts. Written back so `snapshot()` -- which must not
         # do any work of its own -- reads a present list that a cloaked pad is
         # in, rather than the enumeration that structurally cannot list it.
@@ -1646,7 +1740,13 @@ class BridgeManager:
                         first = self._offline_since.setdefault(serial, now)
                     else:
                         first = self._offline_since[serial] = stamped
-                gone = serial not in seen
+                # Rule 5's second witness: enumeration, or -- for a pad that
+                # still enumerates (charging on a cable) or one the whitelist
+                # lets us see through its cloak -- the PnP tree saying the
+                # Bluetooth node is not there (rule 7). Neither runs on the
+                # happy path; this branch is only entered for a DEGRADED child.
+                gone = (serial not in seen
+                        or self._devnode_witness(serial) is False)
                 # `min`, not just `gone_grace`: two witnesses agreeing may
                 # shorten the wait and must never lengthen it, whatever a
                 # caller has set the two graces to.
@@ -1834,6 +1934,7 @@ class BridgeManager:
         with self._lock:
             bridges = list(self._bridges.items())
             present = list(self._present)
+            known = list(self._known)
             errors = dict(self._errors)
             enabled = dict(self._enabled)
             hide = dict(self._hide)
@@ -1866,7 +1967,11 @@ class BridgeManager:
                 attached += 1
             total_rate += snap.get("reports_per_s") or 0.0
 
-        for serial in present:
+        # Present pads with no bridge, then pads this manager has known and
+        # lost (`_known`): the latter keep a row, marked `present: False`, so
+        # a controller that was switched off yesterday still has its toggles
+        # and its last error on the dashboard -- and is counted by nothing.
+        for serial in present + [s for s in known if s not in present_set]:
             if serial not in controllers:
                 controllers[serial] = {
                     "serial": serial, "port": ports.get(serial),
@@ -1878,7 +1983,7 @@ class BridgeManager:
                     "hide_bluetooth": hide.get(serial, hide_default),
                     **(_hide_status(serial) if hide.get(serial, hide_default)
                        else {"hide_effective": None, "hide_note": ""}),
-                    "present": True}
+                    "present": serial in present_set}
         return {
             "master_enabled": master,
             "controllers": controllers,

@@ -341,6 +341,105 @@ class DashboardCase(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertTrue(K.load().enabled)
 
+    # -- /api/action and the host's extra state ----------------------------
+
+    def post_action(self, body, headers=None):
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        status, out, _ = self.request(
+            "POST", "/api/action", body=raw,
+            headers=headers or {"Content-Type": "application/json"})
+        try:
+            return status, json.loads(out)
+        except ValueError:
+            return status, out
+
+    def test_action_without_a_host_is_503(self):
+        status, body = self.post_action({"op": "rescan"})
+        self.assertEqual(status, 503)
+        self.assertFalse(body["ok"])
+
+    def test_action_is_dispatched_to_the_host_with_its_body(self):
+        seen = []
+
+        def host(op, body):
+            seen.append((op, body))
+            return {"ok": True, "text": f"did {op}"}
+        self.dash.on_action = host
+        status, body = self.post_action({"op": "rescan", "why": "test"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"ok": True, "text": "did rescan"})
+        self.assertEqual(seen, [("rescan", {"op": "rescan", "why": "test"})])
+
+    def test_an_op_the_host_does_not_know_is_404(self):
+        self.dash.on_action = lambda op, body: None
+        status, body = self.post_action({"op": "make_coffee"})
+        self.assertEqual(status, 404)
+        self.assertFalse(body["ok"])
+        self.assertIn("make_coffee", body["text"])
+
+    def test_a_body_without_an_op_is_400(self):
+        self.dash.on_action = lambda op, body: {"ok": True}
+        for bad in ({}, {"op": ""}, {"op": 3}):
+            status, body = self.post_action(bad)
+            self.assertEqual(status, 400, bad)
+            self.assertFalse(body["ok"])
+
+    def test_a_host_that_throws_is_a_500_with_its_message(self):
+        def host(op, body):
+            raise RuntimeError("usbip is on fire")
+        self.dash.on_action = host
+        status, body = self.post_action({"op": "rescan"})
+        self.assertEqual(status, 500)
+        self.assertEqual(body, {"ok": False, "text": "usbip is on fire"})
+
+    def test_a_bare_host_answer_is_normalised(self):
+        # A host may answer with just a bool, or a dict missing `text`; the
+        # page always gets the {ok, text} shape it was promised.
+        self.dash.on_action = lambda op, body: True
+        self.assertEqual(self.post_action({"op": "x"})[1],
+                         {"ok": True, "text": ""})
+        self.dash.on_action = lambda op, body: {"ok": False}
+        self.assertEqual(self.post_action({"op": "x"})[1],
+                         {"ok": False, "text": ""})
+
+    def test_action_has_the_same_guards_as_config(self):
+        self.dash.on_action = lambda op, body: {"ok": True}
+        status, _ = self.post_action({"op": "rescan"},
+                                     headers={"Content-Type": "text/plain"})
+        self.assertEqual(status, 415)
+        status, _ = self.post_action(b"{not json")
+        self.assertEqual(status, 400)
+        status, _ = self.post_action({"op": "rescan"},
+                                     headers={"Content-Type": "application/json",
+                                              "Host": "evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_state_carries_the_hosts_extras(self):
+        self.dash.state_extras = lambda: {
+            "update": {"available": "1.0.1", "url": "u", "checked_at": 1.0,
+                       "installing": False},
+            "autostart": {"enabled": True, "mode": "task"},
+            # never allowed to displace the frame's own fields
+            "controllers": "nope", "aggregate": "nope"}
+        state = self.get_json("/api/state")
+        self.assertEqual(state["update"]["available"], "1.0.1")
+        self.assertEqual(state["autostart"], {"enabled": True, "mode": "task"})
+        self.assertIn("aabbccddeeff", state["controllers"])
+        self.assertEqual(state["aggregate"]["present"], 1)
+
+    def test_extras_that_fail_cost_nothing_but_themselves(self):
+        def boom():
+            raise RuntimeError("no")
+        self.dash.state_extras = boom
+        state = self.get_json("/api/state")
+        self.assertNotIn("update", state)
+        self.assertIn("aabbccddeeff", state["controllers"])
+
+    def test_without_a_host_there_are_no_extras(self):
+        state = self.get_json("/api/state")
+        self.assertNotIn("update", state)
+        self.assertNotIn("autostart", state)
+
 
 class PureHelpers(unittest.TestCase):
     def test_host_ok(self):

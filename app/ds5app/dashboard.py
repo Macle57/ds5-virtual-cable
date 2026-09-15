@@ -40,6 +40,64 @@ Development without hardware:  python -m ds5app.dashboard --fake
 serves the same page against a synthetic controller feed -- the full pipeline
 (build report -> UDP datagram -> hub -> decode -> SSE) with everything real
 except the pad. `--fake static` freezes a known state for screenshot tests.
+
+The HTTP API
+------------
+Every response is JSON unless stated. Every request must carry a loopback
+`Host`; every POST must be `application/json`.
+
+    GET  /                  the page (dashboard.html)
+    GET  /api/state         one frame of everything the page renders:
+                              ts            float, server time
+                              controllers   {serial: {...}} -- the manager's
+                                            per-controller snapshot (state,
+                                            enabled, present, port, battery,
+                                            hide_bluetooth, hide_effective,
+                                            hide_note, error, label, ...) plus
+                                            `telemetry` (the decoded live
+                                            input) when the pad is publishing.
+                                            A pad the tray has known and lost
+                                            stays listed with `present: false`.
+                              aggregate     {present, bridges, running,
+                                            degraded, attached, reports_per_s,
+                                            errors, master_enabled} -- counts
+                                            over PRESENT pads only, so the
+                                            header's "N/M bridged" is
+                                            running/present.
+                              update        {available: "1.0.1"|null, url,
+                                            checked_at: ts|null, installing:
+                                            bool, error: str|null} -- the
+                                            tray's update check.
+                              autostart     {enabled: bool, mode: "task"|
+                                            "service"|"none"}
+                              tray          {version, hidhide: bool,
+                                            elevated: bool, pid}
+                            (`update`, `autostart` and `tray` come from the
+                            host through `state_extras`; a config-only or
+                            --fake dashboard omits them.)
+    GET  /api/stream        the same frame as Server-Sent Events, 30 Hz
+    GET  /api/config        {path, config} -- config.json as `Config.to_dict()`
+    POST /api/config        a partial object, deep-merged onto the file and
+                            saved atomically; answers like GET /api/config.
+                            The tray applies the keys it owns LIVE on every
+                            save (`enabled`, `controllers.<serial>.enabled`
+                            / `.hide_bluetooth`, `hide_bluetooth_default`,
+                            `autostart_on_login`, `update_check`) and its
+                            menu follows immediately.
+    GET  /api/actions       the vocabulary the settings page builds its
+                            pickers from (see `actions_meta`)
+    POST /api/action        {"op": <name>, ...} -> {"ok": bool, "text": str}
+                            Dispatched to the host through `on_action`:
+                              rescan          one hotplug pass, now
+                              unhide_all      stop every bridge and unhide
+                                              every pad (the panic button)
+                              update_check    ask GitHub now; `text` says
+                                              what it found
+                              update_install  download and hand off to the
+                                              installer (the tray exits)
+                              open_logs       open the log folder in Explorer
+                            503 when no host is attached, 404 for an op the
+                            host does not know, 400 for a body without `op`.
 """
 
 from __future__ import annotations
@@ -124,17 +182,28 @@ class DashboardServer:
     `on_config_saved(cfg)` is called after every successful POST with the
     freshly saved `Config`, so a host holding a live config object (the tray)
     can fall in line instead of clobbering the change at its next save.
+
+    `state_extras()` returns a dict merged into every `/api/state` frame
+    (`update`, `autostart`, `tray` -- see the module docstring); it is called
+    30 times a second per open stream, so it must be an in-memory read, never
+    a subprocess or a registry query. `on_action(op, body)` handles
+    `POST /api/action`: it returns `{"ok", "text"}`, or None for an op it does
+    not know. Both are optional and both are wrapped: a host that throws costs
+    the page one field or one action, never the server.
     """
 
     def __init__(self, hub=None, snapshot_fn=None,
                  port: int = K.DEFAULT_DASHBOARD_PORT, host: str = "127.0.0.1",
-                 config_path: str | None = None, on_config_saved=None):
+                 config_path: str | None = None, on_config_saved=None,
+                 state_extras=None, on_action=None):
         self.hub = hub
         self.snapshot_fn = snapshot_fn
         self.host = host
         self.port = int(port)
         self.config_path = config_path
         self.on_config_saved = on_config_saved
+        self.state_extras = state_extras
+        self.on_action = on_action
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
@@ -234,8 +303,49 @@ class DashboardServer:
                     c.setdefault("label", cfg.controllers[serial].label)
         except Exception:  # noqa: BLE001
             log.debug("label lookup failed", exc_info=True)
-        return {"ts": time.time(), "controllers": controllers,
-                "aggregate": aggregate}
+        frame = {"ts": time.time(), "controllers": controllers,
+                 "aggregate": aggregate}
+        if self.state_extras is not None:
+            try:
+                extras = self.state_extras()
+                if isinstance(extras, dict):
+                    # The host's fields never displace the three above.
+                    for key, value in extras.items():
+                        frame.setdefault(key, value)
+            except Exception:  # noqa: BLE001
+                log.debug("state_extras failed", exc_info=True)
+        return frame
+
+    # -- actions -----------------------------------------------------------
+
+    def action(self, body: dict) -> tuple[int, dict]:
+        """`POST /api/action` -> (HTTP status, JSON body). Never raises.
+
+        The op names are the host's vocabulary, not this module's: the
+        dashboard is a transport, and the tray decides what "rescan" means.
+        A host that returns None is saying "not one of mine", which is a 404
+        rather than a 500 because a stale page asking a newer or older tray
+        for an op it lacks is an ordinary event, not a fault.
+        """
+        op = body.get("op") if isinstance(body, dict) else None
+        if not isinstance(op, str) or not op.strip():
+            return HTTPStatus.BAD_REQUEST, {"ok": False, "text": "no op given"}
+        if self.on_action is None:
+            return HTTPStatus.SERVICE_UNAVAILABLE, {
+                "ok": False, "text": "no tray is attached to this dashboard"}
+        try:
+            result = self.on_action(op.strip(), body)
+        except Exception as e:  # noqa: BLE001
+            log.exception("action %s failed", op)
+            return HTTPStatus.INTERNAL_SERVER_ERROR, {
+                "ok": False, "text": str(e) or "the action failed"}
+        if result is None:
+            return HTTPStatus.NOT_FOUND, {"ok": False,
+                                          "text": f"unknown action: {op}"}
+        if not isinstance(result, dict):
+            result = {"ok": bool(result), "text": ""}
+        return HTTPStatus.OK, {"ok": bool(result.get("ok", True)),
+                               "text": str(result.get("text") or "")}
 
     # -- config API --------------------------------------------------------
 
@@ -423,13 +533,14 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if not self._guard():
                 return
-            if self.path.split("?", 1)[0] != "/api/config":
+            path = self.path.split("?", 1)[0]
+            if path not in ("/api/config", "/api/action"):
                 self._refuse(HTTPStatus.NOT_FOUND, "not found")
                 return
             ctype = (self.headers.get("Content-Type") or "").split(";")[0]
             if ctype.strip().lower() != "application/json":
                 self._refuse(HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                             "config writes must be application/json")
+                             "POST bodies must be application/json")
                 return
             length = int(self.headers.get("Content-Length") or 0)
             if not 0 < length <= MAX_CONFIG_BYTES:
@@ -442,7 +553,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if not isinstance(updates, dict):
                 self._refuse(HTTPStatus.BAD_REQUEST,
-                             "body must be a JSON object of settings")
+                             "body must be a JSON object")
+                return
+            if path == "/api/action":
+                code, result = self.dash.action(updates)
+                self._send_json(result, code=int(code))
                 return
             try:
                 self._send_json(self.dash.config_post(updates))

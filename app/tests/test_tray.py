@@ -1187,5 +1187,436 @@ class LowBatteryToastTests(unittest.TestCase):
         self.assertEqual(app.notes, [])
 
 
+# ---------------------------------------------------------------------------
+# the dashboard's window onto the tray: /api/state extras and /api/action
+# ---------------------------------------------------------------------------
+
+
+class _FakeInfo:
+    def __init__(self, version="9.9.9"):
+        self.version = version
+        self.page_url = f"https://example.invalid/releases/v{version}"
+
+
+class _FakeUpdater:
+    """Stands in for `update.Updater`: records the loop and answers a check."""
+
+    made: list = []
+    answer = None
+    #: An exception for `check_once` to raise, when a test wants one.
+    raise_with = None
+
+    def __init__(self, notify=None, **kw):
+        self.notify = notify
+        self.started = False
+        self.stopped = False
+        self.checks = 0
+        _FakeUpdater.made.append(self)
+
+    @property
+    def available(self):
+        return _FakeUpdater.answer
+
+    def start(self):
+        self.started = True
+        return self
+
+    def stop(self):
+        self.stopped = True
+
+    def check_once(self):
+        self.checks += 1
+        if _FakeUpdater.raise_with is not None:
+            raise _FakeUpdater.raise_with
+        return _FakeUpdater.answer
+
+
+class DashboardControlTests(unittest.TestCase):
+    """What the "Bridging & tray" card talks to."""
+
+    def setUp(self):
+        _FakeUpdater.made = []
+        _FakeUpdater.answer = None
+        _FakeUpdater.raise_with = None
+        self._saved_updater = T.U.Updater
+        T.U.Updater = _FakeUpdater
+        self._saved_A = (T.A.available, T.A.is_enabled, T.A.set_enabled)
+
+    def tearDown(self):
+        T.U.Updater = self._saved_updater
+        T.A.available, T.A.is_enabled, T.A.set_enabled = self._saved_A
+
+    def app(self, controllers=None):
+        app = app_with(controllers or [controller(A)])
+        app.mgr.poll_once = lambda: app.mgr.calls.append(("poll_once",))
+        return app
+
+    # -- /api/state extras --------------------------------------------------
+
+    def test_extras_have_the_contracted_shape_with_nothing_going_on(self):
+        app = self.app()
+        x = app._dashboard_extras()
+        self.assertEqual(x["update"], {"available": None, "url": None,
+                                       "checked_at": None, "installing": False,
+                                       "error": None})
+        self.assertEqual(set(x["autostart"]), {"enabled", "mode"})
+        self.assertEqual(x["autostart"]["mode"], "none")
+        self.assertEqual(x["tray"]["version"], T.VERSION)
+        self.assertIn("hidhide", x["tray"])
+        self.assertIn("elevated", x["tray"])
+
+    def test_a_check_that_raises_is_reported_as_update_error(self):
+        app = self.app()
+        _FakeUpdater.raise_with = RuntimeError("dns is down")
+        r = app._dashboard_action("update_check", {})
+        self.assertFalse(r["ok"])
+        self.assertIn("dns is down", r["text"])
+        self.assertEqual(app._dashboard_extras()["update"]["error"],
+                         "dns is down")
+        self.assertIsNotNone(app._update_checked_at)
+        # the next check that returns clears it
+        _FakeUpdater.raise_with = None
+        self.assertTrue(app._dashboard_action("update_check", {})["ok"])
+        self.assertIsNone(app._dashboard_extras()["update"]["error"])
+
+    def test_extras_report_a_found_update(self):
+        app = self.app()
+        _FakeUpdater.answer = _FakeInfo("9.9.9")
+        app.updater = _FakeUpdater()
+        x = app._dashboard_extras()["update"]
+        self.assertEqual(x["available"], "9.9.9")
+        self.assertIn("9.9.9", x["url"])
+
+    def test_extras_are_field_reads(self):
+        # 30 Hz per stream: nothing here may ask Task Scheduler or GitHub.
+        app = self.app()
+        T.A.is_enabled = lambda: (_ for _ in ()).throw(AssertionError("asked"))
+        app._autostart_cache = (True, "task")
+        self.assertEqual(app._dashboard_extras()["autostart"],
+                         {"enabled": True, "mode": "task"})
+
+    # -- the autostart cache ----------------------------------------------
+
+    def test_the_cache_reads_the_machine_and_stubs_the_mode(self):
+        app = self.app()
+        T.A.available = lambda: True
+        T.A.is_enabled = lambda: True
+        self.assertEqual(app._refresh_autostart(), (True, "task"))
+        T.A.is_enabled = lambda: False
+        self.assertEqual(app._refresh_autostart(), (False, "task"))
+        T.A.available = lambda: False
+        self.assertEqual(app._refresh_autostart(), (False, "none"))
+
+    def test_autostart_mode_comes_from_the_module_when_it_has_one(self):
+        app = self.app()
+        T.A.available = lambda: True
+        T.A.is_enabled = lambda: True
+        T.A.mode = lambda: "service"
+        try:
+            self.assertEqual(app._refresh_autostart(), (True, "service"))
+        finally:
+            del T.A.mode
+
+    def test_a_toggled_autostart_changes_the_menu_key(self):
+        # This is what makes a "start with Windows" flipped on the dashboard
+        # show up in the menu without a click.
+        app = self.app()
+        app._autostart_cache = (False, "task")
+        before = app._menu_key()
+        app._autostart_cache = (True, "task")
+        self.assertNotEqual(before, app._menu_key())
+
+    # -- update_check applied live ------------------------------------------
+
+    def test_switching_the_check_on_starts_one_loop(self):
+        app = self.app()
+        app._apply_update_check(True)
+        app._apply_update_check(True)
+        self.assertEqual(len(_FakeUpdater.made), 1)
+        self.assertTrue(_FakeUpdater.made[0].started)
+        self.assertTrue(app._update_loop_on)
+
+    def test_switching_the_check_off_stops_it_but_keeps_the_answer(self):
+        app = self.app()
+        app._apply_update_check(True)
+        _FakeUpdater.answer = _FakeInfo()
+        app._apply_update_check(False)
+        self.assertTrue(_FakeUpdater.made[0].stopped)
+        self.assertFalse(app._update_loop_on)
+        self.assertIs(app.updater, _FakeUpdater.made[0])
+        self.assertEqual(app._dashboard_extras()["update"]["available"],
+                         "9.9.9")
+
+    def test_switching_back_on_makes_a_fresh_one(self):
+        app = self.app()
+        app._apply_update_check(True)
+        app._apply_update_check(False)
+        app._apply_update_check(True)
+        self.assertEqual(len(_FakeUpdater.made), 2)
+        self.assertIs(app.updater, _FakeUpdater.made[1])
+        self.assertTrue(_FakeUpdater.made[1].started)
+
+    def test_the_dashboard_saving_update_check_applies_it(self):
+        app = self.app()
+        app._apply_update_check(True)
+        T.A.available = lambda: False
+        cfg = types.SimpleNamespace(enabled=True, controllers={},
+                                    hide_bluetooth_default=False,
+                                    autostart_on_login=False,
+                                    update_check=False)
+        app._on_dashboard_config(cfg)
+        settle()
+        self.assertFalse(app._update_loop_on)
+        self.assertTrue(_FakeUpdater.made[0].stopped)
+        cfg.update_check = True
+        app._on_dashboard_config(cfg)
+        settle()
+        self.assertTrue(app._update_loop_on)
+        self.assertEqual(len(_FakeUpdater.made), 2)
+
+    def test_the_dashboard_saving_autostart_refreshes_the_cache(self):
+        app = self.app()
+        state = {"on": False}
+        T.A.available = lambda: True
+        T.A.is_enabled = lambda: state["on"]
+
+        def set_enabled(want):
+            state["on"] = bool(want)
+        T.A.set_enabled = set_enabled
+        app._refresh_autostart()
+        cfg = types.SimpleNamespace(enabled=True, controllers={},
+                                    hide_bluetooth_default=False,
+                                    autostart_on_login=True, update_check=False)
+        app._on_dashboard_config(cfg)
+        settle()
+        self.assertEqual(app._autostart_cache, (True, "task"))
+
+    # -- /api/action ------------------------------------------------------
+
+    def test_an_op_that_is_not_ours_is_none(self):
+        self.assertIsNone(self.app()._dashboard_action("make_coffee", {}))
+
+    def test_rescan_runs_a_hotplug_pass_off_the_request_thread(self):
+        app = self.app()
+        r = app._dashboard_action("rescan", {"op": "rescan"})
+        settle()
+        self.assertTrue(r["ok"])
+        self.assertIn(("poll_once",), app.mgr.calls)
+
+    def test_a_rescan_while_one_is_running_is_refused(self):
+        app = self.app()
+        app._busy["rescan"] = True
+        r = app._dashboard_action("rescan", {})
+        self.assertFalse(r["ok"])
+        self.assertNotIn(("poll_once",), app.mgr.calls)
+
+    def test_update_check_answers_with_what_it_found(self):
+        app = self.app()
+        _FakeUpdater.answer = _FakeInfo("9.9.9")
+        r = app._dashboard_action("update_check", {})
+        self.assertTrue(r["ok"])
+        self.assertIn("9.9.9", r["text"])
+        # with the daily poll off, a one-off updater is made and KEPT so the
+        # menu row and /api/state can show the answer
+        self.assertIsNotNone(app.updater)
+        self.assertFalse(app.updater.started)
+        self.assertEqual(app._dashboard_extras()["update"]["available"],
+                         "9.9.9")
+
+    def test_update_check_says_so_when_there_is_nothing(self):
+        app = self.app()
+        r = app._dashboard_action("update_check", {})
+        self.assertTrue(r["ok"])
+        self.assertIn(T.VERSION, r["text"])
+        self.assertIsNone(app._dashboard_extras()["update"]["available"])
+
+    def test_update_check_stamps_checked_at(self):
+        app = self.app()
+        self.assertIsNone(app._update_checked_at)
+        app._dashboard_action("update_check", {})
+        self.assertIsNotNone(app._update_checked_at)
+        # ... including through the loop's own path
+        app.updater.check_once()
+        self.assertEqual(app.updater.checks, 2)
+
+    def test_update_install_without_an_update_is_refused(self):
+        app = self.app()
+        calls = []
+        saved = T.U.install
+        T.U.install = lambda *a, **k: calls.append(1)
+        try:
+            r = app._dashboard_action("update_install", {})
+        finally:
+            T.U.install = saved
+        self.assertFalse(r["ok"])
+        self.assertEqual(calls, [])
+        self.assertFalse(app._update_installing)
+
+    def test_update_install_hands_off_to_update_py_once(self):
+        app = self.app()
+        _FakeUpdater.answer = _FakeInfo("9.9.9")
+        app.updater = _FakeUpdater()
+        calls = []
+        saved = T.U.install
+        T.U.install = lambda upd, notify=None, quit_cb=None: calls.append(
+            (upd, quit_cb))
+        try:
+            r = app._dashboard_action("update_install", {})
+            again = app._dashboard_action("update_install", {})
+        finally:
+            T.U.install = saved
+        self.assertTrue(r["ok"])
+        self.assertIn("9.9.9", r["text"])
+        self.assertEqual(calls, [(app.updater, app._quit)])
+        self.assertTrue(app._dashboard_extras()["update"]["installing"])
+        self.assertFalse(again["ok"], "a second click started a second install")
+
+    def test_a_failed_install_clears_the_installing_flag(self):
+        app = self.app()
+        _FakeUpdater.answer = _FakeInfo("9.9.9")
+        app.updater = _FakeUpdater()
+        saved = T.U.install
+
+        def install(upd, notify=None, quit_cb=None):
+            notify("Update failed", "no network")
+        T.U.install = install
+        try:
+            app._dashboard_action("update_install", {})
+        finally:
+            T.U.install = saved
+        self.assertFalse(app._update_installing)
+        self.assertEqual(app.notes, [("Update failed", "no network")])
+
+    def test_the_menu_row_uses_the_same_path(self):
+        app = self.app()
+        saved = T.U.install
+        T.U.install = lambda *a, **k: self.fail("installed with no update")
+        try:
+            app._install_update()
+        finally:
+            T.U.install = saved
+        self.assertEqual(len(app.notes), 1)
+        self.assertIn("No update", app.notes[0][1])
+
+    def test_unhide_all_answers_synchronously_with_the_verdict(self):
+        app = self.app()
+        import ds5app.hidhide as HH_real
+        saved = (HH_real.sweep, HH_real.journal_count, HH_real.unrecorded_hidden,
+                 HH_real.read_records, HH_real.pad_visible)
+        HH_real.sweep = lambda force=False, log_fn=None, **kw: 2
+        HH_real.journal_count = lambda: 0
+        HH_real.unrecorded_hidden = lambda *a, **k: []
+        HH_real.read_records = lambda: []
+        HH_real.pad_visible = lambda s: True
+        try:
+            r = app._dashboard_action("unhide_all", {})
+        finally:
+            (HH_real.sweep, HH_real.journal_count, HH_real.unrecorded_hidden,
+             HH_real.read_records, HH_real.pad_visible) = saved
+        self.assertTrue(r["ok"])
+        self.assertIn("Unhid 2", r["text"])
+        self.assertIn(("stop_all",), app.mgr.calls)
+        self.assertFalse(app._busy.get("unhide-all"))
+        # the verdict goes to the page, not to a balloon as well
+        self.assertEqual(app.notes, [])
+
+    def test_unhide_all_reports_a_stuck_pad_as_not_ok(self):
+        app = self.app()
+        import ds5app.hidhide as HH_real
+        saved = (HH_real.sweep, HH_real.journal_count, HH_real.unrecorded_hidden,
+                 HH_real.read_records, HH_real.pad_visible)
+        HH_real.sweep = lambda force=False, log_fn=None, **kw: 1
+        HH_real.journal_count = lambda: 1
+        HH_real.unrecorded_hidden = lambda *a, **k: []
+        HH_real.read_records = lambda: [{"serial": A}]
+        HH_real.pad_visible = lambda s: False
+        try:
+            r = app._dashboard_action("unhide_all", {})
+        finally:
+            (HH_real.sweep, HH_real.journal_count, HH_real.unrecorded_hidden,
+             HH_real.read_records, HH_real.pad_visible) = saved
+        self.assertFalse(r["ok"])
+        self.assertIn("could not be unhidden", r["text"])
+
+    def test_open_logs_opens_the_log_folder_de_elevated(self):
+        import os
+        import subprocess
+        import tempfile
+        app = self.app()
+        launched = []
+        saved_popen = subprocess.Popen
+        saved_env = os.environ.get("DS5_CONFIG")
+        subprocess.Popen = lambda argv, **kw: launched.append(list(argv))
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["DS5_CONFIG"] = tmp
+            try:
+                r = app._dashboard_action("open_logs", {})
+                expected = os.path.join(tmp, "logs")
+                self.assertTrue(os.path.isdir(expected))
+            finally:
+                subprocess.Popen = saved_popen
+                if saved_env is None:
+                    os.environ.pop("DS5_CONFIG", None)
+                else:
+                    os.environ["DS5_CONFIG"] = saved_env
+        self.assertTrue(r["ok"])
+        if sys.platform == "win32":
+            self.assertEqual(launched, [["explorer.exe", expected]])
+
+
+class FileLogTests(unittest.TestCase):
+    def test_the_tray_log_lands_next_to_the_config(self):
+        import os
+        import tempfile
+        saved_env = os.environ.get("DS5_CONFIG")
+        pkg = logging.getLogger("ds5app")
+        before = list(pkg.handlers)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["DS5_CONFIG"] = tmp
+            try:
+                path = T.install_file_log()
+                self.assertEqual(path, os.path.join(tmp, "logs", "tray.log"))
+                logging.getLogger("ds5app.manager").info("hello from a test")
+                for h in pkg.handlers:
+                    if h not in before:
+                        h.flush()
+                        h.close()
+                        pkg.removeHandler(h)
+                with open(path, encoding="utf-8") as f:
+                    self.assertIn("hello from a test", f.read())
+            finally:
+                if saved_env is None:
+                    os.environ.pop("DS5_CONFIG", None)
+                else:
+                    os.environ["DS5_CONFIG"] = saved_env
+
+
+class StalePadRenderingTests(unittest.TestCase):
+    """A pad the manager remembers but that is switched off (`present:
+    False`) has a row, says so, and is counted by nothing."""
+
+    def test_the_icon_does_not_go_amber_for_a_pad_that_is_off(self):
+        app = app_with([controller(A),
+                        controller(B, state=S.STOPPED, present=False,
+                                   rate=0.0, battery=None)])
+        rgb, bat, count = app._art()
+        self.assertEqual(rgb, T.COLORS[S.RUNNING])
+        self.assertEqual(count, 1)
+        self.assertEqual(bat, 50)
+
+    def test_the_row_says_not_connected(self):
+        app = app_with([controller(A),
+                        controller(B, state=S.STOPPED, present=False,
+                                   rate=0.0, battery=None)])
+        _, text, _, _ = app._slot(1)
+        self.assertEqual(text(), "d42f..485d  not connected")
+
+    def test_the_title_counts_only_what_is_there(self):
+        app = app_with([controller(A),
+                        controller(B, state=S.STOPPED, present=False,
+                                   rate=0.0, battery=None)])
+        self.assertTrue(app._title().startswith("ds5bridge -- 1 of 1 bridged"))
+
+
 if __name__ == "__main__":
     unittest.main()

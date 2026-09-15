@@ -97,6 +97,7 @@ import threading
 import time
 
 from . import _bootstrap  # noqa: F401  (sys.path side effect)
+from . import __version__ as VERSION
 from . import autostart as A
 from . import config as K
 from . import controller as C
@@ -107,6 +108,21 @@ from . import update as U
 log = logging.getLogger("ds5app.tray")
 
 REFRESH_S = 2.0
+
+#: How long the cached "start at login" answer is trusted before the poll
+#: thread asks Task Scheduler again. The dashboard streams that answer 30
+#: times a second and the menu reads it on every rebuild, and `schtasks` is a
+#: subprocess -- so it is read on this cadence, at every toggle, and at every
+#: dashboard save, never on demand.
+AUTOSTART_TTL_S = 60.0
+
+#: The tray's own log, next to the config: `<config dir>\logs\tray.log`,
+#: rotated at 2 MB x 3. A windowed exe has no console, so before this the
+#: manager's event lines (every "controller appeared", every hide, every
+#: teardown) went nowhere -- and "open the logs" from the dashboard would have
+#: had nothing to open.
+LOG_MAX_BYTES = 2_000_000
+LOG_BACKUPS = 3
 
 #: How long a toggled checkbox waits for the user's next click before its side
 #: effects run. Two seconds is long enough to tick three boxes in one visit to
@@ -199,6 +215,40 @@ def _open_url_deelevated(url: str) -> bool:
     return bool(webbrowser.open(url))
 
 
+def logs_dir() -> str:
+    """Where the tray writes its log: `<config dir>\\logs`. Never creates."""
+    return os.path.join(K.config_dir(), "logs")
+
+
+def install_file_log() -> str | None:
+    """Send the `ds5app` loggers to a rotating file. -> its path, or None.
+
+    Best effort and never fatal: a read-only profile costs the log, not the
+    tray. `ds5app` is raised to INFO so the manager's `_emit` lines (which it
+    already logs at that level) land in the file; the root logger and its
+    handlers are left alone, so a console run prints exactly what it did.
+    """
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        d = logs_dir()
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "tray.log")
+        h = RotatingFileHandler(path, maxBytes=LOG_MAX_BYTES,
+                                backupCount=LOG_BACKUPS, encoding="utf-8")
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        h.setLevel(logging.INFO)
+        pkg = logging.getLogger("ds5app")
+        pkg.addHandler(h)
+        if pkg.level == logging.NOTSET or pkg.level > logging.INFO:
+            pkg.setLevel(logging.INFO)
+        return path
+    except Exception:  # noqa: BLE001
+        log.debug("could not open the log file", exc_info=True)
+        return None
+
+
 def short(serial: str) -> str:
     """A bdaddr shortened for a menu. Keeps both ends -- the middle is noise."""
     s = (serial or "").strip()
@@ -231,10 +281,26 @@ def describe(c: dict) -> str:
 
 
 class TrayApp:
-    #: Class-level default so an instance whose __init__ was bypassed (the
-    #: test rig builds them with __new__) still renders a menu: every menu
-    #: lambda goes through U.* helpers that accept None.
+    #: Class-level defaults so an instance whose __init__ was bypassed (the
+    #: test rig builds them with __new__) still renders a menu and a state
+    #: frame: every menu lambda goes through U.* helpers that accept None.
     updater = None
+    #: Whether `updater` has its daily loop running (`config.update_check`).
+    #: The object itself may outlive the loop: a found update stays
+    #: installable after the user switches the check off.
+    _update_loop_on = False
+    #: `time.time()` of the last check attempt, for the dashboard.
+    _update_checked_at = None
+    #: What the last check attempt raised, if anything (`update.error`);
+    #: None after a check that returned, whatever it returned.
+    _update_error = None
+    #: An "Install update" is in flight (download, hand-off, exit).
+    _update_installing = False
+    #: (enabled, mode) as last read from the machine -- see AUTOSTART_TTL_S.
+    _autostart_cache = (False, "none")
+    _autostart_checked_at = 0.0
+    _elevated = False
+    _has_hidhide = False
 
     def __init__(self, args):
         self.args = args
@@ -263,6 +329,8 @@ class TrayApp:
 
         self.cfg = K.load()
         self._reconcile_autostart()
+        self._refresh_autostart()
+        self._elevated = _is_elevated()
         # A --serial on the command line is a one-run override, not a settings
         # change: it restricts this session to one controller without editing
         # what the user has chosen for every other run.
@@ -275,11 +343,13 @@ class TrayApp:
         self.hidhide_cli = getattr(args, "hidhide_cli", None) or self.cfg.hidhide_cli
         self._has_hidhide = self._detect_hidhide()
 
-        #: Background update check (None when `update_check: false`). The whole
-        #: integration is four U.* calls -- this one, two lambdas in `_menu()`,
-        #: one entry in `_menu_key()` -- and everything else lives in update.py,
-        #: deliberately: see its module docstring, "The tray touchpoint".
-        self.updater = U.start_if_enabled(self.cfg, notify=self._notify)
+        #: Background update check (None until `update_check` is on, or a
+        #: manual "Check now" from the dashboard). Everything but the wiring
+        #: lives in update.py, deliberately: see its module docstring, "The
+        #: tray touchpoint". `_apply_update_check` is also what the dashboard
+        #: reaches when it saves the `update_check` key mid-session.
+        self.updater = None
+        self._apply_update_check(bool(self.cfg.update_check))
 
         #: The dashboard's two halves, both strictly optional passengers: the
         #: telemetry hub (a UDP socket every child is told about, so live
@@ -324,7 +394,9 @@ class TrayApp:
             self.dash = DB.DashboardServer(
                 hub=self.hub, snapshot_fn=self.mgr.snapshot,
                 port=self.cfg.dashboard_port,
-                on_config_saved=self._on_dashboard_config)
+                on_config_saved=self._on_dashboard_config,
+                state_extras=self._dashboard_extras,
+                on_action=self._dashboard_action)
         except Exception:  # noqa: BLE001
             log.exception("the dashboard could not be constructed")
 
@@ -388,6 +460,41 @@ class TrayApp:
         if live != self.cfg.autostart_on_login:
             self.cfg.autostart_on_login = live
             K.try_save(self.cfg)
+
+    @staticmethod
+    def _autostart_mode() -> str:
+        """`task` | `service` | `none` -- how this install starts with Windows.
+
+        `autostart.mode()` is the service work's to provide; until it exists
+        the only mechanism is the scheduled task, so that is the answer
+        whenever the task machinery is available at all.
+        """
+        mode = getattr(A, "mode", None)
+        if callable(mode):
+            try:
+                return str(mode() or "none")
+            except Exception:  # noqa: BLE001
+                log.debug("autostart.mode() failed", exc_info=True)
+        try:
+            return "task" if A.available() else "none"
+        except Exception:  # noqa: BLE001
+            return "none"
+
+    def _refresh_autostart(self) -> tuple:
+        """Re-read the machine's answer into the cache. -> (enabled, mode)."""
+        try:
+            if not A.available():
+                self._autostart_cache = (False, "none")
+            else:
+                self._autostart_cache = (bool(A.is_enabled()),
+                                         self._autostart_mode())
+        except Exception:  # noqa: BLE001
+            log.debug("could not read the autostart state", exc_info=True)
+        self._autostart_checked_at = time.monotonic()
+        return self._autostart_cache
+
+    def _autostart_enabled(self) -> bool:
+        return bool(self._autostart_cache[0])
 
     def _ports(self) -> dict:
         return {s: cc.port for s, cc in self.cfg.controllers.items() if cc.port}
@@ -467,9 +574,191 @@ class TrayApp:
                     A.set_enabled(bool(cfg.autostart_on_login))
             except A.AutostartError as e:
                 self._notify("Start at login", str(e))
+            self._refresh_autostart()
+            # The update check used to be read once, at startup; a dashboard
+            # that switches it off should stop the daily poll now, and one
+            # that switches it on should not wait for the next launch.
+            self._apply_update_check(bool(getattr(cfg, "update_check", True)))
             self._refresh_now()
 
         self._work("dashboard-config", apply)
+
+    # -- the dashboard's window onto the tray: state extras and actions -----
+
+    def _dashboard_extras(self) -> dict:
+        """The `update`, `autostart` and `tray` fields of `/api/state`.
+
+        Called 30 times a second per open stream, so everything here is a
+        field read: the updater's answer is held under its own lock, the
+        autostart answer is the cache `AUTOSTART_TTL_S` describes, and the
+        elevation check was done once at startup.
+        """
+        info = self.updater.available if self.updater is not None else None
+        enabled, mode = self._autostart_cache
+        return {
+            "update": {"available": info.version if info else None,
+                       "url": info.page_url if info else None,
+                       "checked_at": self._update_checked_at,
+                       "installing": bool(self._update_installing),
+                       "error": self._update_error},
+            "autostart": {"enabled": bool(enabled), "mode": mode},
+            "tray": {"version": VERSION, "hidhide": bool(self._has_hidhide),
+                     "elevated": bool(self._elevated), "pid": os.getpid()},
+        }
+
+    def _dashboard_action(self, op: str, body: dict):
+        """`POST /api/action` -> {"ok", "text"}, or None for an op not ours.
+
+        The ops are the buttons of the dashboard's "Bridging & tray" card,
+        and each one is the same code the equivalent menu row runs. The slow
+        ones (a rescan can block on a bridge start, an unhide-all stops every
+        bridge) are honest about it in `text` rather than making the page
+        wait; the update check is synchronous because its answer IS the
+        result the user pressed the button for.
+        """
+        handlers = {"rescan": self._act_rescan,
+                    "unhide_all": self._act_unhide_all,
+                    "update_check": self._act_update_check,
+                    "update_install": self._act_update_install,
+                    "open_logs": self._act_open_logs}
+        fn = handlers.get(op)
+        if fn is None:
+            return None
+        return fn()
+
+    def _act_rescan(self) -> dict:
+        if self._work("rescan", self.mgr.poll_once):
+            return {"ok": True, "text": "Rescanning for controllers."}
+        return {"ok": False, "text": "A rescan is already running."}
+
+    def _act_unhide_all(self) -> dict:
+        with self._lock:
+            if self._busy.get("unhide-all"):
+                return {"ok": False, "text": "Already unhiding every pad."}
+            self._busy["unhide-all"] = True
+        try:
+            ok, text = self._do_unhide_all()
+        finally:
+            with self._lock:
+                self._busy["unhide-all"] = False
+            self._refresh_now()
+        return {"ok": ok, "text": text}
+
+    def _act_update_check(self) -> dict:
+        try:
+            info = self._update_check_now()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "text": f"The update check failed: {e}"}
+        if info is not None:
+            return {"ok": True,
+                    "text": f"ds5bridge {info.version} is available "
+                            f"(you have {VERSION})."}
+        return {"ok": True,
+                "text": f"No newer release found (you have {VERSION})."}
+
+    def _act_update_install(self) -> dict:
+        info = self.updater.available if self.updater is not None else None
+        if info is None:
+            return {"ok": False,
+                    "text": "No update is available. Check for updates first."}
+        if self._update_installing:
+            return {"ok": False, "text": f"Already installing {info.version}."}
+        self._update_installing = True
+
+        def note(title: str, text: str) -> None:
+            if title.lower().startswith("update failed"):
+                self._update_installing = False
+            self._notify(title, text)
+
+        U.install(self.updater, notify=note, quit_cb=self._quit)
+        return {"ok": True,
+                "text": f"Downloading ds5bridge {info.version}. The tray "
+                        f"will exit and come back once it is installed."}
+
+    def _act_open_logs(self) -> dict:
+        d = logs_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+            if sys.platform == "win32":
+                import subprocess
+
+                # explorer.exe, as `_open_dashboard` does: from an elevated
+                # tray the shell opens the folder with the desktop's token.
+                subprocess.Popen(["explorer.exe", d], close_fds=True)
+            else:
+                import webbrowser
+
+                webbrowser.open("file://" + d)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "text": f"Could not open {d}: {e}"}
+        return {"ok": True, "text": f"Opened {d}."}
+
+    # -- the update check, switchable at runtime ----------------------------
+
+    def _make_updater(self):
+        """An `Updater` that also stamps `_update_checked_at`.
+
+        update.py owns the check; the tray only wants to know WHEN the last
+        one ran, so the instance's `check_once` is wrapped rather than the
+        class subclassed -- the loop calls it through `self`, so both the
+        daily poll and a manual check land here.
+        """
+        upd = U.Updater(notify=self._notify)
+        inner = upd.check_once
+
+        def check_once():
+            try:
+                result = inner()
+            except Exception as e:  # noqa: BLE001
+                # update.py's own contract is "never raises"; if it ever
+                # does, the page gets the reason instead of a stale answer.
+                self._update_error = str(e) or e.__class__.__name__
+                raise
+            else:
+                self._update_error = None
+                return result
+            finally:
+                self._update_checked_at = time.time()
+        upd.check_once = check_once
+        return upd
+
+    def _apply_update_check(self, enabled: bool) -> None:
+        """Start or stop the daily update poll to match `update_check`.
+
+        Idempotent. Stopping keeps the object: an update the poll already
+        found stays on the menu and in the dashboard, installable; only the
+        polling ends. Starting after a stop makes a fresh one, because a
+        stopped `Updater` cannot be restarted.
+        """
+        if enabled:
+            if self._update_loop_on:
+                return
+            try:
+                self.updater = self._make_updater().start()
+                self._update_loop_on = True
+            except Exception:  # noqa: BLE001
+                log.exception("the update check could not start")
+        else:
+            if not self._update_loop_on:
+                return
+            self._update_loop_on = False
+            try:
+                if self.updater is not None:
+                    self.updater.stop()
+            except Exception:  # noqa: BLE001
+                log.debug("stopping the update check failed", exc_info=True)
+            log.info("update checks are off (update_check: false)")
+
+    def _update_check_now(self):
+        """One synchronous check, whether or not the daily poll is on.
+
+        With the poll off there is no updater yet, so a one-off is made and
+        kept (unstarted): the answer has to live somewhere the menu row and
+        `/api/state` can read it.
+        """
+        if self.updater is None:
+            self.updater = self._make_updater()
+        return self.updater.check_once()
 
     def _stop_dashboard(self) -> None:
         """Best-effort, idempotent, and never in the way of the real teardown."""
@@ -828,50 +1117,54 @@ class TrayApp:
         So the sweep's own count is reported, and then HidHide is asked.
         """
         def go():
-            from . import hidhide as HH
-
-            self.mgr.stop_all()
-            # Whose pads this is answerable for, taken BEFORE the sweep -- a
-            # cleared record is a deleted record, and the serials are what the
-            # visibility check below needs.
-            owed = [r.get("serial") for r in HH.read_records() if r.get("serial")]
-            n = HH.sweep(force=True, log_fn=lambda t: print("  " + t, flush=True))
-            left = HH.journal_count()
-            stray = HH.unrecorded_hidden()
-            stuck = [s for s in owed if HH.pad_visible(s) is False]
-            if left:
-                # A record that survives the sweep is the worse failure of the
-                # two and names the real culprit, so it is reported first even
-                # though its pad is necessarily in `stuck` as well.
-                self._notify("ds5bridge",
-                             f"{left} controller(s) could not be unhidden. Use "
-                             f"HidHideClient.exe, or run `ds5bridge unhide`.")
-            elif stuck:
-                # The blacklist can be empty and the controller still gone: the
-                # HID devnode under it goes phantom, and only a re-enumeration
-                # brings it back. `sweep()` has already tried, including the
-                # elevated route if this process happens to have it.
-                self._notify("ds5bridge", HH.power_cycle_hint(short(stuck[0]))
-                             if len(stuck) == 1 else
-                             f"{len(stuck)} controllers are unhidden but still "
-                             f"not showing up. Switch each one off and on "
-                             f"again.")
-            elif stray is None:
-                self._notify("ds5bridge",
-                             "HidHide would not say what it is hiding, so this "
-                             "cannot confirm your pads are visible. Check "
-                             "HidHideClient.exe.")
-            elif stray:
-                self._notify("ds5bridge",
-                             f"HidHide is still hiding {len(stray)} device(s) "
-                             f"that ds5bridge has no record of. Run `ds5bridge "
-                             f"unhide --all-hidhide`, or untick them in "
-                             f"HidHideClient.exe.")
-            else:
-                self._notify("ds5bridge",
-                             f"Unhid {n} controller(s). Every pad is visible "
-                             f"to Windows again.")
+            ok, text = self._do_unhide_all()
+            self._notify("ds5bridge", text)
         self._work("unhide-all", go)
+
+    def _do_unhide_all(self) -> tuple:
+        """The work behind the panic button. -> (all clear?, what to say).
+
+        Shared by the menu row and the dashboard's `unhide_all` action, so
+        that both say the same thing about the same machine state.
+        """
+        from . import hidhide as HH
+
+        self.mgr.stop_all()
+        # Whose pads this is answerable for, taken BEFORE the sweep -- a
+        # cleared record is a deleted record, and the serials are what the
+        # visibility check below needs.
+        owed = [r.get("serial") for r in HH.read_records() if r.get("serial")]
+        n = HH.sweep(force=True, log_fn=lambda t: print("  " + t, flush=True))
+        left = HH.journal_count()
+        stray = HH.unrecorded_hidden()
+        stuck = [s for s in owed if HH.pad_visible(s) is False]
+        if left:
+            # A record that survives the sweep is the worse failure of the
+            # two and names the real culprit, so it is reported first even
+            # though its pad is necessarily in `stuck` as well.
+            return False, (f"{left} controller(s) could not be unhidden. Use "
+                           f"HidHideClient.exe, or run `ds5bridge unhide`.")
+        if stuck:
+            # The blacklist can be empty and the controller still gone: the
+            # HID devnode under it goes phantom, and only a re-enumeration
+            # brings it back. `sweep()` has already tried, including the
+            # elevated route if this process happens to have it.
+            return False, (HH.power_cycle_hint(short(stuck[0]))
+                           if len(stuck) == 1 else
+                           f"{len(stuck)} controllers are unhidden but still "
+                           f"not showing up. Switch each one off and on "
+                           f"again.")
+        if stray is None:
+            return False, ("HidHide would not say what it is hiding, so this "
+                           "cannot confirm your pads are visible. Check "
+                           "HidHideClient.exe.")
+        if stray:
+            return False, (f"HidHide is still hiding {len(stray)} device(s) "
+                           f"that ds5bridge has no record of. Run `ds5bridge "
+                           f"unhide --all-hidhide`, or untick them in "
+                           f"HidHideClient.exe.")
+        return True, (f"Unhid {n} controller(s). Every pad is visible to "
+                      f"Windows again.")
 
     def _toggle_autostart(self, *_):
         def act():
@@ -883,6 +1176,7 @@ class TrayApp:
                 return
             self.cfg.autostart_on_login = want
             self._save()
+            self._refresh_autostart()
             self._notify("ds5bridge",
                          "ds5bridge will start when you log in."
                          if want else "ds5bridge will no longer start at login.")
@@ -892,8 +1186,10 @@ class TrayApp:
         """The "Install update" row. All of it happens in update.py; the tray
         only supplies its own notifier and the clean way to exit -- the swap
         helper is waiting on this PID, so `_quit` (teardown, then exit) is
-        exactly the right hand-off."""
-        U.install(self.updater, notify=self._notify, quit_cb=self._quit)
+        exactly the right hand-off. Same path as the dashboard's button."""
+        result = self._act_update_install()
+        if not result.get("ok"):
+            self._notify("Install update", result.get("text") or "")
 
     def _rescan(self, *_):
         self._work("rescan", self.mgr.poll_once)
@@ -1139,7 +1435,11 @@ class TrayApp:
         redraw only happens when this tuple actually moves.
         """
         agg = self._snap.get("aggregate", {})
-        cs = [c for c in self._controllers() if c.get("enabled")]
+        # Enabled AND present: a pad the manager remembers but that is
+        # switched off (`present: False`) is not a bridge that failed to
+        # come up, and must not turn the icon amber.
+        cs = [c for c in self._controllers()
+              if c.get("enabled") and c.get("present")]
         if not self._snap.get("master_enabled", True):
             return DISABLED_COLOR, None, 0
         if agg.get("errors"):
@@ -1165,11 +1465,15 @@ class TrayApp:
         would actually notice -- a controller appearing or going away, a state,
         a checkbox, the battery, the count in the first row -- is in here.
 
-        Deliberately absent: `A.is_enabled()` and `_journal_count()`, which are
-        a registry read and a directory listing. Both are evaluated when the
-        menu is rebuilt, and neither may be put on a two-second timer just to
-        notice a change that only a click can cause -- and a click rebuilds the
-        menu anyway, through pystray's own `_handler`.
+        Deliberately absent: `_journal_count()`, a directory listing that is
+        evaluated when the menu is rebuilt and must not be put on a two-second
+        timer just to notice a change that only a click can cause -- and a
+        click rebuilds the menu anyway, through pystray's own `_handler`. The
+        autostart checkbox IS in here, but as the cached answer
+        (`_autostart_cache`, refreshed by every toggle, every dashboard save
+        and the poll thread on `AUTOSTART_TTL_S`), never as a live query: that
+        is what lets a "start with Windows" flipped on the dashboard show in
+        the menu straight away.
         """
         return (self._title().splitlines()[0],
                 # DESIRED values for everything a checkbox renders, so the
@@ -1178,6 +1482,7 @@ class TrayApp:
                 # current one rather than rebuilt again two seconds later.
                 self._desired_master(),
                 self._hide_all_checked(),
+                self._autostart_enabled(),
                 # In-memory read; this is how the "Install update" row appears
                 # when the daily background check lands mid-session.
                 U.menu_visible(self.updater),
@@ -1341,7 +1646,7 @@ class TrayApp:
                  pystray.Menu.SEPARATOR,
                  pystray.MenuItem("Rescan for controllers", self._rescan),
                  pystray.MenuItem("Start at login", self._toggle_autostart,
-                                  checked=lambda _i: A.is_enabled(),
+                                  checked=lambda _i: self._autostart_enabled(),
                                   visible=lambda _i: A.available()),
                  # Hidden until the background check finds a newer release; the
                  # action stages the download, hands off to the swap helper and
@@ -1357,6 +1662,9 @@ class TrayApp:
     def _poll(self) -> None:
         while not self._stop.wait(REFRESH_S):
             try:
+                if (time.monotonic() - self._autostart_checked_at
+                        >= AUTOSTART_TTL_S):
+                    self._refresh_autostart()
                 self._refresh_now()
             except Exception:  # noqa: BLE001
                 pass
@@ -1487,4 +1795,7 @@ def run_tray(args) -> int:
               "    python -m pip install pystray pillow\n"
               "Or use `ds5bridge` (no tray) instead.", file=sys.stderr)
         return 3
+    path = install_file_log()
+    if path:
+        print(f"  log: {path}", flush=True)
     return TrayApp(args).run()
