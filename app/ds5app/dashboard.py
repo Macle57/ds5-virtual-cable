@@ -302,6 +302,8 @@ class DashboardServer:
                 "remote_keys": ([b for b in K.CHORD_BUTTONS if b != "ps"]
                                 + list(K.CHORD_GESTURES)),
                 "gesture_keys": list(K.CHORD_GESTURES),
+                # the Gestures tab: ordered {key, label, help, group}
+                "gestures": K.gesture_meta(),
                 # the key vocabulary a user macro may use, engine order
                 "macro_keys": list(ACT.KEY_NAMES),
                 # the engine's own actions (pad power / lightbar), which the

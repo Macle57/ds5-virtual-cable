@@ -476,7 +476,21 @@ _STATUS_RE = re.compile(
 
 #: The prefixes `cli._log` puts in front of each event.
 _EVENT_PREFIX = {"  *  ": "ready", "  !  ": "warn", " !!! ": "error",
-                 "  ~  ": "battery", "  -  ": "info", "  #  ": "mode"}
+                 "  ~  ": "battery", "  -  ": "info", "  #  ": "mode",
+                 "  >  ": "toast"}
+
+
+def parse_toast_event(text: str):
+    """`(category, title, body)` from a child's toast line
+    (`service.toast_line`: `category|title|body`), or None. The tray gates
+    the category against `config.Notifications` and shows title/body."""
+    parts = text.split("|", 2)
+    if len(parts) != 3:
+        return None
+    category, title, body = (p.strip() for p in parts)
+    if not category or not (title or body):
+        return None
+    return category, title, body
 
 #: `service.mode_line()`: the chord engine's remote/keyboard state.
 _MODE_RE = re.compile(r"^remote (?P<remote>on|off)\s+keyboard "

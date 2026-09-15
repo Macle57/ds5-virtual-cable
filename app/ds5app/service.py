@@ -544,6 +544,16 @@ def mode_line(remote: bool, keyboard: bool) -> str:
             f"keyboard {'open' if keyboard else 'closed'}")
 
 
+def toast_line(category: str, title: str, body: str) -> str:
+    """A tray notification as one child status line: `category|title|body`
+    (printed under `cli._log`'s "toast" prefix, parsed back by
+    `manager.parse_toast_event`). Pipes and newlines inside the parts are
+    flattened so the line stays one line with exactly two separators."""
+    def clean(s: str) -> str:
+        return " ".join(str(s).replace("|", "/").split())
+    return f"{clean(category)}|{clean(title)}|{clean(body)}"
+
+
 class BridgeService:
     def __init__(self, serial: str | None = None, port: int = DEFAULT_PORT,
                  host: str = "127.0.0.1", busid: str = "1-1",
@@ -877,7 +887,12 @@ class BridgeService:
             self._interceptor = I.attach_to_backend(
                 self._backend, self.input_config, allow_disabled=True,
                 on_mode=lambda remote, keyboard: self._emit(
-                    "mode", mode_line(remote, keyboard)))
+                    "mode", mode_line(remote, keyboard)),
+                # A notification for the tray: `<category>|<title>|<body>`
+                # on the child's "toast" line, gated by the tray's
+                # `notifications` config (see `manager.parse_toast_event`).
+                on_toast=lambda category, title, body: self._emit(
+                    "toast", toast_line(category, title, body)))
             if self._interceptor is not None and self.input_config.enabled:
                 self._emit("info",
                            f"chord engine armed (chord button: "

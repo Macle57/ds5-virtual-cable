@@ -62,9 +62,28 @@ class Defaults(unittest.TestCase):
         self.assertEqual(d["r1"], "brightness_up")
         self.assertEqual(d["options"], "projection_cycle")
         self.assertEqual(d["create"], "show_desktop")
-        self.assertEqual(d["touch_slide_horizontal"], "alt_tab")
-        self.assertEqual(d["touch_swipe_up"], "task_view")
-        self.assertEqual(d["touch_swipe_down"], "minimize_all")
+        self.assertEqual(d["r3"], "show_battery")
+        self.assertEqual(d["touch_click_2f"], "right_click")
+        self.assertNotIn("touch_tap_2f", d)
+        self.assertEqual(d["touch_slide_horizontal"], "scroll_horizontal")
+        self.assertEqual(d["touch_slide_vertical"], "scroll")
+        self.assertNotIn("touch_swipe_up", d)
+        self.assertNotIn("touch_swipe_down", d)
+        self.assertEqual(d["touch_pinch"], "pinch_zoom")
+        self.assertEqual(d["touch_slide_horizontal_pressed"], "alt_tab")
+        self.assertEqual(d["touch_swipe_up_pressed"], "task_view")
+        self.assertEqual(d["touch_swipe_down_pressed"], "minimize_all")
+        self.assertEqual(d["touch_pinch_pressed"], "ctrl_zoom")
+        # every gesture row in either table is a served gesture key
+        for table in (CFG.DEFAULT_CHORDS, CFG.DEFAULT_REMOTE_CHORDS):
+            for key in table:
+                if CFG.is_gesture_key(key):
+                    self.assertIn(key, CFG.CHORD_GESTURES)
+        self.assertEqual([g["key"] for g in CFG.gesture_meta()],
+                         list(CFG.CHORD_GESTURES))
+        for g in CFG.gesture_meta():
+            self.assertIn(g["group"], ("taps", "unpressed", "pressed"))
+            self.assertTrue(g["label"] and g["help"])
 
     def test_battery_lightbar_and_remote_defaults(self):
         ic = CFG.InputConfig()

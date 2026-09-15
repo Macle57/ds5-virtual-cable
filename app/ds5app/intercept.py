@@ -120,6 +120,7 @@ injectable `clock` makes every timing rule unit-testable.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -160,6 +161,10 @@ STICK_DEADZONE = 12
 TRIGGER_DEADZONE = 8
 
 # --- gesture tuning (touchpad units: 1920 x 1080 points) ---------------------
+#
+# The live values come from `config.GestureTuning` (`input.gestures`, adopted
+# in `_adopt_cfg`); these are its defaults, kept as module names for anything
+# that reads them.
 
 #: Horizontal 2-finger travel that opens the Alt-Tab switcher, and per further
 #: step through it.
@@ -170,6 +175,10 @@ SWIPE_PX = 200
 #: A touch shorter than this that moved less than TAP_MOVE_PX is a tap.
 TAP_S = 0.25
 TAP_MOVE_PX = 40
+
+#: What the pad's status nibble says about the battery, in the words the
+#: `show_battery` toast uses.
+_BATTERY_STATES = {0x0: "discharging", 0x1: "charging", 0x2: "full"}
 
 # --- remote-mode tuning ------------------------------------------------------
 
@@ -213,7 +222,7 @@ class _Frame:
     """
 
     __slots__ = ("buttons", "dpad", "lx", "ly", "rx", "ry", "l2", "r2",
-                 "t0", "t1", "battery_percent", "discharging")
+                 "t0", "t1", "battery_percent", "discharging", "battery_state")
 
     def __init__(self, body: bytes):
         d = O.digital_keys
@@ -231,8 +240,10 @@ class _Frame:
         self.t0 = _touch_point(body, O.touch_data)
         self.t1 = _touch_point(body, O.touch_data + 4)
         status0 = body[O.status0]
-        self.battery_percent = min(100, (status0 & 0x0F) * 10)
-        self.discharging = ((status0 & 0xF0) >> 4) == 0x00
+        state = (status0 & 0xF0) >> 4
+        self.battery_percent = 100 if state == 0x2 else min(100, (status0 & 0x0F) * 10)
+        self.discharging = state == 0x00
+        self.battery_state = _BATTERY_STATES.get(state, "unknown")
 
     def stick_active(self) -> bool:
         return any(abs(v - STICK_CENTER) > STICK_DEADZONE
@@ -294,7 +305,7 @@ class InputInterceptor:
     def __init__(self, cfg: K.InputConfig, *, actions: OsActions,
                  send_setstate, power_off,
                  clock=time.monotonic, dispatch=None,
-                 on_mode=None, osk=None):
+                 on_mode=None, osk=None, on_toast=None):
         self.actions = actions
         self.send_setstate = send_setstate
         self.power_off = power_off
@@ -305,6 +316,12 @@ class InputInterceptor:
         #: whenever either flips -- the child's status channel.
         self.on_mode = on_mode
         self._mode_sent: tuple | None = None
+        #: `on_toast(category, title, body)`: a notification for the tray to
+        #: show -- `show_battery`, the remote-mode and keyboard flips. The
+        #: body may contain `{pad}`, which the tray replaces with the pad's
+        #: label. Queued under the lock (`_toast`), delivered with the thunks.
+        self.on_toast = on_toast
+        self._toasts_pending: list = []
         #: The on-screen keyboard. Lazy about its window: nothing is drawn
         #: (no thread started) until the `keyboard` action first fires.
         self._osk = osk if osk is not None else OSK.OnScreenKeyboard(actions)
@@ -320,16 +337,34 @@ class InputInterceptor:
         self._chord_used = False
         self._pending_tap_at: float | None = None
         self._replay_until = 0.0
-        #: (chord key, next repeat due) while a repeatable chord is held.
-        self._repeating: tuple[str, float] | None = None
+        #: {"key", "next", "interval", "runs", "max"} while a repeatable
+        #: chord is held.
+        self._repeating: dict | None = None
         self._warned_actions: set[str] = set()
+        #: Toggle-repeat macros currently running, keyed by action name:
+        #: {"run": thunk, "next": due, "interval": s, "runs": n, "max": n}.
+        #: Driven by `tick()`, so they keep going with no input flowing.
+        self._toggles: dict = {}
 
-        # -- gesture state (chord held) --------------------------------------
-        self._g2_active = False
-        self._g2_start: tuple[float, float] = (0.0, 0.0)
-        self._g2_decided: str | None = None
-        #: Shared by the chord-held and remote-mode alt-tab trackers; never
-        #: both live at once (a chord press ends the remote gesture first).
+        # -- the 2-finger gesture tracker ------------------------------------
+        #: One tracker for both contexts (chord held, remote mode); which
+        #: binding table a contact resolves through is fixed when it begins.
+        #: `_tf_decided`: None = undecided, "spent" = a one-shot fired (or the
+        #: contact is used up), "alt_tab" = the switcher is open and stepping,
+        #: "cont" = a continuous action (`_tf_cont`) is tracking the fingers.
+        self._tf_active = False
+        self._tf_table: dict = {}
+        self._tf_at = 0.0
+        self._tf_start: tuple[float, float] = (0.0, 0.0)
+        self._tf_spread0 = 0.0
+        self._tf_last: tuple[float, float] = (0.0, 0.0)
+        self._tf_spread_last = 0.0
+        self._tf_pressed0 = False
+        self._tf_clicked = False
+        self._tf_decided: str | None = None
+        self._tf_cont = None
+        self._tf_axis = "y"
+        self._tf_acc = 0.0
         self._alt_anchor = 0.0
 
         # -- remote mode ------------------------------------------------------
@@ -340,6 +375,9 @@ class InputInterceptor:
         self._rm_touch_moved = 0.0
         self._rm_touch_fingers = 0
         self._rm_touch_max_fingers = 0
+        #: The pad was physically clicked during the current 1-finger
+        #: contact (the left button was held for it): no tap-click on lift.
+        self._rm_touch_clicked = False
         self._rm_mouse_frac = [0.0, 0.0]
         self._rm_scroll_acc = 0.0          # vertical wheel units pending
         #: Buttons remote mode is holding something for, keyed by chord-key
@@ -350,11 +388,6 @@ class InputInterceptor:
         self._rm_needs_release = False
         #: When the remote lightbar colour is next re-asserted (tick()).
         self._rm_lightbar_next = 0.0
-        #: 2-finger gesture per contact: None = undecided, "alt_tab" = the
-        #: switcher is open and stepping. Nothing else -- the touchpad
-        #: deliberately does not scroll.
-        self._rm2_decided: str | None = None
-        self._rm2_start: tuple[float, float] = (0.0, 0.0)
 
         # -- rate translation (sticks/triggers -> pointer/scroll) -------------
         #: Timestamp of the last rate-translated report, shared between remote
@@ -381,7 +414,8 @@ class InputInterceptor:
                       "gestures_fired": 0, "taps_replayed": 0,
                       "remote_toggles": 0, "remote_actions": 0,
                       "battery_flashes": 0, "idle_power_off": 0,
-                      "lightbar_toggles": 0, "keyboard_toggles": 0}
+                      "lightbar_toggles": 0, "keyboard_toggles": 0,
+                      "macro_repeats": 0, "toasts": 0}
 
     @property
     def keyboard_open(self) -> bool:
@@ -421,12 +455,17 @@ class InputInterceptor:
             if spec is not None:
                 registry[name] = spec
         self.registry = registry
-        #: What a button or gesture does in REMOTE mode (module docstring,
-        #: "Remote mode"): the chord table itself when `same_bindings`, else
-        #: the remote section's own table. Both dicts are already merged over
-        #: their defaults by config.py; this is only a choice between them.
+        #: What a BUTTON does in REMOTE mode (module docstring, "Remote
+        #: mode"): the chord table itself when `same_bindings`, else the
+        #: remote section's own table; and separately which table the
+        #: GESTURE rows come from (`same_gestures`). Both dicts are already
+        #: merged over their defaults by config.py; this is only a choice.
         rm = cfg.remote
         self._remote_table = cfg.chords if rm.same_bindings else rm.chords
+        self._remote_gestures = cfg.chords if rm.same_gestures else rm.chords
+        #: Gesture thresholds (`config.GestureTuning`).
+        self._g = cfg.gestures
+        self._tap_s = cfg.gestures.tap_ms / 1000.0
 
     def update_config(self, new_cfg: K.InputConfig) -> None:
         """Adopt a changed config on a RUNNING engine, no bridge restart.
@@ -497,6 +536,10 @@ class InputInterceptor:
                 self._repeating = None
                 self._pending_tap_at = None
                 self._replay_until = 0.0
+            if disabled:
+                # A toggled macro spamming clicks must not outlive the
+                # engine that started it.
+                self._toggles.clear()
             if disabled:
                 # A dimmed or held-off lightbar must not outlive the engine
                 # that did it; queue the game's own colour back before going
@@ -637,6 +680,7 @@ class InputInterceptor:
         """Timers that must run with no input and no host traffic flowing."""
         now = self.clock()
         due: list[bytes] = []
+        runs: list = []
         power_off = False
         with self._lock:
             enabled = bool(self.cfg.enabled)
@@ -646,6 +690,17 @@ class InputInterceptor:
                 self._pending_tap_at = None
                 self._replay_until = now + self._tap_replay_s
                 self.stats["taps_replayed"] += 1
+            # toggled macros: they run on THIS timer because nothing else
+            # runs while the user is not touching the pad
+            if enabled:
+                for name, t in list(self._toggles.items()):
+                    if now >= t["next"]:
+                        t["next"] = now + t["interval"]
+                        t["runs"] += 1
+                        self.stats["macro_repeats"] += 1
+                        runs.append(t["run"])
+                        if t["max"] and t["runs"] >= t["max"]:
+                            del self._toggles[name]
             # queued pad effects. Drained even while disabled: a disable
             # transition queues its own goodbyes (the remote-exit pulse, the
             # lightbar restores), and swallowing those would strand the pad
@@ -685,6 +740,11 @@ class InputInterceptor:
                     power_off = True
         for body in due:
             self._send(body)
+        for fn in runs:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                log.exception("toggled macro failed")
         if power_off:
             log.info("no input for %.0f min -- powering the pad off",
                      self._off_timer_s / 60.0)
@@ -692,7 +752,10 @@ class InputInterceptor:
 
     def close(self) -> None:
         """Release anything held on the OS side (keys, the borrowed default
-        microphone), take the keyboard down, stop the worker."""
+        microphone, a synthetic pinch), stop toggled macros, take the
+        keyboard down, stop the worker."""
+        with self._lock:
+            self._toggles.clear()
         try:
             if self._osk is not None:
                 self._osk.shutdown()
@@ -707,6 +770,10 @@ class InputInterceptor:
     def _note_mode(self, thunks: list) -> None:
         """Queue `on_mode` if remote/keyboard state differs from what was
         last reported. Under the lock; the call itself runs with the thunks."""
+        if self._toasts_pending:
+            pending, self._toasts_pending = self._toasts_pending, []
+            for cat, title, body in pending:
+                thunks.append(lambda c=cat, t=title, b=body: self.on_toast(c, t, b))
         state = (bool(self.remote_mode), self.keyboard_open)
         if state == self._mode_sent:
             return
@@ -753,21 +820,28 @@ class InputInterceptor:
 
     def _chord_held(self, frame: _Frame, now: float, thunks: list) -> None:
         was = self._prev.buttons if self._prev is not None else set()
+        two_fingers = frame.t0[0] and frame.t1[0]
         for key in sorted(frame.buttons - was):
             if key == self.chord_button:
                 continue
+            if key == "touchpad_click" and two_fingers:
+                # A click with two fingers down is the `touch_click_2f`
+                # gesture (the tracker's), not the touchpad-click chord.
+                continue
             if self._fire_chord(key, now, thunks, first=True):
                 break                     # one new chord per report is plenty
-        # held repeatable chord (volume ramp, brightness ramp)
+        # held repeatable chord (volume ramp, brightness ramp, a hold macro)
         rep = self._repeating
         if rep is not None:
-            key, due = rep
-            if key not in frame.buttons:
+            if rep["key"] not in frame.buttons:
                 self._repeating = None
-            elif now >= due:
-                self._repeating = (key, now + self._repeat_s)
+            elif now >= rep["next"]:
+                rep["next"] = now + rep["interval"]
+                rep["runs"] += 1
                 self.stats["chord_repeats"] += 1
-                self._fire_chord(key, now, thunks, first=False)
+                self._fire_chord(rep["key"], now, thunks, first=False)
+                if rep["max"] and rep["runs"] >= rep["max"]:
+                    self._repeating = None
 
     def _fire_chord(self, key: str, now: float, thunks: list,
                     first: bool) -> bool:
@@ -788,19 +862,78 @@ class InputInterceptor:
                 log.warning("chord %r names unknown action %r -- ignored",
                             key, name)
             return False
-        params = self.cfg.actions.get(name) or {}
         if first:
             self.stats["chords_fired"] += 1
             if self.cfg.haptic_ack:
                 self._ack_locked(now)
             if spec.repeatable:
-                self._repeating = (key, now + max(self._repeat_s, 0.25))
-        thunks.append(lambda run=spec.run: self.dispatch(lambda: run(params)))
+                # A built-in ramps after a quarter second at `repeat_ms`; a
+                # hold macro with its own `interval_ms` runs at exactly that.
+                interval = self._repeat_interval(spec)
+                first_due = (now + interval if spec.repeat_interval_s is not None
+                             else now + max(interval, 0.25))
+                self._repeating = {"key": key, "next": first_due,
+                                   "interval": interval, "runs": 1,
+                                   "max": spec.max_runs}
+        self._run_spec(name, spec, now, thunks)
         return True
 
+    def _repeat_interval(self, spec) -> float:
+        """A hold-repeat's cadence: the macro's own, else `repeat_ms`."""
+        if spec.repeat_interval_s is not None:
+            return max(0.01, float(spec.repeat_interval_s))
+        return self._repeat_s
+
+    def _run_spec(self, name: str, spec, now: float, thunks: list) -> None:
+        """Dispatch a registry action once -- or, for a "toggle" macro, start
+        it repeating on the engine's timer (`tick`) / stop it if it is
+        already running. Under the lock; the run itself is a thunk."""
+        params = self.cfg.actions.get(name) or {}
+        fire = lambda run=spec.run: self.dispatch(lambda: run(params))  # noqa: E731
+        if spec.repeat_mode == "toggle":
+            if name in self._toggles:
+                del self._toggles[name]
+                return
+            interval = self._repeat_interval(spec)
+            self._toggles[name] = {"run": fire, "next": now + interval,
+                                   "interval": interval, "runs": 1,
+                                   "max": spec.max_runs}
+            if spec.max_runs == 1:
+                del self._toggles[name]
+        thunks.append(fire)
+
     # =====================================================================
-    # chord-held touchpad gestures
+    # the 2-finger touchpad gestures (chord held, and remote mode)
     # =====================================================================
+    #
+    # One contact = one gesture, decided once. From the moment the second
+    # finger lands, the centroid's travel (dx, dy) and the change in the
+    # fingers' spread (ds) are measured against `input.gestures`, and whether
+    # the pad is physically CLICKED picks the row family:
+    #
+    #   clicked:   |ds| >= pinch_px        -> touch_pinch_pressed
+    #              |dx| >= alt_tab_step_px -> touch_slide_horizontal_pressed
+    #              |dy| >= swipe_px        -> touch_swipe_up/down_pressed
+    #   unclicked: |ds| >= pinch_px        -> touch_pinch
+    #              |dx| >= slide_px        -> touch_slide_horizontal
+    #              |dy| >= slide_px        -> touch_slide_vertical, or -- only
+    #                                        while that row is "none" -- the
+    #                                        compatibility flicks
+    #                                        touch_swipe_up/down at swipe_px
+    #
+    # (a row bound to `alt_tab` waits for alt_tab_step_px whatever the
+    # family). What the row names decides the SHAPE of the gesture: a
+    # continuous action (`ActionSpec.continuous`: scroll, zoom) tracks the
+    # fingers until they lift, `alt_tab` opens the switcher with hold
+    # semantics, anything else fires once and the contact is spent. An
+    # unbound row leaves the contact undecided so a later, bound direction
+    # can still win.
+    #
+    # A contact that never reached a threshold is, on release, one of two
+    # taps: `touch_click_2f` if the pad was clicked during the contact (fired
+    # when the click is RELEASED, so a click that turns into a slide fires
+    # its `_pressed` gesture and never the click), else `touch_tap_2f` if it
+    # was short. A click is never also a tap.
 
     @staticmethod
     def _centroid(frame: _Frame) -> tuple[int, tuple[float, float]]:
@@ -810,60 +943,211 @@ class InputInterceptor:
         return len(pts), (sum(p[0] for p in pts) / len(pts),
                           sum(p[1] for p in pts) / len(pts))
 
+    @staticmethod
+    def _spread(frame: _Frame) -> float:
+        """Distance between the two fingers (0 with fewer than two)."""
+        if not (frame.t0[0] and frame.t1[0]):
+            return 0.0
+        return math.hypot(frame.t0[2] - frame.t1[2], frame.t0[3] - frame.t1[3])
+
     def _chord_gestures(self, frame: _Frame, now: float, thunks: list) -> None:
+        """Chord held: the 2-finger tracker over the chord table."""
+        if self._two_finger(frame, now, thunks, self.cfg.chords):
+            self._chord_used = True
+
+    def _two_finger(self, frame: _Frame, now: float, thunks: list,
+                    table: dict) -> bool:
+        """Feed one frame to the tracker. -> True if a gesture fired or is
+        tracking (the caller marks the chord used)."""
         fingers, c = self._centroid(frame)
+        was = self._prev.buttons if self._prev is not None else set()
+        pressed = "touchpad_click" in frame.buttons
+        was_pressed = "touchpad_click" in was
         if fingers < 2:
-            if self._g2_active:
-                self._end_gesture(thunks)
-            return
-        if not self._g2_active:
-            self._g2_active = True
-            self._g2_start = c
-            self._g2_decided = None
-            return
-        dx = c[0] - self._g2_start[0]
-        dy = c[1] - self._g2_start[1]
-        if self._g2_decided is None:
-            decided = self._decide_two_finger(dx, dy, now, thunks,
-                                              self.cfg.chords)
-            if decided is not None:
-                self._g2_decided = decided
-                self._chord_used = True
-        elif self._g2_decided == "alt_tab":
+            if self._tf_active:
+                self._tf_end(now, thunks, lifted=True)
+            return False
+        spread = self._spread(frame)
+        if not self._tf_active:
+            # The second finger just landed: travel counts from HERE, so
+            # 1-finger mousing can never pre-load a gesture.
+            self._tf_active = True
+            self._tf_table = table
+            self._tf_at = now
+            self._tf_start = self._tf_last = c
+            self._tf_spread0 = self._tf_spread_last = spread
+            self._tf_pressed0 = pressed
+            self._tf_clicked = False
+            self._tf_decided = None
+            self._tf_cont = None
+            self._tf_acc = 0.0
+            return False
+        if pressed and not was_pressed:
+            self._tf_clicked = True
+        dx = c[0] - self._tf_start[0]
+        dy = c[1] - self._tf_start[1]
+        ds = spread - self._tf_spread0
+        busy = self._tf_decided is not None
+        if self._tf_decided is None:
+            if not pressed and was_pressed and self._tf_clicked:
+                # The click came back up before any threshold: a 2-finger
+                # click. Fired on the release, so a click that becomes a
+                # slide can only ever fire the slide.
+                if self._tap_sized(dx, dy, ds):
+                    self._fire_tap("touch_click_2f", now, thunks)
+                self._tf_decided = "spent"
+                busy = True
+            else:
+                decided = self._decide_two_finger(dx, dy, ds, pressed, now,
+                                                  thunks)
+                if decided is not None:
+                    self._tf_decided = decided
+                    busy = True
+                    if decided == "cont":
+                        # The frame that crossed the threshold moved too:
+                        # count it, or a quick slide loses its first step.
+                        self._track_continuous(c, spread, thunks)
+        elif self._tf_decided == "alt_tab":
             self._alt_hold_track(dx, thunks)
+        elif self._tf_decided == "cont":
+            self._track_continuous(c, spread, thunks)
+        self._tf_last = c
+        self._tf_spread_last = spread
+        return busy
 
-    def _decide_two_finger(self, dx: float, dy: float, now: float,
-                           thunks: list, table: dict):
-        """Classify a 2-finger travel against `table` and fire it.
+    def _tap_sized(self, dx: float, dy: float, ds: float) -> bool:
+        g = self._g
+        return (max(abs(dx), abs(dy)) <= g.tap_move_px
+                and abs(ds) <= g.pinch_px)
 
-        -> "alt_tab" (the switcher is open and `_alt_hold_track` steps it),
-        "fired" (a one-shot gesture went out, this contact is spent), or None
-        (not decisive yet, or decisive but unbound -- stays undecided so a
-        later, bound direction can still win). Shared by the chord-held
-        tracker and remote mode, which differ only in the table.
-        """
-        if abs(dx) >= ALT_TAB_START_PX and abs(dx) > abs(dy):
-            name = table.get("touch_slide_horizontal")
-            if not name:
-                return None
-            self.stats["gestures_fired"] += 1
-            if self.cfg.haptic_ack:
-                self._ack_locked(now)
-            if name == "alt_tab":
-                # Hold semantics: the switcher stays open while the fingers
-                # stay down; sliding steps through it; lifting them (or
-                # releasing the chord button) commits.
+    def _decide_two_finger(self, dx: float, dy: float, ds: float,
+                           pressed: bool, now: float, thunks: list):
+        """Classify the travel so far (see the section comment). -> the
+        tracker's decision, or None while nothing decisive and bound."""
+        g = self._g
+        ax, ay, aS = abs(dx), abs(dy), abs(ds)
+        if pressed:
+            if aS >= g.pinch_px and aS > max(ax, ay):
+                return self._commit_gesture("touch_pinch_pressed", "spread",
+                                            dx, now, thunks)
+            if ax >= g.alt_tab_step_px and ax > ay:
+                return self._commit_gesture("touch_slide_horizontal_pressed",
+                                            "x", dx, now, thunks)
+            if ay >= g.swipe_px and ay > ax:
+                key = ("touch_swipe_up_pressed" if dy < 0
+                       else "touch_swipe_down_pressed")
+                return self._commit_gesture(key, "y", dx, now, thunks)
+            return None
+        if aS >= g.pinch_px and aS > max(ax, ay):
+            return self._commit_gesture("touch_pinch", "spread", dx, now, thunks)
+        if ax >= g.slide_px and ax > ay:
+            return self._commit_gesture("touch_slide_horizontal", "x", dx,
+                                        now, thunks)
+        if ay >= g.slide_px and ay > ax:
+            if self._tf_table.get("touch_slide_vertical"):
+                return self._commit_gesture("touch_slide_vertical", "y", dx,
+                                            now, thunks)
+            if ay >= g.swipe_px:
+                key = "touch_swipe_up" if dy < 0 else "touch_swipe_down"
+                return self._commit_gesture(key, "y", dx, now, thunks)
+        return None
+
+    def _commit_gesture(self, key: str, axis: str, dx: float, now: float,
+                        thunks: list):
+        """The contact IS gesture `key`: start what its row names.
+
+        -> "alt_tab" / "cont" / "spent", or None when the row is unbound (the
+        contact stays undecided) or names `alt_tab` before the switcher's
+        own, larger threshold is met."""
+        table = self._tf_table
+        name = table.get(key)
+        if not name:
+            return None
+        spec = self.registry.get(name)
+        if name == "alt_tab" and spec is not None:
+            if abs(dx) < self._g.alt_tab_step_px or axis != "x":
+                # Alt-Tab is a horizontal hold gesture whatever row carries
+                # it; a vertical row bound to it fires the plain step.
+                if axis == "x":
+                    return None
+            else:
+                self.stats["gestures_fired"] += 1
+                if self.cfg.haptic_ack:
+                    self._ack_locked(now)
                 self._alt_hold_begin(dx, thunks)
                 return "alt_tab"
-            self._fire_gesture_action("touch_slide_horizontal", now, thunks,
-                                      ack=False, table=table)
-            return "fired"
-        if abs(dy) >= SWIPE_PX and abs(dy) > abs(dx):
-            key = "touch_swipe_up" if dy < 0 else "touch_swipe_down"
-            if self._fire_gesture_action(key, now, thunks, table=table):
-                self.stats["gestures_fired"] += 1
-            return "fired"
-        return None
+        if spec is not None and spec.continuous is not None:
+            self.stats["gestures_fired"] += 1
+            self._tf_cont = spec.continuous
+            self._tf_axis = axis
+            self._tf_acc = 0.0
+            thunks.append(spec.continuous.begin)
+            return "cont"
+        if self._fire_gesture_action(key, now, thunks, table=table):
+            self.stats["gestures_fired"] += 1
+        return "spent"
+
+    def _track_continuous(self, c, spread: float, thunks: list) -> None:
+        """One frame of a continuous gesture: the movement since the last
+        frame along the decided axis, converted to the action's unit and
+        emitted in its step size (third-notches for scrolling, whole notches
+        for Ctrl+wheel zoom, pixels for the touch pinch)."""
+        cont = self._tf_cont
+        g = self._g
+        # The signed movement, "positive" being what a wheel calls positive:
+        # fingers up = wheel up (content scrolls up, the Windows touchpad
+        # default), fingers right = hwheel right, fingers apart = zoom in.
+        if self._tf_axis == "x":
+            d = c[0] - self._tf_last[0]
+        elif self._tf_axis == "y":
+            d = -(c[1] - self._tf_last[1])
+        else:
+            d = spread - self._tf_spread_last
+        if cont.unit == "wheel":
+            per = (g.zoom_px_per_notch if self._tf_axis == "spread"
+                   else g.scroll_px_per_notch)
+            units = d * 120.0 / max(1, per) * self.cfg.remote.scroll_speed
+        else:
+            units = d * g.pinch_gain
+        self._tf_acc += units
+        step = max(1, int(cont.step))
+        whole = int(self._tf_acc / step) * step
+        if whole:
+            self._tf_acc -= whole
+            thunks.append(lambda w=whole, u=cont.update: u(w))
+
+    def _fire_tap(self, key: str, now: float, thunks: list) -> None:
+        """`touch_tap_2f` / `touch_click_2f` through the contact's table. No
+        haptic ack: a click that rumbles is a click people stop making."""
+        if self._fire_gesture_action(key, now, thunks, ack=False,
+                                     table=self._tf_table):
+            self.stats["gestures_fired"] += 1
+
+    def _tf_end(self, now: float, thunks: list, lifted: bool) -> None:
+        """The contact is over: commit an open switcher, end a continuous
+        action, or -- if the fingers lifted with nothing decided -- fire
+        the tap it was."""
+        decided = self._tf_decided
+        if decided == "alt_tab":
+            thunks.append(lambda: self.actions.alt_tab_commit())
+        elif decided == "cont":
+            thunks.append(self._tf_cont.end)
+        elif decided is None and lifted:
+            dx = self._tf_last[0] - self._tf_start[0]
+            dy = self._tf_last[1] - self._tf_start[1]
+            ds = self._tf_spread_last - self._tf_spread0
+            if self._tf_clicked:
+                # Lifted with the click still down (or released this very
+                # frame): a 2-finger click, once.
+                if self._tap_sized(dx, dy, ds):
+                    self._fire_tap("touch_click_2f", now, thunks)
+            elif (not self._tf_pressed0 and now - self._tf_at <= self._tap_s
+                    and self._tap_sized(dx, dy, ds)):
+                self._fire_tap("touch_tap_2f", now, thunks)
+        self._tf_active = False
+        self._tf_decided = None
+        self._tf_cont = None
+        self._tf_clicked = False
 
     # -- the alt-tab hold tracker, shared with remote mode -------------------
 
@@ -905,15 +1189,14 @@ class InputInterceptor:
             return False
         if ack and self.cfg.haptic_ack:
             self._ack_locked(now)
-        params = self.cfg.actions.get(name) or {}
-        thunks.append(lambda run=spec.run: self.dispatch(lambda: run(params)))
+        self._run_spec(name, spec, now, thunks)
         return True
 
     def _end_gesture(self, thunks: list) -> None:
-        if self._g2_decided == "alt_tab":
-            thunks.append(lambda: self.actions.alt_tab_commit())
-        self._g2_active = False
-        self._g2_decided = None
+        """The context ended under the fingers (chord released, a config
+        change, a mode switch): commit / end what is open, fire no tap."""
+        if self._tf_active:
+            self._tf_end(self.clock(), thunks, lifted=False)
 
     def _engine_action(self, name: str, now: float, thunks: list) -> None:
         """The actions that act on the PAD rather than the OS (see
@@ -925,6 +1208,8 @@ class InputInterceptor:
             thunks.append(self.power_off)
         elif name == "keyboard":
             self._keyboard_toggle(thunks)
+        elif name == "show_battery":
+            self._toast("battery", "Battery", self.battery_text())
         elif name == "pad_lightbar_toggle":
             self._lightbar_off = not self._lightbar_off
             self.stats["lightbar_toggles"] += 1
@@ -945,6 +1230,27 @@ class InputInterceptor:
         self.stats["keyboard_toggles"] += 1
         if fn is not None:
             thunks.append(fn)
+        self._toast("keyboard", "On-screen keyboard",
+                    "On-screen keyboard "
+                    + ("opened" if self.keyboard_open else "closed"))
+
+    # -- toasts -------------------------------------------------------------
+
+    def battery_text(self) -> str:
+        """`{pad}: NN % (discharging|charging|full)` from the last report;
+        the tray fills in the pad's label."""
+        f = self._prev
+        if f is None:
+            return "{pad}: battery unknown"
+        return f"{{pad}}: {f.battery_percent} % ({f.battery_state})"
+
+    def _toast(self, category: str, title: str, body: str) -> None:
+        """Queue a notification (under the lock); `_note_mode` hands the
+        queue to the thunk list so `on_toast` runs outside the lock."""
+        if self.on_toast is None:
+            return
+        self.stats["toasts"] += 1
+        self._toasts_pending.append((category, title, body))
 
     # =====================================================================
     # remote mode
@@ -954,7 +1260,13 @@ class InputInterceptor:
         self.remote_mode = not self.remote_mode
         self.stats["remote_toggles"] += 1
         log.info("remote mode %s", "ON" if self.remote_mode else "off")
+        self._toast("remote_mode", "Remote mode",
+                    f"Remote mode {'on' if self.remote_mode else 'off'} ({{pad}})")
         rm = self.cfg.remote
+        if not self.remote_mode:
+            # Leaving remote mode stops a toggled macro (contract: the
+            # engine turning off, remote-mode exit and close() all do).
+            self._toggles.clear()
         if self.remote_mode:
             # Distinct feedback: double pulse + the remote lightbar colour.
             self._queue_pulse(now, count=2)
@@ -978,12 +1290,11 @@ class InputInterceptor:
         mode held something: let go of all of it."""
         for key in list(self._rm_held):
             self._remote_release_key(key, thunks)
-        if self._rm2_decided == "alt_tab":
-            # A mid-slide switcher commits, exactly as lifting the fingers
-            # would -- leaving Alt down across a mode change is the stuck-key
-            # failure actions.py is built to avoid.
-            thunks.append(lambda: self.actions.alt_tab_commit())
-        self._rm2_decided = None
+        # A mid-slide switcher commits and a scroll/pinch ends, exactly as
+        # lifting the fingers would -- leaving Alt down (or two synthetic
+        # touch contacts) across a mode change is the stuck-input failure
+        # actions.py is built to avoid.
+        self._end_gesture(thunks)
         self._rm_touch_fingers = 0
         self._rm_touch_max_fingers = 0
 
@@ -1015,19 +1326,23 @@ class InputInterceptor:
         if spec.hold:
             press, release = spec.hold
             thunks.append(press)
-            entry = {"release": release, "next": None, "repeat": None}
+            entry = {"release": release, "next": None, "repeat": None,
+                     "interval": ARROW_REPEAT_S, "runs": 1, "max": 0}
             if spec.repeatable:
                 # Re-trigger like a held keyboard key: up then down again.
                 entry["next"] = now + ARROW_REPEAT_S
                 entry["repeat"] = lambda: (release(), press())
             self._rm_held[key] = entry
             return
-        fire = lambda run=spec.run: self.dispatch(lambda: run(params))  # noqa: E731
-        thunks.append(fire)
+        self._run_spec(name, spec, now, thunks)
         if spec.repeatable:
-            self._rm_held[key] = {"release": None,
-                                  "next": now + max(self._repeat_s, 0.25),
-                                  "repeat": fire}
+            interval = self._repeat_interval(spec)
+            first_due = (now + interval if spec.repeat_interval_s is not None
+                         else now + max(interval, 0.25))
+            fire = lambda run=spec.run: self.dispatch(lambda: run(params))  # noqa: E731
+            self._rm_held[key] = {"release": None, "next": first_due,
+                                  "repeat": fire, "interval": interval,
+                                  "runs": 1, "max": spec.max_runs}
 
     def _remote_release_key(self, key: str, thunks: list) -> None:
         entry = self._rm_held.pop(key, None)
@@ -1039,12 +1354,27 @@ class InputInterceptor:
         a = self.actions
         rm = self.cfg.remote
 
+        fingers, c = self._centroid(frame)
+
         # -- buttons, through the binding table ------------------------------
         for key in sorted(was - frame.buttons):
             self._remote_release_key(key, thunks)
         dpad_held = any(k.startswith("dpad_") for k in self._rm_held)
         for key in sorted(frame.buttons - was):
             if key == self.chord_button:
+                continue
+            if key == "touchpad_click":
+                # Never a row in remote mode: with fewer than two fingers
+                # the physical click IS the left mouse button, held for the
+                # press (a drag); with two it is the tracker's
+                # `touch_click_2f`.
+                if fingers < 2:
+                    self._rm_touch_clicked = True
+                    thunks.append(lambda: a.mouse_button("left", True))
+                    self._rm_held[key] = {
+                        "release": lambda: a.mouse_button("left", False),
+                        "next": None, "repeat": None,
+                        "interval": 0.0, "runs": 1, "max": 0}
                 continue
             if key.startswith("dpad_"):
                 # One direction at a time: rolling onto a diagonal must not
@@ -1061,70 +1391,42 @@ class InputInterceptor:
             return
         for key, entry in list(self._rm_held.items()):
             if entry["next"] is not None and now >= entry["next"]:
-                entry["next"] = now + (ARROW_REPEAT_S if entry["release"]
-                                       else self._repeat_s)
+                entry["next"] = now + entry["interval"]
+                entry["runs"] += 1
                 thunks.append(entry["repeat"])
+                if entry["max"] and entry["runs"] >= entry["max"]:
+                    entry["next"] = None
 
-        # -- touchpad ---------------------------------------------------------
-        fingers, c = self._centroid(frame)
+        # -- touchpad: 1 finger = the pointer, 2 = the gesture tracker --------
         if fingers and not self._rm_touch_fingers:
             self._rm_touch_at = now
             self._rm_touch_start = c
             self._rm_touch_moved = 0.0
+            self._rm_touch_clicked = "touchpad_click" in frame.buttons
         if fingers:
-            if fingers < 2 and self._rm2_decided == "alt_tab":
-                # One finger left mid-slide: commit, as a full lift would.
-                self._rm2_decided = None
-                thunks.append(lambda: self.actions.alt_tab_commit())
-            if fingers >= 2 and self._rm_touch_fingers < 2:
-                # The second finger just landed: gesture travel counts from
-                # HERE, so 1-finger mousing cannot pre-load an alt-tab.
-                self._rm2_start = c
-                self._rm2_decided = None
             if self._rm_touch_fingers:
                 dx = c[0] - self._rm_touch_last[0]
                 dy = c[1] - self._rm_touch_last[1]
                 self._rm_touch_moved += abs(dx) + abs(dy)
                 if fingers == 1 and self._rm_touch_max_fingers <= 1:
                     self._rm_mouse(dx, dy, rm.mouse_speed, thunks)
-                elif fingers >= 2:
-                    self._rm_two_finger(c, dx, dy, now, thunks)
             self._rm_touch_last = c
             self._rm_touch_max_fingers = max(self._rm_touch_max_fingers, fingers)
         elif self._rm_touch_fingers:
-            # contact ended: an open switcher commits; otherwise, was it a tap?
-            if self._rm2_decided == "alt_tab":
-                thunks.append(lambda: self.actions.alt_tab_commit())
-            elif (now - self._rm_touch_at <= TAP_S
-                    and self._rm_touch_moved <= TAP_MOVE_PX):
-                if self._rm_touch_max_fingers >= 2:
-                    thunks.append(lambda: (a.mouse_button("right", True),
-                                           a.mouse_button("right", False)))
-                else:
-                    thunks.append(lambda: (a.mouse_button("left", True),
-                                           a.mouse_button("left", False)))
-            self._rm2_decided = None
+            # Contact ended: a short, still, 1-finger touch was a left click.
+            # (The 2-finger taps and clicks are the tracker's, below.)
+            if (self._rm_touch_max_fingers == 1
+                    and now - self._rm_touch_at <= self._tap_s
+                    and self._rm_touch_moved <= self._g.tap_move_px
+                    and not self._rm_touch_clicked):
+                thunks.append(lambda: (a.mouse_button("left", True),
+                                       a.mouse_button("left", False)))
             self._rm_touch_max_fingers = 0
         self._rm_touch_fingers = fingers
+        self._two_finger(frame, now, thunks, self._remote_gestures)
 
         # -- sticks and triggers ----------------------------------------------
         self._stick_rates(frame, now, thunks, triggers=True)
-
-    def _rm_two_finger(self, c, dx: float, dy: float, now: float,
-                       thunks: list) -> None:
-        """Remote-mode 2-finger movement: the same three gestures as under a
-        chord (decisive horizontal slide, swipe up, swipe down), resolved
-        through the remote table. The touchpad deliberately does NOT scroll
-        -- scrolling belongs to the right stick and triggers, so a sloppy
-        2-finger drag can never fight the gesture decision or nudge the page
-        by accident."""
-        tx = c[0] - self._rm2_start[0]
-        ty = c[1] - self._rm2_start[1]
-        if self._rm2_decided is None:
-            self._rm2_decided = self._decide_two_finger(tx, ty, now, thunks,
-                                                        self._remote_table)
-        elif self._rm2_decided == "alt_tab":
-            self._alt_hold_track(tx, thunks)
 
     def _stick_rates(self, frame: _Frame, now: float, thunks: list,
                      *, triggers: bool) -> None:
@@ -1319,7 +1621,7 @@ def attach_to_backend(backend, input_cfg: K.InputConfig | None,
                       *, actions: OsActions | None = None,
                       clock=time.monotonic,
                       allow_disabled: bool = False,
-                      on_mode=None) -> InputInterceptor | None:
+                      on_mode=None, on_toast=None) -> InputInterceptor | None:
     """Build the engine from config and hang it on a `BridgeBackend`.
 
     Returns None (and attaches nothing) when the section is missing, or --
@@ -1342,6 +1644,7 @@ def attach_to_backend(backend, input_cfg: K.InputConfig | None,
         power_off=backend.power_off_pad,
         clock=clock,
         on_mode=on_mode,
+        on_toast=on_toast,
     )
     backend.interceptor = engine
     return engine

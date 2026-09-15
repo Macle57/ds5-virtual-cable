@@ -279,7 +279,8 @@ class TrayApp:
         #: integration is four U.* calls -- this one, two lambdas in `_menu()`,
         #: one entry in `_menu_key()` -- and everything else lives in update.py,
         #: deliberately: see its module docstring, "The tray touchpoint".
-        self.updater = U.start_if_enabled(self.cfg, notify=self._notify)
+        self.updater = U.start_if_enabled(
+            self.cfg, notify=lambda t, x: self._notify_if("update", t, x))
 
         #: The dashboard's two halves, both strictly optional passengers: the
         #: telemetry hub (a UDP socket every child is told about, so live
@@ -486,12 +487,30 @@ class TrayApp:
 
     def _on_event(self, serial: str, kind: str, text: str) -> None:
         print(f"  {short(serial)} {kind}: {text}", flush=True)
-        if kind in ("warn", "error") and self.icon is not None:
-            self._notify(f"ds5bridge -- {short(serial)}", text)
-        elif kind == "battery_low" and self.icon is not None:
+        if self.icon is None:
+            return
+        if kind == "error":
+            # Never gated by a category: a bridge that died is not news a
+            # person opts out of. The master switch still silences it.
+            self._notify_if(None, f"ds5bridge -- {short(serial)}", text)
+        elif kind == "warn":
+            # Every warn the manager emits is about the controller's
+            # connection (offline, gone, extras detached).
+            self._notify_if("connection", f"ds5bridge -- {short(serial)}", text)
+        elif kind == "battery_low":
             # Once per threshold per discharge (manager.LowBatteryAlerts);
             # the label the user gave the pad, else the short serial.
-            self._notify("ds5bridge", f"{self._name_of(serial)} {text}")
+            self._notify_if("battery_low", "ds5bridge",
+                            f"{self._name_of(serial)} {text}")
+        elif kind == "toast":
+            # The chord engine's notifications (`show_battery`, remote mode,
+            # the keyboard): `category|title|body`, `{pad}` = this pad.
+            parsed = M.parse_toast_event(text)
+            if parsed is None:
+                return
+            category, title, body = parsed
+            self._notify_if(category, title,
+                            body.replace("{pad}", self._name_of(serial)))
 
     def _name_of(self, serial: str) -> str:
         try:
@@ -499,6 +518,21 @@ class TrayApp:
         except (KeyError, AttributeError):
             label = ""
         return (label or "").strip() or short(serial)
+
+    def _notifications_allow(self, category) -> bool:
+        """The `notifications` config: the master switch, then the category
+        (None = master switch only). Read live -- `_on_dashboard_config`
+        adopts a saved config, so a toggle applies to the next balloon."""
+        try:
+            n = self.cfg.notifications
+        except AttributeError:
+            return True
+        return n.allows(category) if category is not None else bool(n.enabled)
+
+    def _notify_if(self, category, title: str, text: str) -> None:
+        """`_notify`, gated by the `notifications` config."""
+        if self._notifications_allow(category):
+            self._notify(title, text)
 
     def _notify(self, title: str, text: str) -> None:
         try:
@@ -665,7 +699,7 @@ class TrayApp:
             s, note = ineffective[0]
             more = (f" (and {len(ineffective) - 1} more)"
                     if len(ineffective) > 1 else "")
-            self._notify("Hide Bluetooth pad -- NOT hidden yet",
+            self._notify_if("hide", "Hide Bluetooth pad -- NOT hidden yet",
                          f"{short(s)}{more}: {note}")
             return
         if len(hid) == 1 and not shown:
@@ -673,11 +707,11 @@ class TrayApp:
             # untouched: a game that is running right now keeps seeing the
             # pad. Saying so here is the difference between a feature that
             # looks broken and one that looks honest.
-            self._notify("Hide Bluetooth pad",
+            self._notify_if("hide", "Hide Bluetooth pad",
                          f"{short(hid[0])} is hidden. Games started "
                          f"from now on will not see the Bluetooth pad.")
         elif len(shown) == 1 and not hid:
-            self._notify("Hide Bluetooth pad",
+            self._notify_if("hide", "Hide Bluetooth pad",
                          f"{short(shown[0])} is visible to everything again.")
         else:
             bits = []
@@ -687,7 +721,7 @@ class TrayApp:
             if shown:
                 bits.append(f"{len(shown)} controller(s) visible to "
                             f"everything again.")
-            self._notify("Hide Bluetooth pads", " ".join(bits))
+            self._notify_if("hide", "Hide Bluetooth pads", " ".join(bits))
 
     def _cancel_pending(self) -> None:
         """Drop every unapplied intent and disarm the timer. Used at teardown.
@@ -734,7 +768,7 @@ class TrayApp:
                 # Said at click time, not two seconds later: with HidHide
                 # absent there is no hardware side to wait for, and delaying
                 # "this will do nothing" makes it read like it did something.
-                self._notify("Hide Bluetooth pad",
+                self._notify_if("hide", "Hide Bluetooth pad",
                              "HidHide is not installed, so nothing is "
                              "hidden. See the user guide.")
             self._poke_apply()
@@ -772,11 +806,11 @@ class TrayApp:
         self._save()
         self.mgr.hide_default = bool(want)
         if not self._has_hidhide:
-            self._notify("Hide Bluetooth pads",
+            self._notify_if("hide", "Hide Bluetooth pads",
                          "HidHide is not installed, so nothing is hidden. "
                          "See the user guide.")
         elif not serials:
-            self._notify("Hide Bluetooth pads",
+            self._notify_if("hide", "Hide Bluetooth pads",
                          "No controller is connected. Pads that show up "
                          "from now on will be hidden while bridged."
                          if want else

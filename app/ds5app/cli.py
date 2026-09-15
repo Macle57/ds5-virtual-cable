@@ -51,7 +51,8 @@ def _log(kind: str, text: str) -> None:
     # into the kind -- "mode" carries the chord engine's remote/keyboard
     # state, which the tray needs even with telemetry off.
     prefix = {"warn": "  !  ", "error": " !!! ", "ready": "  *  ",
-              "battery": "  ~  ", "mode": "  #  "}.get(kind, "  -  ")
+              "battery": "  ~  ", "mode": "  #  ",
+              "toast": "  >  "}.get(kind, "  -  ")
     print(prefix + text, flush=True)
 
 
