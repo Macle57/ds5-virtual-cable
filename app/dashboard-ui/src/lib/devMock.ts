@@ -8,7 +8,7 @@
      ?mock          the above, remote mode held on
      ?mock=flip     remote mode toggles every ~12 s (toast + badges)
      ?mock=all      the hide fault on the first pad too
-     ?mock=offline  the LAST pad is switched off (present:false, "controller
+     ?mock=offline  the FIRST pad is switched off (present:false, "controller
                     offline") -- the auto-select must land on the other one
      ?mock=update   an update is available (the Install button lights up)
 
@@ -46,8 +46,9 @@ export function mockState(state: LiveState): LiveState {
   let aggregate = state.aggregate;
   if (mode === "offline" && serials.length > 1) {
     // the manager keeps the stale entry (present:false) so the page can show
-    // a "disconnected" tab; aggregate.present reflects reality (section 4)
-    const off = serials[serials.length - 1];
+    // a "disconnected" tab; aggregate.present reflects reality (section 4).
+    // The FIRST serial goes off, so "first tab" and "connected tab" differ.
+    const off = serials[0];
     const { telemetry: _t, ...rest } = controllers[off];
     void _t;
     controllers[off] = { ...rest, present: false, state: "controller offline", attached: false, reports_per_s: 0, battery_percent: null };

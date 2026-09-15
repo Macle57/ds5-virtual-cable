@@ -79,9 +79,12 @@ export const useStore = create<Store>((set, get) => ({
       set({
         state,
         active: chooseActive(state, active, manual),
-        // a backend that serves the 1.0 state fields serves /api/action too
-        actionApi: get().actionApi === "unknown" && (state.update !== undefined || state.autostart !== undefined)
-          ? "available" : get().actionApi,
+        // The first frame settles it: a backend that serves the 1.0 state
+        // fields (`update` / `autostart`, CONTRACT section 5) serves
+        // /api/action too; one that serves neither is a 0.5 tray and the
+        // buttons grey out up front (a 404 later would say the same).
+        actionApi: get().actionApi !== "unknown" ? get().actionApi
+          : (state.update !== undefined || state.autostart !== undefined) ? "available" : "missing",
       });
     };
     // Seed the remote lightbar colour without opening settings (one fetch;

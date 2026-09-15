@@ -45,7 +45,16 @@ export default function SettingsPanel() {
   const tab: Tab = TABS.some((t) => t.id === tabRaw) ? (tabRaw as Tab) : "general";
   const ref = useRef<HTMLElement>(null);
 
-  useEffect(() => { ref.current?.scrollIntoView({ behavior: "smooth", block: "start" }); }, []);
+  // Scroll the panel into view -- and again once the live view above has
+  // arrived and settled (a ?settings= deep link mounts the panel before the
+  // first state frame; the pad card then mounts above it and pushes it down).
+  const hasPads = useStore((s) => Object.keys(s.state.controllers).length > 0);
+  useEffect(() => {
+    const go = () => ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    go();
+    const ts = [450, 1200].map((ms) => setTimeout(go, ms));
+    return () => ts.forEach(clearTimeout);
+  }, [hasPads]);
 
   const input = (() => {
     if (!cfg) return null;
