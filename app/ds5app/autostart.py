@@ -68,6 +68,18 @@ unquoted makes Windows try "C:\\Program.exe" first, and that has been the
 classic Run-key bug for twenty years; the XML form needs no quoting because
 Command and Arguments are separate elements.
 
+Since 1.0 there is a second mechanism, and it is the recommended one: the
+WINDOWS SERVICE (`winsvc.py`), which starts the tray at boot, before anyone
+signs in. This module does not create or remove the service -- the installer
+and `ds5bridge service install` do -- but it is the one place that answers
+"how does this machine start ds5bridge?" (`mode()`: `service`, `task` or
+`none`) and it maps the tray's "Start with Windows" switch and the config's
+`autostart_on_login` onto whichever mechanism is installed: in service mode
+the switch is the service's start type (automatic vs manual; the service
+stays registered either way, so the running tray is not touched), in task
+mode it is the task's existence, as before. `migrate_legacy()` never creates
+the task when the service is installed.
+
 Everything here is safe on a machine that is not Windows and on a machine where
 the change is refused (no elevation, group policy, a security product that
 guards the task library): the read paths return False/None and the write paths
@@ -134,8 +146,13 @@ def is_python(path: str) -> bool:
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def build_action(exe: str, app_dir: str | None = None) -> tuple[str, str]:
+def build_action(exe: str, app_dir: str | None = None,
+                 extra_args: tuple[str, ...] = ()) -> tuple[str, str]:
     """(command, arguments) for a given launcher. No filesystem, no scheduler.
+
+    `extra_args` are the tray's own arguments after the verb (the service
+    passes `("tray", "--service-child")`); empty means the plain tray, and
+    the launcher form then has no arguments at all, exactly as before.
 
     A packaged launcher already knows how to start itself and needs nothing but
     its path. A python interpreter does not, and the naive
@@ -156,11 +173,18 @@ def build_action(exe: str, app_dir: str | None = None) -> tuple[str, str]:
     exe = (exe or "").strip().strip('"')
     if not exe:
         raise AutostartError("no launcher to register for start-at-login.")
+    args = tuple(a for a in extra_args if a)
     if not is_python(exe):
-        return exe, ""
+        # A launcher knows it is the tray; only what comes AFTER the verb
+        # is worth passing (entry_tray.py adds "tray" itself).
+        return exe, " ".join(a for a in args if a != "tray")
     root = (app_dir or APP_DIR).rstrip("\\/")
+    argv = list(args) or ["tray"]
+    if argv[0] != "tray":
+        argv.insert(0, "tray")
+    rendered = ",".join(f"'{a}'" for a in argv)
     program = (f"import sys;sys.path.insert(0,r'{root}');"
-               f"from ds5app.cli import main;sys.exit(main(['tray']))")
+               f"from ds5app.cli import main;sys.exit(main([{rendered}]))")
     return exe, f'-c "{program}"'
 
 
@@ -382,6 +406,79 @@ def available() -> bool:
     return sys.platform == "win32"
 
 
+# ---------------------------------------------------------------------------
+# which mechanism this machine uses
+# ---------------------------------------------------------------------------
+
+MODE_SERVICE = "service"
+MODE_TASK = "task"
+MODE_NONE = "none"
+
+
+def _service_installed() -> bool:
+    """Seam over winsvc.installed(); the tests rebind it."""
+    try:
+        from . import winsvc as W
+
+        return W.installed()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _service_starts_at_boot() -> bool:
+    try:
+        from . import winsvc as W
+
+        return W.starts_at_boot()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _service_set_start_at_boot(enabled: bool) -> None:
+    from . import winsvc as W
+
+    try:
+        W.set_start_at_boot(enabled)
+    except W.ServiceError as e:
+        raise AutostartError(str(e)) from e
+
+
+def mode() -> str:
+    """`service` when the Windows service is registered (whatever its start
+    type), else `task` when the logon task exists, else `none`. Never raises.
+    The service wins when both exist: the installer removes the other when
+    one is chosen, so both is a leftover, and the service is what actually
+    starts first at boot."""
+    if not available():
+        return MODE_NONE
+    if _service_installed():
+        return MODE_SERVICE
+    if query_task() is not None:
+        return MODE_TASK
+    return MODE_NONE
+
+
+def label() -> str:
+    """The tray row's text for the current mode."""
+    return ("Start with Windows (service)" if mode() == MODE_SERVICE
+            else "Start at login")
+
+
+def describe() -> str:
+    """One line for `doctor`: how (and whether) this machine starts ds5bridge."""
+    m = mode()
+    if m == MODE_SERVICE:
+        try:
+            from . import winsvc as W
+
+            return f"yes -- Windows service '{W.SERVICE_NAME}' ({W.status_text()})"
+        except Exception:  # noqa: BLE001
+            return "yes -- Windows service"
+    if m == MODE_TASK:
+        return "yes -- " + (current_command() or "")
+    return "no"
+
+
 def query_task() -> dict | None:
     """The registered task's fields (`parse_task_xml`), or None when there is
     no task. Never raises."""
@@ -403,13 +500,19 @@ def current_command() -> str | None:
 
 
 def is_enabled() -> bool:
-    """Never raises, and never guesses True.
+    """Does this machine start ds5bridge on its own? Never raises, never
+    guesses True.
 
-    Deliberately does not compare against `command()`: a task written by the
-    frozen build and read back from a source checkout would compare unequal,
-    and a checkbox that reads "off" while the machine really does start the
-    program at login is worse than one that is merely out of date.
+    Service mode: the service's start type is automatic. Task mode: the task
+    exists -- deliberately not compared against `command()`: a task written by
+    the frozen build and read back from a source checkout would compare
+    unequal, and a checkbox that reads "off" while the machine really does
+    start the program at login is worse than one that is merely out of date.
     """
+    if not available():
+        return False
+    if _service_installed():
+        return _service_starts_at_boot()
     return bool(current_command())
 
 
@@ -475,7 +578,16 @@ def disable() -> None:
 
 
 def set_enabled(enabled: bool, exe: str | None = None) -> None:
-    """Apply `config.autostart_on_login`. One call for a checkbox handler."""
+    """Apply `config.autostart_on_login`. One call for a checkbox handler.
+
+    Under the service this flips the service's start type and nothing else:
+    the service stays registered and the running tray keeps running; only
+    the next boot changes. Under the task it registers or deletes the task.
+    """
+    if available() and _service_installed():
+        _service_set_start_at_boot(bool(enabled))
+        log.info("start-with-Windows (service) %s", "on" if enabled else "off")
+        return
     if enabled:
         enable(exe)
     else:
@@ -538,7 +650,12 @@ def migrate_legacy() -> bool:
     if TRAY_EXE not in low and "ds5app" not in low and "ds5bridge" not in low:
         log.info("Run value '%s' (%s) is not ours; leaving it", VALUE_NAME, old)
         return False
-    if is_enabled():
+    if _service_installed():
+        # The service starts ds5bridge; a Run value would start a SECOND tray
+        # at logon (and could not, being elevated). Just drop it.
+        _delete_legacy_run_value()
+        return True
+    if query_task() is not None:
         # The task already exists; the value is just a leftover.
         _delete_legacy_run_value()
         return True

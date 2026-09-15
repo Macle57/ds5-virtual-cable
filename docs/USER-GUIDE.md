@@ -205,11 +205,15 @@ Right-click for the menu:
 | **Hide Bluetooth pads while bridged** | optional, off by default — sets *every* controller at once; see below |
 | **Hide per controller >** | the same choice, one pad at a time |
 | **Rescan for controllers** | look again now instead of waiting for the next sweep |
-| **Start at login** | run the tray when you log in — a scheduled task named `ds5bridge` that starts it with administrator rights and no prompt |
-| **Quit** | stop everything and put it all back |
+| **Start with Windows (service)** / **Start at login** | whichever way the installer set up: as a Windows service (ds5bridge starts at boot, *before anyone signs in*, and keeps running across log-off/log-on — the tick switches the service between automatic and manual start) or the scheduled task `ds5bridge` at your sign-in (administrator rights, no prompt). Re-run the installer to change which. |
+| **Quit** (*Quit (stops the ds5bridge service)* under the service) | stop everything and put it all back. Under the service this stops the service too — otherwise it would just start the tray again. Start it again from the Start menu (**ds5bridge**), or `ds5bridge.exe service start` |
 
-Every one of those is remembered, in
-`%APPDATA%\ds5bridge\config.json`.
+Every one of those is remembered, in `%APPDATA%\ds5bridge\config.json` —
+or, when ds5bridge runs as the service, in `%ProgramData%\ds5bridge\config.json`
+(the installer copies your settings there once). The **ds5bridge dashboard**
+shortcuts the installer offers (Start menu, Desktop) open the same dashboard
+as the menu row. (Balloons are normal Windows notifications: with **Do not
+disturb** on you will not see them.)
 
 #### Turning it off, and why you might
 
@@ -432,15 +436,19 @@ after that**. The check is one small request for public release information —
 nothing about you or your machine is sent, and nothing is downloaded or
 installed by the check itself.
 
-When a newer version exists you get a balloon notification, and the tray's
-right-click menu grows one row: **Install update x.y.z**. Clicking it downloads
-the new version, verifies it against the release's published SHA-256 checksums,
-and restarts the tray on the new version — bridging stops for the few seconds
-that takes and comes back on its own. If a download ever fails its checksum it
-is deleted and nothing changes.
+When a newer version exists you get a balloon notification, and — by default
+— **it installs itself a minute later**: the new installer is downloaded,
+verified against the release's published SHA-256 checksums and run silently
+(app only, no driver, no reboot); the tray, or the service, restarts on the
+new version. Bridging stops for the few seconds that takes and comes back on
+its own. If a download ever fails its checksum it is deleted and nothing
+changes. The tray's right-click menu also grows a row, **Install update
+x.y.z**, for doing it right now.
 
-Not interested? Put `"update_check": false` in
-`%APPDATA%\ds5bridge\config.json` and the tray never asks GitHub anything.
+Prefer to decide yourself? Put `"update_auto_install": false` in your
+`config.json` (or untick it in the dashboard): the balloon and the menu row
+stay, nothing installs without a click. Not interested at all? `"update_check":
+false` and the tray never asks GitHub anything.
 You can always update by re-running the install line — it is the same
 download, and it leaves your settings alone.
 
@@ -467,7 +475,7 @@ irm https://raw.githubusercontent.com/Macle57/ds5-virtual-cable/main/scripts/uni
 (The one-liner runs the same Settings → Apps uninstaller when it is there,
 passing your switches on, so the two are one path.) Either way it quits the
 tray, detaches the virtual pad, un-hides anything HidHide was hiding, removes
-the app, its shortcut and its start-at-login task — and then **removes the
+the app, its shortcuts and its start-with-Windows service or task — and then **removes the
 two drivers too**, verifying each removal, and ends with a bold **"A RESTART
 IS REQUIRED to finish removing the drivers"** followed by Windows' own
 "restart now?" question. The

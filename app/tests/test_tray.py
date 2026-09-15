@@ -1617,6 +1617,92 @@ class StalePadRenderingTests(unittest.TestCase):
                                    rate=0.0, battery=None)])
         self.assertTrue(app._title().startswith("ds5bridge -- 1 of 1 bridged"))
 
+class ServiceChildTests(unittest.TestCase):
+    """The tray under the Windows service: what Quit means, and the exit code
+    the supervisor reads."""
+
+    def app(self, service_child):
+        app = app_with([controller(A, enabled=True)])
+        app.service_child = service_child
+        app._shutdown_icon = lambda: None
+        return app
+
+    def test_quit_label_says_what_it_does(self):
+        self.assertEqual(self.app(True)._quit_label(), "Quit (stops the ds5bridge service)")
+        self.assertEqual(self.app(False)._quit_label(), "Quit")
+
+    def test_the_menu_quit_stops_the_service(self):
+        app = self.app(True)
+        app._quit()
+        settle()
+        self.assertEqual(app._exit_code, T.W.EXIT_STOP_SERVICE)
+        self.assertIn(("close",), app.mgr.calls)
+
+    def test_a_stop_from_the_service_exits_zero(self):
+        app = self.app(True)
+        app._quit_for_service()
+        settle()
+        self.assertEqual(app._exit_code, 0)
+        self.assertIn(("close",), app.mgr.calls)
+
+    def test_a_standalone_tray_never_uses_the_service_code(self):
+        app = self.app(False)
+        app._quit()
+        settle()
+        self.assertEqual(app._exit_code, 0)
+
+    def test_a_close_message_is_a_quiet_quit(self):
+        app = self.app(True)
+        app.icon = _FakeIcon()
+        app._install_close_handler()
+        handler = app.icon._message_handlers[0x0010]
+        self.assertEqual(handler(0, 0), 0)
+        settle()
+        self.assertEqual(app._exit_code, 0)
+        self.assertIn(("close",), app.mgr.calls)
+
+    def test_a_second_tray_next_to_a_running_service_declines(self):
+        saved = T.W.is_running, T._message_box
+        boxes = []
+        try:
+            T.W.is_running = lambda: True
+            T._message_box = lambda text, title: boxes.append(title)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(T._service_already_running(
+                    types.SimpleNamespace(service_child=False)))
+            # The service's own child, of course, is not a second instance.
+            self.assertFalse(T._service_already_running(
+                types.SimpleNamespace(service_child=True)))
+            T.W.is_running = lambda: False
+            self.assertFalse(T._service_already_running(
+                types.SimpleNamespace(service_child=False)))
+            self.assertEqual(boxes, ["ds5bridge"])
+        finally:
+            T.W.is_running, T._message_box = saved
+
+    def test_a_saved_auto_install_switch_reaches_the_running_updater(self):
+        # The dashboard's toggle (config.update_auto_install) must apply
+        # without a restart, like update_check's sibling rows do.
+        app = self.app(False)
+        app._refresh_now = lambda: None
+        app.updater = types.SimpleNamespace(auto_install=True)
+        saved = T.A.available
+        try:
+            T.A.available = lambda: False
+            for want in (False, True):
+                cfg = types.SimpleNamespace(
+                    enabled=True, controllers={}, hide_bluetooth_default=False,
+                    autostart_on_login=False, update_auto_install=want)
+                app._on_dashboard_config(cfg)
+                settle()
+                self.assertIs(app.updater.auto_install, want)
+            # No updater (update_check off): nothing to apply, no crash.
+            app.updater = None
+            app._on_dashboard_config(cfg)
+            settle()
+        finally:
+            T.A.available = saved
+
 
 if __name__ == "__main__":
     unittest.main()

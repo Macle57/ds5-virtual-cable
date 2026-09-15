@@ -23,11 +23,14 @@ It is not published.)
 
 | checkbox | default | what happens |
 |---|---|---|
-| **ds5bridge app** | always | Copied from inside the exe to `%LOCALAPPDATA%\ds5bridge\app` (the layout the in-app updater owns). Start Menu shortcut. Cannot be unticked: this installer always installs ds5bridge. |
+| **ds5bridge app** | always | Copied from inside the exe to `%LOCALAPPDATA%\ds5bridge\app` (the layout the in-app updater owns). Start Menu shortcut for the tray. Cannot be unticked: this installer always installs ds5bridge. |
 | **usbip-win2 0.9.7.7** | on | The virtual-USB driver the bridge needs. Its own installer — extracted from the exe, or downloaded from its GitHub release — is SHA-256 checked against the pinned hash, then run silently. Exactly 0.9.7.7 — its maintainer warns 0.9.7.8 corrupts memory. Your USB 3.0 hubs restart briefly while it installs. |
 | **HidHide 1.5.230** | on | Optional; only the "hide the Bluetooth pad while bridged" feature needs it. Extracted and hash-checked the same way. Its class filter only joins a HID device's stack when that stack is built, so right after installing it the installer **restarts the device node of every connected Bluetooth DualSense** (only those — never a keyboard or mouse) and then reads each one's driver stack (`DEVPKEY_Device_Stack`) to prove `\Driver\HidHide` is in it: `[ok] HidHide filter -- attached to N DualSense device(s), no reboot needed`. Only a pad it could not fix gets a `[reboot]` line. The installer never reboots on its own. |
 | *task:* restore point | on | A System Restore point before the driver goes in (usbip-win2's README asks for one). Only offered when usbip-win2 is selected; only made when it is actually about to be installed. |
-| *task:* start at login | off | The scheduled task `ds5bridge` (Task Scheduler library root): at logon of the installing user only, *Run with highest privileges*, interactive token, no execution time limit, one instance, runs on battery — the same task the tray's own "Start at login" switch creates, and the only way to start an elevated program at logon without a prompt (an HKCU Run entry cannot; Windows skips it silently). |
+| *task:* start ds5bridge with Windows | on | Two exclusive options under it (radio buttons); choosing one removes the other, unticking the box removes both. |
+| &nbsp;&nbsp;*— as a Windows service, before anyone signs in* | **default** | The Windows service `ds5bridge` (LocalSystem, automatic start; `sc query ds5bridge`). It starts at boot, before the sign-in screen, and keeps `ds5bridge-tray.exe --service-child` running in the console session — the same tray, icon, menu, dashboard and everything, so your controllers are bridged before you sign in and stay bridged across log-off and log-on, the way Chrome Remote Desktop's host works. The tray's settings then live in `%ProgramData%\ds5bridge\config.json` (your `%APPDATA%\ds5bridge\config.json` is copied there once, the first time this option is installed); its log is `%ProgramData%\ds5bridge\logs\tray.log`, the service's `service.log`. Registered by `ds5bridge.exe service install`; **Quit** in the tray menu stops the service (the menu says so). See "The service" below. |
+| &nbsp;&nbsp;*— when you sign in* | | The scheduled task `ds5bridge` (Task Scheduler library root): at logon of the installing user only, *Run with highest privileges*, interactive token, no execution time limit, one instance, runs on battery — the same task the tray's own "Start at login" switch creates, and the only way to start an elevated program at logon without a prompt (an HKCU Run entry cannot; Windows skips it silently). What 0.5 offered. |
+| *task:* Start menu entry / Desktop shortcut | on / on | Internet shortcuts named **ds5bridge dashboard** that open `http://127.0.0.1:<dashboard_port>/` (the port from `config.json`, default 8765) in your default browser — the quickest way to the dashboard. |
 
 Every step is idempotent: if usbip-win2 0.9.7.7 or HidHide is already there,
 its box stays ticked but reads "already installed (will be verified, not
@@ -70,7 +73,7 @@ each verification it ran:
 [ok] HidHideCLI.exe -- 1.5.230.0 (C:\Program Files\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe)
 [ok] service HidHide -- running
 [ok] HidHide filter -- attached to 2 DualSense device(s), no reboot needed
-[ok] start-at-login -- scheduled task 'ds5bridge' registered (at logon of PC\you, highest privileges, no prompt)
+[ok] start with Windows -- service 'ds5bridge' registered (LocalSystem, automatic start: ds5bridge starts before anyone signs in; settings in C:\ProgramData\ds5bridge)
 [ok] ds5bridge.exe --version -- 0.5.0 (C:\Users\you\AppData\Local\ds5bridge\app\ds5bridge.exe)
 [ok] ds5bridge-tray.exe -- present
 ```
@@ -111,8 +114,8 @@ Standard Inno Setup switches apply. The ones that matter here:
 | `/NORESTART` | never reboot. **Always pass it in silent mode.** The installer never restarts after an install, but its preflight can find that a restart must come *first* (a usbip-win2 removal left half-done, see below): interactive runs ask; a silent run without this switch restarts on its own, with it Setup exits with code 8 and must be run again after the restart (a silent run does not relaunch itself). |
 | `/VERYSILENT /SUPPRESSMSGBOXES` | fully unattended. With plain `/SILENT`, a refusal (another installer still running after a minute's wait) is shown as a message box that waits for OK; with these two it goes to the log only (exit code 7; 8 when a restart must come first). |
 | `/COMPONENTS="app,usbip"` | choose the checkboxes; names are `app`, `usbip`, `hidhide` (`app` is always installed, whatever the list says). Without the switch, Inno Setup reuses the selection of the previous run on that machine. |
-| `/TASKS="autostart"` / `/MERGETASKS="!restorepoint"` | tick / untick the two tasks (`restorepoint` is on by default, `autostart` off) |
-| `/STARTTRAY=1` | ds5bridge's own: start the tray at the end of a **silent** run (the installer is elevated, and so is the tray, so no prompt). What the in-app updater passes. Ignored in an interactive run, where the Finish page's checkbox decides. |
+| `/TASKS=...` / `/MERGETASKS=...` | tick / untick tasks. Names: `restorepoint` (on by default), `autostart\service` (on by default: the Windows service), `autostart\task` (the sign-in task instead), `!autostart` (neither: removes a service or task from an earlier install), `dashstartmenu` and `dashdesktop` (on by default). E.g. `/MERGETASKS="autostart\task,!dashdesktop"`. |
+| `/STARTTRAY=1` | ds5bridge's own: start ds5bridge at the end of a **silent** run — the **service** when that is the chosen mode (`ds5bridge.exe service start`; its supervisor starts the tray), otherwise the tray exe (the installer is elevated, and so is the tray, so no prompt). What the in-app updater passes. Ignored in an interactive run, where the Finish page's "Start ds5bridge now" checkbox does the same. |
 | `/LOG="file"` | full log including every helper line |
 
 Exit code 0 means Setup finished; read `last-install-check.txt` (or grep the
@@ -133,9 +136,51 @@ release's `SHA256SUMS` (a mismatch deletes the file; a `SHA256SUMS` that does
 not name the installer is a refusal, not a pass), and runs it — interactively
 by default, or with `-Silent` (→ `/SILENT /NORESTART /SUPPRESSMSGBOXES`),
 `-NoHidHide` / `-NoUsbip` (→ `/COMPONENTS=...`), `-NoRestorePoint` /
-`-Autostart` (→ `/MERGETASKS=...`), `-AppVersion v0.5.0` (a specific tag),
+`-Autostart` (the service) / `-AutostartAtLogin` (the task) / `-NoAutostart` /
+`-NoShortcuts` (→ `/MERGETASKS=...`), `-AppVersion v0.5.0` (a specific tag),
 `-Setup <local exe>` (a build you already have; no hash to check it against)
 and `-DryRun`. It never elevates itself; the installer does.
+
+## The service
+
+`ds5bridge.exe service ...` is the command line behind the "as a Windows
+service" option, and what to reach for when something about it needs a
+look:
+
+| command | what it does |
+|---|---|
+| `ds5bridge.exe service status` | installed? running? starts with Windows? and where the logs are |
+| `ds5bridge.exe service install` | register it (administrator): `sc create ds5bridge binPath= "\"...\ds5bridge.exe\" service" start= auto obj= LocalSystem`, a description, and a failure policy (the Service Control Manager restarts a crashed supervisor). Copies your `%APPDATA%\ds5bridge\config.json` and any hide-journal records into `%ProgramData%\ds5bridge` once (`--no-migrate` / `--migrate-from DIR`). Idempotent; re-running the installer or an update runs it again. Removes the sign-in task if one is there. |
+| `ds5bridge.exe service start` / `stop` | through the SCM; `stop` waits for the tray to tear its bridges down (pads unhidden, virtual pads detached) — up to a minute |
+| `ds5bridge.exe service uninstall` | stop and delete it |
+| `ds5bridge.exe service` | what the SCM runs; from a terminal it just says so |
+
+How it works: the service process (`ds5bridge.exe service`, LocalSystem,
+session 0) is a **supervisor only**. It starts `ds5bridge-tray.exe
+--service-child` in the active console session (its own SYSTEM token,
+re-stamped with the session id, on `winsta0\default`), restarts it if it
+exits (with a backoff, so a crash cannot loop hot), moves it when the console
+session changes (fast user switching, a log-off that tears the old session
+down), and stops it through a named event when the service stops or Windows
+shuts down. The tray runs as SYSTEM in your session: the icon, balloons,
+input injection and the dashboard all work as before; the browser for "Open
+dashboard" is started with *your* token (not SYSTEM's). Before anyone signs
+in there is no taskbar, so the tray bridges without an icon and adds it when
+explorer starts. **Quit** in the tray menu (labelled *Quit (stops the
+ds5bridge service)*) exits with a code the supervisor reads as "stop the
+service", so Quit is not a restart button; "Start with Windows (service)" in
+the menu switches the service between automatic and manual start (the
+service stays installed, the running tray is untouched). A tray started by
+hand while the service runs declines with a message rather than fighting the
+first one for the pads. The in-app updater stops the service, runs the
+installer, and the installer's `/STARTTRAY=1` starts the service again.
+
+Two things verified from the SYSTEM child that were open questions: the
+dictation toggle's default-device switch (`IPolicyConfig`) changes *your*
+default microphone exactly as before -- Windows' default audio roles are
+machine-wide, not per user; and the balloons are ordinary notifications, so
+Windows' **Do not disturb** hides them like everyone else's (they are not
+lost: bridging still happens, only the message is).
 
 ## Uninstall
 
@@ -148,7 +193,8 @@ Settings → Apps → **ds5bridge** → Uninstall, or run
 * **Also remove HidHide** — same rule. Untick if DS4Windows or similar uses
   it. (Its filter driver unloads at the next reboot.)
 * **Delete my settings too** — off by default. `%APPDATA%\ds5bridge`
-  (per-controller settings, labels, the hide journal).
+  (per-controller settings, labels, the hide journal) and the service's
+  copy in `%ProgramData%\ds5bridge` (its `config.json`, journal, logs).
 
 Removing either driver needs **one restart** afterwards, and the uninstaller
 makes that unmistakable: its result dialog opens with a bold **"A RESTART IS
@@ -161,9 +207,11 @@ uninstall (`/SILENT` or `/VERYSILENT`) never restarts and never asks — not
 even without `/NORESTART` — and reports the same facts as `[reboot]` lines in
 `%TEMP%\ds5bridge-uninstall-check.txt`.
 
-Before anything is deleted the uninstaller stops the tray, removes the
-start-at-login task (and a pre-0.5.0 Run value), runs `ds5bridge cleanup` and
-`ds5bridge unhide`, stops usbip's auto-re-attach (`usbip attach -X`) and
+Before anything is deleted the uninstaller stops the service (its tray tears
+down on the way out) or the tray, removes the service and the start-at-login
+task (and a pre-0.5.0 Run value) and the dashboard shortcuts, runs
+`ds5bridge cleanup` and `ds5bridge unhide` (for the user's settings and the
+service's), stops usbip's auto-re-attach (`usbip attach -X`) and
 detaches every attached device, and removes ds5bridge's own entries from
 HidHide's whitelist and hide list. When HidHide
 itself is being removed, its whole hide list is cleared and the cloak turned
@@ -301,8 +349,17 @@ the removal itself, following the same origin records and the same guards.
 * **The app lives in your profile** (`%LOCALAPPDATA%\ds5bridge`), the layout
   the updater and the installer share. If you are a standard user and elevate
   the installer with a *different* administrator account, the app — and the
-  start-at-login task — land in that account's profile instead; install from
-  an administrator account.
+  start-at-login task and the shortcuts — land in that account's profile
+  instead; install from an administrator account. (The service, being
+  machine-wide, does not care which account installed it; its settings are
+  in `%ProgramData%`.)
+* **Updating from 0.5.0.** The 0.5 "start at login" task selection is
+  remembered by Inno as `autostart`, which is now the parent of the two
+  options, so an update (silent or interactive without changing the Tasks
+  page) moves you to the service — the recommended mode; your settings are
+  copied to `%ProgramData%\ds5bridge` and the task is removed. Pick *when
+  you sign in* on the Tasks page (or pass `/MERGETASKS="autostart\task"`) to
+  keep the task instead; from then on Inno remembers that choice for updates.
 * **Reboot.** After an install, usually none: the installer attaches HidHide's
   filter to the connected controllers itself and the app does the same for a
   pad it bridges (a pad that connects later gets the filter as its device

@@ -7,6 +7,9 @@
     ds5bridge unhide          rescue: give back a pad left hidden by a crash
     ds5bridge doctor          is this machine set up correctly?
     ds5bridge tray            the same thing with a system-tray icon
+    ds5bridge service ...     the Windows service that starts the tray at boot,
+                              before anyone signs in (install/uninstall/start/
+                              stop/status; bare `service` is what the SCM runs)
 
 Everything the two-terminal Phase-3 procedure did by hand, in order, with the
 teardown that used to be easy to get wrong. See `docs/USER-GUIDE.md`.
@@ -306,8 +309,7 @@ def cmd_doctor(args) -> int:
             print(f"{'[note]':7}{c.serial} is switched off in settings "
                   f"(the tray menu turns it back on)")
     if A.available():
-        print(f"{'[ok]':7}at login   "
-              f"{'yes -- ' + (A.current_command() or '') if A.is_enabled() else 'no'}")
+        print(f"{'[ok]':7}autostart  {A.describe()}")
 
     problems += _doctor_hidhide(cfg, live)
 
@@ -728,8 +730,71 @@ def run_loop(svc, status_every: float, tick: float = 0.5) -> None:
 
 
 def cmd_tray(args) -> int:
+    if getattr(args, "service_child", False):
+        # Under the service there is no console and no user profile: the
+        # narration and the log records go to ProgramData\ds5bridge\logs.
+        from . import winsvc as W
+
+        path = W.setup_file_logging("tray", logging.DEBUG if args.verbose
+                                    else logging.INFO)
+        stream = W.LogStream(logging.getLogger("ds5app.tray.stdout"))
+        sys.stdout = sys.stderr = stream
+        if path:
+            logging.getLogger("ds5app.cli").info("service child starting; "
+                                                 "log at %s", path)
     from .tray import run_tray
     return run_tray(args)
+
+
+def cmd_service(args) -> int:
+    """`ds5bridge service [install|uninstall|start|stop|status]`.
+
+    With no action this IS the service: `winsvc.run_service()` hands the
+    process to the Service Control Manager and returns when the service
+    stops (or at once, with a hint, when a person ran it from a terminal).
+    """
+    from . import winsvc as W
+
+    action = getattr(args, "action", None) or "run"
+    if action == "run":
+        return W.run_service()
+    if action == "status":
+        print(f"service '{W.SERVICE_NAME}': {W.status_text()}")
+        q = W.query()
+        if q and q.get("binpath"):
+            print(f"  {q['binpath']}")
+        print(f"  logs: {W.log_dir()}")
+        return 0 if q else 1
+    try:
+        if action == "install":
+            exe = getattr(args, "exe", None)
+            W.install(exe, start_at_boot=not getattr(args, "manual", False))
+            print(f"service '{W.SERVICE_NAME}' registered: {W.bin_path(exe)}")
+            if not getattr(args, "no_migrate", False):
+                moved = W.migrate_user_config(getattr(args, "migrate_from", None))
+                for f in moved:
+                    print(f"  settings migrated: {f}")
+                if not moved:
+                    print(f"  settings: {W.program_data_dir()} (nothing to migrate)")
+            if getattr(args, "start", False):
+                W.start()
+                print("  started")
+        elif action == "uninstall":
+            W.uninstall()
+            print(f"service '{W.SERVICE_NAME}' removed")
+        elif action == "start":
+            W.start()
+            print(f"service '{W.SERVICE_NAME}' started ({W.status_text()})")
+        elif action == "stop":
+            W.stop()
+            print(f"service '{W.SERVICE_NAME}' stopped")
+        else:
+            print(f"unknown service action {action!r}")
+            return 2
+    except W.ServiceError as e:
+        print(f"[FAIL] {e}")
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -815,8 +880,36 @@ def build_parser() -> argparse.ArgumentParser:
     # outcome than carrying a dead flag.
     t.add_argument("--autostart", action="store_true",
                    help=argparse.SUPPRESS)
+    # Set by the Windows service (winsvc.py), never by a person: this tray is
+    # the service's child. Quit stops the service; the stop event ends it.
+    t.add_argument("--service-child", dest="service_child", action="store_true",
+                   help=argparse.SUPPRESS)
     t.add_argument("-v", "--verbose", action="store_true")
     t.set_defaults(func=cmd_tray)
+
+    sv = sub.add_parser("service",
+                        help="the Windows service that starts ds5bridge at "
+                             "boot, before anyone signs in")
+    sv.add_argument("action", nargs="?", default="run",
+                    choices=("run", "install", "uninstall", "start", "stop",
+                             "status"),
+                    help="install/uninstall need an administrator prompt; "
+                         "bare `service` is what the Service Control Manager "
+                         "runs")
+    sv.add_argument("--exe", default=None, metavar="PATH",
+                    help="install: the ds5bridge.exe to register (default: "
+                         "the one next to this program)")
+    sv.add_argument("--manual", action="store_true",
+                    help="install: register but do not start with Windows")
+    sv.add_argument("--start", action="store_true",
+                    help="install: start it right away")
+    sv.add_argument("--no-migrate", action="store_true",
+                    help="install: do not copy this user's settings into "
+                         "%%ProgramData%%\\ds5bridge")
+    sv.add_argument("--migrate-from", default=None, metavar="DIR",
+                    help="install: the settings directory to migrate (default "
+                         "%%APPDATA%%\\ds5bridge)")
+    sv.set_defaults(func=cmd_service)
 
     return p
 

@@ -26,12 +26,17 @@
 
 param(
     [switch]$OneFile,
-    [switch]$Clean
+    [switch]$Clean,
+    # The interpreter to build with. Default: the repo's own venv. A worktree
+    # has no venv of its own and must NOT get a junction to the main
+    # checkout's (removing the worktree once emptied the real venv through
+    # it); pass the main checkout's python.exe here instead.
+    [string]$Python = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$py = Join-Path $repo 'prototype\.venv\Scripts\python.exe'
+$py = if ($Python) { $Python } else { Join-Path $repo 'prototype\.venv\Scripts\python.exe' }
 $spec = Join-Path $PSScriptRoot 'ds5bridge.spec'
 $dist = Join-Path $repo 'dist'
 $work = Join-Path $repo 'build'

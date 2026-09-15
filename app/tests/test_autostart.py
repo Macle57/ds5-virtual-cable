@@ -86,9 +86,16 @@ class _Rig(unittest.TestCase):
         self.sch = FakeSchtasks()
         self.legacy = {}
         self._saved = (AUTO._run_schtasks, AUTO.available, AUTO.legacy_run_value,
-                       AUTO._delete_legacy_run_value, AUTO.resolve_exe)
+                       AUTO._delete_legacy_run_value, AUTO.resolve_exe,
+                       AUTO._service_installed, AUTO._service_starts_at_boot,
+                       AUTO._service_set_start_at_boot)
         AUTO._run_schtasks = self.sch
         AUTO.available = lambda: True
+        # No Windows service unless a test installs the fake one.
+        self.service = {"installed": False, "auto": True, "set": []}
+        AUTO._service_installed = lambda: self.service["installed"]
+        AUTO._service_starts_at_boot = lambda: self.service["auto"]
+        AUTO._service_set_start_at_boot = lambda v: self.service["set"].append(v)
         AUTO.legacy_run_value = lambda: self.legacy.get(AUTO.VALUE_NAME)
 
         def delete():
@@ -98,7 +105,9 @@ class _Rig(unittest.TestCase):
 
     def tearDown(self):
         (AUTO._run_schtasks, AUTO.available, AUTO.legacy_run_value,
-         AUTO._delete_legacy_run_value, AUTO.resolve_exe) = self._saved
+         AUTO._delete_legacy_run_value, AUTO.resolve_exe,
+         AUTO._service_installed, AUTO._service_starts_at_boot,
+         AUTO._service_set_start_at_boot) = self._saved
 
 
 class TaskDocumentTests(unittest.TestCase):
@@ -278,6 +287,83 @@ class ReadOnlyOnThisMachine(unittest.TestCase):
 
     def test_current_user_has_a_name(self):
         self.assertTrue(AUTO.current_user())
+
+
+
+class ModeTests(_Rig):
+    """`mode()` and how the one switch maps onto service or task."""
+
+    def test_nothing_installed(self):
+        self.assertEqual(AUTO.mode(), AUTO.MODE_NONE)
+        self.assertFalse(AUTO.is_enabled())
+        self.assertEqual(AUTO.describe(), "no")
+        self.assertEqual(AUTO.label(), "Start at login")
+
+    def test_the_task_alone(self):
+        AUTO.enable()
+        self.assertEqual(AUTO.mode(), AUTO.MODE_TASK)
+        self.assertTrue(AUTO.is_enabled())
+        self.assertIn(TRAY, AUTO.describe())
+        self.assertEqual(AUTO.label(), "Start at login")
+
+    def test_the_service_wins_over_a_leftover_task(self):
+        AUTO.enable()
+        self.service["installed"] = True
+        self.assertEqual(AUTO.mode(), AUTO.MODE_SERVICE)
+        self.assertEqual(AUTO.label(), "Start with Windows (service)")
+
+    def test_in_service_mode_the_switch_is_the_start_type(self):
+        self.service["installed"] = True
+        self.service["auto"] = True
+        self.assertTrue(AUTO.is_enabled())
+        self.service["auto"] = False
+        self.assertFalse(AUTO.is_enabled())
+        # And flipping it never touches the task library.
+        AUTO.set_enabled(False)
+        AUTO.set_enabled(True)
+        self.assertEqual(self.service["set"], [False, True])
+        self.assertEqual(self.sch.calls, [])
+
+    def test_in_task_mode_the_switch_is_the_task(self):
+        AUTO.set_enabled(True)
+        self.assertIn(AUTO.TASK_NAME, self.sch.tasks)
+        AUTO.set_enabled(False)
+        self.assertNotIn(AUTO.TASK_NAME, self.sch.tasks)
+        self.assertEqual(self.service["set"], [])
+
+    def test_migration_under_the_service_only_drops_the_run_value(self):
+        self.service["installed"] = True
+        self.legacy[AUTO.VALUE_NAME] = f'"{TRAY}"'
+        self.assertTrue(AUTO.migrate_legacy())
+        self.assertNotIn(AUTO.VALUE_NAME, self.legacy)
+        self.assertNotIn(AUTO.TASK_NAME, self.sch.tasks)   # no task was created
+
+    def test_off_windows_the_mode_is_none(self):
+        AUTO.available = lambda: False
+        self.service["installed"] = True
+        self.assertEqual(AUTO.mode(), AUTO.MODE_NONE)
+        self.assertFalse(AUTO.is_enabled())
+
+
+class ServiceChildCommandTests(unittest.TestCase):
+    """`build_action` with the service's extra arguments."""
+
+    def test_a_launcher_gets_only_the_flag(self):
+        cmd, args = AUTO.build_action(TRAY, extra_args=("tray", "--service-child"))
+        self.assertEqual(cmd, TRAY)
+        self.assertEqual(args, "--service-child")
+
+    def test_a_launcher_with_nothing_extra_is_unchanged(self):
+        self.assertEqual(AUTO.build_action(TRAY), (TRAY, ""))
+
+    def test_python_carries_the_arguments_into_the_program(self):
+        cmd, args = AUTO.build_action(r"C:\Py\pythonw.exe", app_dir=r"D:\src\app",
+                                      extra_args=("tray", "--service-child"))
+        self.assertIn("main(['tray','--service-child'])", args)
+        self.assertTrue(args.startswith('-c "'))
+        # The plain form still says exactly what it always said.
+        _cmd, plain = AUTO.build_action(r"C:\Py\pythonw.exe", app_dir=r"D:\src\app")
+        self.assertIn("main(['tray'])", plain)
 
 
 if __name__ == "__main__":
