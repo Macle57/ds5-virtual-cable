@@ -157,7 +157,11 @@ Name: "restorepoint"; Description: "Create a System Restore point before install
 ; Chrome Remote Desktop's host -- and the logon task is what 0.5 offered.
 ; Choosing one removes the other (helper: service-install / autostart-enable).
 ; Unticking the box removes both. The selection is remembered by Inno for the
-; next run, so the in-app updater's silent run keeps whichever was chosen.
+; next run, so the in-app updater's silent run keeps whichever was chosen; a
+; 0.5 install (task, no service) remembered plain 'autostart', which now means
+; the service -- the recommended mode. Nothing here reads the machine's
+; current task/service to pre-select a radio: that would override /TASKS and
+; /MERGETASKS (CurPageChanged runs in silent mode too), and did, once.
 Name: "autostart"; Description: "Start ds5bridge with Windows"; Components: app
 Name: "autostart\service"; Description: "when Windows starts, before anyone signs in -- as a Windows service (recommended)"; Components: app; Flags: exclusive
 Name: "autostart\task"; Description: "when you sign in -- a scheduled task with administrator rights, as before"; Components: app; Flags: exclusive unchecked
@@ -245,7 +249,6 @@ var
   HaveHidHideCli: String;   // '' when not installed
   HaveService: Boolean;     // the ds5bridge Windows service is registered
   HaveTask: Boolean;        // the ds5bridge logon task is registered
-  TasksReflected: Boolean;  // the Tasks page was set to match the machine once
   // what this run will actually do
   NeedUsbip, NeedHidHide: Boolean;
   UsbipInstaller, HidHideInstaller: String;
@@ -602,18 +605,6 @@ begin
       WizardForm.ComponentsList.ItemCaption[1] := 'usbip-win2 ' + UsbipVersion + ' -- replaces the installed ' + HaveUsbipVer + ' ({#UsbipHow})';
     if HaveHidHideCli <> '' then
       WizardForm.ComponentsList.ItemCaption[2] := 'HidHide -- already installed (will be verified, not reinstalled)';
-  end
-  else if CurPageID = wpSelectTasks then
-  begin
-    // Once: show how the machine starts ds5bridge today. A logon task with
-    // no service (a 0.5 install, or a deliberate choice) keeps the task
-    // radio; anything else leaves the default (the service).
-    if not TasksReflected then
-    begin
-      TasksReflected := True;
-      if HaveTask and not HaveService then
-        WizardSelectTasks('autostart,autostart\task');
-    end;
   end
   else if CurPageID = SummaryPage.ID then
   begin

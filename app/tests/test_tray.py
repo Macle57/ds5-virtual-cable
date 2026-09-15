@@ -1251,6 +1251,29 @@ class ServiceChildTests(unittest.TestCase):
         finally:
             T.W.is_running, T._message_box = saved
 
+    def test_a_saved_auto_install_switch_reaches_the_running_updater(self):
+        # The dashboard's toggle (config.update_auto_install) must apply
+        # without a restart, like update_check's sibling rows do.
+        app = self.app(False)
+        app._refresh_now = lambda: None
+        app.updater = types.SimpleNamespace(auto_install=True)
+        saved = T.A.available
+        try:
+            T.A.available = lambda: False
+            for want in (False, True):
+                cfg = types.SimpleNamespace(
+                    enabled=True, controllers={}, hide_bluetooth_default=False,
+                    autostart_on_login=False, update_auto_install=want)
+                app._on_dashboard_config(cfg)
+                settle()
+                self.assertIs(app.updater.auto_install, want)
+            # No updater (update_check off): nothing to apply, no crash.
+            app.updater = None
+            app._on_dashboard_config(cfg)
+            settle()
+        finally:
+            T.A.available = saved
+
 
 if __name__ == "__main__":
     unittest.main()

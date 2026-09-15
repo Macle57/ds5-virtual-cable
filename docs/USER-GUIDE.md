@@ -212,7 +212,8 @@ Every one of those is remembered, in `%APPDATA%\ds5bridge\config.json` —
 or, when ds5bridge runs as the service, in `%ProgramData%\ds5bridge\config.json`
 (the installer copies your settings there once). The **ds5bridge dashboard**
 shortcuts the installer offers (Start menu, Desktop) open the same dashboard
-as the menu row.
+as the menu row. (Balloons are normal Windows notifications: with **Do not
+disturb** on you will not see them.)
 
 #### Turning it off, and why you might
 

@@ -489,7 +489,12 @@ class TrayApp:
                 if A.available() and A.is_enabled() != bool(cfg.autostart_on_login):
                     A.set_enabled(bool(cfg.autostart_on_login))
             except A.AutostartError as e:
-                self._notify("Start at login", str(e))
+                self._notify("Start with Windows", str(e))
+            # -- SERVICE region: the automatic-install switch applies live,
+            # like update_check's sibling rows (config.update_auto_install).
+            if self.updater is not None:
+                self.updater.auto_install = bool(cfg.update_auto_install)
+            # -- end SERVICE region
             self._refresh_now()
 
         self._work("dashboard-config", apply)

@@ -175,6 +175,13 @@ hand while the service runs declines with a message rather than fighting the
 first one for the pads. The in-app updater stops the service, runs the
 installer, and the installer's `/STARTTRAY=1` starts the service again.
 
+Two things verified from the SYSTEM child that were open questions: the
+dictation toggle's default-device switch (`IPolicyConfig`) changes *your*
+default microphone exactly as before -- Windows' default audio roles are
+machine-wide, not per user; and the balloons are ordinary notifications, so
+Windows' **Do not disturb** hides them like everyone else's (they are not
+lost: bridging still happens, only the message is).
+
 ## Uninstall
 
 Settings → Apps → **ds5bridge** → Uninstall, or run
@@ -351,8 +358,8 @@ the removal itself, following the same origin records and the same guards.
   options, so an update (silent or interactive without changing the Tasks
   page) moves you to the service — the recommended mode; your settings are
   copied to `%ProgramData%\ds5bridge` and the task is removed. Pick *when
-  you sign in* on the Tasks page to keep the task instead (the page pre-selects
-  it when a task and no service is found).
+  you sign in* on the Tasks page (or pass `/MERGETASKS="autostart\task"`) to
+  keep the task instead; from then on Inno remembers that choice for updates.
 * **Reboot.** After an install, usually none: the installer attaches HidHide's
   filter to the connected controllers itself and the app does the same for a
   pad it bridges (a pad that connects later gets the filter as its device

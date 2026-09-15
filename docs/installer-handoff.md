@@ -800,3 +800,65 @@ Harness notes: a pytest that calls a modal `MessageBoxW` hangs the run -- the
 tray's second-instance guard is behind `tray._message_box` for that reason;
 `cli.main()` pauses on Enter when the process owns its console, so tests stub
 `_owns_console`.
+
+### Verified on this machine (SERVICE agent, second incarnation, 2026-09-15 15:35-16:12)
+
+Build: `build.ps1 -Clean -Python <main venv python>` then `build-installer.ps1
+-BundleUsbip/-BundleHidHide <main checkout's vendor files>` from the worktree
+(no venv junction). Installed over the 0.5.0 install with `/SILENT /NORESTART
+/SUPPRESSMSGBOXES /COMPONENTS=app /MERGETASKS="autostart\service,dashstartmenu,
+dashdesktop" /STARTTRAY=1` (drivers untouched). Version string still 0.5.0
+(the coordinator bumps it). Evidence: `scratchpad\` of this session
+(`install-service*.log`, `uninstall.log`, `shot-*.png`, `audioprobe\*.json`),
+`%ProgramData%\ds5bridge\logs\{service,tray}.log`.
+
+| check | result |
+|---|---|
+| install over 0.5.0, service mode | task `ds5bridge` removed, `config.json` + both `hidden\*.json` migrated to `%ProgramData%\ds5bridge`, service registered (LocalSystem, AUTO_START, `"...\app\ds5bridge.exe" service`), started by `/STARTTRAY=1` via `ds5bridge.exe service start` |
+| processes | `ds5bridge.exe service` pid in session 0 as `NT AUTHORITY\SYSTEM`; `ds5bridge-tray.exe --service-child` in session 1 as SYSTEM; the two `ds5bridge.exe run` bridge children under it in session 1 |
+| pads | `/api/state`: both `running`, `hide_effective: true`, `attached: true`, 250 reports/s each; `usbip port` shows two imported devices; `HidHideCLI --dev-list` lists both BT HID collections |
+| tray icon | present in the overflow flyout (UIA name "ds5bridge -- 2 of 2 bridged / cameo ... / blue ..."); menu rows read "Start with Windows (service)" and "Quit (stops the ds5bridge service)" (`shot-menu1.png`) |
+| balloon | toast "ds5bridge -- ds5bridge will no longer start with Windows (the service stays installed; start it from the Start menu)" rendered from the SYSTEM child (`shot-balloon-1.png`). NOTE: this machine had Windows "Do not disturb" ON, which hides every balloon and did not even keep them in the Notification Center; it had to be switched off for the screenshot and was switched back on |
+| "Start with Windows (service)" row | toggles the start type: `sc qc` DEMAND_START after the first click, AUTO_START after the second; tray.log "start-with-Windows (service) off/on" |
+| Open dashboard from the SYSTEM child | a new Chrome process owned by the signed-in user (`macle`, session 1), not SYSTEM (`open_url_as_user`) |
+| Desktop / Start-menu `.url` | both created (`URL=http://127.0.0.1:8765/`, `IconFile=...\ds5bridge-tray.exe`); opening the Desktop one lands on the live dashboard (`shot-shortcut.png`) |
+| Quit from the menu | child exits 3, service.log "the user quit the tray; stopping the service", `sc query` STOPPED within a second, 0 processes, HidHide list empty, nothing attached |
+| `sc start` | RUNNING in 1 s; both pads bridged + hidden again within 30 s (twice) |
+| `sc stop` | STOPPED in 2 s: "control 0x1 received; stopping" -> child asked -> "child pid N exited with 0"; pads unhidden, nothing attached |
+| uninstall `/SILENT /KEEPUSBIP=1 /KEEPHIDHIDE=1` | 9 s: service stopped by the teardown then removed, cleanup/unhide run for both settings dirs, HidHide whitelist entries removed, app dir + both `.url` shortcuts gone, `%ProgramData%\ds5bridge\config.json` kept, both drivers untouched |
+| reinstall (same switches) | 21 s, service RUNNING, both pads bridged + hidden, labels intact (settings came from ProgramData), shortcuts back |
+| `audio_default` (IPolicyConfig) from SYSTEM in the console session | WORKS and affects the signed-in user: a probe launched exactly like the service child (SYSTEM token re-stamped with session 1) called `SetDefaultEndpoint` on another capture device; an observer running as the user saw the default capture device change 2.5 s later and revert when the probe restored it (`audioprobe\observer.json`, `probe-MACLE_PC$-flip.json`). The default-device roles are machine-wide, not per user, so the dictation toggle needs no change under the service |
+
+Bug found and fixed on the way (commit after 02d8ff3): the `wpSelectTasks`
+"reflect the machine" code pre-selected `autostart\task` whenever a logon
+task and no service existed -- and `CurPageChanged` runs in silent mode too,
+so the first install ignored `/MERGETASKS="autostart\service"` and registered
+the task (install-service.log: "tasks selected: autostart,autostart\task").
+Removed: Inno's remembered selection already keeps a deliberate 1.0 choice,
+and a 0.5 task moves to the service, as the docs say.
+
+Harness notes for whoever tests this next:
+* Clicking the SYSTEM tray's menu from an elevated (High IL) helper does
+  NOT work: UIPI drops injected input into the System-IL menu window (the
+  menu stays open with the cursor on the row -- what the user saw). Inject
+  from SYSTEM in the console session instead: a SYSTEM scheduled task
+  running a script that calls `winsvc.launch_in_session(...)` on the click
+  helper (`scratchpad\as-system.ps1` + `launch2.py` + `ui.ps1`). The
+  overflow-flyout icon position comes from UIA (`Show Hidden Icons` ->
+  `TopLevelWindowForOverflowXamlIsland`).
+* Screenshots must be DPI-aware (`SetProcessDPIAware`), or the taskbar is
+  cropped off at 125 %.
+* `Start-Process ... unins000.exe /SILENT` with polling works; the
+  uninstaller's `ds5bridge-uninstall-check.txt` lands in the ELEVATED
+  session's `%TEMP%`, read the `/LOG` instead.
+* Both pads went "present but no HID collection" after the MANAGER's dev
+  tray was torn down; `pnputil /restart-device` on the two
+  `BTHENUM\{00001124-...}` nodes brought the HID children back after ~40 s
+  without a power-cycle.
+
+NOT proven here (the coordinator's reboot test): the child starting in the
+console session BEFORE sign-in (LogonUI only) and pystray adding the icon on
+`TaskbarCreated` after sign-in; a console-session change (fast user switch);
+the in-app update from a real GitHub release through the service path
+(`-Service ds5bridge` in the helper, `/STARTTRAY=1` starting the service).
+
