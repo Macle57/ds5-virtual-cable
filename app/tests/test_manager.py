@@ -24,6 +24,7 @@ The four properties worth breaking a build over:
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 import unittest
@@ -1540,6 +1541,40 @@ class TestDevnodeWitness(_Base):
         # address: Windows really has zero-address BTHENUM service nodes.)
         self.assertIsNone(M._devnode_present(""))
         self.assertIsNone(M._devnode_present("not-a-bdaddr"))
+
+    def test_the_real_witness_reads_the_hid_child_not_the_bthenum_node(self):
+        """Measured 2026-09-15: a paired pad's BTHENUM nodes stay present
+        when it is off; only the HID child leaves. So the witness is the
+        child, and a present parent with no started child is False."""
+        from ds5app import hidhide as HH
+        saved = (HH.bt_parent_for_serial, HH._locate_devnode,
+                 HH._child_devinsts, HH._devnode_started)
+        parent = ("BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0002054c"
+                  "_PID&0ce6\\7&16440032&0&D42F4BA1485D_C00000000")
+        try:
+            HH.bt_parent_for_serial = lambda s: parent
+            HH._locate_devnode = lambda i, phantom=True: 7
+            HH._devnode_started = lambda d: True
+            HH._child_devinsts = lambda d: []
+            if sys.platform == "win32":
+                self.assertIs(HH.hid_child_present(A), False)
+                HH._child_devinsts = lambda d: [8]
+                self.assertIs(HH.hid_child_present(A), True)
+                HH._devnode_started = lambda d: False
+                self.assertIs(HH.hid_child_present(A), False)
+                # parent gone altogether: unusual, so "cannot say"
+                HH._locate_devnode = lambda i, phantom=True: None
+                self.assertIsNone(HH.hid_child_present(A))
+                # not the HID service node: cannot say
+                HH._locate_devnode = lambda i, phantom=True: 7
+                HH.bt_parent_for_serial = lambda s: parent.replace(
+                    "00001124", "00001200")
+                self.assertIsNone(HH.hid_child_present(A))
+            else:
+                self.assertIsNone(HH.hid_child_present(A))
+        finally:
+            (HH.bt_parent_for_serial, HH._locate_devnode,
+             HH._child_devinsts, HH._devnode_started) = saved
 
 
 class TestPrehide(_Base):

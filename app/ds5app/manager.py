@@ -274,29 +274,25 @@ def _hidden_serials() -> list[str]:
 
 
 def _devnode_present(serial: str):
-    """Is this pad's Bluetooth devnode PRESENT right now? True / False / None.
+    """Is this pad's Bluetooth link up, as the PnP tree sees it? True/False/None.
 
     The third witness of `poll_once` rule 7, and the only one that owes
-    nothing to HidHide: it asks the Plug and Play manager (`CM_Locate_DevNode`
-    on the pad's BTHENUM HID-service node, found by its address) rather than
-    the HID device set that HidHide filters. A cloak stops `hid_enumerate`
-    from listing a pad; it cannot stop the PnP tree from knowing whether the
-    Bluetooth link behind that pad is up. A switched-off DualSense has no
-    present BTHENUM node (measured 2026-08-27, `hidhide.devnode_present`);
-    one that is on has, cloaked or not.
+    nothing to HidHide: it asks the Plug and Play manager rather than the HID
+    device set that HidHide filters. A cloak stops `hid_enumerate` from
+    listing a pad; it cannot stop the PnP tree from knowing whether the pad's
+    HID child devnode exists -- and that child exists exactly while the
+    Bluetooth link is up (`hidhide.hid_child_present`, measured 2026-09-15
+    on both pads: the BTHENUM nodes of a paired pad never leave, the HID
+    child under the 00001124 service node comes and goes with the link).
 
     None -- "cannot say" -- whenever the answer would be a guess: not Windows,
-    no such node even as a phantom (never paired, or the enumerator listing
-    failed), or any exception. Only a node Windows knows about and reports as
-    NOT present is a False. Never raises; ~1 ms.
+    no such node (never paired, or the enumerator listing failed), or any
+    exception. Never raises; ~1 ms.
     """
     try:
         from . import hidhide as HH
 
-        parent = HH.bt_parent_for_serial(serial)
-        if not parent:
-            return None
-        return bool(HH.devnode_present(parent))
+        return HH.hid_child_present(serial)
     except Exception:  # noqa: BLE001
         log.debug("devnode witness for %s failed", serial, exc_info=True)
         return None
@@ -1668,13 +1664,20 @@ class BridgeManager:
            not asked about it: only enumeration -- which sees a cloaked pad,
            because the tray is whitelisted -- brings it back, exactly as the
            start loop below already required. Second, a third witness that
-           owes nothing to HidHide: the pad's own Bluetooth devnode
-           (`_devnode_present`, `CM_Locate_DevNode` on its BTHENUM node). A
-           node Windows reports as not present is a pad that is off, whatever
-           the journal says; a node that IS present vouches for a cloaked pad
+           owes nothing to HidHide: the pad's HID child devnode under its
+           BTHENUM service node (`_devnode_present`), which the PnP tree has
+           exactly while the Bluetooth link is up. No child is a pad that is
+           off, whatever the journal says; a child vouches for a cloaked pad
            on its own, whitelist or no whitelist; and "cannot say" falls back
            to the rules above. The same witness also counts as the second
            voice of rule 5 for a pad that enumerates while its radio is dead.
+
+           Measured 2026-09-15 on hardware, in this order: the first cut of
+           this witness asked whether the BTHENUM node itself was present,
+           and a switched-off pad's node is -- all three of a paired pad's
+           BTHENUM nodes stay present and started -- so the pad stayed at
+           "1 of 2" through the very fix meant to end that. The HID child
+           is what leaves.
         """
         now = time.monotonic()
         with self._lock:

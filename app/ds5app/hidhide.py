@@ -959,8 +959,101 @@ def devnode_present(instance_id: str) -> bool:
     Without this, every ordinary "user switched the controller off" teardown
     would re-enumerate a Bluetooth node for nothing and then advise the user to
     power-cycle a controller they had just deliberately turned off.
+
+    Measured again 2026-09-15 (Windows 11 26200, both pads, one switched off
+    by feature 0x08): the FIRST bullet does not hold on this machine. All
+    three BTHENUM nodes of a paired pad -- `Dev_<addr>`, the 00001124 HID
+    service node and the 00001200 PnP-information node -- stay present and
+    started (`CM_Get_DevNode_Status` 0x180600a) for as long as the pad is
+    paired, on or off. What comes and goes with the link is the HID CHILD of
+    the 00001124 node, which is why `hid_child_present()` -- not this -- is
+    the presence witness `manager.poll_once` uses. This function still
+    answers "does Windows currently present this node", which is the right
+    question for a HID child instance path (the 2026-08-27 phantom).
     """
     return _locate_devnode(instance_id, phantom=False) is not None
+
+
+#: `CM_Get_DevNode_Status` bits: the devnode's driver stack is up.
+_DN_STARTED = 0x00000008
+
+
+def _child_devinsts(devinst) -> list:
+    """Present children of a devnode (`CM_Get_Child` + `CM_Get_Sibling`).
+
+    The device tree these walk holds present devnodes only; a phantom child
+    is reachable through `CM_Locate_DevNode(PHANTOM)` but is not a child
+    here, which is exactly the distinction the caller wants.
+    """
+    out = []
+    try:
+        cm = _cfgmgr()
+        child = ctypes.c_ulong(0)
+        if cm.CM_Get_Child(ctypes.byref(child), devinst, 0) != _CR_SUCCESS:
+            return out
+        out.append(child.value)
+        cur = child
+        while True:
+            sib = ctypes.c_ulong(0)
+            if cm.CM_Get_Sibling(ctypes.byref(sib), cur, 0) != _CR_SUCCESS:
+                break
+            out.append(sib.value)
+            cur = ctypes.c_ulong(sib.value)
+    except Exception:  # noqa: BLE001
+        log.debug("could not walk the children of devinst %s", devinst,
+                  exc_info=True)
+    return out
+
+
+def _devnode_started(devinst) -> bool:
+    try:
+        cm = _cfgmgr()
+        st = ctypes.c_ulong(0)
+        pn = ctypes.c_ulong(0)
+        if cm.CM_Get_DevNode_Status(ctypes.byref(st), ctypes.byref(pn),
+                                    ctypes.c_ulong(devinst), 0) != _CR_SUCCESS:
+            return False
+        return bool(st.value & _DN_STARTED)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def hid_child_present(serial: str):
+    """Is this pad's Bluetooth link UP, as the PnP tree sees it? True/False/None.
+
+    The HidHide-independent presence witness. HidHide filters the HID device
+    set that `hid_enumerate` reads; it does not touch the PnP device tree,
+    and the tree carries the one fact that tracks the radio link: a paired
+    DualSense's BTHENUM HID-service node (`bt_parent_for_serial`, the
+    00001124 one) has a HID child devnode while the pad is connected and
+    NONE while it is off. Measured 2026-09-15 on both pads (see
+    `devnode_present`): the BTHENUM nodes themselves never leave.
+
+    * True  -- the service node is present and has a started HID child;
+    * False -- the service node is present and has no started child: the
+      pad is off (or, the 2026-08-27 case, its child has gone phantom --
+      either way the link is not usable);
+    * None  -- cannot say: not Windows, no 00001124 node for this address
+      (never paired, or the enumerator listing failed), or an exception.
+
+    Never raises; about a millisecond.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        parent = bt_parent_for_serial(serial)
+        if not parent or "00001124" not in parent.lower():
+            return None
+        devinst = _locate_devnode(parent, phantom=False)
+        if devinst is None:
+            # Present nodes never leave on this machine (see above), so a
+            # missing one is an unusual state -- unpaired mid-session -- and
+            # "cannot say" is the honest answer rather than "off".
+            return None
+        return any(_devnode_started(c) for c in _child_devinsts(devinst))
+    except Exception:  # noqa: BLE001
+        log.debug("HID-child witness for %s failed", serial, exc_info=True)
+        return None
 
 
 def parent_instance_id(instance_id: str) -> str:

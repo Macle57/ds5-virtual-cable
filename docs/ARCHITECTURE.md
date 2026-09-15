@@ -90,11 +90,12 @@ Three witnesses, because each one is blind somewhere:
 2. **The bridge child.** It holds the pad's HID handle and reports DEGRADED
    the moment the Bluetooth link dies; a handle works through a cloak. Blind
    once the bridge is torn down.
-3. **The PnP tree** (`CM_Locate_DevNode` on the pad's BTHENUM HID-service
-   node, found by its address). HidHide filters the HID device set, not the
-   devnode tree, so this sees a cloaked pad -- and a switched-off pad has no
-   present BTHENUM node. Blind to nothing on Windows; answers "cannot say"
-   elsewhere.
+3. **The PnP tree** (`hidhide.hid_child_present`: the pad's BTHENUM
+   HID-service node, found by its address, has a started HID child devnode
+   exactly while the Bluetooth link is up -- the BTHENUM nodes of a paired
+   pad themselves never leave, measured 2026-09-15). HidHide filters the HID
+   device set, not the devnode tree, so this sees a cloaked pad. Blind to
+   nothing on Windows; answers "cannot say" elsewhere.
 
 The HidHide journal (what WE hid) is a fourth voice with a specific job: a
 cloaked pad the whitelist does not let us enumerate must not be declared
