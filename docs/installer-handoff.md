@@ -925,3 +925,21 @@ Also seen today: the 15-minute idle off-timer (`input.off_timer_minutes`)
 switched both pads off at 02:36, 21:35 and 22:05 -- each time exactly 15 min
 after a (re)start bridged them with nobody touching them. It is working as
 designed; it just looks like a fault when the pads are only being watched.
+
+## 2026-09-15 22:29 -- reboot test of 1.0.1 in service mode (coordinator) -- PASSED
+
+`shutdown /g` with both pads bridged. After the restart (boot 22:29:48;
+Automatic Restart Sign-On logged the user in at 22:30:19, so "before sign-in"
+is only three seconds wide on this machine -- what the logs prove is that the
+service starts at boot without anyone's help): `service.log` "ds5bridge service
+starting" 22:30:22, "tray started in session 1" 22:30:22, "session change:
+event 7 ... console now 1" 22:30:24. The pads had dropped their link during the
+restart; the tray found blue absent at 22:30:23 and unhid it (the journal's
+"pad not present" branch, as designed), then both pads reconnected on their own
+and were bridged AND hidden again by 22:32:10 (`hide_effective: true`, 250 rps
+each) with no one touching anything. The icon is in the hidden-icons flyout
+after sign-in ("ds5bridge -- 2 of 2 bridged", both pads listed): pystray's
+`TaskbarCreated` handling works for a child that started before Explorer.
+The updater found nothing newer (1.0.1 is latest). Seen: every tray.log line
+is written twice under the service child (two handlers on the same logger) --
+cosmetic, not fixed here.
