@@ -66,7 +66,8 @@ Every response is JSON unless stated. Every request must carry a loopback
                                             running/present.
                               update        {available: "1.0.1"|null, url,
                                             checked_at: ts|null, installing:
-                                            bool} -- the tray's update check.
+                                            bool, error: str|null} -- the
+                                            tray's update check.
                               autostart     {enabled: bool, mode: "task"|
                                             "service"|"none"}
                               tray          {version, hidhide: bool,

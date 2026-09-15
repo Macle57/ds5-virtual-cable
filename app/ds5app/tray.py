@@ -291,6 +291,9 @@ class TrayApp:
     _update_loop_on = False
     #: `time.time()` of the last check attempt, for the dashboard.
     _update_checked_at = None
+    #: What the last check attempt raised, if anything (`update.error`);
+    #: None after a check that returned, whatever it returned.
+    _update_error = None
     #: An "Install update" is in flight (download, hand-off, exit).
     _update_installing = False
     #: (enabled, mode) as last read from the machine -- see AUTOSTART_TTL_S.
@@ -596,7 +599,8 @@ class TrayApp:
             "update": {"available": info.version if info else None,
                        "url": info.page_url if info else None,
                        "checked_at": self._update_checked_at,
-                       "installing": bool(self._update_installing)},
+                       "installing": bool(self._update_installing),
+                       "error": self._update_error},
             "autostart": {"enabled": bool(enabled), "mode": mode},
             "tray": {"version": VERSION, "hidhide": bool(self._has_hidhide),
                      "elevated": bool(self._elevated), "pid": os.getpid()},
@@ -641,7 +645,10 @@ class TrayApp:
         return {"ok": ok, "text": text}
 
     def _act_update_check(self) -> dict:
-        info = self._update_check_now()
+        try:
+            info = self._update_check_now()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "text": f"The update check failed: {e}"}
         if info is not None:
             return {"ok": True,
                     "text": f"ds5bridge {info.version} is available "
@@ -701,7 +708,15 @@ class TrayApp:
 
         def check_once():
             try:
-                return inner()
+                result = inner()
+            except Exception as e:  # noqa: BLE001
+                # update.py's own contract is "never raises"; if it ever
+                # does, the page gets the reason instead of a stale answer.
+                self._update_error = str(e) or e.__class__.__name__
+                raise
+            else:
+                self._update_error = None
+                return result
             finally:
                 self._update_checked_at = time.time()
         upd.check_once = check_once

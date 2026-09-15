@@ -1203,6 +1203,8 @@ class _FakeUpdater:
 
     made: list = []
     answer = None
+    #: An exception for `check_once` to raise, when a test wants one.
+    raise_with = None
 
     def __init__(self, notify=None, **kw):
         self.notify = notify
@@ -1224,6 +1226,8 @@ class _FakeUpdater:
 
     def check_once(self):
         self.checks += 1
+        if _FakeUpdater.raise_with is not None:
+            raise _FakeUpdater.raise_with
         return _FakeUpdater.answer
 
 
@@ -1233,6 +1237,7 @@ class DashboardControlTests(unittest.TestCase):
     def setUp(self):
         _FakeUpdater.made = []
         _FakeUpdater.answer = None
+        _FakeUpdater.raise_with = None
         self._saved_updater = T.U.Updater
         T.U.Updater = _FakeUpdater
         self._saved_A = (T.A.available, T.A.is_enabled, T.A.set_enabled)
@@ -1252,12 +1257,27 @@ class DashboardControlTests(unittest.TestCase):
         app = self.app()
         x = app._dashboard_extras()
         self.assertEqual(x["update"], {"available": None, "url": None,
-                                       "checked_at": None, "installing": False})
+                                       "checked_at": None, "installing": False,
+                                       "error": None})
         self.assertEqual(set(x["autostart"]), {"enabled", "mode"})
         self.assertEqual(x["autostart"]["mode"], "none")
         self.assertEqual(x["tray"]["version"], T.VERSION)
         self.assertIn("hidhide", x["tray"])
         self.assertIn("elevated", x["tray"])
+
+    def test_a_check_that_raises_is_reported_as_update_error(self):
+        app = self.app()
+        _FakeUpdater.raise_with = RuntimeError("dns is down")
+        r = app._dashboard_action("update_check", {})
+        self.assertFalse(r["ok"])
+        self.assertIn("dns is down", r["text"])
+        self.assertEqual(app._dashboard_extras()["update"]["error"],
+                         "dns is down")
+        self.assertIsNotNone(app._update_checked_at)
+        # the next check that returns clears it
+        _FakeUpdater.raise_with = None
+        self.assertTrue(app._dashboard_action("update_check", {})["ok"])
+        self.assertIsNone(app._dashboard_extras()["update"]["error"])
 
     def test_extras_report_a_found_update(self):
         app = self.app()
