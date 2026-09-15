@@ -56,6 +56,30 @@ class FakeRenderer:
         self.calls.append("close")
 
 
+class FakeTouch:
+    """A `actions.TouchInjector` stand-in: records contact frames."""
+
+    def __init__(self):
+        self.frames: list = []
+        self._points: list = []
+
+    def down(self, points):
+        self._points = [tuple(p) for p in points]
+        self.frames.append(("down", self._points))
+
+    def move(self, points):
+        self._points = [tuple(p) for p in points]
+        self.frames.append(("move", self._points))
+
+    def up(self):
+        self._points = []
+        self.frames.append(("up",))
+
+    @property
+    def active(self):
+        return bool(self._points)
+
+
 class FakeAudio:
     """An `audio_default.AudioSystem` stand-in that never touches COM."""
 
@@ -143,13 +167,16 @@ class EngineCase(unittest.TestCase):
         self.sent: list[bytes] = []
         self.modes: list[tuple] = []
         self.power_offs = 0
+        self.toasts: list[tuple] = []
         self.clock = Clock()
         self.audio = FakeAudio()
+        self.touch = FakeTouch()
         self.acts = A.OsActions(inject=self.batches.append,
                                 run_ps=lambda s, timeout=10.0:
                                 (self.scripts.append(s), True)[1],
                                 launch=lambda c: (self.launched.append(c), True)[1],
-                                audio=self.audio, sleep=lambda s: None)
+                                audio=self.audio, sleep=lambda s: None,
+                                touch=self.touch, cursor=lambda: (1000, 600))
         cfg = K.InputConfig.from_dict(over)
 
         def power_off():
@@ -161,7 +188,8 @@ class EngineCase(unittest.TestCase):
         self.eng = I.InputInterceptor(
             cfg, actions=self.acts, send_setstate=self.sent.append,
             power_off=power_off, clock=self.clock, dispatch=lambda fn: fn(),
-            on_mode=lambda r, k: self.modes.append((r, k)), osk=self.osk)
+            on_mode=lambda r, k: self.modes.append((r, k)), osk=self.osk,
+            on_toast=lambda c, t, b: self.toasts.append((c, t, b)))
         return self.eng
 
     def make_remote(self, **over):
