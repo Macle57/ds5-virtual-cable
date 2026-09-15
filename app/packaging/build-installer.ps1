@@ -37,7 +37,10 @@ param(
     [switch]$Bundle,
     [string]$BundleUsbip = '',
     [string]$BundleHidHide = '',
-    [string]$OutputDir = ''
+    [string]$OutputDir = '',
+    # Passed through to build.ps1 (-Python): the interpreter to build the app
+    # with, for a worktree without its own venv.
+    [string]$Python = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,6 +78,7 @@ if ($Rebuild -or -not (Test-Path (Join-Path $appDir 'ds5bridge-tray.exe'))) {
     Write-Host '--- app build (build.ps1) ---'
     $buildArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'build.ps1'))
     if ($Rebuild) { $buildArgs += '-Clean' }
+    if ($Python) { $buildArgs += @('-Python', $Python) }
     & powershell.exe @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build.ps1 failed ($LASTEXITCODE)" }
 }

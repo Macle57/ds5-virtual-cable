@@ -755,3 +755,48 @@ dictation from the pad, `display_*` actions on a real second screen, a real
 discharge through 20 %/10 % for the toast, the interactive uninstaller's bold
 restart dialog + Inno restart prompt, log-off/log-on autostart of the task,
 install.ps1 against a real GitHub release (repo still private).
+
+## 2026-09-15 -- v1.0.0: the Windows service (SERVICE agent, branch `v1-service`)
+
+Design as built (app/ds5app/winsvc.py, cli.py `service`, tray.py
+`--service-child`, autostart.py `mode()`, ds5bridge.iss / setup-helper.ps1):
+the service `ds5bridge` (LocalSystem, automatic start, `ds5bridge.exe
+service`) is a supervisor that starts `ds5bridge-tray.exe --service-child` in
+the active console session with its own SYSTEM token re-stamped with the
+session id (`SetTokenInformation(TokenSessionId)`) on `winsta0\default`,
+restarts it with a 2..60 s backoff when it exits, moves it when the console
+session changes (polled every second; SERVICE_CONTROL_SESSIONCHANGE is
+logged), and stops it through the manual-reset event
+`Global\ds5bridge-service-stop` (60 s grace, then TerminateProcess). The
+tray's menu Quit exits with code 3 (`EXIT_STOP_SERVICE`) and the supervisor
+then stops the service instead of restarting. Child config dir
+`DS5_CONFIG=%ProgramData%\ds5bridge` (config.json copied from `%APPDATA%`
+once by `service install`; hide-journal records moved); logs
+`%ProgramData%\ds5bridge\logs\{service,tray}.log` (rotating 2 MB x 3).
+
+### Spike (2026-09-15 10:24-10:27, this machine, before any code shipped)
+
+A throwaway SCM service `ds5spike` (`python.exe spike_svc.py` hosting the
+REAL winsvc.py, child = a stdlib `pythonw.exe spike_child.py` doing
+Shell_NotifyIcon + a balloon + SendInput; scratchpad `spike\`):
+
+| fact | result |
+|---|---|
+| `StartServiceCtrlDispatcherW` / `RegisterServiceCtrlHandlerExW` / `SetServiceStatus` via ctypes from a frozen-style host | service reached RUNNING; `sc query` showed our pid |
+| `CreateProcessAsUserW` with the SYSTEM token + `TokenSessionId=1`, `lpDesktop=winsta0\default` | child: `session=1 user=SYSTEM desktop=Default`, `Shell_TrayWnd` found, `APPDATA` = systemprofile (hence DS5_CONFIG) |
+| `Shell_NotifyIcon(NIM_ADD)` + NIF_INFO balloon from that child | both returned 1 (no error) |
+| `SendInput` (relative mouse move) from that child | `cursor (937, 396) -> (977, 436)` -- input injection reaches the user's desktop |
+| `sc stop` with the child waiting on the named event | child exited 0, service STOPPED in 1.1 s |
+| `sc stop` with a child that ignores the event | STOP_PENDING checkpoints accepted for 60 s, then TerminateProcess, STOPPED in 61.7 s |
+
+Not spiked (the coordinator's reboot test): the child in session 1 BEFORE
+sign-in (LogonUI only), and pystray re-adding the icon on `TaskbarCreated`
+after sign-in (pystray 0.19.5's `_on_taskbarcreated` re-runs `_show`; a
+failed NIM_ADD before that is silent -- `Shell_NotifyIcon` has no errcheck in
+pystray's win32 bindings -- so the child bridges without an icon until
+explorer is up).
+
+Harness notes: a pytest that calls a modal `MessageBoxW` hangs the run -- the
+tray's second-instance guard is behind `tray._message_box` for that reason;
+`cli.main()` pauses on Enter when the process owns its console, so tests stub
+`_owns_console`.
