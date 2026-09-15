@@ -78,11 +78,18 @@ chords.
 | L1 / R1 | `brightness_down` / `brightness_up` | WMI via PowerShell; repeats; no-op on monitors without WMI brightness |
 | Options | `projection_cycle` | Win+P |
 | Create (Share) | `show_desktop` | Win+D |
-| Touchpad click | `keyboard` | the pad-driven on-screen keyboard (below); press again to close |
+| R3 | `show_battery` | a notification: "*label*: 80 % (discharging)" for the pad that pressed it |
+| Touchpad click (1 finger) | `keyboard` | the pad-driven on-screen keyboard (below); press again to close |
 | Mute (the mic button) | `dictation` | Windows voice typing, listening through the **pad's** microphone (below) |
-| 2-finger horizontal slide | `alt_tab` | **hold semantics**: switcher opens on ~150 px of travel, each further 150 px steps (slide back = step back), lifting the fingers or releasing PS commits (Alt-up) |
-| 2-finger swipe up | `task_view` | Win+Tab |
-| 2-finger swipe down | `minimize_all` | Win+M |
+| 2-finger click | `right_click` | the pad physically clicked with two fingers on it, like a Windows touchpad |
+| 2-finger slide, pad **not** clicked | `scroll` / `scroll_horizontal` | continuous, proportional to travel, like a precision touchpad |
+| 2-finger pinch / spread, not clicked | `pinch_zoom` | a real touch-screen pinch (Chrome zooms its viewport) |
+| 2-finger horizontal slide **while clicked** | `alt_tab` | **hold semantics**: switcher opens on ~150 px of travel, each further 150 px steps (slide back = step back), lifting the fingers or releasing PS commits (Alt-up) |
+| 2-finger swipe up / down while clicked | `task_view` / `minimize_all` | Win+Tab / Win+M |
+| 2-finger pinch while clicked | `ctrl_zoom` | Ctrl + wheel, one notch per 80 px of spread |
+
+The full gesture vocabulary, with the remote-mode column, is in
+[Two-finger gestures](#two-finger-gestures) below.
 
 A **plain PS tap** still reaches the game: if PS comes up quickly with no
 chord fired, the engine waits out the double-press window (400 ms) and then
@@ -107,8 +114,62 @@ the table above can be re-bound without guessing:
 | shell | `show_desktop` (Win+D) `minimize_all` (Win+M) `task_view` (Win+Tab) `alt_tab` `projection_cycle` (Win+P chooser) |
 | projection, no chooser | `display_extend` (`DisplaySwitch.exe /extend`) `display_second_only` (`/external`) `display_pc_only` (`/internal`) `display_duplicate` (`/clone`) `display_cycle` — PC only → duplicate → extend → second only → …, remembering where it is for the life of the bridge (an explicit `display_*` moves the cycle too) |
 | mouse and keys | `left_click` `right_click` `middle_click` `escape` `enter` `arrow_up` `arrow_down` `arrow_left` `arrow_right` — from a chord these tap; in remote mode they are **held** for the length of the press (Cross = drag) and the arrows re-trigger every 300 ms |
+| continuous (follow the fingers) | `scroll` `scroll_horizontal` (wheel events proportional to travel, `remote.scroll_speed` applies) `ctrl_zoom` (Ctrl + wheel, whole notches) `pinch_zoom` (Windows touch injection: two synthetic contacts spread or close around the pointer — Chrome/Edge zoom the **visual viewport** the way a precision-touchpad pinch does, which is not the Ctrl zoom level). Bound to a *button* they do one step (`input.actions.<name>.step` notches) |
 | voice typing | `dictation` — see below |
-| the engine's own (`engine_actions`) | `pad_power_off` `pad_lightbar_toggle` `keyboard` |
+| the engine's own (`engine_actions`) | `pad_power_off` `pad_lightbar_toggle` `keyboard` `show_battery` |
+
+## Two-finger gestures
+
+Every 2-finger touchpad gesture is a row in **both** binding tables
+(`input.chords` while PS is held, and remote mode — see
+[`same_gestures`](#remote-mode)). `/api/actions` serves the rows as
+`gestures` (`{key, label, help, group}`, group `taps | unpressed | pressed`),
+which is what the dashboard's Gestures tab renders.
+
+| key | what you do | default (PS held) | default (remote mode) |
+|---|---|---|---|
+| `touch_tap_2f` | two fingers touch briefly, **no** click | *(none)* | `right_click` |
+| `touch_click_2f` | click the pad with two fingers resting on it | `right_click` | `right_click` |
+| `touch_slide_horizontal` | 2-finger horizontal slide, pad not clicked | `scroll_horizontal` | `scroll_horizontal` |
+| `touch_slide_vertical` | 2-finger vertical slide, pad not clicked | `scroll` | `scroll` |
+| `touch_swipe_up` / `touch_swipe_down` | compatibility flick (200 px), unpressed — fires **only while `touch_slide_vertical` is `none`** | *(none)* | *(none)* |
+| `touch_pinch` | fingers apart / together, pad not clicked | `pinch_zoom` | `pinch_zoom` |
+| `touch_slide_horizontal_pressed` | horizontal slide **while the pad is clicked** | `alt_tab` | `alt_tab` |
+| `touch_swipe_up_pressed` | swipe up while clicked | `task_view` | `task_view` |
+| `touch_swipe_down_pressed` | swipe down while clicked | `minimize_all` | `minimize_all` |
+| `touch_pinch_pressed` | pinch / spread while clicked | `ctrl_zoom` | `ctrl_zoom` |
+
+One contact is exactly **one** gesture:
+
+- A contact that ends as a **click** (`touch_click_2f`) never also fires the
+  tap. The click fires when the physical button comes back **up**, so a
+  click that turns into a slide fires only its `_pressed` gesture and never
+  the right click.
+- A contact that becomes a slide or pinch fires neither tap.
+- Travel is measured from the moment the second finger lands, so 1-finger
+  mousing in remote mode cannot pre-load a gesture.
+- Rows bound to `alt_tab` open the switcher with hold semantics; rows bound
+  to a continuous action (`scroll*`, `*_zoom`) track the fingers until they
+  lift; anything else fires once and the contact is spent. An unbound row
+  leaves the contact undecided, so a later, bound direction can still win.
+- Under PS, a 2-finger click is **not** the `touchpad_click` chord (that
+  needs one finger or none). In remote mode a 1-finger physical click is the
+  intrinsic left mouse button, held for the press (drag).
+
+Thresholds live in `input.gestures` (touchpad points, 1920 × 1080 over
+~52 × 23 mm), and apply live:
+
+| key | default | meaning |
+|---|---|---|
+| `tap_ms` | 250 | a touch shorter than this that moved less than `tap_move_px` is a tap |
+| `tap_move_px` | 40 | … and the most a tap or a 2-finger click may travel |
+| `slide_px` | 40 | unpressed travel at which a contact becomes a slide (scrolling starts) |
+| `swipe_px` | 200 | vertical travel for the swipes (pressed, and the compat flicks) |
+| `alt_tab_step_px` | 150 | horizontal travel that opens Alt-Tab, and per further step |
+| `pinch_px` | 80 | spread change at which a contact becomes a pinch |
+| `scroll_px_per_notch` | 100 | finger travel per wheel notch (120 units), before `remote.scroll_speed` |
+| `zoom_px_per_notch` | 80 | spread change per Ctrl+wheel notch |
+| `pinch_gain` | 1.0 | screen px the injected contacts move per point of spread change |
 
 ### Dictation through the pad's microphone
 
@@ -176,23 +237,28 @@ are not bindings:
 |---|---|
 | touchpad 1-finger drag | move the pointer (`remote.mouse_speed`) |
 | touchpad 1-finger tap | left click |
-| touchpad 2-finger tap | right click |
+| touchpad 1-finger physical click | left mouse button, held for the press (drag) |
 | left stick | move the pointer (rate) |
-| right stick (vertical) | scroll (rate — the touchpad deliberately does not scroll; sticks and triggers own it) |
+| right stick (vertical) | scroll (rate) |
 | L2 / R2 | scroll up / down (analog rate) |
 
-Every **button** and the **three 2-finger gestures** resolve through a
-binding table, and which table is `remote.same_bindings`:
+Every **button** and every **2-finger gesture** resolves through a binding
+table. Two switches, one per row family:
 
-- **`same_bindings: true` (default)** — the `input.chords` table. A button or
-  gesture means in remote mode exactly what it means with PS held: Cross =
-  play/pause, dpad = volume/track, Options = Win+P, 2-finger slide = Alt-Tab,
-  swipes = Task View / minimize. One table to maintain; the dashboard shows
-  the checkbox ticked.
-- **`same_bindings: false`** — `input.remote.chords`, merged over
-  `DEFAULT_REMOTE_CHORDS` with the same rules as `input.chords` (name a key
-  to change it, `"none"` to remove it, removals written back as `"none"`).
-  The defaults are the classic remote map this feature shipped with:
+- **`remote.same_bindings`** (default `true`) — the BUTTON rows come from
+  `input.chords`: a button means in remote mode exactly what it means with
+  PS held (Cross = play/pause, dpad = volume/track, Options = Win+P). Off:
+  the button rows of `input.remote.chords`.
+- **`remote.same_gestures`** (default `true`) — the GESTURE rows (every key
+  starting with `touch_`, except `touchpad_click`) come from `input.chords`.
+  Off: the gesture rows of `input.remote.chords`. The dashboard's Gestures
+  tab shows this as "Remote mode uses the same gestures" and, when off, a
+  second gesture table.
+
+`input.remote.chords` is merged over `DEFAULT_REMOTE_CHORDS` with the same
+rules as `input.chords` (name a key to change it, `"none"` to remove it,
+removals written back as `"none"`). Its defaults are the classic remote map
+this feature shipped with, plus the gesture rows:
 
   | key | default remote action |
   |---|---|
@@ -200,17 +266,27 @@ binding table, and which table is `remote.same_bindings`:
   | `circle` | `escape` |
   | `options` | `enter` |
   | `dpad_up` / `dpad_down` / `dpad_left` / `dpad_right` | `arrow_up` … `arrow_right` (held; re-trigger every 300 ms) |
-  | `touch_slide_horizontal` | `alt_tab` (hold semantics, as under a chord) |
+  | `touch_tap_2f` / `touch_click_2f` | `right_click` |
+  | `touch_slide_horizontal` / `touch_slide_vertical` | `scroll_horizontal` / `scroll` |
+  | `touch_pinch` / `touch_pinch_pressed` | `pinch_zoom` / `ctrl_zoom` |
+  | `touch_slide_horizontal_pressed` | `alt_tab` (hold semantics, as under a chord) |
+  | `touch_swipe_up_pressed` / `touch_swipe_down_pressed` | `task_view` / `minimize_all` |
+
+Note that with the default `same_gestures: true` the chord table governs,
+where `touch_tap_2f` is unbound — a 2-finger **click** right-clicks in both
+modes; bind `touch_tap_2f` in `input.chords` (or switch `same_gestures` off)
+to get the tap back.
 
 A bound row fires directly — no chord button held. A row set to `"none"`
 does nothing in remote mode; the intrinsic layer above is never a row, so
 taps still click and the touchpad still moves the pointer whatever the
 table says. Actions with hold semantics (`*_click`, `escape`, `enter`,
 `arrow_*`) are held for the press; other repeatable actions (volume,
-brightness) repeat at `repeat_ms` while held. Buttons in remote mode give
-**no haptic ack** (a click that rumbles is a click you stop making);
-gestures ack as they do under a chord. Changing either table or the
-checkbox applies live, and anything held is released on the way out.
+brightness, hold macros) repeat while held. Buttons in remote mode give
+**no haptic ack** (a click that rumbles is a click you stop making), and
+neither do the two taps or the continuous gestures; the one-shot shell
+gestures ack as they do under a chord. Changing either table or a switch
+applies live, and anything held is released on the way out.
 
 ### Mode reporting
 
@@ -226,7 +302,42 @@ parses into `/api/state` → `controllers[serial].remote_mode` /
 `.keyboard_open` — `true`/`false`, or `null` before the child has said —
 so the dashboard's badges work with telemetry switched off.
 
-## Low-battery notifications
+## Notifications
+
+Every balloon the tray shows carries a category, and the top-level
+`notifications` section of `config.json` says which are shown (the
+dashboard's Notifications card, applied live on save):
+
+```json
+"notifications": { "enabled": true, "battery_low": true, "remote_mode": true,
+                   "keyboard": false, "connection": true, "hide": true,
+                   "update": true }
+```
+
+| key | gates |
+|---|---|
+| `enabled` | the master switch — off, no balloon at all (errors included) |
+| `battery_low` | the once-per-threshold low-battery toasts below |
+| `remote_mode` | "Remote mode on/off (*label*)" |
+| `keyboard` | "On-screen keyboard opened/closed" (off by default: the keyboard is on screen already) |
+| `connection` | a controller going offline / vanishing / extras detached (the manager's warnings) |
+| `hide` | HidHide cloak applied or lifted |
+| `update` | "Update available" from the background check |
+
+`show_battery` (the R3 chord by default; bindable to any chord, remote
+button or gesture) shows "*label*: 80 % (discharging|charging|full)" for the
+pad that pressed it, and is gated by the master switch only. A bridge error
+balloon is likewise master-switch only.
+
+**Transport.** The engine runs in the bridge child; the balloons are the
+tray's. The child prints one status line per toast, `  >  category|title|body`
+(`service.toast_line`), the manager parses it into a `toast` event
+(`manager.parse_toast_event`), and the tray's `_on_event` looks the category
+up in `config.Notifications.allows()` before calling `_notify(title, body)`.
+`{pad}` in the body is replaced with the pad's label (or short serial) by
+the tray, which is the only side that knows it.
+
+### Low-battery notifications
 
 The child already logs every new low battery reading; the lightbar flashes on
 its own schedule. Neither is what a Windows notification should follow. The
@@ -269,37 +380,59 @@ excluded (gyro noise never sleeps; a pad face-down on the couch must idle).
   "haptic_strength": 25,
   "stick_mouse_in_chord": true,
   "off_timer_minutes": 15.0,
-  "chords": { "triangle": "pad_power_off", "...": "see the table above" },
+  "chords": { "triangle": "pad_power_off", "r3": "show_battery",
+              "touch_click_2f": "right_click", "touch_slide_vertical": "scroll",
+              "touch_pinch": "pinch_zoom",
+              "touch_slide_horizontal_pressed": "alt_tab",
+              "...": "see the tables above" },
   "actions": { "volume_up": {"step": 1} },
   "macros": { "task_manager": { "keys": ["ctrl", "shift", "esc"],
                                 "label": "Task Manager" },
-              "spotify": { "run": "spotify.exe" } },
+              "spotify": { "run": "spotify.exe" },
+              "spam_click": { "keys": ["space"], "label": "Auto space",
+                              "repeat": { "mode": "toggle", "interval_ms": 50,
+                                          "max_runs": 0 } } },
   "battery": { "enabled": true, "low_percent": 20, "critical_percent": 10,
                "low_interval_s": 30.0, "critical_interval_s": 10.0,
                "low_color": [255, 140, 0], "critical_color": [255, 0, 0],
                "low_blinks": 2, "critical_blinks": 3 },
   "lightbar": { "dim_after_minutes": 0.0, "dim_level": 0.3 },
+  "gestures": { "tap_ms": 250, "tap_move_px": 40, "slide_px": 40,
+                "swipe_px": 200, "alt_tab_step_px": 150, "pinch_px": 80,
+                "scroll_px_per_notch": 100, "zoom_px_per_notch": 80,
+                "pinch_gain": 1.0 },
   "remote": { "enabled": false, "mouse_speed": 1.6, "scroll_speed": 1.0,
               "lightbar_color": [255, 120, 0],
-              "same_bindings": true,
+              "same_bindings": true, "same_gestures": true,
               "chords": { "cross": "left_click", "circle": "escape",
                           "options": "enter", "dpad_up": "arrow_up",
                           "dpad_down": "arrow_down", "dpad_left": "arrow_left",
                           "dpad_right": "arrow_right",
-                          "touch_slide_horizontal": "alt_tab" } }
+                          "touch_tap_2f": "right_click",
+                          "touch_click_2f": "right_click",
+                          "touch_slide_horizontal": "scroll_horizontal",
+                          "touch_slide_vertical": "scroll",
+                          "touch_pinch": "pinch_zoom",
+                          "touch_slide_horizontal_pressed": "alt_tab",
+                          "touch_swipe_up_pressed": "task_view",
+                          "touch_swipe_down_pressed": "minimize_all",
+                          "touch_pinch_pressed": "ctrl_zoom" } }
 }
 ```
 
-Three action names are the engine's own rather than OS actions
+(and, top level, next to `input`: the `notifications` section above.)
+
+Four action names are the engine's own rather than OS actions
 (`config.ENGINE_ACTIONS`, served as `engine_actions` by `/api/actions`):
 `pad_power_off` and `pad_lightbar_toggle` act on the pad through the bridge,
-`keyboard` toggles the on-screen keyboard. None of them touches the desktop
-through `SendInput`.
+`keyboard` toggles the on-screen keyboard, `show_battery` sends a toast.
+None of them touches the desktop through `SendInput`.
 
 `/api/actions` also serves `defaults.chords`, `defaults.remote_chords`,
 `chord_keys` (buttons a chord may bind), `remote_keys` (what the remote table
-binds: every button but the arming one, plus the three gestures) and
-`gesture_keys`.
+binds: every button but the arming one, plus every gesture), `gesture_keys`
+and `gestures` (the ordered `{key, label, help, group}` rows of the Gestures
+tab).
 
 `chords` entries MERGE over the defaults — name one to change one; map a key
 to `"none"` to remove it (removals are written back as `"none"` so they
@@ -319,10 +452,27 @@ newer build loses nothing here.
   pageup pagedown up down left right`, `f1`..`f24`, letters, digits,
   `numpad0`..`numpad9`, the media/volume keys and punctuation (`minus`,
   `equals`, `lbracket`, ...). Common aliases (`control`, `escape`, `pgup`,
-  `del`) are accepted. At most 8 keys. `"repeat": true` makes it fire again
-  at `repeat_ms` while the chord is held.
+  `del`) are accepted. At most 8 keys.
 - `{"run": "..."}` — a command line, started detached with no console and
   never waited for, the way the Run box would.
+
+Either kind may carry `repeat`:
+
+```json
+"repeat": { "mode": "hold", "interval_ms": 50, "max_runs": 0 }
+```
+
+| `mode` | behaviour |
+|---|---|
+| `once` (default when absent) | fires once per press |
+| `hold` | fires again every `interval_ms` for as long as the bound button is held (a chord, or a remote-mode button) |
+| `toggle` | the first press starts it repeating every `interval_ms` on the engine's own timer — no input needed — and the next press of the same macro stops it. The engine turning off, leaving remote mode and the bridge stopping all stop it too |
+
+`max_runs` (0 = unlimited) caps the number of runs per activation, the
+first one included. `"repeat": true` is still accepted and means `hold` at
+the engine's `repeat_ms`. A macro bound to a gesture repeats the same way
+(a toggle macro on a swipe starts and stops with alternate swipes). The
+dashboard's macro editor shows a Repeat select and interval field.
 
 `label` is what the settings page shows. A macro may not shadow a built-in
 name; a malformed one is skipped with one log line and takes nothing else
@@ -362,6 +512,15 @@ clock drives every timing rule, `SendInput` is a recorder, PowerShell a stub.
   `SendInput`, the `launch` seam, every malformed shape), config round-trip
   and null tombstones, chords bound to macros, built-in shadowing, live
   `update_config` re-resolution (16)
+- `app/tests/test_gestures_v1.py` — the 2-finger tracker: click-vs-tap
+  exclusivity in both contexts, pressed vs unpressed row families, the
+  compat flicks, tunable thresholds; scroll proportionality and
+  `scroll_speed`; pinch direction through a recorded touch-injection seam
+  and through Ctrl+wheel (whole notches); every exit path lifting a live
+  pinch; hold/toggle macro timing and what stops a toggle; `show_battery`
+  text and the remote/keyboard toasts; the child's toast line through
+  `ChildBridge`; `Notifications` and the tray's category gating; the config
+  watcher carrying the new keys (58)
 - `emulator/tests/test_bridge.py::InterceptorSeamTests` — containment (a
   raising engine costs a counter, never the bridge), `push_setstate_body`
   signing and non-contamination of host state, the 0x08 power-off bytes (10)
@@ -387,3 +546,11 @@ clock drives every timing rule, `SendInput` is a recorder, PowerShell a stub.
    fights the topmost tool window.
 8. Low-battery toasts on a real discharge (the pad's 10 % steps; the
    re-arm after charging).
+9. The v1 gestures from real fingers: 2-finger click vs tap under thumb
+   jitter (`tap_move_px` 40), the unpressed scroll feel
+   (`scroll_px_per_notch` 100), the pinch commit threshold (`pinch_px` 80)
+   against the natural spread drift of a 2-finger slide, and whether a
+   clicked slide ever reaches `alt_tab_step_px` before the click is released.
+   The actions themselves (`pinch_zoom` on Chrome's viewport, `ctrl_zoom`,
+   `scroll`, `right_click`, `show_battery`) were verified on the desktop by
+   driving `OsActions` directly.

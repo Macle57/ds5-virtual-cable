@@ -171,10 +171,149 @@ if sys.platform == "win32":
         n = ctypes.windll.user32.SendInput(len(arr), arr, ctypes.sizeof(_INPUT))
         if n != len(arr):
             log.warning("SendInput delivered %d of %d events", n, len(arr))
+
+    def cursor_pos() -> tuple[int, int]:
+        pt = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        return int(pt.x), int(pt.y)
+
+    # -- touch injection (InitializeTouchInjection / InjectTouchInput) -------
+    #
+    # A pinch has no SendInput spelling: Ctrl+wheel is the *page* zoom, a
+    # different thing from what two fingers on a precision touchpad do to
+    # Chrome (the visual viewport zooms, like on a phone). The only way to get
+    # that from software is to BE two fingers: Windows 8+ lets a process
+    # inject synthetic touch contacts, and every app that handles WM_POINTER
+    # touch -- Chrome, Edge, the Photos app, Maps -- pinches on them exactly
+    # as on a touch screen.
+
+    _PT_TOUCH = 2
+    _POINTER_FLAG_INRANGE = 0x00000002
+    _POINTER_FLAG_INCONTACT = 0x00000004
+    _POINTER_FLAG_DOWN = 0x00010000
+    _POINTER_FLAG_UPDATE = 0x00020000
+    _POINTER_FLAG_UP = 0x00040000
+    _TOUCH_MASK_CONTACTAREA = 0x1
+    _TOUCH_MASK_ORIENTATION = 0x2
+    _TOUCH_MASK_PRESSURE = 0x4
+    _TOUCH_FEEDBACK_NONE = 3
+
+    class _POINTER_INFO(ctypes.Structure):
+        _fields_ = (("pointerType", wintypes.UINT), ("pointerId", wintypes.UINT),
+                    ("frameId", wintypes.UINT), ("pointerFlags", wintypes.UINT),
+                    ("sourceDevice", wintypes.HANDLE),
+                    ("hwndTarget", wintypes.HWND),
+                    ("ptPixelLocation", wintypes.POINT),
+                    ("ptHimetricLocation", wintypes.POINT),
+                    ("ptPixelLocationRaw", wintypes.POINT),
+                    ("ptHimetricLocationRaw", wintypes.POINT),
+                    ("dwTime", wintypes.DWORD), ("historyCount", wintypes.UINT),
+                    ("InputData", wintypes.INT), ("dwKeyStates", wintypes.DWORD),
+                    ("PerformanceCount", ctypes.c_uint64),
+                    ("ButtonChangeType", wintypes.INT))
+
+    class _POINTER_TOUCH_INFO(ctypes.Structure):
+        _fields_ = (("pointerInfo", _POINTER_INFO),
+                    ("touchFlags", wintypes.UINT), ("touchMask", wintypes.UINT),
+                    ("rcContact", wintypes.RECT), ("rcContactRaw", wintypes.RECT),
+                    ("orientation", wintypes.UINT), ("pressure", wintypes.UINT))
+
+    class TouchInjector:
+        """Synthetic touch contacts, `down(points)` / `move(points)` / `up()`.
+
+        Initialised lazily on the first `down` (the process registers as a
+        touch source once; failing to -- an old Windows, a session with no
+        interactive desktop -- costs one log line and every later call is a
+        no-op). Contact ids are stable across a down/move/up sequence, which
+        is what makes the receiving app treat them as the same two fingers.
+        """
+
+        def __init__(self, max_contacts: int = 2):
+            self.max_contacts = max_contacts
+            self._ready: bool | None = None
+            self._points: list = []
+
+        def _init(self) -> bool:
+            if self._ready is None:
+                ok = ctypes.windll.user32.InitializeTouchInjection(
+                    self.max_contacts, _TOUCH_FEEDBACK_NONE)
+                self._ready = bool(ok)
+                if not ok:
+                    log.warning("touch injection unavailable (error %d) -- "
+                                "pinch_zoom will do nothing",
+                                ctypes.GetLastError())
+            return self._ready
+
+        def _inject(self, points, flags: int) -> None:
+            arr = (_POINTER_TOUCH_INFO * len(points))()
+            for i, (slot, (x, y)) in enumerate(zip(arr, points)):
+                pi = slot.pointerInfo
+                pi.pointerType = _PT_TOUCH
+                pi.pointerId = i
+                pi.pointerFlags = flags
+                pi.ptPixelLocation.x = int(x)
+                pi.ptPixelLocation.y = int(y)
+                slot.touchFlags = 0
+                slot.touchMask = (_TOUCH_MASK_CONTACTAREA | _TOUCH_MASK_ORIENTATION
+                                  | _TOUCH_MASK_PRESSURE)
+                slot.rcContact.left = int(x) - 2
+                slot.rcContact.right = int(x) + 2
+                slot.rcContact.top = int(y) - 2
+                slot.rcContact.bottom = int(y) + 2
+                slot.orientation = 90
+                slot.pressure = 32000
+            if not ctypes.windll.user32.InjectTouchInput(len(arr), arr):
+                log.debug("InjectTouchInput failed (error %d)",
+                          ctypes.GetLastError())
+
+        def down(self, points) -> None:
+            if self._points or not self._init():
+                return
+            self._points = [tuple(p) for p in points]
+            self._inject(self._points, _POINTER_FLAG_DOWN
+                         | _POINTER_FLAG_INRANGE | _POINTER_FLAG_INCONTACT)
+
+        def move(self, points) -> None:
+            if not self._points:
+                return
+            self._points = [tuple(p) for p in points]
+            self._inject(self._points, _POINTER_FLAG_UPDATE
+                         | _POINTER_FLAG_INRANGE | _POINTER_FLAG_INCONTACT)
+
+        def up(self) -> None:
+            if not self._points:
+                return
+            pts, self._points = self._points, []
+            self._inject(pts, _POINTER_FLAG_UP)
+
+        @property
+        def active(self) -> bool:
+            return bool(self._points)
+
 else:  # pragma: no cover - the app targets Windows; keep imports safe elsewhere
     def send_input_events(events: list) -> None:
         log.debug("SendInput unavailable on %s; dropped %d events",
                   sys.platform, len(events))
+
+    def cursor_pos() -> tuple[int, int]:
+        return (0, 0)
+
+    class TouchInjector:
+        def __init__(self, max_contacts: int = 2):
+            self._points: list = []
+
+        def down(self, points) -> None:
+            self._points = [tuple(p) for p in points]
+
+        def move(self, points) -> None:
+            self._points = [tuple(p) for p in points]
+
+        def up(self) -> None:
+            self._points = []
+
+        @property
+        def active(self) -> bool:
+            return bool(self._points)
 
 
 def run_powershell(script: str, timeout: float = 10.0) -> bool:
@@ -334,9 +473,78 @@ def key_vk(name: object) -> int | None:
 MACRO_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 
+def _steps(params: dict) -> int:
+    """`step` of a continuous action fired from a button: whole notches."""
+    try:
+        return max(1, min(50, int(params.get("step", 1))))
+    except (TypeError, ValueError):
+        return 1
+
+
 # ---------------------------------------------------------------------------
 # the actions
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Continuous:
+    """The motion-driven form of an action, for gestures that TRACK the
+    fingers rather than fire once: `begin()` when a contact commits to the
+    gesture, `update(delta)` per further movement, `end()` when the fingers
+    lift (idempotent -- the engine calls it on every exit path).
+
+    `unit` says what `delta` is: "wheel" -- wheel units, 120 per notch, the
+    sign a physical wheel would have; "px" -- screen pixels. `step` is the
+    granularity the engine accumulates to before calling `update`: scrolling
+    flows in third-notches, Ctrl+wheel zoom wants whole notches (Chrome zooms
+    one level per wheel event whatever the delta), touch pinch moves by the
+    pixel.
+    """
+
+    begin: object
+    update: object              # callable(delta: int) -> None
+    end: object
+    unit: str = "wheel"
+    step: int = 40
+
+
+#: What `macro.repeat` may say (`parse_repeat`).
+REPEAT_MODES = ("once", "hold", "toggle")
+DEFAULT_REPEAT_INTERVAL_MS = 50
+
+
+def parse_repeat(value: object) -> tuple[str, float | None, int]:
+    """`(mode, interval_s or None, max_runs)` from a macro's `repeat` field.
+
+    Three spellings are accepted: the old boolean (`true` = hold, at the
+    engine's `repeat_ms`), a bare mode name, or the object
+    `{"mode": "hold"|"toggle"|"once", "interval_ms": 50, "max_runs": 0}`.
+    `interval_s` None means "the engine's `repeat_ms`" -- only the object
+    form sets its own cadence. Anything unrecognisable is `once`.
+    """
+    if isinstance(value, bool) or value is None:
+        return ("hold" if value else "once"), None, 0
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        return (mode if mode in REPEAT_MODES else "once"), None, 0
+    if not isinstance(value, dict):
+        return "once", None, 0
+    mode = value.get("mode")
+    mode = mode.strip().lower() if isinstance(mode, str) else "once"
+    if mode not in REPEAT_MODES:
+        mode = "once"
+    interval = value.get("interval_ms", DEFAULT_REPEAT_INTERVAL_MS)
+    try:
+        interval_ms = max(10, min(10000, int(interval)))
+    except (TypeError, ValueError):
+        interval_ms = DEFAULT_REPEAT_INTERVAL_MS
+    try:
+        max_runs = max(0, int(value.get("max_runs", 0) or 0))
+    except (TypeError, ValueError):
+        max_runs = 0
+    if mode == "once":
+        return mode, None, 0
+    return mode, interval_ms / 1000.0, max_runs
 
 
 @dataclass(frozen=True)
@@ -348,6 +556,15 @@ class ActionSpec:
     holds the left mouse button down for as long as Cross is, and re-triggers
     a held arrow key. `run` stays the TAP form of the same action (press and
     release in one `SendInput`), which is what a PS-chord fires.
+
+    `continuous`, when present, is the gesture-tracking form (`Continuous`);
+    `run` is then what a BUTTON bound to the same name does -- one notch,
+    one zoom step.
+
+    `repeat_mode` / `repeat_interval_s` / `max_runs` are a user macro's
+    `repeat` object: `repeatable` stays the flag the engine's hold-repeat
+    reads (True for "hold"), `repeat_interval_s` None means the engine's
+    `repeat_ms`, "toggle" is driven by the engine's own timer.
     """
 
     name: str
@@ -355,6 +572,19 @@ class ActionSpec:
     repeatable: bool = False
     doc: str = ""
     hold: object = None         # (press(), release()) or None
+    continuous: object = None   # Continuous or None
+    repeat_mode: str = "once"
+    repeat_interval_s: float | None = None
+    max_runs: int = 0
+
+
+#: The synthetic pinch starts with its two contacts this far apart (screen
+#: px) around the cursor, so it can close as well as open, and never closer
+#: than the minimum -- two contacts on one pixel stop being a pinch.
+PINCH_START_SPREAD_PX = 240
+PINCH_MIN_SPREAD_PX = 24
+#: A button bound to `pinch_zoom` / `ctrl_zoom` / `scroll*`: one step of it.
+PINCH_TAP_STEP_PX = 120
 
 
 class OsActions:
@@ -369,10 +599,17 @@ class OsActions:
     """
 
     def __init__(self, inject=None, run_ps=None, launch=None, audio=None,
-                 sleep=None):
+                 sleep=None, touch=None, cursor=None):
         self.inject = inject or send_input_events
         self.run_ps = run_ps or run_powershell
         self.launch = launch or launch_command
+        #: Synthetic touch contacts (`TouchInjector`: down/move/up) and the
+        #: pointer position the pinch is centred on -- both seams, so the
+        #: tests record contact frames instead of pinching the desktop.
+        self.touch = touch if touch is not None else TouchInjector()
+        self.cursor = cursor or cursor_pos
+        self._pinch_center: tuple[int, int] | None = None
+        self._pinch_spread = 0.0
         self._lock = threading.Lock()
         self._alt_held = False
         self._shift_held = False
@@ -453,13 +690,70 @@ class OsActions:
     def alt_tab_open(self) -> bool:
         return self._alt_held
 
+    # -- scrolling and zooming (the continuous gesture actions) -------------
+
+    def ctrl_wheel(self, delta: int) -> None:
+        """Ctrl + wheel, the page zoom every browser and editor understands:
+        Ctrl down, the wheel event, Ctrl up in ONE SendInput, so a real
+        keystroke can never land between them and get a Ctrl+letter."""
+        if delta:
+            self.inject([("key", VK_CONTROL, True), ("wheel", int(delta)),
+                         ("key", VK_CONTROL, False)])
+
+    def _pinch_points(self) -> list:
+        cx, cy = self._pinch_center or (0, 0)
+        half = self._pinch_spread / 2.0
+        return [(int(round(cx - half)), int(cy)), (int(round(cx + half)), int(cy))]
+
+    def pinch_begin(self) -> None:
+        """Put two touch contacts down either side of the cursor."""
+        with self._lock:
+            if self._pinch_center is not None:
+                return
+            self._pinch_center = tuple(self.cursor())
+            self._pinch_spread = float(PINCH_START_SPREAD_PX)
+            pts = self._pinch_points()
+        self.touch.down(pts)
+
+    def pinch_update(self, delta_px: int) -> None:
+        """Move the contacts `delta_px` further apart (negative: together)."""
+        with self._lock:
+            if self._pinch_center is None or not delta_px:
+                return
+            self._pinch_spread = max(float(PINCH_MIN_SPREAD_PX),
+                                     self._pinch_spread + float(delta_px))
+            pts = self._pinch_points()
+        self.touch.move(pts)
+
+    def pinch_end(self) -> None:
+        """Lift both contacts. Idempotent."""
+        with self._lock:
+            if self._pinch_center is None:
+                return
+            self._pinch_center = None
+        self.touch.up()
+
+    @property
+    def pinch_active(self) -> bool:
+        return self._pinch_center is not None
+
+    def pinch_step(self, delta_px: int) -> None:
+        """One whole pinch from a button press: down, one move, up."""
+        self.pinch_begin()
+        self.pinch_update(delta_px)
+        self.pinch_end()
+
     def close(self) -> None:
         """Release anything still held -- a stuck Alt key outlives the bridge --
-        and give the default microphone back if dictation borrowed it."""
+        lift a synthetic pinch, and give the default microphone back if
+        dictation borrowed it."""
         try:
             self.alt_tab_cancel()
         finally:
-            self.dictation.restore()
+            try:
+                self.pinch_end()
+            finally:
+                self.dictation.restore()
 
     # -- registry actions ---------------------------------------------------
 
@@ -513,8 +807,10 @@ class OsActions:
           {"run": "notepad.exe"}               start a program, detached
 
         plus optional `label` (what the settings page shows) and `repeat`
-        (True: fires again at `repeat_ms` while the chord is held -- only
-        sensible for key macros). Anything malformed is logged and skipped;
+        (`parse_repeat`: `true`, a mode name, or `{"mode": "hold"|"toggle"|
+        "once", "interval_ms": 50, "max_runs": 0}` -- "hold" fires again
+        every interval while the chord is held, "toggle" runs on its own
+        until the next press). Anything malformed is logged and skipped;
         a bad macro must never take the engine down, only itself.
         """
         if not isinstance(name, str) or not MACRO_NAME_RE.match(name):
@@ -526,7 +822,7 @@ class OsActions:
             return None
         label = definition.get("label")
         doc = label.strip() if isinstance(label, str) and label.strip() else name
-        repeat = bool(definition.get("repeat", False))
+        mode, interval, max_runs = parse_repeat(definition.get("repeat", False))
         keys = definition.get("keys")
         cmd = definition.get("run")
         if isinstance(keys, list) and keys:
@@ -541,10 +837,12 @@ class OsActions:
                 log.warning("macro %r: more than 8 keys -- skipped", name)
                 return None
             return ActionSpec(name, lambda p, vks=tuple(vks): self.tap(*vks),
-                              repeat, doc)
+                              mode == "hold", doc, repeat_mode=mode,
+                              repeat_interval_s=interval, max_runs=max_runs)
         if isinstance(cmd, str) and cmd.strip():
             return ActionSpec(name, lambda p, c=cmd.strip(): self.launch(c),
-                              False, doc)
+                              mode == "hold", doc, repeat_mode=mode,
+                              repeat_interval_s=interval, max_runs=max_runs)
         log.warning("macro %r: needs a non-empty 'keys' list or a 'run' "
                     "command -- skipped", name)
         return None
@@ -620,6 +918,39 @@ class OsActions:
                        "right mouse button", hold=held_button("right")),
             ActionSpec("middle_click", lambda p: a.click("middle"), False,
                        "middle mouse button", hold=held_button("middle")),
+            # -- continuous: scrolling and zooming that follow the fingers.
+            #    From a button they do one step (params `step`: notches) ------
+            ActionSpec("scroll",
+                       lambda p: a.wheel(-WHEEL_DELTA * _steps(p)), True,
+                       "vertical scroll following the fingers (a button: one "
+                       "notch down)",
+                       continuous=Continuous(lambda: None,
+                                             lambda d: a.wheel(d),
+                                             lambda: None, "wheel", 40)),
+            ActionSpec("scroll_horizontal",
+                       lambda p: a.wheel(WHEEL_DELTA * _steps(p), True), True,
+                       "horizontal scroll following the fingers (a button: "
+                       "one notch right)",
+                       continuous=Continuous(lambda: None,
+                                             lambda d: a.wheel(d, True),
+                                             lambda: None, "wheel", 40)),
+            ActionSpec("ctrl_zoom",
+                       lambda p: a.ctrl_wheel(WHEEL_DELTA * _steps(p)), True,
+                       "Ctrl+wheel page zoom following a pinch (a button: "
+                       "one step in)",
+                       continuous=Continuous(lambda: None,
+                                             lambda d: a.ctrl_wheel(d),
+                                             lambda: None, "wheel",
+                                             WHEEL_DELTA)),
+            ActionSpec("pinch_zoom",
+                       lambda p: a.pinch_step(PINCH_TAP_STEP_PX * _steps(p)),
+                       False,
+                       "touch-screen pinch: two injected touch contacts spread "
+                       "or close around the pointer, so Chrome zooms its "
+                       "viewport like a precision touchpad (a button: one "
+                       "spread)",
+                       continuous=Continuous(a.pinch_begin, a.pinch_update,
+                                             a.pinch_end, "px", 1)),
             ActionSpec("escape", lambda p: a.tap(VK_ESCAPE), False,
                        "Esc key", hold=held_key(VK_ESCAPE)),
             ActionSpec("enter", lambda p: a.tap(VK_RETURN), False,

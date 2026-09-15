@@ -399,10 +399,17 @@ class DashboardServer:
         if self._actions_meta is None:
             registry = ACT.OsActions().registry()
             self._actions_meta = {
-                "actions": [
-                    {"name": spec.name, "doc": spec.doc,
-                     "repeatable": bool(spec.repeatable)}
-                    for _, spec in sorted(registry.items())],
+                # `show_battery` is an engine action (no OS side), but the
+                # dashboard lists it among the ordinary picks, so it is
+                # served here (sorted in) as well as in `engine_actions`.
+                "actions": sorted(
+                    [{"name": spec.name, "doc": spec.doc,
+                      "repeatable": bool(spec.repeatable)}
+                     for spec in registry.values()]
+                    + [{"name": "show_battery",
+                        "doc": K.ENGINE_ACTIONS["show_battery"],
+                        "repeatable": False, "engine": True}],
+                    key=lambda a: a["name"]),
                 "chord_buttons": list(K.CHORD_BUTTONS),
                 "chord_keys": list(K.CHORD_BUTTONS),
                 # what the remote-mode table binds: every button but the
@@ -412,6 +419,8 @@ class DashboardServer:
                 "remote_keys": ([b for b in K.CHORD_BUTTONS if b != "ps"]
                                 + list(K.CHORD_GESTURES)),
                 "gesture_keys": list(K.CHORD_GESTURES),
+                # the Gestures tab: ordered {key, label, help, group}
+                "gestures": K.gesture_meta(),
                 # the key vocabulary a user macro may use, engine order
                 "macro_keys": list(ACT.KEY_NAMES),
                 # the engine's own actions (pad power / lightbar), which the

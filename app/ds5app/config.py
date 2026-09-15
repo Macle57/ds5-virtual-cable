@@ -197,8 +197,75 @@ CHORD_BUTTONS = ("cross", "circle", "square", "triangle",
                  "l1", "r1", "l3", "r3", "create", "options", "ps",
                  "touchpad_click", "mute")
 
-#: Touchpad gestures that can carry an action while the chord button is held.
-CHORD_GESTURES = ("touch_slide_horizontal", "touch_swipe_up", "touch_swipe_down")
+#: The 2-finger touchpad gestures, in the order the dashboard shows them.
+#: Every one is a key in BOTH binding tables (`input.chords` and
+#: `input.remote.chords`). Three groups (`GESTURE_META`): "taps" -- a short
+#: 2-finger touch and a physical click with two fingers down; "unpressed" --
+#: 2-finger movement while the pad is NOT clicked; "pressed" -- the same
+#: movement while the pad IS clicked, the way Alt-Tab / Task View /
+#: minimize-all moved when unpressed slides became scrolling. A contact is
+#: exactly one of these: a click never doubles as a tap, a slide never fires
+#: the tap, a clicked-then-slid contact fires only its `_pressed` gesture.
+CHORD_GESTURES = (
+    "touch_tap_2f", "touch_click_2f",
+    "touch_slide_horizontal", "touch_slide_vertical",
+    "touch_swipe_up", "touch_swipe_down", "touch_pinch",
+    "touch_slide_horizontal_pressed", "touch_swipe_up_pressed",
+    "touch_swipe_down_pressed", "touch_pinch_pressed",
+)
+
+#: What /api/actions serves as `gestures` -- the dashboard renders its
+#: Gestures tab from this list, verbatim and in this order.
+GESTURE_META = (
+    {"key": "touch_tap_2f", "group": "taps",
+     "label": "Two-finger tap",
+     "help": "two fingers touch briefly without clicking the pad"},
+    {"key": "touch_click_2f", "group": "taps",
+     "label": "Two-finger click",
+     "help": "click the pad while two fingers rest on it (a Windows "
+             "touchpad's right click)"},
+    {"key": "touch_slide_horizontal", "group": "unpressed",
+     "label": "Two-finger horizontal slide",
+     "help": "two fingers slide left/right, pad not clicked"},
+    {"key": "touch_slide_vertical", "group": "unpressed",
+     "label": "Two-finger vertical slide",
+     "help": "two fingers slide up/down, pad not clicked"},
+    {"key": "touch_swipe_up", "group": "unpressed",
+     "label": "Two-finger swipe up",
+     "help": "a quick 2-finger flick up; fires only while the vertical "
+             "slide row is 'none'"},
+    {"key": "touch_swipe_down", "group": "unpressed",
+     "label": "Two-finger swipe down",
+     "help": "a quick 2-finger flick down; fires only while the vertical "
+             "slide row is 'none'"},
+    {"key": "touch_pinch", "group": "unpressed",
+     "label": "Pinch / spread",
+     "help": "two fingers move apart or together, pad not clicked"},
+    {"key": "touch_slide_horizontal_pressed", "group": "pressed",
+     "label": "Horizontal slide while clicked",
+     "help": "two fingers slide left/right with the pad held down"},
+    {"key": "touch_swipe_up_pressed", "group": "pressed",
+     "label": "Swipe up while clicked",
+     "help": "two fingers swipe up with the pad held down"},
+    {"key": "touch_swipe_down_pressed", "group": "pressed",
+     "label": "Swipe down while clicked",
+     "help": "two fingers swipe down with the pad held down"},
+    {"key": "touch_pinch_pressed", "group": "pressed",
+     "label": "Pinch / spread while clicked",
+     "help": "two fingers move apart or together with the pad held down"},
+)
+
+
+def gesture_meta() -> list:
+    """`GESTURE_META` as fresh dicts, for /api/actions."""
+    return [dict(g) for g in GESTURE_META]
+
+
+def is_gesture_key(key: str) -> bool:
+    """A gesture row (as opposed to a button row) in either binding table:
+    every key that starts with `touch_`, except the physical click."""
+    return key.startswith("touch_") and key != "touchpad_click"
+
 
 #: chord key (a button or gesture name) -> action name. Action names resolve
 #: against `ds5app.actions.registry()`; an unknown name is ignored with one
@@ -214,11 +281,20 @@ DEFAULT_CHORDS = {
     "dpad_right": "media_next",
     "l1": "brightness_down",
     "r1": "brightness_up",
+    "r3": "show_battery",
     "options": "projection_cycle",
     "create": "show_desktop",
-    "touch_slide_horizontal": "alt_tab",
-    "touch_swipe_up": "task_view",
-    "touch_swipe_down": "minimize_all",
+    # Gestures. Unpressed 2-finger movement behaves like a precision
+    # touchpad (scroll, pinch-zoom); the shell gestures live on the CLICKED
+    # variants. `touch_tap_2f` and the two unpressed swipes are unbound here.
+    "touch_click_2f": "right_click",
+    "touch_slide_horizontal": "scroll_horizontal",
+    "touch_slide_vertical": "scroll",
+    "touch_pinch": "pinch_zoom",
+    "touch_slide_horizontal_pressed": "alt_tab",
+    "touch_swipe_up_pressed": "task_view",
+    "touch_swipe_down_pressed": "minimize_all",
+    "touch_pinch_pressed": "ctrl_zoom",
     # Two buttons nothing else claimed: the touchpad click opens the pad-driven
     # on-screen keyboard, the mute button (the one with the microphone on it)
     # starts voice typing through the pad's own microphone.
@@ -243,7 +319,18 @@ DEFAULT_REMOTE_CHORDS = {
     "dpad_down": "arrow_down",
     "dpad_left": "arrow_left",
     "dpad_right": "arrow_right",
-    "touch_slide_horizontal": "alt_tab",
+    # The same gesture rows as the chord table, plus the classic remote
+    # right click on a 2-finger tap. `touchpad_click` is deliberately not a
+    # row: in remote mode a 1-finger physical click is the left mouse button.
+    "touch_tap_2f": "right_click",
+    "touch_click_2f": "right_click",
+    "touch_slide_horizontal": "scroll_horizontal",
+    "touch_slide_vertical": "scroll",
+    "touch_pinch": "pinch_zoom",
+    "touch_slide_horizontal_pressed": "alt_tab",
+    "touch_swipe_up_pressed": "task_view",
+    "touch_swipe_down_pressed": "minimize_all",
+    "touch_pinch_pressed": "ctrl_zoom",
 }
 
 
@@ -373,8 +460,76 @@ class LightbarPolicy:
         return out
 
 
+_GESTURES_KNOWN = ("tap_ms", "tap_move_px", "slide_px", "swipe_px",
+                   "alt_tab_step_px", "pinch_px", "scroll_px_per_notch",
+                   "zoom_px_per_notch", "pinch_gain")
+
+
+@dataclass
+class GestureTuning:
+    """Thresholds for the 2-finger gestures, in touchpad points (the pad is
+    1920 x 1080 points over roughly 52 x 23 mm, so ~37 points per mm).
+    Every default was chosen against real pad traffic; they are here so a
+    user with a different thumb can move them without a code change."""
+
+    #: A touch shorter than this (ms) that travelled less than `tap_move_px`
+    #: is a tap; a physical click that travelled less is a click.
+    tap_ms: int = 250
+    tap_move_px: int = 40
+    #: Unpressed 2-finger travel at which the contact commits to a slide
+    #: (horizontal or vertical, whichever dominates) -- scrolling begins.
+    slide_px: int = 40
+    #: Vertical travel that fires a swipe (the pressed swipes, and the
+    #: unpressed compatibility flicks).
+    swipe_px: int = 200
+    #: Horizontal travel that opens Alt-Tab, and per further step through it.
+    alt_tab_step_px: int = 150
+    #: Change in finger spread at which a contact commits to a pinch.
+    pinch_px: int = 80
+    #: Finger travel per wheel notch (120 units) for the `scroll` actions,
+    #: before `remote.scroll_speed`.
+    scroll_px_per_notch: int = 100
+    #: Spread change per Ctrl+wheel notch for `ctrl_zoom`.
+    zoom_px_per_notch: int = 80
+    #: Screen pixels the injected touch contacts move per point of finger
+    #: spread change, for `pinch_zoom`.
+    pinch_gain: float = 1.0
+    extra: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "GestureTuning":
+        if not isinstance(data, dict):
+            return cls()
+        g = cls(
+            tap_ms=_as_int(data.get("tap_ms"), 250, 50, 2000),
+            tap_move_px=_as_int(data.get("tap_move_px"), 40, 5, 500),
+            slide_px=_as_int(data.get("slide_px"), 40, 5, 1000),
+            swipe_px=_as_int(data.get("swipe_px"), 200, 20, 1000),
+            alt_tab_step_px=_as_int(data.get("alt_tab_step_px"), 150, 20, 1000),
+            pinch_px=_as_int(data.get("pinch_px"), 80, 10, 1000),
+            scroll_px_per_notch=_as_int(data.get("scroll_px_per_notch"),
+                                        100, 5, 2000),
+            zoom_px_per_notch=_as_int(data.get("zoom_px_per_notch"),
+                                      80, 5, 2000),
+            pinch_gain=_as_float(data.get("pinch_gain"), 1.0, 0.05),
+        )
+        g.extra = {k: v for k, v in data.items() if k not in _GESTURES_KNOWN}
+        return g
+
+    def to_dict(self) -> dict:
+        out = dict(self.extra)
+        out.update(tap_ms=int(self.tap_ms), tap_move_px=int(self.tap_move_px),
+                   slide_px=int(self.slide_px), swipe_px=int(self.swipe_px),
+                   alt_tab_step_px=int(self.alt_tab_step_px),
+                   pinch_px=int(self.pinch_px),
+                   scroll_px_per_notch=int(self.scroll_px_per_notch),
+                   zoom_px_per_notch=int(self.zoom_px_per_notch),
+                   pinch_gain=float(self.pinch_gain))
+        return out
+
+
 _REMOTE_KNOWN = ("enabled", "mouse_speed", "scroll_speed", "lightbar_color",
-                 "same_bindings", "chords")
+                 "same_bindings", "same_gestures", "chords")
 
 
 @dataclass
@@ -413,12 +568,19 @@ class RemoteMode:
     #: The lightbar while remote mode is on -- the visible "you are not in the
     #: game any more" cue, alongside the haptic pattern.
     lightbar_color: list = field(default_factory=lambda: [255, 120, 0])
-    #: Remote mode uses the `input.chords` table (True) or its own `chords`.
+    #: Remote mode's BUTTON rows come from the `input.chords` table (True)
+    #: or from its own `chords`.
     same_bindings: bool = True
+    #: Remote mode's GESTURE rows (`is_gesture_key`) come from the
+    #: `input.chords` table (True) or from its own `chords`. Independent of
+    #: `same_bindings`: a user who wants the classic remote buttons can still
+    #: keep one gesture table, and vice versa.
+    same_gestures: bool = True
     #: The remote-mode binding table, MERGED over `DEFAULT_REMOTE_CHORDS`
     #: exactly the way `InputConfig.chords` merges over `DEFAULT_CHORDS`.
-    #: Consulted only while `same_bindings` is False, but always parsed and
-    #: always written, so a user can flip the switch without losing the table.
+    #: Consulted only while `same_bindings` / `same_gestures` is False, but
+    #: always parsed and always written, so a user can flip a switch without
+    #: losing the table.
     chords: dict = field(default_factory=lambda: dict(DEFAULT_REMOTE_CHORDS))
     extra: dict = field(default_factory=dict)
 
@@ -432,6 +594,7 @@ class RemoteMode:
             scroll_speed=_as_float(data.get("scroll_speed"), 1.0, 0.1),
             lightbar_color=_as_color(data.get("lightbar_color"), [255, 120, 0]),
             same_bindings=_as_bool(data.get("same_bindings"), True),
+            same_gestures=_as_bool(data.get("same_gestures"), True),
             chords=merge_chords(DEFAULT_REMOTE_CHORDS, data.get("chords"),
                                 "input.remote.chords"),
         )
@@ -445,6 +608,7 @@ class RemoteMode:
                    scroll_speed=float(self.scroll_speed),
                    lightbar_color=list(self.lightbar_color),
                    same_bindings=bool(self.same_bindings),
+                   same_gestures=bool(self.same_gestures),
                    chords=chords_to_dict(DEFAULT_REMOTE_CHORDS, self.chords))
         return out
 
@@ -458,13 +622,15 @@ ENGINE_ACTIONS = {
     "pad_lightbar_toggle": "lightbar off; press again to bring it back",
     "keyboard": "on-screen keyboard driven by the pad (Steam-style); "
                 "press again, or Circle/Options on it, to close",
+    "show_battery": "a notification with this pad's battery level and "
+                    "charging state",
 }
 
 _INPUT_KNOWN = ("enabled", "chord_button", "chords", "actions", "macros",
                 "double_press_ms", "tap_replay_ms", "repeat_ms",
                 "haptic_ack", "haptic_strength", "stick_mouse_in_chord",
                 "off_timer_minutes",
-                "battery", "lightbar", "remote")
+                "battery", "lightbar", "remote", "gestures")
 
 
 @dataclass
@@ -513,6 +679,8 @@ class InputConfig:
     battery: BatteryAlerts = field(default_factory=BatteryAlerts)
     lightbar: LightbarPolicy = field(default_factory=LightbarPolicy)
     remote: RemoteMode = field(default_factory=RemoteMode)
+    #: Thresholds for the 2-finger gestures (`GestureTuning`).
+    gestures: GestureTuning = field(default_factory=GestureTuning)
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -536,6 +704,7 @@ class InputConfig:
             battery=BatteryAlerts.from_dict(data.get("battery")),
             lightbar=LightbarPolicy.from_dict(data.get("lightbar")),
             remote=RemoteMode.from_dict(data.get("remote")),
+            gestures=GestureTuning.from_dict(data.get("gestures")),
         )
         ic.chords = merge_chords(DEFAULT_CHORDS, data.get("chords"),
                                  "input.chords")
@@ -582,13 +751,76 @@ class InputConfig:
                    off_timer_minutes=float(self.off_timer_minutes),
                    battery=self.battery.to_dict(),
                    lightbar=self.lightbar.to_dict(),
-                   remote=self.remote.to_dict())
+                   remote=self.remote.to_dict(),
+                   gestures=self.gestures.to_dict())
         return out
+
+
+# ---------------------------------------------------------------------------
+# the `notifications` section: which tray balloons are shown
+# ---------------------------------------------------------------------------
+#
+# Every balloon the tray shows carries a category; `tray._on_event` looks the
+# category up here before calling `_notify`. `enabled` is the master switch.
+# The categories are the vocabulary of the `toast` child event
+# (`<category>|<title>|<body>`, see `intercept.InputInterceptor.on_toast`)
+# and of the dashboard's Notifications card.
+
+NOTIFICATION_CATEGORIES = ("battery_low", "remote_mode", "keyboard",
+                           "connection", "hide", "update")
+_NOTIFY_KNOWN = ("enabled",) + NOTIFICATION_CATEGORIES
+
+
+@dataclass
+class Notifications:
+    enabled: bool = True
+    #: The once-per-threshold low-battery toasts (`manager.LowBatteryAlerts`).
+    battery_low: bool = True
+    #: "Remote mode on/off" when the pad flips modes.
+    remote_mode: bool = True
+    #: "On-screen keyboard opened/closed". Off: the keyboard is on screen,
+    #: the balloon would only repeat it.
+    keyboard: bool = False
+    #: A controller going offline / vanishing / being detached.
+    connection: bool = True
+    #: HidHide cloak applied or lifted.
+    hide: bool = True
+    #: "Update available" from the background check.
+    update: bool = True
+    extra: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "Notifications":
+        if not isinstance(data, dict):
+            if data is not None:
+                log.warning("'notifications' is %s, not an object -- using "
+                            "defaults", type(data).__name__)
+            return cls()
+        n = cls()
+        for key in _NOTIFY_KNOWN:
+            setattr(n, key, _as_bool(data.get(key), getattr(n, key)))
+        n.extra = {k: v for k, v in data.items() if k not in _NOTIFY_KNOWN}
+        return n
+
+    def to_dict(self) -> dict:
+        out = dict(self.extra)
+        out.update({k: bool(getattr(self, k)) for k in _NOTIFY_KNOWN})
+        return out
+
+    def allows(self, category: str) -> bool:
+        """Should a balloon of `category` be shown? Unknown categories (an
+        engine newer than this tray) are allowed by the master switch alone;
+        `show_battery` -- category "battery" -- is gated only by it too."""
+        if not self.enabled:
+            return False
+        if category in NOTIFICATION_CATEGORIES:
+            return bool(getattr(self, category))
+        return True
 
 
 _CFG_KNOWN = ("enabled", "autostart_on_login", "auto_bridge_new", "port_base",
               "controllers", "hide_bluetooth_default", "hidhide_cli",
-              "dashboard_port", "update_check", "input")
+              "dashboard_port", "update_check", "input", "notifications")
 
 
 @dataclass
@@ -626,6 +858,8 @@ class Config:
     #: mode, idle off-timer, battery lightbar alerts). Global, not
     #: per-controller: a chord means the same thing on every pad.
     input: InputConfig = field(default_factory=InputConfig)
+    #: Which tray balloons are shown (`Notifications`).
+    notifications: Notifications = field(default_factory=Notifications)
     extra: dict = field(default_factory=dict)
     #: Where this was loaded from, so `save()` round-trips to the same file even
     #: if the environment changes underneath a long-running tray process.
@@ -748,6 +982,7 @@ class Config:
             dashboard_port=_as_dashboard_port(data.get("dashboard_port")),
             update_check=_as_bool(data.get("update_check"), True),
             input=InputConfig.from_dict(data.get("input")),
+            notifications=Notifications.from_dict(data.get("notifications")),
         )
         raw = data.get("controllers")
         if raw is not None and not isinstance(raw, dict):
@@ -779,6 +1014,7 @@ class Config:
                    dashboard_port=int(self.dashboard_port),
                    update_check=bool(self.update_check),
                    input=self.input.to_dict(),
+                   notifications=self.notifications.to_dict(),
                    controllers={s: cc.to_dict()
                                 for s, cc in sorted(self.controllers.items())})
         return out

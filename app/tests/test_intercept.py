@@ -56,6 +56,30 @@ class FakeRenderer:
         self.calls.append("close")
 
 
+class FakeTouch:
+    """A `actions.TouchInjector` stand-in: records contact frames."""
+
+    def __init__(self):
+        self.frames: list = []
+        self._points: list = []
+
+    def down(self, points):
+        self._points = [tuple(p) for p in points]
+        self.frames.append(("down", self._points))
+
+    def move(self, points):
+        self._points = [tuple(p) for p in points]
+        self.frames.append(("move", self._points))
+
+    def up(self):
+        self._points = []
+        self.frames.append(("up",))
+
+    @property
+    def active(self):
+        return bool(self._points)
+
+
 class FakeAudio:
     """An `audio_default.AudioSystem` stand-in that never touches COM."""
 
@@ -143,13 +167,16 @@ class EngineCase(unittest.TestCase):
         self.sent: list[bytes] = []
         self.modes: list[tuple] = []
         self.power_offs = 0
+        self.toasts: list[tuple] = []
         self.clock = Clock()
         self.audio = FakeAudio()
+        self.touch = FakeTouch()
         self.acts = A.OsActions(inject=self.batches.append,
                                 run_ps=lambda s, timeout=10.0:
                                 (self.scripts.append(s), True)[1],
                                 launch=lambda c: (self.launched.append(c), True)[1],
-                                audio=self.audio, sleep=lambda s: None)
+                                audio=self.audio, sleep=lambda s: None,
+                                touch=self.touch, cursor=lambda: (1000, 600))
         cfg = K.InputConfig.from_dict(over)
 
         def power_off():
@@ -161,17 +188,20 @@ class EngineCase(unittest.TestCase):
         self.eng = I.InputInterceptor(
             cfg, actions=self.acts, send_setstate=self.sent.append,
             power_off=power_off, clock=self.clock, dispatch=lambda fn: fn(),
-            on_mode=lambda r, k: self.modes.append((r, k)), osk=self.osk)
+            on_mode=lambda r, k: self.modes.append((r, k)), osk=self.osk,
+            on_toast=lambda c, t, b: self.toasts.append((c, t, b)))
         return self.eng
 
     def make_remote(self, **over):
         """An engine with remote mode switched on -- it ships OFF, so every
         test that toggles into it has to opt in the way a user would -- and
-        on the CLASSIC remote map (`same_bindings` off): these tests pin the
-        map remote mode shipped with; `RemoteSameBindings` covers the default."""
+        on the CLASSIC remote map (`same_bindings` and `same_gestures` off):
+        these tests pin the map remote mode shipped with; `RemoteSameBindings`
+        covers the default."""
         rm = over.setdefault("remote", {})
         rm.setdefault("enabled", True)
         rm.setdefault("same_bindings", False)
+        rm.setdefault("same_gestures", False)
         return self.make(**over)
 
     @property
@@ -396,6 +426,11 @@ class TapReplay(EngineCase):
         self.assertEqual(buttons_of(out), set())
 
 
+#: PS held and the pad clicked: the shell gestures (Alt-Tab, Task View,
+#: minimize-all) live on the PRESSED 2-finger rows since v1.0.
+PSC = ("ps", "touchpad_click")
+
+
 class Gestures(EngineCase):
     def two(self, cx, cy=500):
         """Two fingers around centroid (cx, cy)."""
@@ -404,17 +439,17 @@ class Gestures(EngineCase):
     def test_horizontal_slide_holds_alt_tab_and_steps_both_ways(self):
         self.make()
         self.feed(report(buttons=("ps",)),
-                  report(buttons=("ps",), touches=self.two(500)),
-                  report(buttons=("ps",), touches=self.two(660)))
+                  report(buttons=PSC, touches=self.two(500)),
+                  report(buttons=PSC, touches=self.two(660)))
         self.assertTrue(self.acts.alt_tab_open)
         n_tabs = len([e for e in self.events if e == ("key", A.VK_TAB, True)])
         # a further step forward
-        self.feed(report(buttons=("ps",), touches=self.two(820)))
+        self.feed(report(buttons=PSC, touches=self.two(820)))
         self.assertEqual(
             len([e for e in self.events if e == ("key", A.VK_TAB, True)]),
             n_tabs + 1)
         # slide back: Shift+Tab
-        self.feed(report(buttons=("ps",), touches=self.two(660)))
+        self.feed(report(buttons=PSC, touches=self.two(660)))
         self.assertIn(("key", A.VK_SHIFT, True), self.events)
         # lifting the fingers commits (Alt up)
         self.feed(report(buttons=("ps",)))
@@ -424,34 +459,53 @@ class Gestures(EngineCase):
     def test_releasing_the_chord_button_commits_too(self):
         self.make()
         self.feed(report(buttons=("ps",)),
-                  report(buttons=("ps",), touches=self.two(500)),
-                  report(buttons=("ps",), touches=self.two(700)),
-                  report(touches=self.two(700)))
+                  report(buttons=PSC, touches=self.two(500)),
+                  report(buttons=PSC, touches=self.two(700)))
+        self.assertTrue(self.acts.alt_tab_open)
+        self.feed(report(buttons=("touchpad_click",), touches=self.two(700)))
         self.assertFalse(self.acts.alt_tab_open)
 
     def test_two_finger_swipe_up_is_task_view(self):
         self.make()
         self.feed(report(buttons=("ps",)),
-                  report(buttons=("ps",), touches=((900, 700), (1000, 700))),
-                  report(buttons=("ps",), touches=((900, 450), (1000, 450))))
+                  report(buttons=PSC, touches=((900, 700), (1000, 700))),
+                  report(buttons=PSC, touches=((900, 450), (1000, 450))))
         self.assertIn(("key", A.VK_LWIN, True), self.events)
         self.assertIn(("key", A.VK_TAB, True), self.events)
 
     def test_two_finger_swipe_down_is_minimize_all(self):
         self.make()
         self.feed(report(buttons=("ps",)),
-                  report(buttons=("ps",), touches=((900, 300), (1000, 300))),
-                  report(buttons=("ps",), touches=((900, 550), (1000, 550))))
+                  report(buttons=PSC, touches=((900, 300), (1000, 300))),
+                  report(buttons=PSC, touches=((900, 550), (1000, 550))))
         self.assertIn(("key", A.VK_M, True), self.events)
 
     def test_a_swipe_fires_once_per_contact(self):
         self.make()
         self.feed(report(buttons=("ps",)),
-                  report(buttons=("ps",), touches=((900, 700), (1000, 700))),
-                  report(buttons=("ps",), touches=((900, 450), (1000, 450))),
-                  report(buttons=("ps",), touches=((900, 200), (1000, 200))))
+                  report(buttons=PSC, touches=((900, 700), (1000, 700))),
+                  report(buttons=PSC, touches=((900, 450), (1000, 450))),
+                  report(buttons=PSC, touches=((900, 200), (1000, 200))))
         wins = [e for e in self.events if e == ("key", A.VK_LWIN, True)]
         self.assertEqual(len(wins), 1)
+
+    def test_an_unpressed_vertical_slide_scrolls_under_the_chord(self):
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=((900, 300), (1000, 300))),
+                  report(buttons=("ps",), touches=((900, 550), (1000, 550))))
+        self.assertNotIn(("key", A.VK_M, True), self.events)
+        self.assertTrue([e for e in self.events if e[0] == "wheel"])
+
+    def test_the_touchpad_click_chord_is_not_fired_with_two_fingers_down(self):
+        # PS + click = keyboard; PS + 2 fingers + click = `touch_click_2f`.
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=((900, 500), (1000, 500))),
+                  report(buttons=PSC, touches=((900, 500), (1000, 500))),
+                  report(buttons=("ps",), touches=((900, 500), (1000, 500))))
+        self.assertFalse(self.eng.keyboard_open)
+        self.assertIn(("button", "right", True), self.events)
 
     def test_one_finger_under_the_chord_is_just_swallowed(self):
         self.make()
@@ -752,64 +806,73 @@ class RemoteModeInputs(EngineCase):
         self.feed(report())
         self.assertIn(("button", "right", True), self.events)
 
-    def test_two_finger_drag_does_not_scroll(self):
-        # Scrolling belongs to the right stick and triggers alone; a 2-finger
-        # drag is only ever an alt-tab slide (horizontal) or nothing.
+    def test_two_finger_vertical_drag_scrolls(self):
+        # Unpressed 2-finger vertical travel is a scroll, like a precision
+        # touchpad: fingers moving DOWN = wheel negative (content down).
         self.make_remote()
         self.enter()
         self.feed(report(touches=((500, 300), (600, 300))))
         for y in range(360, 900, 60):
             self.feed(report(touches=((500, y), (600, y))))
-        self.assertFalse([e for e in self.events
-                          if e[0] in ("wheel", "hwheel")])
+        wheels = [e for e in self.events if e[0] == "wheel"]
+        self.assertTrue(wheels)
+        self.assertTrue(all(w[1] < 0 for w in wheels))
+        self.assertFalse([e for e in self.events if e[0] == "hwheel"])
 
     def test_two_finger_horizontal_slide_is_alt_tab(self):
         # The chord-held gesture, available without the chord: a decisive
-        # horizontal 2-finger slide opens the switcher with hold semantics.
+        # horizontal 2-finger slide WITH THE PAD CLICKED opens the switcher
+        # with hold semantics.
         self.make_remote()
         self.enter()
-        self.feed(report(touches=((450, 500), (550, 500))),
-                  report(touches=((610, 500), (710, 500))))
+        tc = ("touchpad_click",)
+        self.feed(report(buttons=tc, touches=((450, 500), (550, 500))),
+                  report(buttons=tc, touches=((610, 500), (710, 500))))
         self.assertTrue(self.acts.alt_tab_open)
         n_tabs = len([e for e in self.events if e == ("key", A.VK_TAB, True)])
-        self.feed(report(touches=((770, 500), (870, 500))))   # step further
+        self.feed(report(buttons=tc, touches=((770, 500), (870, 500))))
         self.assertEqual(
             len([e for e in self.events if e == ("key", A.VK_TAB, True)]),
             n_tabs + 1)
-        self.feed(report())                                    # lift commits
+        self.feed(report(buttons=tc), report())               # lift commits
         self.assertFalse(self.acts.alt_tab_open)
-        self.assertEqual(self.events[-1], ("key", A.VK_MENU, False))
+        self.assertIn(("key", A.VK_MENU, False), self.events)
+        # the click that carried the slide never became a right click
+        self.assertNotIn(("button", "right", True), self.events)
 
     def test_an_alt_tab_contact_stops_scrolling(self):
         self.make_remote()
         self.enter()
-        self.feed(report(touches=((450, 500), (550, 500))),
-                  report(touches=((610, 500), (710, 500))))
+        tc = ("touchpad_click",)
+        self.feed(report(buttons=tc, touches=((450, 500), (550, 500))),
+                  report(buttons=tc, touches=((610, 500), (710, 500))))
         self.assertTrue(self.acts.alt_tab_open)
         before = [e for e in self.events if e[0] in ("wheel", "hwheel")]
-        self.feed(report(touches=((650, 560), (750, 560))))
+        self.feed(report(buttons=tc, touches=((650, 560), (750, 560))))
         after = [e for e in self.events if e[0] in ("wheel", "hwheel")]
         self.assertEqual(before, after)
 
-    def test_vertical_two_finger_drag_does_nothing(self):
-        # Vertical-dominant travel is neither a scroll (removed on purpose)
-        # nor an alt-tab (that needs horizontal dominance).
+    def test_an_unpressed_horizontal_slide_scrolls_sideways(self):
         self.make_remote()
         self.enter()
-        self.feed(report(touches=((450, 300), (550, 300))))
-        for y in (360, 420, 480, 540, 600):
-            self.feed(report(touches=((450, y), (550, y))))
-        self.assertFalse([e for e in self.events
-                          if e[0] in ("wheel", "hwheel")])
+        self.feed(report(touches=((450, 500), (550, 500))))
+        for x in (500, 560, 620, 680):
+            self.feed(report(touches=((x - 50, 500), (x + 50, 500))))
         self.assertFalse(self.acts.alt_tab_open)
+        hw = [e for e in self.events if e[0] == "hwheel"]
+        self.assertTrue(hw)
+        self.assertTrue(all(h[1] > 0 for h in hw))         # right = positive
+        self.assertFalse([e for e in self.events if e[0] == "wheel"])
 
     def test_a_chord_press_commits_a_remote_alt_tab(self):
         self.make_remote()
         self.enter()
-        self.feed(report(touches=((450, 500), (550, 500))),
-                  report(touches=((610, 500), (710, 500))))
+        tc = ("touchpad_click",)
+        self.feed(report(buttons=tc, touches=((450, 500), (550, 500))),
+                  report(buttons=tc, touches=((610, 500), (710, 500))))
         self.assertTrue(self.acts.alt_tab_open)
-        self.feed(report(buttons=("ps",), touches=((610, 500), (710, 500))))
+        self.feed(report(buttons=("ps", "touchpad_click"),
+                         touches=((610, 500), (710, 500))))
         self.assertFalse(self.acts.alt_tab_open)
 
     def test_triggers_scroll(self):
@@ -1120,8 +1183,8 @@ class Wiring(EngineCase):
     def test_close_releases_a_mid_gesture_alt(self):
         self.make()
         self.feed(report(buttons=("ps",)),
-                  report(buttons=("ps",), touches=((450, 500), (550, 500))),
-                  report(buttons=("ps",), touches=((650, 500), (750, 500))))
+                  report(buttons=PSC, touches=((450, 500), (550, 500))),
+                  report(buttons=PSC, touches=((650, 500), (750, 500))))
         self.assertTrue(self.acts.alt_tab_open)
         self.eng.close()
         self.assertFalse(self.acts.alt_tab_open)
@@ -1282,8 +1345,8 @@ class UpdateConfig(EngineCase):
     def test_disable_commits_a_mid_gesture_alt_tab(self):
         self.make()
         self.feed(report(buttons=("ps",)),
-                  report(buttons=("ps",), touches=((450, 500), (550, 500))),
-                  report(buttons=("ps",), touches=((650, 500), (750, 500))))
+                  report(buttons=PSC, touches=((450, 500), (550, 500))),
+                  report(buttons=PSC, touches=((650, 500), (750, 500))))
         self.assertTrue(self.acts.alt_tab_open)
         self.eng.update_config(K.InputConfig.from_dict({"enabled": False}))
         self.assertFalse(self.acts.alt_tab_open)       # no stuck Alt, ever
@@ -1410,7 +1473,10 @@ class RemoteBindings(EngineCase):
         self.assertEqual((d["dpad_up"], d["dpad_down"], d["dpad_left"],
                           d["dpad_right"]),
                          ("arrow_up", "arrow_down", "arrow_left", "arrow_right"))
-        self.assertEqual(d["touch_slide_horizontal"], "alt_tab")
+        self.assertEqual(d["touch_slide_horizontal_pressed"], "alt_tab")
+        self.assertEqual(d["touch_slide_horizontal"], "scroll_horizontal")
+        self.assertEqual(d["touch_tap_2f"], "right_click")
+        self.assertEqual(d["touch_click_2f"], "right_click")
         self.assertNotIn("touch_swipe_up", d)
 
     def test_a_rebound_button_fires_the_new_action_directly(self):
@@ -1474,7 +1540,9 @@ class RemoteBindings(EngineCase):
                           and b[P.BC_VIBRATION_RIGHT]])
 
     def test_a_remote_swipe_fires_when_bound(self):
-        self.make_remote(remote={"chords": {"touch_swipe_up": "task_view"}})
+        # The compatibility flick: only while the vertical slide row is off.
+        self.make_remote(remote={"chords": {"touch_swipe_up": "task_view",
+                                            "touch_slide_vertical": "none"}})
         self.enter()
         self.feed(report(touches=((450, 800), (550, 800))))
         for y in (740, 680, 620, 560, 500):
@@ -1544,10 +1612,59 @@ class RemoteSameBindings(EngineCase):
     def test_gestures_mean_what_the_chord_gesture_means(self):
         self.make(remote={"enabled": True})
         self.enter()
-        self.feed(report(touches=((450, 300), (550, 300))))
+        tc = ("touchpad_click",)
+        self.feed(report(buttons=tc, touches=((450, 300), (550, 300))))
         for y in (360, 420, 480, 540, 600):
-            self.feed(report(touches=((450, y), (550, y))))
+            self.feed(report(buttons=tc, touches=((450, y), (550, y))))
         self.assertIn(("key", A.VK_M, True), self.events)          # minimize_all
+
+    def test_same_gestures_is_the_default_and_independent_of_bindings(self):
+        self.assertTrue(K.RemoteMode().same_gestures)
+        rm = K.InputConfig.from_dict({"remote": {"same_bindings": False}}).remote
+        self.assertTrue(rm.same_gestures)
+        rm = K.InputConfig.from_dict({"remote": {"same_gestures": False}}).remote
+        self.assertTrue(rm.same_bindings)
+        self.assertFalse(rm.same_gestures)
+
+    def test_same_gestures_takes_the_chord_tables_gesture_rows(self):
+        # The chord table leaves `touch_tap_2f` unbound; the remote table
+        # binds it to right_click. With same_gestures (default) the chord
+        # table wins even though the BUTTONS come from the remote table.
+        self.make(remote={"enabled": True, "same_bindings": False})
+        self.enter()
+        self.feed(report(touches=((500, 500), (600, 500))))
+        self.clock.advance(0.1)
+        self.feed(report())
+        self.assertNotIn(("button", "right", True), self.events)
+        self.feed(report(buttons=("cross",)))                     # remote buttons
+        self.assertEqual(self.events[-1], ("button", "left", True))
+
+    def test_same_gestures_off_takes_the_remote_tables_gesture_rows(self):
+        self.make(remote={"enabled": True, "same_gestures": False,
+                          "chords": {"touch_slide_vertical": "volume_up"}})
+        self.enter()
+        self.feed(report(touches=((500, 500), (600, 500))))
+        self.clock.advance(0.1)
+        self.feed(report())
+        self.assertIn(("button", "right", True), self.events)     # tap_2f
+        self.batches.clear()
+        self.feed(report(touches=((500, 300), (600, 300))),
+                  report(touches=((500, 400), (600, 400))))
+        self.assertIn(("key", A.VK_VOLUME_UP, True), self.events)
+        self.assertFalse([e for e in self.events if e[0] == "wheel"])
+        # ... while the buttons still follow `same_bindings` (the chord table)
+        self.feed(report(buttons=("cross",)), report())
+        self.assertIn(("key", A.VK_MEDIA_PLAY_PAUSE, True), self.events)
+
+    def test_the_gesture_tables_swap_live(self):
+        self.make(remote={"enabled": True})
+        self.enter()
+        self.eng.update_config(K.InputConfig.from_dict(
+            {"remote": {"enabled": True, "same_gestures": False}}))
+        self.feed(report(touches=((500, 500), (600, 500))))
+        self.clock.advance(0.1)
+        self.feed(report())
+        self.assertIn(("button", "right", True), self.events)
 
     def test_the_intrinsic_pointer_controls_stay(self):
         self.make(remote={"enabled": True})
