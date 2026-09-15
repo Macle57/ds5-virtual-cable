@@ -103,6 +103,7 @@ from . import controller as C
 from . import manager as M
 from . import service as S
 from . import update as U
+from . import winsvc as W
 
 log = logging.getLogger("ds5app.tray")
 
@@ -181,11 +182,20 @@ def _is_elevated() -> bool:
 def _open_url_deelevated(url: str) -> bool:
     """Open a URL in the default browser WITHOUT passing our token on.
 
-    Elevated on Windows: `explorer.exe <url>` -- the shell opens it with the
-    desktop's ordinary token (`_open_dashboard` says why that matters).
-    Otherwise `webbrowser.open`, which is the right call when there is no
-    elevation to shed. Returns whether a launch was attempted successfully.
+    As SYSTEM (the service child): with the signed-in user's own token, via
+    `winsvc.open_url_as_user` -- explorer would otherwise start the browser
+    as SYSTEM. Elevated on Windows: `explorer.exe <url>` -- the shell opens
+    it with the desktop's ordinary token (`_open_dashboard` says why that
+    matters). Otherwise `webbrowser.open`, which is the right call when there
+    is no elevation to shed. Returns whether a launch was attempted
+    successfully.
     """
+    if sys.platform == "win32" and W.is_system():
+        try:
+            if W.open_url_as_user(url):
+                return True
+        except Exception:  # noqa: BLE001
+            log.debug("open_url_as_user failed", exc_info=True)
     if sys.platform == "win32" and _is_elevated():
         try:
             import subprocess
@@ -235,11 +245,19 @@ class TrayApp:
     #: test rig builds them with __new__) still renders a menu: every menu
     #: lambda goes through U.* helpers that accept None.
     updater = None
+    service_child = False
+    _exit_code = 0
 
     def __init__(self, args):
         self.args = args
         self.icon = None
         self._stop = threading.Event()
+        #: Under the Windows service (winsvc.py) this tray is the service's
+        #: child: Quit stops the service (exit code EXIT_STOP_SERVICE, which
+        #: the supervisor reads as "do not restart me"), a stop from the
+        #: service arrives on a named event, and everything else is the same.
+        self.service_child = bool(getattr(args, "service_child", False))
+        self._exit_code = 0
         self._busy: dict[str, bool] = {}
         self._lock = threading.Lock()
         #: What the menu looked like the last time it was actually rebuilt, and
@@ -279,7 +297,12 @@ class TrayApp:
         #: integration is four U.* calls -- this one, two lambdas in `_menu()`,
         #: one entry in `_menu_key()` -- and everything else lives in update.py,
         #: deliberately: see its module docstring, "The tray touchpoint".
-        self.updater = U.start_if_enabled(self.cfg, notify=self._notify)
+        self.updater = U.start_if_enabled(
+            self.cfg, notify=self._notify,
+            # The automatic install (config.update_auto_install) is the
+            # menu row's action, called by the updater's own thread.
+            install_fn=lambda: U.install(self.updater, notify=self._notify,
+                                         quit_cb=self._quit))
 
         #: The dashboard's two halves, both strictly optional passengers: the
         #: telemetry hub (a UDP socket every child is told about, so live
@@ -876,16 +899,27 @@ class TrayApp:
     def _toggle_autostart(self, *_):
         def act():
             want = not A.is_enabled()
+            service = A.mode() == A.MODE_SERVICE
             try:
                 A.set_enabled(want)
             except A.AutostartError as e:
-                self._notify("Start at login", str(e))
+                self._notify("Start with Windows" if service
+                             else "Start at login", str(e))
                 return
             self.cfg.autostart_on_login = want
             self._save()
-            self._notify("ds5bridge",
-                         "ds5bridge will start when you log in."
-                         if want else "ds5bridge will no longer start at login.")
+            if service:
+                self._notify("ds5bridge",
+                             "ds5bridge will start with Windows, before "
+                             "anyone signs in." if want else
+                             "ds5bridge will no longer start with Windows "
+                             "(the service stays installed; start it from "
+                             "the Start menu).")
+            else:
+                self._notify("ds5bridge",
+                             "ds5bridge will start when you log in."
+                             if want else
+                             "ds5bridge will no longer start at login.")
         self._work("autostart", act)
 
     def _install_update(self, *_):
@@ -926,12 +960,17 @@ class TrayApp:
 
         def _hard_exit():
             time.sleep(3.0)
-            os._exit(0)
+            os._exit(self._exit_code)
 
         threading.Thread(target=_hard_exit, name="tray-exit", daemon=True).start()
 
-    def _quit(self, *_):
+    def _quit(self, *_, stop_service: bool = True):
         """Cancel unapplied intents, then tear down. CANCEL, not flush.
+
+        Under the service, `stop_service` decides the exit code: True (the
+        menu's Quit, the updater's hand-off) exits with EXIT_STOP_SERVICE so
+        the supervisor stops the service rather than restarting this tray;
+        False (the service itself asked, via the stop event) exits 0.
 
         The choice matters and was made on one question: which behaviour can
         strand a pad hidden? Cancelling cannot. A pending "hide" was never
@@ -946,11 +985,59 @@ class TrayApp:
         Nothing the user chose is lost either way, because every click already
         wrote the config; the next launch converges on it.
         """
+        if self.service_child and stop_service:
+            self._exit_code = W.EXIT_STOP_SERVICE
         self._cancel_pending()
         try:
             self.mgr.close()
         finally:
             self._shutdown_icon()
+
+    def _quit_for_service(self) -> None:
+        """The service asked us to stop (its stop event): tear down, exit 0."""
+        self._quit(stop_service=False)
+
+    def _watch_service_stop(self) -> None:
+        """Under the service: a thread that waits on the supervisor's stop
+        event and runs the normal Quit path when it fires. Nothing without
+        the event (a tray started by hand with --service-child)."""
+        if not self.service_child:
+            return
+        handle = W.open_stop_event()
+        if handle is None:
+            log.warning("--service-child without a stop event; the service "
+                        "will have to terminate this tray to stop it")
+            return
+
+        def wait():
+            if W.wait_event(handle):
+                print("  the service asked us to stop", flush=True)
+                try:
+                    self._quit_for_service()
+                except Exception:  # noqa: BLE001
+                    log.exception("teardown on the service's stop request failed")
+                    os._exit(1)
+
+        threading.Thread(target=wait, name="service-stop", daemon=True).start()
+
+    def _install_close_handler(self) -> None:
+        """WM_CLOSE on the icon's window -- what `taskkill` (without /F) and
+        the installer's stop-app send -- becomes a proper Quit instead of
+        being ignored (pystray's window procedure swallows every message it
+        has no handler for). Reaches into pystray's private handler table,
+        exactly as `_watch_menu_visibility` does, and fails just as softly.
+        """
+        handlers = getattr(self.icon, "_message_handlers", None)
+        if not isinstance(handlers, dict):
+            return
+        WM_CLOSE = 0x0010
+
+        def on_close(_w, _l):
+            print("  close requested; quitting", flush=True)
+            self._quit(stop_service=False)
+            return 0
+
+        handlers[WM_CLOSE] = on_close
 
     # -- rendering ---------------------------------------------------------
 
@@ -1340,7 +1427,7 @@ class TrayApp:
                                                       > 0)),
                  pystray.Menu.SEPARATOR,
                  pystray.MenuItem("Rescan for controllers", self._rescan),
-                 pystray.MenuItem("Start at login", self._toggle_autostart,
+                 pystray.MenuItem(lambda _i: A.label(), self._toggle_autostart,
                                   checked=lambda _i: A.is_enabled(),
                                   visible=lambda _i: A.available()),
                  # Hidden until the background check finds a newer release; the
@@ -1351,8 +1438,15 @@ class TrayApp:
                                   visible=lambda _i:
                                       U.menu_visible(self.updater)),
                  pystray.Menu.SEPARATOR,
-                 pystray.MenuItem("Quit", self._quit)]
+                 pystray.MenuItem(self._quit_label(), self._quit)]
         return pystray.Menu(*items)
+
+    def _quit_label(self) -> str:
+        """Under the service the menu must say what Quit really does: the
+        supervisor would otherwise just restart the tray, so Quit stops the
+        service, and nothing bridges until it is started again."""
+        return ("Quit (stops the ds5bridge service)" if self.service_child
+                else "Quit")
 
     def _poll(self) -> None:
         while not self._stop.wait(REFRESH_S):
@@ -1443,6 +1537,8 @@ class TrayApp:
         self.icon = pystray.Icon("ds5bridge", _icon_image(COLORS[S.STOPPED], None),
                                  "ds5bridge -- starting", menu=self._menu())
         self._watch_menu_visibility()
+        self._install_close_handler()
+        self._watch_service_stop()
         threading.Thread(target=self._poll, name="tray-poll", daemon=True).start()
 
         self._startup_reconcile()
@@ -1475,7 +1571,33 @@ class TrayApp:
             self._cancel_pending()
             self.mgr.close()
             self._stop_dashboard()
-        return 0
+        return self._exit_code
+
+
+def _service_already_running(args) -> bool:
+    """A tray started BY HAND while the service's own tray is running would
+    be a second instance fighting the first for the same ports and pads.
+    Say so (a message box: there is no console) and decline. Only when the
+    service is genuinely running -- a stopped service is no obstacle."""
+    if getattr(args, "service_child", False) or sys.platform != "win32":
+        return False
+    try:
+        if not W.is_running():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    text = ("ds5bridge is already running as a Windows service -- its icon "
+            "is next to the clock.\n\nTo run it by hand instead, stop the "
+            "service first (right-click the icon > Quit, or "
+            "`ds5bridge.exe service stop`).")
+    print("  " + text.replace("\n\n", " "), flush=True)
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, text, "ds5bridge", 0x40)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
 
 
 def run_tray(args) -> int:
@@ -1487,4 +1609,6 @@ def run_tray(args) -> int:
               "    python -m pip install pystray pillow\n"
               "Or use `ds5bridge` (no tray) instead.", file=sys.stderr)
         return 3
+    if _service_already_running(args):
+        return 5
     return TrayApp(args).run()

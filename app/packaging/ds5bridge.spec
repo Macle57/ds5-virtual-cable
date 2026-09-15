@@ -40,6 +40,9 @@ hidden = [
     #   cli.cmd_run_all -> ds5app.manager, and cli.cmd_doctor -> config/autostart,
     # both imported inside the function bodies for the same reason.
     "ds5app.manager", "ds5app.config", "ds5app.autostart",
+    #   cli.cmd_service / cmd_tray and autostart reach ds5app.winsvc (the
+    # Windows service supervisor) from inside function bodies.
+    "ds5app.winsvc",
     #   service/manager/tray/cli all reach ds5app.hidhide from inside function
     # bodies too, so that a machine with a broken hardware stack can still run
     # `doctor` and `unhide`.

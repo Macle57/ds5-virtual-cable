@@ -588,7 +588,7 @@ class InputConfig:
 
 _CFG_KNOWN = ("enabled", "autostart_on_login", "auto_bridge_new", "port_base",
               "controllers", "hide_bluetooth_default", "hidhide_cli",
-              "dashboard_port", "update_check", "input")
+              "dashboard_port", "update_check", "update_auto_install", "input")
 
 
 @dataclass
@@ -620,6 +620,15 @@ class Config:
     #: without a click. See `update.py` for what a check actually sends
     #: (nothing about you; a conditional GET of public release metadata).
     update_check: bool = True
+    # -- SERVICE region (update.py's auto-install; see its docstring) --------
+    #: When a check finds a newer release, install it without a click: the
+    #: updater downloads the installer, verifies it against the release's
+    #: SHA256SUMS and runs it silently a minute later; the tray (or the
+    #: service) restarts itself on the new version. False keeps the old
+    #: "Install update" menu row / dashboard button as the only way. Nothing
+    #: without `update_check`.
+    update_auto_install: bool = True
+    # -- end SERVICE region ---------------------------------------------------
     #: Keyed by LOWERCASED bdaddr, e.g. "d42f4ba1485d".
     controllers: dict = field(default_factory=dict)
     #: The chord/shortcut engine (PS-button chords, touch gestures, remote
@@ -747,6 +756,7 @@ class Config:
             hidhide_cli=_as_str(data.get("hidhide_cli"), "") or None,
             dashboard_port=_as_dashboard_port(data.get("dashboard_port")),
             update_check=_as_bool(data.get("update_check"), True),
+            update_auto_install=_as_bool(data.get("update_auto_install"), True),
             input=InputConfig.from_dict(data.get("input")),
         )
         raw = data.get("controllers")
@@ -778,6 +788,7 @@ class Config:
                    hidhide_cli=self.hidhide_cli,
                    dashboard_port=int(self.dashboard_port),
                    update_check=bool(self.update_check),
+                   update_auto_install=bool(self.update_auto_install),
                    input=self.input.to_dict(),
                    controllers={s: cc.to_dict()
                                 for s, cc in sorted(self.controllers.items())})

@@ -98,6 +98,29 @@ opens with the driver boxes unticked; they read "already installed" anyway.)
 A source checkout has no `app` directory to update, so `install_root()`
 answers None and "update now" degrades to opening the release page in the
 browser -- the person running from source updates with `git pull` anyway.
+
+Installing on its own (`update_auto_install`, 1.0)
+--------------------------------------------------
+With `config.update_auto_install` true (the default) the same "Update now"
+runs WITHOUT a click: `AUTO_INSTALL_DELAY_S` after a check finds a newer
+release, once per version per process, with a "Updating to x.y.z" toast
+first. The decision (`Updater.should_auto_install`) and the act
+(`Updater.run_auto_install`, which calls the injected `install_fn`) are
+separate and tested without a network or a tray; the tray injects
+`lambda: install(self.updater, ...)` so the automatic path IS the manual
+path. A failure ends in a notification and the version is not retried
+until the next start (`_told`-style once-per-version bookkeeping), so a
+broken release cannot make the tray download it every day.
+
+Under the Windows service (winsvc.py)
+-------------------------------------
+The tray that runs the update is the service's child, and the supervisor
+restarts a child that exits -- so the helper has to stop the SERVICE, not
+wait for a pid: `spawn_installer` passes `-Service ds5bridge` when the tray
+is the service child, the helper runs `sc stop` and waits for STOPPED (the
+child's own exit, with EXIT_STOP_SERVICE, has usually done it already), the
+installer's /STARTTRAY=1 then starts the service instead of the tray exe,
+and a refused install restarts the service instead of relaunching the exe.
 """
 
 from __future__ import annotations
@@ -157,6 +180,11 @@ SUMS_NAME = "SHA256SUMS"
 
 CHECK_INTERVAL_S = 24 * 3600.0     # "at startup + daily"
 STARTUP_DELAY_S = 20.0             # let the tray finish coming up first
+#: How long after a check finds a newer release the automatic install
+#: starts. Long enough for the "Updating to ..." toast to be read and for
+#: a person mid-game to notice; short enough that "it updates itself" is
+#: true the same day.
+AUTO_INSTALL_DELAY_S = 60.0
 HTTP_TIMEOUT_S = 15.0
 CACHE_NAME = "update-cache.json"
 
@@ -475,7 +503,8 @@ class Updater:
 
     def __init__(self, current_version: str | None = None,
                  cache_file: str | None = None,
-                 notify=None):
+                 notify=None, auto_install: bool = False, install_fn=None,
+                 auto_delay_s: float = AUTO_INSTALL_DELAY_S):
         self._current = current_version or app_version()
         self._cache_file = cache_file
         self._notify = notify
@@ -484,6 +513,44 @@ class Updater:
         self._info: UpdateInfo | None = None
         self._told: set[str] = set()
         self._thread: threading.Thread | None = None
+        #: The automatic path: `install_fn()` is what the tray's menu row
+        #: would do; `auto_install` is `config.update_auto_install`.
+        self.auto_install = bool(auto_install)
+        self._install_fn = install_fn
+        self.auto_delay_s = float(auto_delay_s)
+        self._auto_tried: set[str] = set()
+        #: True from the moment an install (manual or automatic) has started
+        #: until the process exits; a second start is refused.
+        self.installing = False
+
+    def should_auto_install(self, info: "UpdateInfo | None") -> bool:
+        """The decision, pure: on, an update in hand, something to call, not
+        already started, and this version not tried before in this process."""
+        return bool(self.auto_install and info is not None
+                    and self._install_fn is not None and not self.installing
+                    and info.version not in self._auto_tried)
+
+    def run_auto_install(self, info: "UpdateInfo") -> bool:
+        """The act: once per version. True when `install_fn` was called."""
+        with self._lock:
+            if info.version in self._auto_tried or self.installing:
+                return False
+            self._auto_tried.add(info.version)
+        log.info("installing %s automatically (update_auto_install)", info.version)
+        try:
+            self._install_fn()
+        except Exception:  # noqa: BLE001 -- the loop must survive anything
+            log.exception("automatic update failed to start")
+            if self._notify is not None:
+                try:
+                    self._notify("Update failed",
+                                 f"ds5bridge {info.version} could not be "
+                                 f"installed automatically; use the tray "
+                                 f"menu's Install update.")
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
+        return True
 
     @property
     def available(self) -> UpdateInfo | None:
@@ -521,10 +588,15 @@ class Updater:
         if self._stop.wait(STARTUP_DELAY_S):
             return
         while True:
+            info = None
             try:
-                self.check_once()
+                info = self.check_once()
             except Exception:  # noqa: BLE001 -- the loop must survive anything
                 log.exception("update check failed")
+            if self.should_auto_install(info):
+                if self._stop.wait(self.auto_delay_s):
+                    return
+                self.run_auto_install(info)
             if self._stop.wait(CHECK_INTERVAL_S):
                 return
 
@@ -532,12 +604,17 @@ class Updater:
 # -- the four tray-facing helpers, all None-safe (see the module docstring) --
 
 
-def start_if_enabled(cfg, notify=None) -> Updater | None:
-    """The tray's one constructor call. None when the config says no."""
+def start_if_enabled(cfg, notify=None, install_fn=None) -> Updater | None:
+    """The tray's one constructor call. None when the config says no.
+
+    `install_fn` is what the automatic path calls -- the tray passes the
+    same thing its "Install update" row does; without it there is no
+    automatic install whatever the config says."""
     if not getattr(cfg, "update_check", True):
         log.info("update checks are off (update_check: false)")
         return None
-    return Updater(notify=notify).start()
+    auto = bool(getattr(cfg, "update_auto_install", True)) and install_fn is not None
+    return Updater(notify=notify, auto_install=auto, install_fn=install_fn).start()
 
 
 def menu_visible(updater: Updater | None) -> bool:
@@ -560,6 +637,9 @@ def install(updater: Updater | None, notify=None, quit_cb=None) -> None:
     info = updater.available if updater is not None else None
     if info is None:
         return
+    if updater.installing:
+        return                      # once is enough; the helper is on its way
+    updater.installing = True
 
     root = install_root()
     if root is None:
@@ -570,6 +650,7 @@ def install(updater: Updater | None, notify=None, quit_cb=None) -> None:
         _say(notify, "Update available",
              f"ds5bridge {info.version}: this copy is not the packaged "
              f"install, so grab it from the release page (opening it now).")
+        updater.installing = False
         try:
             import webbrowser
 
@@ -578,18 +659,23 @@ def install(updater: Updater | None, notify=None, quit_cb=None) -> None:
             pass
         return
 
+    service = service_name_if_child()
+
     def work():
         try:
             _say(notify, "Updating",
-                 f"Downloading ds5bridge {info.version} ...")
+                 f"Updating to ds5bridge {info.version}: downloading ...")
             setup_exe = download_and_verify(info, root)
-            spawn_installer(root, setup_exe, info.version)
+            spawn_installer(root, setup_exe, info.version, service=service)
             _say(notify, "Updating",
-                 f"Installing {info.version}; the tray will restart itself.")
+                 f"Installing {info.version}; ds5bridge restarts itself "
+                 f"in a moment.")
         except UpdateError as e:
+            updater.installing = False
             _say(notify, "Update failed", str(e))
             return
         except Exception:  # noqa: BLE001
+            updater.installing = False
             log.exception("update failed")
             _say(notify, "Update failed",
                  "Something unexpected went wrong; nothing was changed. "
@@ -744,6 +830,21 @@ def _discard(path: str) -> None:
         pass
 
 
+def service_name_if_child() -> str | None:
+    """The Windows service to stop and restart around the install, or None
+    when this tray is not the service's child (a standalone tray, a source
+    checkout). Read from the command line, not the SCM: a tray started by
+    hand while the service is stopped must not stop-and-start it."""
+    try:
+        from . import winsvc as W
+
+        if W.CHILD_FLAG in sys.argv[1:]:
+            return W.SERVICE_NAME
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def installer_args(root: str, version: str) -> tuple[list[str], str]:
     """(switches, log path) for an in-place update: `INSTALLER_SWITCHES` says
     why each switch, the log lands next to the download. Pure, for the tests."""
@@ -767,15 +868,42 @@ param(
     [Parameter(Mandatory)][string]$Setup,
     [string]$SetupArgs = '',
     [string]$LogPath = '',
-    [string]$Exe = 'ds5bridge-tray.exe'
+    [string]$Exe = 'ds5bridge-tray.exe',
+    # The Windows service this tray is the child of ('' when it is not):
+    # stopped before the installer runs (the supervisor would otherwise
+    # restart the tray under the install), restarted if the installer
+    # refuses; the installer's own /STARTTRAY=1 starts it on success.
+    [string]$Service = ''
 )
 $ErrorActionPreference = 'Stop'
 $logFile = Join-Path $Root 'updates\update.log'
 function Log([string]$m) {
     try { Add-Content -Path $logFile -Value ("{0}  {1}" -f (Get-Date -Format s), $m) } catch {}
 }
+function Relaunch {
+    if ($Service) {
+        Log "starting the service $Service again"
+        try { & sc.exe start $Service | Out-Null } catch { Log "sc start failed: $_" }
+    } else {
+        try { Start-Process -FilePath (Join-Path $app $Exe) -WorkingDirectory $app } catch { Log "relaunch failed: $_" }
+    }
+}
 $app = Join-Path $Root 'app'
 try {
+    if ($Service) {
+        # The tray exits with the code that stops the service on its own;
+        # `sc stop` covers the case where it did not, and either way the
+        # install waits for STOPPED (1061/1062 = already stopping/stopped).
+        Log "stopping the service $Service"
+        try { & sc.exe stop $Service 2>&1 | Out-Null } catch {}
+        $deadline = (Get-Date).AddSeconds(120)
+        while ((Get-Date) -lt $deadline) {
+            $q = (& sc.exe query $Service 2>&1 | Out-String)
+            if ($q -match 'STATE\s*:\s*1\s+STOPPED' -or $q -match '1060') { break }
+            Start-Sleep -Seconds 1
+        }
+        Log ("service state: " + (((& sc.exe query $Service 2>&1 | Out-String) -split "`n" | Select-String 'STATE') -join '').Trim())
+    }
     Log "waiting for pid $WaitPid"
     try { Wait-Process -Id $WaitPid -Timeout 120 -ErrorAction Stop } catch {}
     Start-Sleep -Seconds 1
@@ -789,15 +917,16 @@ try {
         # removal waiting for its reboot, ...): its log says why. The old
         # version is untouched, so bring it back.
         Log 'installer did not complete; relaunching the current version'
-        try { Start-Process -FilePath (Join-Path $app $Exe) -WorkingDirectory $app } catch { Log "relaunch failed: $_" }
+        Relaunch
         exit 1
     }
-    # Exit 0: the installer has started the new tray (/STARTTRAY=1). Tidy up.
+    # Exit 0: the installer has started the new tray, or the service
+    # (/STARTTRAY=1). Tidy up.
     Remove-Item -LiteralPath $Setup -Force -ErrorAction SilentlyContinue
     Log 'done'
 } catch {
     Log "helper failed: $_"
-    try { Start-Process -FilePath (Join-Path $app $Exe) -WorkingDirectory $app } catch { Log "relaunch failed: $_" }
+    Relaunch
     exit 1
 }
 """
@@ -814,8 +943,28 @@ def write_helper(root: str) -> str:
     return path
 
 
-def spawn_installer(root: str, setup_exe: str, version: str) -> None:
+def helper_command(helper: str, root: str, setup_exe: str, version: str,
+                   pid: int, service: str | None = None) -> list[str]:
+    """The powershell.exe command line for the helper. Pure, for the tests."""
+    switches, log_path = installer_args(root, version)
+    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-File", helper,
+           "-WaitPid", str(pid),
+           "-Root", root,
+           "-Setup", setup_exe,
+           "-SetupArgs", " ".join(switches),
+           "-LogPath", log_path]
+    if service:
+        cmd += ["-Service", service]
+    return cmd
+
+
+def spawn_installer(root: str, setup_exe: str, version: str,
+                    service: str | None = None) -> None:
     """Start the helper detached, then it is the caller's job to exit.
+
+    `service`: the Windows service this tray is the child of, which the
+    helper stops before installing and restarts if the install is refused.
 
     DETACHED_PROCESS + CREATE_NO_WINDOW so the helper survives this process
     (it must -- it is waiting for this process to die) and never flashes a
@@ -825,20 +974,13 @@ def spawn_installer(root: str, setup_exe: str, version: str) -> None:
     installer it starts shows no UAC prompt.
     """
     helper = write_helper(root)
-    switches, log_path = installer_args(root, version)
     flags = 0
     if os.name == "nt":
         flags = (subprocess.DETACHED_PROCESS
                  | subprocess.CREATE_NO_WINDOW
                  | subprocess.CREATE_NEW_PROCESS_GROUP)
     subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-File", helper,
-         "-WaitPid", str(os.getpid()),
-         "-Root", root,
-         "-Setup", setup_exe,
-         "-SetupArgs", " ".join(switches),
-         "-LogPath", log_path],
+        helper_command(helper, root, setup_exe, version, os.getpid(), service),
         creationflags=flags,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
