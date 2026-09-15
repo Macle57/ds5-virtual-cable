@@ -21,7 +21,13 @@ export default function PlayerTabs() {
   );
 }
 
+/* `present: false` is the manager keeping a switched-off pad's entry so the
+   tab survives (it comes back cloaked, so the config it wears matters);
+   shown dimmed, as "disconnected". */
+const gone = (c: Controller) => c.present === false;
+
 function tone(c: Controller) {
+  if (gone(c)) return "idle";
   if (c.state === "running") return "ok";
   if (c.state === "controller offline") return "warn";
   if (c.error) return "bad";
@@ -33,14 +39,19 @@ const TONE_CLASS = { ok: "bg-ok text-ok", warn: "bg-warn text-warn", bad: "bg-ba
 function PlayerTab({ index, serial, c, active, onSelect }:
   { index: number; serial: string; c: Controller; active: boolean; onSelect: () => void }) {
   const t = tone(c);
-  const pct = c.telemetry?.decoded?.battery_percent ?? c.battery_percent;
-  const remote = remoteMode(c) === true;
+  const off = gone(c);
+  const pct = off ? null : c.telemetry?.decoded?.battery_percent ?? c.battery_percent;
+  const remote = !off && remoteMode(c) === true;
   const rc = useRemoteColor();
+  const sub = off ? (c.label ? short(serial) + " · disconnected" : "disconnected")
+                  : c.label ? short(serial) : c.state ?? "telemetry";
   return (
-    <button role="tab" aria-selected={active} onClick={onSelect}
+    <button role="tab" aria-selected={active} onClick={onSelect} data-present={off ? "false" : "true"}
+      title={off ? "switched off or out of range — its settings still apply when it returns" : undefined}
       className={
-        "relative flex items-center gap-3 rounded-xl border px-3.5 py-2 text-left transition-colors " +
-        (active ? "border-cross/70 bg-cross/10" : "border-line bg-panel/60 hover:border-line-2")
+        "relative flex items-center gap-3 rounded-xl border px-3.5 py-2 text-left transition-[color,border-color,opacity] " +
+        (active ? "border-cross/70 bg-cross/10" : "border-line bg-panel/60 hover:border-line-2") +
+        (off ? " opacity-55 saturate-50 hover:opacity-80" : "")
       }>
       {active && (
         <motion.span layoutId="tab-glow" transition={{ type: "spring", stiffness: 500, damping: 40 }}
@@ -51,10 +62,10 @@ function PlayerTab({ index, serial, c, active, onSelect }:
         P{index}
       </span>
       <span className="leading-tight">
-        <span className="display block text-[15px]">
+        <span className={"display block text-[15px]" + (off ? " text-ink-2" : "")}>
           {c.label || short(serial)}
         </span>
-        <span className="mono block text-[10.5px] text-ink-3">{c.label ? short(serial) : c.state ?? "telemetry"}</span>
+        <span className="mono block text-[10.5px] text-ink-3">{sub}</span>
       </span>
       <span className="ml-1 flex items-center gap-2">
         {remote && (

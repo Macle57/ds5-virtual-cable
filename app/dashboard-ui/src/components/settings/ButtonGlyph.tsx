@@ -24,12 +24,28 @@ export default function ButtonGlyph({ name, size = 30 }: { name: string; size?: 
     case "ps": return pill("PS", "var(--color-cross)");
     case "touchpad_click": return wrap(<><rect x={-13} y={-8} width={26} height={16} rx={4} /><circle cx={4} cy={1} r={2.5} fill="var(--color-cyan)" stroke="none" /></>, "var(--color-cyan)");
     case "mute": return wrap(<><rect x={-3} y={-11} width={6} height={13} rx={3} /><path d="M-7 -2 a7 7 0 0 0 14 0 M0 5 v6 M-4 11 h8" /><path d="M-9 -9 L9 9" strokeOpacity={0.8} /></>, "var(--color-amber)");
-    case "touch_slide_horizontal": return wrap(<><path d="M-12 0 h24 M-12 0 l4 -4 M-12 0 l4 4 M12 0 l-4 -4 M12 0 l-4 4" /><circle cx={-3} cy={-7} r={2} fill="var(--color-cyan)" stroke="none" /><circle cx={3} cy={-7} r={2} fill="var(--color-cyan)" stroke="none" /></>, "var(--color-cyan)");
-    case "touch_swipe_up": return wrap(<><path d="M0 12 v-22 M0 -10 l-5 5 M0 -10 l5 5" /><circle cx={-8} cy={9} r={2} fill="var(--color-cyan)" stroke="none" /><circle cx={8} cy={9} r={2} fill="var(--color-cyan)" stroke="none" /></>, "var(--color-cyan)");
-    case "touch_swipe_down": return wrap(<><path d="M0 -12 v22 M0 10 l-5 -5 M0 10 l5 -5" /><circle cx={-8} cy={-9} r={2} fill="var(--color-cyan)" stroke="none" /><circle cx={8} cy={-9} r={2} fill="var(--color-cyan)" stroke="none" /></>, "var(--color-cyan)");
-    default: return pill(name.slice(0, 3).toUpperCase());
+    default: {
+      // the touch gestures: one glyph per motion, and a "_pressed" variant
+      // framed by the clicked pad's outline
+      const pressed = name.endsWith("_pressed");
+      const base = pressed ? name.slice(0, -"_pressed".length) : name;
+      const g = GESTURES[base];
+      if (!g) return pill(name.slice(0, 3).toUpperCase());
+      return wrap(<>{pressed && <rect x={-14} y={-14} width={28} height={28} rx={5} strokeOpacity={0.55} strokeWidth={1.6} />}{g}</>, "var(--color-cyan)");
+    }
   }
 }
+
+const dot = (cx: number, cy: number) => <circle cx={cx} cy={cy} r={2} fill="var(--color-cyan)" stroke="none" />;
+const GESTURES: Record<string, React.ReactNode> = {
+  touch_slide_horizontal: <><path d="M-12 0 h24 M-12 0 l4 -4 M-12 0 l4 4 M12 0 l-4 -4 M12 0 l-4 4" />{dot(-3, -7)}{dot(3, -7)}</>,
+  touch_slide_vertical: <><path d="M0 -12 v24 M0 -12 l-4 4 M0 -12 l4 4 M0 12 l-4 -4 M0 12 l4 -4" />{dot(-7, -3)}{dot(-7, 3)}</>,
+  touch_swipe_up: <><path d="M0 12 v-22 M0 -10 l-5 5 M0 -10 l5 5" />{dot(-8, 9)}{dot(8, 9)}</>,
+  touch_swipe_down: <><path d="M0 -12 v22 M0 10 l-5 -5 M0 10 l5 -5" />{dot(-8, -9)}{dot(8, -9)}</>,
+  touch_tap_2f: <><circle cx={-4} cy={0} r={4} /><circle cx={5} cy={-3} r={4} /><path d="M-11 -8 a11 11 0 0 1 4 -4 M8 6 a11 11 0 0 1 -4 4" strokeOpacity={0.6} /></>,
+  touch_click_2f: <><rect x={-13} y={-8} width={26} height={16} rx={4} strokeOpacity={0.55} />{dot(-4, 0)}{dot(4, 0)}<path d="M0 -14 v3 M-5 -12 l2 2 M5 -12 l-2 2" strokeOpacity={0.8} /></>,
+  touch_pinch: <><path d="M-4 -4 L-11 -11 M-11 -11 h5 M-11 -11 v5 M4 4 L11 11 M11 11 h-5 M11 11 v-5" />{dot(-3, 4)}{dot(3, -4)}</>,
+};
 
 function dpad(arrow: string) {
   return (

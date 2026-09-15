@@ -5,16 +5,42 @@
    document and are described from their definition. */
 import type { LucideIcon } from "lucide-react";
 import {
-  ArrowLeftRight, CircleOff, Copy, HelpCircle, Keyboard, LayoutGrid, LightbulbOff, Mic, Minimize2, Monitor,
-  MonitorDown, MonitorSpeaker, Mouse, MousePointer, MousePointerClick, PanelsTopLeft, Play, Power, Projector,
-  RefreshCw, SkipBack, SkipForward, Sun, SunDim, Terminal, Volume1, Volume2, VolumeX,
+  ArrowDown, ArrowLeft, ArrowLeftRight, ArrowRight, ArrowUp, BatteryMedium, CircleOff, Copy, CornerDownLeft, HelpCircle,
+  Keyboard, LayoutGrid, LightbulbOff, Maximize2, Mic, Minimize2, Monitor, MonitorDown, MonitorSpeaker, Mouse, MousePointer,
+  MousePointerClick, MoveHorizontal, MoveVertical, PanelsTopLeft, Play, Power, Projector, RefreshCw, SkipBack, SkipForward,
+  Sun, SunDim, Terminal, Undo2, Volume1, Volume2, VolumeX, ZoomIn,
 } from "lucide-react";
-import type { ActionsMeta, Json } from "./types";
+import type { ActionsMeta, Json, MacroRepeat, RepeatMode } from "./types";
 
-export type Group = "none" | "media" | "volume" | "display" | "windows" | "mouse" | "voice" | "pad" | "macro" | "other";
+export type Group = "none" | "media" | "volume" | "display" | "windows" | "mouse" | "voice" | "keys" | "pad" | "macro" | "other";
 export type IconType = LucideIcon;
 
-export interface MacroDef { keys?: string[]; run?: string; label?: string; repeat?: boolean }
+/* `repeat`: a bool from 0.5 (true = repeat while held) or the 1.0 object. */
+export interface MacroDef {
+  keys?: string[]; run?: string; label?: string;
+  repeat?: boolean | { mode?: string; interval_ms?: number; max_runs?: number } | null;
+}
+
+export const REPEAT_MODES: { value: RepeatMode; label: string; doc: string }[] = [
+  { value: "once", label: "Once per press", doc: "fires once each time the chord lands" },
+  { value: "hold", label: "While held", doc: "fires again every interval while the button stays down" },
+  { value: "toggle", label: "Toggle", doc: "one press starts repeating, the next press stops it" },
+];
+export const DEFAULT_REPEAT: MacroRepeat = { mode: "once", interval_ms: 50, max_runs: 0 };
+
+/* The repeat settings of a macro, normalised: absent/false = once, a 0.5
+   `true` = hold at the engine's cadence. */
+export function macroRepeat(m: MacroDef | null | undefined): MacroRepeat {
+  const r = m?.repeat;
+  if (r === true) return { ...DEFAULT_REPEAT, mode: "hold" };
+  if (r && typeof r === "object") {
+    const mode = REPEAT_MODES.some((x) => x.value === r.mode) ? (r.mode as RepeatMode) : "once";
+    const iv = Number(r.interval_ms), mx = Number(r.max_runs);
+    return { mode, interval_ms: Number.isFinite(iv) && iv > 0 ? Math.round(iv) : DEFAULT_REPEAT.interval_ms,
+             max_runs: Number.isFinite(mx) && mx >= 0 ? Math.round(mx) : 0 };
+  }
+  return { ...DEFAULT_REPEAT };
+}
 
 export interface ActionInfo {
   name: string;
@@ -36,6 +62,7 @@ export const GROUPS: { id: Group; title: string; color: string }[] = [
   { id: "windows", title: "Windows", color: "var(--color-cross)" },
   { id: "mouse", title: "Mouse", color: "var(--color-orange)" },
   { id: "voice", title: "Voice & typing", color: "var(--color-violet)" },
+  { id: "keys", title: "Keys", color: "var(--color-ink-2)" },
   { id: "pad", title: "Controller", color: "var(--color-circle)" },
   { id: "macro", title: "Your macros", color: "var(--color-triangle)" },
   { id: "other", title: "Other", color: "var(--color-ink-2)" },
@@ -67,8 +94,19 @@ const BUILTIN: Record<string, { label: string; group: Group; Icon: IconType }> =
   left_click:       { label: "Left click",         group: "mouse",   Icon: MousePointerClick },
   right_click:      { label: "Right click",        group: "mouse",   Icon: MousePointer },
   middle_click:     { label: "Middle click",       group: "mouse",   Icon: Mouse },
+  scroll:           { label: "Scroll",             group: "mouse",   Icon: MoveVertical },
+  scroll_horizontal: { label: "Scroll sideways",   group: "mouse",   Icon: MoveHorizontal },
+  pinch_zoom:       { label: "Pinch zoom",         group: "mouse",   Icon: Maximize2 },
+  ctrl_zoom:        { label: "Ctrl + wheel zoom",  group: "mouse",   Icon: ZoomIn },
   dictation:        { label: "Voice typing",       group: "voice",   Icon: Mic },
   keyboard:         { label: "On-screen keyboard", group: "voice",   Icon: Keyboard },
+  escape:           { label: "Esc",                group: "keys",    Icon: Undo2 },
+  enter:            { label: "Enter",              group: "keys",    Icon: CornerDownLeft },
+  arrow_up:         { label: "Arrow up",           group: "keys",    Icon: ArrowUp },
+  arrow_down:       { label: "Arrow down",         group: "keys",    Icon: ArrowDown },
+  arrow_left:       { label: "Arrow left",         group: "keys",    Icon: ArrowLeft },
+  arrow_right:      { label: "Arrow right",        group: "keys",    Icon: ArrowRight },
+  show_battery:     { label: "Battery toast",      group: "pad",     Icon: BatteryMedium },
 };
 
 /* Docs for when /api/actions has not served one (an older server, or the
@@ -87,6 +125,13 @@ const BUILTIN_DOC: Record<string, string> = {
   middle_click: "middle-click where the pointer is",
   dictation: "Win+H: start / stop voice typing",
   keyboard: "show / hide the on-screen keyboard",
+  scroll: "wheel scroll, proportional to the slide",
+  scroll_horizontal: "sideways wheel scroll, proportional to the slide",
+  pinch_zoom: "zoom the way a precision-touchpad pinch does",
+  ctrl_zoom: "Ctrl + wheel: the app's zoom level",
+  show_battery: "the battery toast: this pad's charge as a notification",
+  escape: "the Esc key", enter: "the Enter key",
+  arrow_up: "up arrow key", arrow_down: "down arrow key", arrow_left: "left arrow key", arrow_right: "right arrow key",
 };
 
 /* The engine's own actions: served by /api/actions when the server knows
@@ -120,7 +165,7 @@ export function describeMacro(name: string, m: MacroDef): ActionInfo {
   return {
     name, label: m.label?.trim() || name, doc: macroSummary(m), group: "macro",
     Icon: isRun ? Terminal : Keyboard, color: groupColor("macro"),
-    repeatable: !!m.repeat && !isRun, macro: m,
+    repeatable: macroRepeat(m).mode !== "once" && !isRun, macro: m,
   };
 }
 

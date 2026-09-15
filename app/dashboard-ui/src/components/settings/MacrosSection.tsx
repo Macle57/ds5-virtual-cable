@@ -1,43 +1,52 @@
 import { useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, Keyboard, Pencil, Plus, Repeat, Terminal, Trash2, X } from "lucide-react";
-import type { ActionsMeta, Json } from "../../lib/types";
+import { AlertTriangle, Keyboard, Pencil, Plus, Repeat, Terminal, ToggleRight, Trash2, X } from "lucide-react";
+import type { ActionsMeta, Json, MacroRepeat, RepeatMode } from "../../lib/types";
 import { getPath, useStore } from "../../lib/store";
 import {
-  MODIFIERS, engineActions, eventKeyName, keyCap, keyGroups, macroList, macroSummary, slugify, type MacroDef,
+  DEFAULT_REPEAT, MODIFIERS, REPEAT_MODES, engineActions, eventKeyName, keyCap, keyGroups, macroList, macroRepeat, macroSummary,
+  slugify, type MacroDef,
 } from "../../lib/actionMeta";
-import { keyLabel } from "./help";
+import { HELP, keyLabel } from "./help";
 import ButtonGlyph from "./ButtonGlyph";
+import { Row } from "./controls";
 
 type Kind = "keys" | "run";
-interface Draft { name: string; label: string; kind: Kind; keys: string[]; run: string; repeat: boolean }
+interface Draft { name: string; label: string; kind: Kind; keys: string[]; run: string; repeat: MacroRepeat }
 
 const asObj = (v: unknown): Record<string, Json> =>
   v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, Json>) : {};
 
-const fresh = (): Draft => ({ name: "", label: "", kind: "keys", keys: [], run: "", repeat: false });
+const fresh = (): Draft => ({ name: "", label: "", kind: "keys", keys: [], run: "", repeat: { ...DEFAULT_REPEAT } });
 const fromDef = (name: string, m: MacroDef): Draft => ({
   name, label: m.label ?? "", kind: Array.isArray(m.keys) && m.keys.length ? "keys" : "run",
-  keys: Array.isArray(m.keys) ? m.keys.slice() : [], run: m.run ?? "", repeat: !!m.repeat,
+  keys: Array.isArray(m.keys) ? m.keys.slice() : [], run: m.run ?? "", repeat: macroRepeat(m),
 });
 
 /* ---- the section ---------------------------------------------------------- */
 export function MacrosSection({ actions }: { actions: ActionsMeta }) {
   const rawMacros = useStore((s) => getPath(s.cfg, ["input", "macros"]));
   const rawChords = useStore((s) => getPath(s.cfg, ["input", "chords"]));
+  const rawRemote = useStore((s) => getPath(s.cfg, ["input", "remote", "chords"]));
   const patch = useStore((s) => s.patchConfig);
   const macros = useMemo(() => macroList(rawMacros), [rawMacros]);
   const chords = asObj(rawChords);
+  const remote = asObj(rawRemote);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [editing, setEditing] = useState<string | null>(null);   // name being edited, or null = new
 
-  const boundTo = (name: string) => Object.entries(chords).filter(([, v]) => v === name).map(([k]) => k);
+  const boundTo = (name: string) => [
+    ...Object.entries(chords).filter(([, v]) => v === name).map(([k]) => ({ k, remote: false })),
+    ...Object.entries(remote).filter(([, v]) => v === name).map(([k]) => ({ k, remote: true })),
+  ];
   const reserved = new Set(["none", ...engineActions(actions).map((a) => a.name), ...actions.actions.map((a) => a.name)]);
 
+  // The POST is a deep merge, so every field is written explicitly: a kind
+  // switch or "repeat: once" must not leave the old value behind on disk.
   const save = (d: Draft) => {
     const def: MacroDef = { label: d.label.trim() || undefined };
-    if (d.kind === "keys") { def.keys = d.keys; if (d.repeat) def.repeat = true; }
-    else def.run = d.run.trim();
+    if (d.kind === "keys") { def.keys = d.keys; def.run = ""; def.repeat = { ...d.repeat }; }
+    else { def.run = d.run.trim(); def.keys = []; def.repeat = { ...DEFAULT_REPEAT }; }
     patch((cfg) => {
       const inp = asObj(cfg.input); cfg.input = inp;
       const ms = asObj(inp.macros); inp.macros = ms;
@@ -53,6 +62,9 @@ export function MacrosSection({ actions }: { actions: ActionsMeta }) {
       ms[name] = null;                                   // tombstone: the POST is a merge
       const ch = asObj(inp.chords); inp.chords = ch;
       for (const k of Object.keys(ch)) if (ch[k] === name) ch[k] = "none";
+      const rm = asObj(inp.remote); inp.remote = rm;
+      const rc = asObj(rm.chords); rm.chords = rc;
+      for (const k of Object.keys(rc)) if (rc[k] === name) rc[k] = "none";
     });
     if (editing === name) { setDraft(null); setEditing(null); }
   };
@@ -101,6 +113,7 @@ export function MacrosSection({ actions }: { actions: ActionsMeta }) {
             const isRun = !(Array.isArray(m.keys) && m.keys.length);
             const Icon = isRun ? Terminal : Keyboard;
             const bound = boundTo(name);
+            const rep = macroRepeat(m);
             return (
               <motion.div layout key={name}
                           className={"rounded-xl border p-3 " + (editing === name ? "border-triangle/60 bg-triangle/[.06]" : "border-line bg-well/50")}>
@@ -111,7 +124,7 @@ export function MacrosSection({ actions }: { actions: ActionsMeta }) {
                   <div className="min-w-0 flex-1 leading-tight">
                     <div className="display flex items-center gap-2 text-[14.5px]">
                       <span className="truncate">{m.label?.trim() || name}</span>
-                      {m.repeat && !isRun && <Repeat size={12} className="flex-none text-ink-3" aria-label="repeats while held" />}
+                      {rep.mode !== "once" && !isRun && <RepeatPill rep={rep} />}
                     </div>
                     <div className="mono text-[10.5px] text-ink-3">{name}</div>
                   </div>
@@ -128,9 +141,10 @@ export function MacrosSection({ actions }: { actions: ActionsMeta }) {
                 <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-[11px] text-ink-3">
                   {bound.length === 0 ? "not bound yet" : <>
                     <span>bound to</span>
-                    {bound.map((k) => (
-                      <span key={k} className="inline-flex items-center gap-1 rounded-md border border-line bg-well px-1.5 py-0.5 text-ink-2">
-                        <ButtonGlyph name={k} size={14} /> {keyLabel(k)}
+                    {bound.map(({ k, remote: r }) => (
+                      <span key={(r ? "r:" : "") + k} className="inline-flex items-center gap-1 rounded-md border border-line bg-well px-1.5 py-0.5 text-ink-2"
+                            title={r ? "in remote mode" : "while chording"}>
+                        <ButtonGlyph name={k} size={14} /> {keyLabel(k)}{r && <span className="text-ink-3"> · remote</span>}
                       </span>
                     ))}
                   </>}
@@ -141,6 +155,17 @@ export function MacrosSection({ actions }: { actions: ActionsMeta }) {
         </div>
       )}
     </div>
+  );
+}
+
+/* "hold · 50 ms" / "toggle · 50 ms · ×20" */
+function RepeatPill({ rep }: { rep: MacroRepeat }) {
+  const Icon = rep.mode === "toggle" ? ToggleRight : Repeat;
+  return (
+    <span className="inline-flex flex-none items-center gap-1 rounded-md border border-line bg-well px-1.5 py-0.5 text-[10.5px] font-normal text-ink-3"
+          title={REPEAT_MODES.find((r) => r.value === rep.mode)?.doc}>
+      <Icon size={11} /> {rep.mode} · {rep.interval_ms} ms{rep.max_runs > 0 && ` · ×${rep.max_runs}`}
+    </span>
   );
 }
 
@@ -168,6 +193,7 @@ function MacroEditor({ draft, setDraft, editing, keys, taken, reserved, onSave, 
   const [pending, setPending] = useState<string[]>([]);     // modifiers held in the capture box
   const [capturing, setCapturing] = useState(false);
   const up = (p: Partial<Draft>) => setDraft({ ...draft, ...p });
+  const upRepeat = (p: Partial<MacroRepeat>) => up({ repeat: { ...draft.repeat, ...p } });
 
   // the name follows the label until the user edits it, and is fixed once
   // the macro exists (chords bind by name)
@@ -181,6 +207,7 @@ function MacroEditor({ draft, setDraft, editing, keys, taken, reserved, onSave, 
   else if (!editing && taken.has(draft.name)) problems.push(`a macro named "${draft.name}" already exists`);
   if (draft.kind === "keys" && draft.keys.length === 0) problems.push("press a shortcut or add keys");
   if (draft.kind === "keys" && draft.keys.length > 8) problems.push("at most 8 keys");
+  if (draft.kind === "keys" && draft.repeat.mode !== "once" && !(draft.repeat.interval_ms >= 10)) problems.push("repeat interval: at least 10 ms");
   if (draft.kind === "run" && !draft.run.trim()) problems.push("what should it launch?");
 
   const onCapture = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -194,6 +221,7 @@ function MacroEditor({ draft, setDraft, editing, keys, taken, reserved, onSave, 
     else setPending(mods);
   };
 
+  const repeating = draft.repeat.mode !== "once";
   return (
     <div className="mt-4 rounded-xl border border-triangle/50 bg-well/60 p-4">
       <div className="mb-3 flex items-center gap-2">
@@ -256,10 +284,6 @@ function MacroEditor({ draft, setDraft, editing, keys, taken, reserved, onSave, 
                 </select>
                 {draft.keys.length > 0 && <button className="btn" onClick={() => up({ keys: [] })}>Clear</button>}
               </div>
-              <label className="flex items-center justify-between gap-3 text-[13px] text-ink-2">
-                <span className="flex items-center gap-2"><Repeat size={14} className="text-ink-3" /> Repeat while the chord is held</span>
-                <button type="button" role="switch" aria-checked={draft.repeat} className="switch" onClick={() => up({ repeat: !draft.repeat })} />
-              </label>
               <p className="text-[11.5px] leading-relaxed text-ink-3">
                 Some combinations never reach the page (Win+E, Ctrl+Alt+Del, media keys): build those with “Add a key”.
               </p>
@@ -278,6 +302,37 @@ function MacroEditor({ draft, setDraft, editing, keys, taken, reserved, onSave, 
           )}
         </div>
       </div>
+
+      {/* repeat: saved as input.macros.<name>.repeat = {mode, interval_ms, max_runs} */}
+      {draft.kind === "keys" && (
+        <div className="mt-3 rounded-lg border border-line bg-well/60 px-3">
+          <Row label="Repeat" keyName={`macros.${draft.name || "<name>"}.repeat`} help={HELP.macro_repeat} stack>
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex gap-1 rounded-lg border border-line bg-well p-1">
+                {REPEAT_MODES.map((r) => (
+                  <button key={r.value} type="button" onClick={() => upRepeat({ mode: r.value as RepeatMode })} title={r.doc}
+                          className={"display flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[12.5px] transition-colors " +
+                            (draft.repeat.mode === r.value ? "bg-cross/15 text-cross" : "text-ink-2 hover:text-ink")}>
+                    {r.value === "toggle" ? <ToggleRight size={13} /> : r.value === "hold" ? <Repeat size={13} /> : null}{r.label}
+                  </button>
+                ))}
+              </div>
+              <label className={"flex items-center gap-2 text-[12.5px] text-ink-2 transition-opacity " + (repeating ? "" : "opacity-40")}>
+                every
+                <input type="number" className="field num" style={{ width: 84 }} min={10} step={10} disabled={!repeating}
+                       value={draft.repeat.interval_ms} onChange={(e) => upRepeat({ interval_ms: Number(e.target.value) })} />
+                ms
+              </label>
+              <label className={"flex items-center gap-2 text-[12.5px] text-ink-2 transition-opacity " + (repeating ? "" : "opacity-40")}>
+                max runs
+                <input type="number" className="field num" style={{ width: 84 }} min={0} step={1} disabled={!repeating}
+                       value={draft.repeat.max_runs} onChange={(e) => upRepeat({ max_runs: Math.max(0, Math.round(Number(e.target.value) || 0)) })} />
+                <span className="text-ink-3">(0 = unlimited)</span>
+              </label>
+            </div>
+          </Row>
+        </div>
+      )}
 
       <div className="mt-4 flex flex-wrap items-center gap-3">
         {problems.length > 0 && (
