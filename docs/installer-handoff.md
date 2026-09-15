@@ -862,3 +862,66 @@ console session BEFORE sign-in (LogonUI only) and pystray adding the icon on
 the in-app update from a real GitHub release through the service path
 (`-Service ds5bridge` in the helper, `/STARTTRAY=1` starting the service).
 
+
+## 2026-09-15 21:00-22:45 -- the first automatic update from a real release (coordinator)
+
+Sequence on this machine (installed: the SERVICE agent's build, version string
+0.5.0, service mode, config in `%ProgramData%\ds5bridge`), after `main` was
+tagged `v1.0.0` and the release workflow (run 34959934519) published
+`ds5bridge-setup-1.0.0-bundled.exe` + `SHA256SUMS`:
+
+1. **The repository was private**, so the updater's anonymous
+   `releases/latest` was a 404 and nothing could ever be offered. Made public
+   (user's decision, `gh repo edit --visibility public`); the endpoint then
+   answered `v1.0.0` unauthenticated.
+2. `sc stop`/`sc start` of the service -> startup check 20 s later found
+   1.0.0 -> automatic install 60 s after that, exactly as designed
+   (`tray.log`: "installing 1.0.0 automatically (update_auto_install)").
+3. **Bug 1 -- one stalled read ended the download.** The connection was at
+   36 KB/s; 22 MB in, a read blocked for 60 s, `TimeoutError` came out of
+   `_download`, the partial file stayed in `updates\`, the automatic path
+   marked the version as tried and would not retry until the next process.
+   Fixed in `update.py` (commit 46207c7): HTTP Range resume (GitHub's asset
+   CDN answers 206; a plain 200 restarts the file), up to 6 attempts with
+   backoff, the partial discarded only when every attempt failed, and the
+   loop retries a failed automatic install after 10 min, 3 times per version.
+   `Updater` takes an injectable `http_get` -- two tray-helper tests had
+   been passing only because the private repo returned 404.
+4. Second attempt (service restarted, user upgraded the connection):
+   download complete and verified in 12 min, `apply-update.ps1` written,
+   "update helper started; exiting", the tray exited with the quit code, the
+   supervisor stopped the service -- **and nothing else happened**. No
+   `updates\update.log` at all: the helper never ran its first line.
+5. **Bug 2 -- `powershell.exe` under `DETACHED_PROCESS` runs nothing.**
+   Reproduced with a 12-case matrix from the venv Python (all DETACHED
+   variants: exit 0, script not run; all CREATE_NO_WINDOW variants: run).
+   Windows PowerShell needs a console; a detached process has none and it
+   gives up silently with exit 0. Fixed in commit fe96df0:
+   `helper_creation_flags()` = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+   `spawn_detached()`, and `TestHelperSpawn` runs a real powershell.exe. The
+   same flag was removed from `actions.launch_command` (macro `run`
+   commands went through cmd.exe detached).
+6. **The helper itself is sound.** Run by hand, elevated, with the exact
+   arguments the tray would pass (`-WaitPid 99999999 ... -Service ds5bridge`):
+   `update.log` shows stop -> wait -> installer -> "installer exit 0" ->
+   "done" in 17 s; `install-1.0.0.log` "all verification checks passed",
+   "STARTTRAY=1: starting the ds5bridge service", exit 0; `ds5bridge.exe
+   --version` = 1.0.0; service RUNNING.
+7. `v1.0.1` was tagged with fix 3 only, then -- fifteen minutes old, nobody
+   else's yet -- **deleted and re-cut** with fix 5 as well (`gh release
+   delete --cleanup-tag`, re-tag), so the first public patch release is not
+   one whose own updater cannot hand off. The service was stopped meanwhile
+   so 1.0.0 could not install the first 1.0.1 (a same-version re-release
+   can never be offered again: `is_newer` is strict).
+
+Consequences for anyone reading the logs: the installed **1.0.0 still has
+both bugs**. Its update to 1.0.1 downloads (resumable only from 1.0.1 on),
+verifies, exits the tray, and the service stops; finishing it means running
+`%LOCALAPPDATA%\ds5bridge\updates\apply-update.ps1` by hand, elevated, as in
+step 6. From 1.0.1 on the hand-off is expected to work; the next real
+release is its proof.
+
+Also seen today: the 15-minute idle off-timer (`input.off_timer_minutes`)
+switched both pads off at 02:36, 21:35 and 22:05 -- each time exactly 15 min
+after a (re)start bridged them with nobody touching them. It is working as
+designed; it just looks like a fault when the pads are only being watched.
