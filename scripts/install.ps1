@@ -54,9 +54,19 @@
     Untick the System Restore point (/MERGETASKS=!restorepoint). Not
     recommended on a first install.
 .PARAMETER Autostart
-    Tick "Start ds5bridge at login" (a scheduled task with highest
-    privileges, so the elevated tray starts with no prompt; the tray menu
-    has the same switch).
+    Tick "Start ds5bridge with Windows" as a Windows SERVICE (the default
+    on a fresh install): it starts at boot, before anyone signs in, and
+    keeps the tray running in your session. /MERGETASKS=autostart\service.
+.PARAMETER AutostartAtLogin
+    Tick the other option: a scheduled task at YOUR sign-in, with highest
+    privileges (what 0.5 offered; the tray menu's "Start at login").
+    /MERGETASKS=autostart\task. The two are exclusive.
+.PARAMETER NoAutostart
+    Untick "Start ds5bridge with Windows" altogether (removes a service or
+    task from an earlier install). /MERGETASKS=!autostart.
+.PARAMETER NoShortcuts
+    No Desktop / Start-menu shortcuts to the dashboard
+    (/MERGETASKS=!dashdesktop,!dashstartmenu).
 .PARAMETER NoLaunch
     After a -Silent install, do not start the tray. (A silent installer
     never starts it on its own; this script does, when it can do so without
@@ -81,6 +91,9 @@ param(
     [switch]$NoUsbip,
     [switch]$NoRestorePoint,
     [switch]$Autostart,
+    [switch]$AutostartAtLogin,
+    [switch]$NoAutostart,
+    [switch]$NoShortcuts,
     [switch]$NoLaunch,
     [string]$AppVersion = '',
     [string]$Setup = '',
@@ -219,8 +232,11 @@ function Get-SetupArgs([string]$LogPath) {
     if (-not $NoHidHide) { $components += 'hidhide' }
     if ($NoUsbip -or $NoHidHide) { $sw += ('/COMPONENTS=' + ($components -join ',')) }
     $tasks = @()
-    if ($NoRestorePoint) { $tasks += '!restorepoint' }
-    if ($Autostart)      { $tasks += 'autostart' }
+    if ($NoRestorePoint)  { $tasks += '!restorepoint' }
+    if ($NoAutostart)     { $tasks += '!autostart' }
+    elseif ($AutostartAtLogin) { $tasks += 'autostart\task' }
+    elseif ($Autostart)   { $tasks += 'autostart\service' }
+    if ($NoShortcuts)     { $tasks += @('!dashdesktop', '!dashstartmenu') }
     if ($tasks.Count -gt 0) { $sw += ('/MERGETASKS=' + ($tasks -join ',')) }
     $sw += ('/LOG="{0}"' -f $LogPath)
     return $sw

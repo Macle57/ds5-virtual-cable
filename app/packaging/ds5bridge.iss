@@ -152,7 +152,19 @@ Name: "hidhide"; Description: "HidHide {#HidHideVersion} -- optional: hides the 
 
 [Tasks]
 Name: "restorepoint"; Description: "Create a System Restore point before installing the driver (recommended)"; Components: usbip
-Name: "autostart"; Description: "Start ds5bridge at login"; Components: app; Flags: unchecked
+; Start with Windows: two exclusive ways (radio buttons under one box). The
+; service is the default -- it starts at boot, before anyone signs in, like
+; Chrome Remote Desktop's host -- and the logon task is what 0.5 offered.
+; Choosing one removes the other (helper: service-install / autostart-enable).
+; Unticking the box removes both. The selection is remembered by Inno for the
+; next run, so the in-app updater's silent run keeps whichever was chosen.
+Name: "autostart"; Description: "Start ds5bridge with Windows"; Components: app
+Name: "autostart\service"; Description: "when Windows starts, before anyone signs in -- as a Windows service (recommended)"; Components: app; Flags: exclusive
+Name: "autostart\task"; Description: "when you sign in -- a scheduled task with administrator rights, as before"; Components: app; Flags: exclusive unchecked
+; Shortcuts that open the dashboard (http://127.0.0.1:<dashboard_port>/) in
+; the default browser; the port is read from config.json (DashboardUrl).
+Name: "dashstartmenu"; Description: "Start menu entry"; GroupDescription: "Open the dashboard from:"; Components: app
+Name: "dashdesktop"; Description: "Desktop shortcut"; GroupDescription: "Open the dashboard from:"; Components: app
 
 [Files]
 ; Our own code is embedded: it is ours to redistribute, it is the thing being
@@ -177,24 +189,37 @@ Source: "bundle\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\ds5bridge"; Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Comment: "ds5bridge -- a Bluetooth DualSense, presented to Windows as a wired one"; Components: app
+; Internet shortcuts (.url): Windows opens them with the default browser, so
+; no elevated process is involved (the tray hands URLs to explorer for the
+; same reason). The tray's own icon, so they are recognisable.
+Name: "{userprograms}\ds5bridge dashboard"; Filename: "{code:DashboardUrl}"; IconFilename: "{app}\app\ds5bridge-tray.exe"; Comment: "The ds5bridge dashboard, in your browser"; Components: app; Tasks: dashstartmenu
+Name: "{userdesktop}\ds5bridge dashboard"; Filename: "{code:DashboardUrl}"; IconFilename: "{app}\app\ds5bridge-tray.exe"; Comment: "The ds5bridge dashboard, in your browser"; Components: app; Tasks: dashdesktop
 
-; No [Registry] section any more: start-at-login is a scheduled task (the
-; helper's autostart-enable verb, run in ssPostInstall when the task is
-; ticked; autostart-disable on uninstall) -- the same task the tray's own
-; "Start at login" switch creates. The HKCU Run value the 0.4 installers
-; wrote cannot start an elevated program, and the tray is one now.
+; No [Registry] section any more: start-with-Windows is the service (helper:
+; service-install, run in ssPostInstall) or the scheduled task (helper:
+; autostart-enable) -- the same task the tray's own "Start at login" switch
+; creates. The HKCU Run value the 0.4 installers wrote cannot start an
+; elevated program, and the tray is one now.
 
 [Run]
-; The tray carries requireAdministrator (ds5bridge.spec), so it is launched
-; from this elevated process directly -- no runasoriginaluser, which would
-; put a UAC prompt behind the Finish button. skipifsilent: a silent install
-; does not start it unless told to with /STARTTRAY=1 (CurStepChanged/ssDone),
-; which is how the in-app updater gets its new tray back.
-Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Description: "Start ds5bridge now"; Flags: postinstall nowait skipifsilent; Components: app
+; "Start ds5bridge now" on the Finish page: in service mode that means
+; starting the SERVICE (its supervisor starts the tray in this session; a
+; tray started by hand next to it would be a second instance), otherwise the
+; tray exe itself. The tray carries requireAdministrator (ds5bridge.spec), so
+; it is launched from this elevated process directly -- no runasoriginaluser,
+; which would put a UAC prompt behind the Finish button. skipifsilent: a
+; silent install does not start anything unless told to with /STARTTRAY=1
+; (CurStepChanged/ssDone), which is how the in-app updater gets its new tray
+; -- or service -- back.
+Filename: "{app}\app\ds5bridge.exe"; Parameters: "service start"; WorkingDir: "{app}\app"; Description: "Start ds5bridge now"; Flags: postinstall nowait skipifsilent runhidden; Components: app; Tasks: autostart\service
+Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Description: "Start ds5bridge now"; Flags: postinstall nowait skipifsilent; Components: app; Tasks: not autostart\service
 
 [UninstallDelete]
 ; Files the updater put there after us (a swapped app dir, staged updates).
 Type: filesandordirs; Name: "{app}\app"
+; The service's logs. Its settings (config.json, the hide journal) stay
+; unless "delete my settings" is ticked, like the per-user ones.
+Type: filesandordirs; Name: "{commonappdata}\ds5bridge\logs"
 Type: filesandordirs; Name: "{app}\updates"
 Type: filesandordirs; Name: "{app}\installer"
 ; The copy of this setup a restart-and-resume left behind (RegisterResume).
@@ -218,6 +243,9 @@ var
   // machine state at wizard start
   HaveUsbipVer: String;     // '' when not installed
   HaveHidHideCli: String;   // '' when not installed
+  HaveService: Boolean;     // the ds5bridge Windows service is registered
+  HaveTask: Boolean;        // the ds5bridge logon task is registered
+  TasksReflected: Boolean;  // the Tasks page was set to match the machine once
   // what this run will actually do
   NeedUsbip, NeedHidHide: Boolean;
   UsbipInstaller, HidHideInstaller: String;
@@ -317,6 +345,66 @@ begin
   if FileExists(P) then begin Result := P; Exit; end;
   P := ExpandConstant('{commonpf64}\Nefarius Software Solutions\HidHide\HidHideCLI.exe');
   if FileExists(P) then begin Result := P; Exit; end;
+end;
+
+// How the machine starts ds5bridge today (for the Tasks page and the plan).
+function ServiceRegistered(): Boolean;
+var
+  Txt: String;
+begin
+  Result := RunCapture(ExpandConstant('{sys}\sc.exe'), 'query ds5bridge', Txt) = 0;
+end;
+
+function TaskRegistered(): Boolean;
+var
+  Txt: String;
+begin
+  Result := RunCapture(ExpandConstant('{sys}\schtasks.exe'), '/Query /TN ds5bridge', Txt) = 0;
+end;
+
+// "dashboard_port": N out of a config.json, without a JSON parser: the key,
+// then digits. '' when the file or the key is not there.
+function ReadDashboardPort(const Path: String): String;
+var
+  Txt: AnsiString;
+  S: String;
+  I: Integer;
+begin
+  Result := '';
+  if not FileExists(Path) then Exit;
+  if not LoadStringFromFile(Path, Txt) then Exit;
+  S := String(Txt);
+  I := Pos('"dashboard_port"', S);
+  if I = 0 then Exit;
+  I := I + Length('"dashboard_port"');
+  while (I <= Length(S)) and ((S[I] = ' ') or (S[I] = ':') or (S[I] = #9)) do I := I + 1;
+  while (I <= Length(S)) and (S[I] >= '0') and (S[I] <= '9') do
+  begin
+    Result := Result + S[I];
+    I := I + 1;
+  end;
+end;
+
+// The dashboard's address for the shortcuts: the service's settings first
+// (they win once service mode is installed), then this user's, else the
+// default port (config.DEFAULT_DASHBOARD_PORT).
+function DashboardUrl(Param: String): String;
+var
+  Port: String;
+begin
+  Port := ReadDashboardPort(ExpandConstant('{commonappdata}\ds5bridge\config.json'));
+  if Port = '' then
+    Port := ReadDashboardPort(ExpandConstant('{userappdata}\ds5bridge\config.json'));
+  if Port = '' then Port := '8765';
+  Result := 'http://127.0.0.1:' + Port + '/';
+end;
+
+function ServiceModeSelected(): Boolean;
+begin
+  // The parent box with the service radio -- or the parent alone, which is
+  // what a remembered 0.5 selection ('autostart' = the task then) becomes:
+  // the recommended mode, documented in docs/installer.md.
+  Result := WizardIsTaskSelected('autostart') and not WizardIsTaskSelected('autostart\task');
 end;
 
 // Adoption bookkeeping. Name is 'Usbip' or 'HidHide'. "Installed by us"
@@ -485,7 +573,10 @@ begin
   Summary := TStringList.Create;
   HaveUsbipVer := InstalledUsbipVersion();
   HaveHidHideCli := HidHideCliPath();
-  Log('found usbip-win2: "' + HaveUsbipVer + '"; HidHideCLI: "' + HaveHidHideCli + '"');
+  HaveService := ServiceRegistered();
+  HaveTask := TaskRegistered();
+  Log('found usbip-win2: "' + HaveUsbipVer + '"; HidHideCLI: "' + HaveHidHideCli + '"' +
+      '; service: ' + IntToStr(Integer(HaveService)) + '; logon task: ' + IntToStr(Integer(HaveTask)));
   DownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing),
                                      SetupMessage(msgPreparingDesc), @OnDownloadProgress);
   DownloadPage.ShowBaseNameInsteadOfUrl := True;
@@ -511,6 +602,18 @@ begin
       WizardForm.ComponentsList.ItemCaption[1] := 'usbip-win2 ' + UsbipVersion + ' -- replaces the installed ' + HaveUsbipVer + ' ({#UsbipHow})';
     if HaveHidHideCli <> '' then
       WizardForm.ComponentsList.ItemCaption[2] := 'HidHide -- already installed (will be verified, not reinstalled)';
+  end
+  else if CurPageID = wpSelectTasks then
+  begin
+    // Once: show how the machine starts ds5bridge today. A logon task with
+    // no service (a 0.5 install, or a deliberate choice) keeps the task
+    // radio; anything else leaves the default (the service).
+    if not TasksReflected then
+    begin
+      TasksReflected := True;
+      if HaveTask and not HaveService then
+        WizardSelectTasks('autostart,autostart\task');
+    end;
   end
   else if CurPageID = SummaryPage.ID then
   begin
@@ -576,6 +679,15 @@ begin
   end;
   if WizardIsComponentSelected('app') then
     S := S + Space + 'ds5bridge {#AppVersion}: install to ' + ExpandConstant('{app}\app') + NewLine;
+  if WizardIsTaskSelected('autostart\task') then
+    S := S + Space + 'start at sign-in: the scheduled task ''ds5bridge'' (any ds5bridge service is removed)' + NewLine
+  else if WizardIsTaskSelected('autostart') then
+    S := S + Space + 'start with Windows: the service ''ds5bridge'', before anyone signs in (settings in ' +
+         ExpandConstant('{commonappdata}\ds5bridge') + '; any logon task is removed)' + NewLine
+  else
+    S := S + Space + 'start with Windows: off (any ds5bridge service or logon task is removed)' + NewLine;
+  if WizardIsTaskSelected('dashstartmenu') or WizardIsTaskSelected('dashdesktop') then
+    S := S + Space + 'dashboard shortcut(s) -> ' + DashboardUrl('') + NewLine;
   S := S + Space + 'then verify everything and show the result' + NewLine;
   Result := S;
 end;
@@ -851,18 +963,30 @@ begin
     InstallDrivers
   else if CurStep = ssPostInstall then
   begin
-    // Start-at-login: the scheduled task, through the same helper verb the
-    // uninstaller reverses. Registered before the verification so its
-    // result line is in the summary.
-    if WizardIsTaskSelected('autostart') then
+    // Start with Windows: the service or the logon task, each helper verb
+    // removing the other (they are exclusive); neither ticked removes both.
+    // Before the verification so the result lines are in the summary. The
+    // service is registered here and STARTED by [Run] / STARTTRAY=1 below.
+    if WizardIsTaskSelected('autostart\task') then
     begin
       WizardForm.StatusLabel.Caption := 'Registering start-at-login ...';
       RunHelper('autostart-enable', '');
+    end
+    else if WizardIsTaskSelected('autostart') then
+    begin
+      WizardForm.StatusLabel.Caption := 'Registering the ds5bridge service ...';
+      RunHelper('service-install', '');
+    end
+    else
+    begin
+      RunHelper('autostart-disable', '');
+      RunHelper('service-uninstall', '');
     end;
     WizardForm.StatusLabel.Caption := 'Verifying the installation ...';
     // The app is always expected (it is a fixed component): a missing
     // ds5bridge.exe is a [FAIL], never an [info].
     Expect := ' -ExpectApp';
+    if ServiceModeSelected() then Expect := Expect + ' -ExpectService';
     if WizardIsComponentSelected('usbip') then Expect := Expect + ' -ExpectUsbip';
     if WizardIsComponentSelected('hidhide') and ((HaveHidHideCli <> '') or NeedHidHide) then Expect := Expect + ' -ExpectHidHide';
     RunHelper('verify-install', Expect);
@@ -885,10 +1009,24 @@ begin
     // Finish page's checkbox is the user's to tick.
     if WizardSilent and (ExpandConstant('{param:STARTTRAY|0}') = '1') and (FailCount = 0) then
     begin
-      Log('STARTTRAY=1: starting the tray');
-      if not Exec(ExpandConstant('{app}\app\ds5bridge-tray.exe'), '', ExpandConstant('{app}\app'),
-                  SW_SHOWNORMAL, ewNoWait, RC) then
-        Log('the tray could not be started (' + SysErrorMessage(RC) + ')');
+      if ServiceModeSelected() then
+      begin
+        // Service mode: the service starts the tray (in the console
+        // session, as SYSTEM); starting the exe here would make two.
+        Log('STARTTRAY=1: starting the ds5bridge service');
+        if Exec(ExpandConstant('{app}\app\ds5bridge.exe'), 'service start', ExpandConstant('{app}\app'),
+                SW_HIDE, ewWaitUntilTerminated, RC) then
+          Log('ds5bridge.exe service start: exit ' + IntToStr(RC))
+        else
+          Log('the service could not be started (' + SysErrorMessage(RC) + ')');
+      end
+      else
+      begin
+        Log('STARTTRAY=1: starting the tray');
+        if not Exec(ExpandConstant('{app}\app\ds5bridge-tray.exe'), '', ExpandConstant('{app}\app'),
+                    SW_SHOWNORMAL, ewNoWait, RC) then
+          Log('the tray could not be started (' + SysErrorMessage(RC) + ')');
+      end;
     end;
   end;
 end;
@@ -938,7 +1076,7 @@ begin
     Info.Left := ScaleX(16); Info.Top := ScaleY(12); Info.Width := ScaleX(440);
     Info.WordWrap := True;
     Info.AutoSize := True;
-    Info.Caption := 'ds5bridge itself (the app, its shortcut and start-at-login task) will be removed. ' +
+    Info.Caption := 'ds5bridge itself (the app, its shortcuts, and its start-with-Windows service or logon task) will be removed. ' +
       'Before that, any bridged controller is detached and any hidden controller is made visible again.' + #13#10#13#10 +
       'The two drivers are separate products. Ticked = removed too; untick to keep one ' +
       '(keep it if another program, such as DS4Windows, uses it). Removing either needs ONE restart afterwards:';
@@ -962,7 +1100,7 @@ begin
     CbPurge := TNewCheckBox.Create(Form);
     CbPurge.Parent := Form;
     CbPurge.Left := ScaleX(24); CbPurge.Top := ScaleY(160); CbPurge.Width := ScaleX(430);
-    CbPurge.Caption := 'Delete my settings too (' + ExpandConstant('{userappdata}\ds5bridge') + ')';
+    CbPurge.Caption := 'Delete my settings too (' + ExpandConstant('{userappdata}\ds5bridge') + ' and ' + ExpandConstant('{commonappdata}\ds5bridge') + ')';
     CbPurge.Checked := PurgeSettings;
 
     Ok := TNewButton.Create(Form);
@@ -1133,8 +1271,10 @@ begin
       // each driver step only if no other installer is at work right then.
       UninstallProgressForm.StatusLabel.Caption := 'Stopping ds5bridge and detaching the virtual controller ...';
       RunHelper('teardown', '');
-      // The start-at-login task (ours, or the tray's -- same task), and the
+      // The service (stopped by the teardown already; deleted here), the
+      // start-at-login task (ours, or the tray's -- same task), and the
       // pre-0.5.0 Run value if it is still there.
+      RunHelper('service-uninstall', '');
       RunHelper('autostart-disable', '');
       UninstallProgressForm.StatusLabel.Caption := 'Clearing HidHide entries ...';
       if RemoveHidHide then
@@ -1211,9 +1351,25 @@ begin
         AddSummary('[warn] settings -- ' + ExpandConstant('{userappdata}\ds5bridge') + ' could not be removed completely')
       else
         AddSummary('[ok] settings -- ' + ExpandConstant('{userappdata}\ds5bridge') + ' removed');
+      // The service's settings. Only ours: the directory also holds the
+      // usbip-win2 removal log/task copy and the resume copy of this setup.
+      DeleteFile(ExpandConstant('{commonappdata}\ds5bridge\config.json'));
+      DeleteFile(ExpandConstant('{commonappdata}\ds5bridge\config.json.bad'));
+      DeleteFile(ExpandConstant('{commonappdata}\ds5bridge\update-cache.json'));
+      DelTree(ExpandConstant('{commonappdata}\ds5bridge\hidden'), True, True, True);
+      DelTree(ExpandConstant('{commonappdata}\ds5bridge\logs'), True, True, True);
+      if FileExists(ExpandConstant('{commonappdata}\ds5bridge\config.json')) then
+        AddSummary('[warn] service settings -- ' + ExpandConstant('{commonappdata}\ds5bridge\config.json') + ' could not be removed')
+      else
+        AddSummary('[ok] service settings -- ' + ExpandConstant('{commonappdata}\ds5bridge') + ' cleared');
     end
-    else if DirExists(ExpandConstant('{userappdata}\ds5bridge')) then
-      AddSummary('[info] settings -- kept at ' + ExpandConstant('{userappdata}\ds5bridge') + ' (run with /PURGESETTINGS=1 or tick the box to remove them)');
+    else
+    begin
+      if DirExists(ExpandConstant('{userappdata}\ds5bridge')) then
+        AddSummary('[info] settings -- kept at ' + ExpandConstant('{userappdata}\ds5bridge') + ' (run with /PURGESETTINGS=1 or tick the box to remove them)');
+      if FileExists(ExpandConstant('{commonappdata}\ds5bridge\config.json')) then
+        AddSummary('[info] service settings -- kept at ' + ExpandConstant('{commonappdata}\ds5bridge') + ' (same switch/box removes them)');
+    end;
 
     OutFile := ExpandConstant('{%TEMP}\ds5bridge-uninstall-check.txt');
     Summary.SaveToFile(OutFile);

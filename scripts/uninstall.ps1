@@ -114,6 +114,13 @@ $AppDir        = Join-Path $InstallRoot 'app'
 $ConfigDir     = Join-Path $env:APPDATA 'ds5bridge'
 $JournalDir    = Join-Path $ConfigDir 'hidden'
 $ShortcutPath  = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\ds5bridge.lnk'
+# The dashboard shortcuts (Internet shortcuts) ds5bridge-setup.exe offers.
+$DashShortcuts = @((Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\ds5bridge dashboard.url'),
+                   (Join-Path ([Environment]::GetFolderPath('Desktop')) 'ds5bridge dashboard.url'))
+# The Windows service (app/ds5app/winsvc.py) -- the 1.0 way to start with
+# Windows; its tray keeps its settings in $ServiceConfigDir.
+$ServiceName   = 'ds5bridge'
+$ServiceConfigDir = Join-Path $env:ProgramData 'ds5bridge'
 $RunKey        = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValueName  = 'ds5bridge'   # the pre-0.5.0 start-at-login entry
 $AutostartTask = 'ds5bridge'   # the start-at-login task (app/ds5app/autostart.py)
@@ -373,10 +380,29 @@ function Assert-Elevation {
 # 1. stop the bridge and repay its debts
 # ---------------------------------------------------------------------------
 
+function Get-Ds5ServiceState {
+    $out = & sc.exe query $ServiceName 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 1060) { return 'absent' }
+    if ($out -match 'STATE\s*:\s*\d+\s+(\w+)') { return $Matches[1] }
+    return 'unknown'
+}
+
 function Stop-Bridge {
     Write-Host ''
     Write-Host '--- stopping the bridge ---'
     $exe = Join-Path $AppDir 'ds5bridge.exe'
+    # The service first: its supervisor restarts a tray that is merely
+    # killed. `sc stop` reaches the tray through the service's stop event,
+    # so the tray detaches and unhides on its own way out.
+    $svc = Get-Ds5ServiceState
+    if ($svc -ne 'absent' -and $svc -ne 'STOPPED') {
+        if (Would "stop the ds5bridge service (its tray detaches and unhides the controllers on the way out)") {
+            $null = Run "$env:SystemRoot\System32\sc.exe" @('stop', $ServiceName) 30
+            $deadline = (Get-Date).AddSeconds(90)
+            while ((Get-Date) -lt $deadline -and (Get-Ds5ServiceState) -notin @('STOPPED', 'absent')) { Start-Sleep -Seconds 1 }
+            if ((Get-Ds5ServiceState) -eq 'STOPPED') { Good 'service stopped' } else { Warn "the service is still $(Get-Ds5ServiceState); its tray is stopped by force below" }
+        }
+    }
     $procs = @(Get-Process -Name 'ds5bridge-tray', 'ds5bridge' -ErrorAction SilentlyContinue)
     if ($procs.Count -gt 0) {
         if (Would 'quit the running ds5bridge (it detaches the virtual pad on the way out)') {
@@ -395,8 +421,15 @@ function Stop-Bridge {
     if (Test-Path $exe) {
         if (Would 'run "ds5bridge cleanup" and "ds5bridge unhide" (detach leftovers, un-cloak pads)') {
             # Best effort by design: a broken half-install must still be removable.
-            try { & $exe cleanup 2>&1 | ForEach-Object { "       $_" } } catch { Warn "cleanup: $_" }
-            try { & $exe unhide  2>&1 | ForEach-Object { "       $_" } } catch { Warn "unhide: $_" }
+            # Once for the user's settings, once for the service's (DS5_CONFIG).
+            $dirs = @('')
+            if (Test-Path (Join-Path $ServiceConfigDir 'config.json')) { $dirs += $ServiceConfigDir }
+            foreach ($d in $dirs) {
+                if ($d) { $env:DS5_CONFIG = $d } else { Remove-Item Env:\DS5_CONFIG -ErrorAction SilentlyContinue }
+                try { & $exe cleanup 2>&1 | ForEach-Object { "       $_" } } catch { Warn "cleanup: $_" }
+                try { & $exe unhide  2>&1 | ForEach-Object { "       $_" } } catch { Warn "unhide: $_" }
+            }
+            Remove-Item Env:\DS5_CONFIG -ErrorAction SilentlyContinue
         }
     } else { Say 'no installed exe found -- skipping its cleanup/unhide verbs' }
 
@@ -418,8 +451,18 @@ function Stop-Bridge {
 function Remove-App {
     Write-Host ''
     Write-Host '--- the app ---'
-    # Start-at-login is a scheduled task since 0.5.0 (the Run key cannot
-    # start the elevated tray); the Run value is what older installs left.
+    # Start with Windows: the service (1.0), the scheduled task (0.5; the
+    # Run key cannot start the elevated tray), or the Run value older
+    # installs left. Whichever is there goes.
+    if ((Get-Ds5ServiceState) -ne 'absent') {
+        if (Would "remove the ds5bridge Windows service") {
+            $null = Run "$env:SystemRoot\System32\sc.exe" @('stop', $ServiceName) 30
+            $deadline = (Get-Date).AddSeconds(90)
+            while ((Get-Date) -lt $deadline -and (Get-Ds5ServiceState) -notin @('STOPPED', 'absent')) { Start-Sleep -Seconds 1 }
+            $r = Run "$env:SystemRoot\System32\sc.exe" @('delete', $ServiceName) 30
+            if ($r.Code -eq 0) { Good 'service removed' } else { Warn "could not remove the service (sc exit $($r.Code)): $(($r.Out -replace '\s+', ' ').Trim())" }
+        }
+    } else { Say 'no ds5bridge service (nothing to remove)' }
     $task = Run "$env:SystemRoot\System32\schtasks.exe" @('/Query', '/TN', $AutostartTask) 30
     if ($task.Code -eq 0) {
         if (Would "remove the start-at-login task (scheduled task '$AutostartTask')") {
@@ -441,6 +484,11 @@ function Remove-App {
     if (Test-Path $ShortcutPath) {
         if (Would 'remove the Start Menu shortcut') { Remove-Item $ShortcutPath -Force; Good 'shortcut removed' }
     } else { Say 'no Start Menu shortcut (nothing to remove)' }
+    foreach ($sc in $DashShortcuts) {
+        if (Test-Path $sc) {
+            if (Would "remove the dashboard shortcut ($sc)") { Remove-Item $sc -Force; Good 'dashboard shortcut removed' }
+        }
+    }
 
     if (Test-Path $InnoUninstKey) {
         if (Would 'remove the Settings > Apps entry left by ds5bridge-setup.exe') {
@@ -459,11 +507,27 @@ function Remove-App {
 }
 
 function Remove-Settings {
-    if (-not (Test-Path $ConfigDir)) { return }
-    if ($PurgeSettings) {
-        if (Would "remove your settings ($ConfigDir)") { Remove-Item $ConfigDir -Recurse -Force; Good 'settings removed' }
-    } else {
-        Say "settings kept at $ConfigDir (use -PurgeSettings to remove them too)"
+    if (Test-Path $ConfigDir) {
+        if ($PurgeSettings) {
+            if (Would "remove your settings ($ConfigDir)") { Remove-Item $ConfigDir -Recurse -Force; Good 'settings removed' }
+        } else {
+            Say "settings kept at $ConfigDir (use -PurgeSettings to remove them too)"
+        }
+    }
+    # The service's settings live in ProgramData next to files that are not
+    # settings (the usbip-win2 removal log); only the settings go.
+    $svcCfg = Join-Path $ServiceConfigDir 'config.json'
+    if (Test-Path $svcCfg) {
+        if ($PurgeSettings) {
+            if (Would "remove the service's settings ($ServiceConfigDir)") {
+                foreach ($n in 'config.json', 'config.json.bad', 'update-cache.json', 'hidden', 'logs') {
+                    Remove-Item (Join-Path $ServiceConfigDir $n) -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                Good 'service settings removed'
+            }
+        } else {
+            Say "the service's settings are kept at $ServiceConfigDir (use -PurgeSettings to remove them too)"
+        }
     }
 }
 

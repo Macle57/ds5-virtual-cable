@@ -71,9 +71,20 @@
         autostart-enable         register the start-at-login task (the same
                                  scheduled task app/ds5app/autostart.py
                                  writes: `ds5bridge`, logon of this user,
-                                 RunLevel HighestAvailable, no time limit)
+                                 RunLevel HighestAvailable, no time limit);
+                                 removes the Windows service if one is there
+                                 (the two are exclusive)
         autostart-disable        delete that task, and the pre-0.5.0 HKCU
                                  Run value if it points at this install
+        service-install          register the Windows service `ds5bridge`
+                                 (`ds5bridge.exe service install`: LocalSystem,
+                                 automatic start, starts the tray before
+                                 anyone signs in; migrates this user's
+                                 %APPDATA%\ds5bridge\config.json into
+                                 %ProgramData%\ds5bridge once); removes the
+                                 logon task if one is there. Does not start it.
+        service-uninstall        stop (gracefully: the tray tears down its
+                                 bridges) and delete that service
         verify-install           the post-install checks
         verify-removed           the post-uninstall checks
 
@@ -99,7 +110,7 @@ param(
     [Parameter(Mandatory = $true, Position = 0)]
     [ValidateSet('preflight', 'check-busy', 'restore-point', 'stop-app', 'teardown', 'hidhide-clear',
                  'remove-usbip', 'remove-hidhide', 'hidhide-attach', 'autostart-enable', 'autostart-disable',
-                 'verify-install', 'verify-removed')]
+                 'service-install', 'service-uninstall', 'verify-install', 'verify-removed')]
     [string]$Verb,
     # Results file (appended). Optional: without it, lines go to stdout only.
     [string]$Out = '',
@@ -111,6 +122,8 @@ param(
     [switch]$ExpectUsbip,
     [switch]$ExpectHidHide,
     [switch]$ExpectApp,
+    # verify-install: the Windows service was chosen, so its absence is a FAIL.
+    [switch]$ExpectService,
     # verify-removed: what was asked to be removed.
     [switch]$ExpectNoUsbip,
     [switch]$ExpectNoHidHide,
@@ -164,6 +177,12 @@ $BtPadHidNodePrefix = 'BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&000205
 $HidHideDriverObject = '\Driver\HidHide'
 # The start-at-login task -- name and shape identical to app/ds5app/autostart.py.
 $AutostartTask   = 'ds5bridge'
+# The Windows service (app/ds5app/winsvc.py): the other, recommended way to
+# start with Windows. Its tray child keeps its settings and hide journal in
+# $ServiceConfigDir (DS5_CONFIG), not in %APPDATA%.
+$ServiceName     = 'ds5bridge'
+$ServiceConfigDir = Join-Path $env:ProgramData 'ds5bridge'
+$ServiceStopWaitSec = 90
 $LegacyRunKey    = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $LegacyRunValue  = 'ds5bridge'
 # The virtual (usbip-attached) pad, as Windows enumerates it. One present
@@ -171,6 +190,9 @@ $LegacyRunValue  = 'ds5bridge'
 $VirtualPadPrefix = 'USB\VID_054C&PID_0CE6\'
 $InstallRoot     = Join-Path $env:LOCALAPPDATA 'ds5bridge'
 $JournalDir      = Join-Path $env:APPDATA 'ds5bridge\hidden'
+# Both places a hide record can live: the user's (tray by hand, or the logon
+# task) and the service's. Every debt in either is repaid.
+$JournalDirs     = @($JournalDir, (Join-Path $ServiceConfigDir 'hidden'))
 # The device classes HidHide's MSI registers itself on as an upper filter
 # (nefconw --add-class-filter): HIDClass, XnaComposite, XboxComposite.
 # $ClassKeyRoot / $ServicesKeyRoot are variables only so a test can point
@@ -576,6 +598,49 @@ function Parse-HidHideList([string]$Text, [string]$Flag) {
     return $items
 }
 
+function Get-Ds5ServiceState {
+    # 'absent', or the SCM state word (RUNNING, STOPPED, STOP_PENDING, ...).
+    $out = & sc.exe query $ServiceName 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 1060) { return 'absent' }
+    if ($out -match 'STATE\s*:\s*\d+\s+(\w+)') { return $Matches[1] }
+    return "unknown (sc exit $LASTEXITCODE)"
+}
+
+function Get-Ds5ServiceStartType {
+    $out = & sc.exe qc $ServiceName 2>&1 | Out-String
+    if ($out -match 'START_TYPE\s*:\s*\d+\s+([A-Z_]+)') { return $Matches[1] }
+    return '?'
+}
+
+function Stop-Ds5Service([int]$WaitSec = 90) {
+    # Ask the SCM, then wait: the supervisor hands the stop to the tray,
+    # which detaches and unhides on the way out (up to a minute). Returns
+    # the final state ('absent' when there is no service).
+    $st = Get-Ds5ServiceState
+    if ($st -eq 'absent' -or $st -eq 'STOPPED') { return $st }
+    $null = Run "$env:SystemRoot\System32\sc.exe" @('stop', $ServiceName) 30
+    $deadline = (Get-Date).AddSeconds($WaitSec)
+    while ((Get-Date) -lt $deadline) {
+        $st = Get-Ds5ServiceState
+        if ($st -eq 'STOPPED' -or $st -eq 'absent') { break }
+        Start-Sleep -Seconds 1
+    }
+    return $st
+}
+
+function Invoke-AppVerb([string[]]$Arguments, [string]$ConfigDir = '', [int]$TimeoutSec = 60) {
+    # `ds5bridge.exe <verb>` with DS5_CONFIG pointing at one settings
+    # directory, so the app's own rescue verbs read the right journal.
+    $exe = Join-Path $AppDir 'ds5bridge.exe'
+    $prev = $env:DS5_CONFIG
+    try {
+        if ($ConfigDir) { $env:DS5_CONFIG = $ConfigDir } else { Remove-Item Env:\DS5_CONFIG -ErrorAction SilentlyContinue }
+        return (Run $exe $Arguments $TimeoutSec)
+    } finally {
+        if ($null -ne $prev) { $env:DS5_CONFIG = $prev } else { Remove-Item Env:\DS5_CONFIG -ErrorAction SilentlyContinue }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # verbs
 # ---------------------------------------------------------------------------
@@ -767,6 +832,19 @@ function Invoke-RestorePoint {
 }
 
 function Invoke-StopApp {
+    # The service first: its supervisor would otherwise restart the tray
+    # the moment it is killed below. `sc stop` reaches the tray through the
+    # service's stop event, so this IS the tray's own teardown.
+    $svc = Get-Ds5ServiceState
+    if ($svc -ne 'absent') {
+        if ($svc -eq 'STOPPED') {
+            Emit INFO 'ds5bridge service' 'installed, not running'
+        } else {
+            $st = Stop-Ds5Service $ServiceStopWaitSec
+            if ($st -eq 'STOPPED') { Emit PASS 'ds5bridge service' 'stopped (its tray detached and unhid the controllers on the way out)' }
+            else { Emit WARN 'ds5bridge service' "still $st after $ServiceStopWaitSec s; its tray is stopped by force below" }
+        }
+    }
     $procs = @(Get-Process -Name 'ds5bridge-tray', 'ds5bridge' -ErrorAction SilentlyContinue)
     if ($procs.Count -eq 0) { Emit INFO 'ds5bridge' 'not running'; return 0 }
     # taskkill without /F posts WM_CLOSE, which the tray's teardown handles:
@@ -793,10 +871,17 @@ function Invoke-Teardown {
     if (Test-Path $exe) {
         # The app's own rescue verbs know the journal format and the port
         # layout; they are the authoritative way to repay the hide debt.
-        $r = Run $exe @('cleanup') 60
-        Emit INFO 'ds5bridge cleanup' ("exit {0}: {1}" -f $r.Code, ($r.Out -replace '\s+', ' ').Trim())
-        $r = Run $exe @('unhide') 60
-        Emit INFO 'ds5bridge unhide' ("exit {0}: {1}" -f $r.Code, ($r.Out -replace '\s+', ' ').Trim())
+        # Once per settings directory: the user's, and the service's when
+        # one exists (its tray hides pads with records in ProgramData).
+        $dirs = @('')
+        if (Test-Path (Join-Path $ServiceConfigDir 'config.json')) { $dirs += $ServiceConfigDir }
+        foreach ($d in $dirs) {
+            $where = if ($d) { " ($d)" } else { '' }
+            $r = Invoke-AppVerb @('cleanup') $d 60
+            Emit INFO "ds5bridge cleanup$where" ("exit {0}: {1}" -f $r.Code, ($r.Out -replace '\s+', ' ').Trim())
+            $r = Invoke-AppVerb @('unhide') $d 60
+            Emit INFO "ds5bridge unhide$where" ("exit {0}: {1}" -f $r.Code, ($r.Out -replace '\s+', ' ').Trim())
+        }
     } else {
         Emit INFO 'ds5bridge' "no exe at $exe; skipping its cleanup/unhide verbs"
     }
@@ -840,8 +925,9 @@ function Invoke-HidHideClear {
     #    gone, and a record that outlives its unhide is the one thing this
     #    feature must never leave behind.
     $n = 0
-    if (Test-Path $JournalDir) {
-        foreach ($f in Get-ChildItem $JournalDir -Filter '*.json' -ErrorAction SilentlyContinue) {
+    foreach ($jd in $JournalDirs) {
+        if (-not (Test-Path $jd)) { continue }
+        foreach ($f in Get-ChildItem $jd -Filter '*.json' -ErrorAction SilentlyContinue) {
             try {
                 $rec = Get-Content -Raw $f.FullName | ConvertFrom-Json
                 foreach ($id in @($rec.instance_ids)) { if ($id) { $null = Run $cli @('--dev-unhide', "$id") 20; $n++ } }
@@ -1190,6 +1276,12 @@ function Remove-LegacyRunValue {
 function Invoke-AutostartEnable {
     $tray = Join-Path $AppDir 'ds5bridge-tray.exe'
     if (-not (Test-Path $tray)) { Emit WARN 'start-at-login' "not registered: $tray is missing"; return 0 }
+    # Exclusive with the service: a machine that starts the tray both at boot
+    # and at logon would run two of them.
+    if ((Get-Ds5ServiceState) -ne 'absent') {
+        Emit INFO 'ds5bridge service' 'removed: start-at-login (the logon task) was chosen instead'
+        $null = Invoke-ServiceUninstall
+    }
     $user = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
     $xml = Join-Path $env:TEMP ('ds5bridge-task-' + [IO.Path]::GetRandomFileName() + '.xml')
     try {
@@ -1215,6 +1307,50 @@ function Invoke-AutostartDisable {
         Emit INFO 'start-at-login' 'no scheduled task registered'
     }
     Remove-LegacyRunValue
+    return 0
+}
+
+function Invoke-ServiceInstall {
+    $exe = Join-Path $AppDir 'ds5bridge.exe'
+    if (-not (Test-Path $exe)) { Emit FAIL 'start with Windows' "the service was not registered: $exe is missing"; return 1 }
+    # Exclusive with the logon task (see Invoke-AutostartEnable).
+    $q = Run "$env:SystemRoot\System32\schtasks.exe" @('/Query', '/TN', $AutostartTask) 30
+    if ($q.Code -eq 0) {
+        $r = Run "$env:SystemRoot\System32\schtasks.exe" @('/Delete', '/TN', $AutostartTask, '/F') 30
+        if ($r.Code -eq 0) { Emit INFO 'start-at-login' "the logon task '$AutostartTask' was removed: the service starts ds5bridge now" }
+        else { Emit WARN 'start-at-login' "the logon task '$AutostartTask' could not be removed (schtasks exit $($r.Code)); delete it in Task Scheduler, or two trays start" }
+    }
+    Remove-LegacyRunValue
+    # The exe registers the service (sc create/config, LocalSystem, auto
+    # start, failure restarts) and migrates this user's settings into
+    # ProgramData once; it prints what it moved.
+    $r = Run $exe @('service', 'install') 120
+    if ($r.Code -ne 0) {
+        Emit FAIL 'start with Windows' ("the service could not be registered (exit $($r.Code)): " + ($r.Out -replace '\s+', ' ').Trim())
+        return 1
+    }
+    foreach ($line in ($r.Out -split "`r?`n")) {
+        if ($line -match 'settings migrated:\s*(.+)$') { Emit INFO 'settings' "migrated into the service's directory: $($Matches[1].Trim())" }
+    }
+    $st = Get-Ds5ServiceState
+    if ($st -eq 'absent') { Emit FAIL 'start with Windows' "the service '$ServiceName' is not registered after ds5bridge.exe service install"; return 1 }
+    Emit PASS 'start with Windows' "service '$ServiceName' registered (LocalSystem, automatic start: ds5bridge starts before anyone signs in; settings in $ServiceConfigDir)"
+    return 0
+}
+
+function Invoke-ServiceUninstall {
+    $st = Get-Ds5ServiceState
+    if ($st -eq 'absent') { Emit INFO 'ds5bridge service' 'not installed'; return 0 }
+    $st = Stop-Ds5Service $ServiceStopWaitSec
+    if ($st -ne 'STOPPED' -and $st -ne 'absent') {
+        Emit WARN 'ds5bridge service' "still $st after $ServiceStopWaitSec s; deleting it anyway (Windows removes it once it has stopped)"
+    }
+    $r = Run "$env:SystemRoot\System32\sc.exe" @('delete', $ServiceName) 30
+    Start-Sleep -Seconds 1
+    $st = Get-Ds5ServiceState
+    if ($st -eq 'absent') { Emit PASS 'ds5bridge service' 'removed' }
+    elseif ($r.Code -eq 0) { Emit PASS 'ds5bridge service' "marked for deletion (gone once it has stopped: $st)" }
+    else { Emit FAIL 'ds5bridge service' ("could not be removed (sc exit $($r.Code)): " + ($r.Out -replace '\s+', ' ').Trim()); return 1 }
     return 0
 }
 
@@ -1272,6 +1408,17 @@ function Invoke-VerifyInstall {
     } else {
         Emit $(if ($ExpectApp) { 'FAIL' } else { 'INFO' }) 'ds5bridge.exe' "not at $app"
     }
+    # start with Windows: the service, the task, or neither -- never both
+    $svc = Get-Ds5ServiceState
+    $task = (Run "$env:SystemRoot\System32\schtasks.exe" @('/Query', '/TN', $AutostartTask) 30).Code -eq 0
+    if ($svc -ne 'absent') {
+        $start = Get-Ds5ServiceStartType
+        $how = if ($start -like 'AUTO_START*') { 'automatic start, before anyone signs in' } else { "start type $start" }
+        Emit $(if ($ExpectService -or $start -like 'AUTO_START*') { 'PASS' } else { 'INFO' }) 'start with Windows' "service '$ServiceName' registered ($svc; $how)"
+        if ($task) { Emit WARN 'start-at-login' "the logon task '$AutostartTask' is ALSO registered -- two trays would start; remove one (the tray's switch, or Task Scheduler)" }
+    } elseif ($ExpectService) {
+        Emit FAIL 'start with Windows' "the service '$ServiceName' is not registered"
+    }
     $pads = Get-BtPads
     Emit INFO 'Bluetooth DualSense' "$($pads.Count) connected right now"
     return $(if ($script:Fails -gt 0) { 1 } else { 0 })
@@ -1296,6 +1443,10 @@ function Remove-HidHideLeftoverSys {
 
 function Invoke-VerifyRemoved {
     Repair-OrphanHidHideFilter
+    $svc = Get-Ds5ServiceState
+    if ($svc -eq 'absent') { Emit PASS 'ds5bridge service' 'gone' }
+    elseif ($svc -eq 'STOPPED') { Emit INFO 'ds5bridge service' 'marked for deletion (gone once Windows lets go of it)' }
+    else { Emit FAIL 'ds5bridge service' "still registered ($svc)" }
     if ($ExpectNoHidHide -or -not (Get-HidHideCli)) { Remove-HidHideLeftoverSys }
     $exe = Get-UsbipExe
     if ($UsbipPendingReboot) {
@@ -1356,6 +1507,8 @@ $rc = switch ($Verb) {
     'hidhide-attach' { Invoke-HidHideAttach }
     'autostart-enable'  { Invoke-AutostartEnable }
     'autostart-disable' { Invoke-AutostartDisable }
+    'service-install'   { Invoke-ServiceInstall }
+    'service-uninstall' { Invoke-ServiceUninstall }
     'verify-install' { Invoke-VerifyInstall }
     'verify-removed' { Invoke-VerifyRemoved }
 }
