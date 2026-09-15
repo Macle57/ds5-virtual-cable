@@ -1,9 +1,14 @@
 import { create } from "zustand";
-import type { ActionsMeta, ConfigDoc, Controller, LiveState } from "./types";
+import type { ActionOp, ActionResponse, ActionsMeta, ConfigDoc, Controller, LiveState } from "./types";
 import { rgbToHex } from "../components/settings/help";
 import { mockActions, mockState } from "./devMock";
 
 export type LinkStatus = "connecting" | "live" | "snapshot" | "reconnecting";
+
+/* Whether POST /api/action exists on this backend: the 1.0 tray serves it
+   (and `update`/`autostart` in /api/state, which is how the page tells
+   before it has tried); 0.5 answers 404 and the buttons go grey. */
+export type ActionApi = "unknown" | "available" | "missing";
 
 interface Toast { id: number; text: string; error: boolean }
 
@@ -12,6 +17,7 @@ interface Store {
   state: LiveState;
   link: LinkStatus;
   active: string | null;                     // selected serial
+  manual: boolean;                           // the user picked a tab: auto-select stands down until reload
   setActive: (serial: string) => void;
   connect: () => void;
 
@@ -33,6 +39,11 @@ interface Store {
   saveConfig: () => Promise<void>;
   patchConfig: (mutate: (cfg: ConfigDoc) => void) => void;
 
+  /* tray controls (POST /api/action) */
+  actionApi: ActionApi;
+  busyOp: ActionOp | null;
+  runAction: (op: ActionOp) => Promise<ActionResponse | null>;
+
   toasts: Toast[];
   toast: (text: string, error?: boolean) => void;
 }
@@ -44,14 +55,16 @@ export const useStore = create<Store>((set, get) => ({
   state: EMPTY,
   link: "connecting",
   active: null,
-  setActive: (serial) => set({ active: serial }),
+  manual: false,
+  setActive: (serial) => set({ active: serial, manual: true }),
 
   connect: () => {
     const apply = (incoming: LiveState) => {
       const state = mockState(incoming);
       const serials = Object.keys(state.controllers).sort();
       const prev = get().state.controllers;
-      const active = get().active;
+      const { active, manual } = get();
+      noteInput(state);
       // Remote mode flipping is the one lifecycle event the pad itself
       // announces (lightbar + rumble); echo it here so a glance at the page
       // says why the game just stopped listening.
@@ -65,7 +78,13 @@ export const useStore = create<Store>((set, get) => ({
       }
       set({
         state,
-        active: active && serials.includes(active) ? active : serials[0] ?? null,
+        active: chooseActive(state, active, manual),
+        // The first frame settles it: a backend that serves the 1.0 state
+        // fields (`update` / `autostart`, CONTRACT section 5) serves
+        // /api/action too; one that serves neither is a 0.5 tray and the
+        // buttons grey out up front (a 404 later would say the same).
+        actionApi: get().actionApi !== "unknown" ? get().actionApi
+          : (state.update !== undefined || state.autostart !== undefined) ? "available" : "missing",
       });
     };
     // Seed the remote lightbar colour without opening settings (one fetch;
@@ -159,6 +178,41 @@ export const useStore = create<Store>((set, get) => ({
     set({ cfg: { ...cfg }, dirty: true });
   },
 
+  actionApi: "unknown",
+  busyOp: null,
+  /* One tray op. A 404 marks the endpoint missing for the rest of the page
+     life (the buttons disable themselves); anything else is toasted with
+     the tray's own text. Returns null when nothing was run. */
+  runAction: async (op) => {
+    if (get().actionApi === "missing" || get().busyOp) return null;
+    set({ busyOp: op });
+    try {
+      const r = await fetch("/api/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ op }),
+      });
+      if (r.status === 404) {
+        set({ actionApi: "missing" });
+        get().toast("This tray is older than the page: tray controls need ds5bridge 1.0.", true);
+        return null;
+      }
+      let res: ActionResponse;
+      try { res = await r.json(); }
+      catch { res = { ok: r.ok, text: r.ok ? "" : `HTTP ${r.status}` }; }
+      if (!r.ok && res.ok === undefined) res.ok = false;
+      set({ actionApi: "available" });
+      const text = (res.text || "").trim();
+      if (text || !res.ok) get().toast(text || `${ACTION_LABEL[op]} failed`, !res.ok);
+      return res;
+    } catch (e) {
+      get().toast(`${ACTION_LABEL[op]}: ` + (e as Error).message, true);
+      return null;
+    } finally {
+      set({ busyOp: null });
+    }
+  },
+
   toasts: [],
   toast: (text, error = false) => {
     const id = ++toastSeq;
@@ -166,6 +220,59 @@ export const useStore = create<Store>((set, get) => ({
     setTimeout(() => set({ toasts: get().toasts.filter((t) => t.id !== id) }), 3800);
   },
 }));
+
+export const ACTION_LABEL: Record<ActionOp, string> = {
+  rescan: "Rescan", unhide_all: "Unhide all", update_check: "Check for updates",
+  update_install: "Install update", open_logs: "Open logs",
+};
+
+/* ---- which tab to show --------------------------------------------------- */
+
+/* A pad that is both present and bridged. A telemetry-only run (--fake, or
+   a bridge without the manager) has no lifecycle fields: then "connected"
+   is the feed saying so. */
+export const isConnected = (c: Controller | undefined): boolean => {
+  if (!c || c.present === false) return false;
+  if (c.state !== undefined) return c.state === "running";
+  return c.telemetry?.connected !== false;
+};
+
+/* Per-serial wall time of the last CHANGE in what the user is doing with the
+   pad (buttons, d-pad, triggers, touches, sticks past the jitter). Module
+   state, not store state: it changes every frame someone plays and nothing
+   renders it. */
+const lastInput = new Map<string, { sig: string; at: number }>();
+function noteInput(state: LiveState) {
+  const now = Date.now();
+  for (const [serial, c] of Object.entries(state.controllers)) {
+    const d = c.telemetry?.decoded;
+    if (!d) continue;
+    const q = (v: number) => Math.round((v - 128) / 16);   // sticks: ignore the rest-position jitter
+    const sig = [
+      Object.entries(d.buttons ?? {}).filter(([, on]) => on).map(([k]) => k).join(","), d.dpad,
+      d.l2 > 8 ? 1 : 0, d.r2 > 8 ? 1 : 0, (d.touch ?? []).filter((t) => t.active).length,
+      q(d.lx), q(d.ly), q(d.rx), q(d.ry),
+    ].join("|");
+    const e = lastInput.get(serial);
+    if (!e) lastInput.set(serial, { sig, at: 0 });        // the first frame is not an input
+    else if (e.sig !== sig) { e.sig = sig; e.at = now; }
+  }
+}
+const lastInputAt = (serial: string) => lastInput.get(serial)?.at ?? 0;
+
+/* The tab to show: the connected pad (present + running) over a stale one;
+   with several connected, the one touched most recently; a manual choice
+   holds until reload. When the selected pad drops and another is connected,
+   follow -- unless the user chose. */
+export function chooseActive(state: LiveState, active: string | null, manual: boolean): string | null {
+  const serials = Object.keys(state.controllers).sort();
+  if (!serials.length) return null;
+  if (active && serials.includes(active) && (manual || isConnected(state.controllers[active]))) return active;
+  const connected = serials.filter((s) => isConnected(state.controllers[s]));
+  if (!connected.length) return active && serials.includes(active) ? active : serials[0];
+  if (connected.length === 1) return connected[0];
+  return [...connected].sort((a, b) => lastInputAt(b) - lastInputAt(a) || a.localeCompare(b))[0];
+}
 
 /* ---- selectors -------------------------------------------------------- */
 

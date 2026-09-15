@@ -1,19 +1,21 @@
 import { useEffect, useRef } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  SlidersHorizontal, Keyboard, Grid3x3, Hand, MousePointer2, Lightbulb, BatteryWarning, Gamepad2,
+  Radio, Keyboard, Grid3x3, Hand, MousePointer2, Lightbulb, BatteryWarning, Gamepad2, Bell,
   RotateCcw, Save, Loader2, Wand2,
 } from "lucide-react";
 import { useStore } from "../../lib/store";
 import {
   BatterySection, ChordsSection, ControllersSection, GeneralSection, GenericInputSection,
-  GesturesSection, LightbarSection, MacrosSection, RemoteSection, ShortcutsSection,
+  GesturesSection, LightbarSection, MacrosSection, NotificationsSection, RemoteSection, ShortcutsSection,
 } from "./sections";
 
-type Tab = "general" | "shortcuts" | "chords" | "gestures" | "macros" | "remote" | "lightbar" | "battery" | "controllers";
+type Tab = "general" | "shortcuts" | "chords" | "gestures" | "macros" | "remote" | "lightbar" | "battery" | "notifications" | "controllers";
 
+/* "general" keeps its id (deep links: ?settings=general) but is the tray's
+   switches now -- what the user reaches for first. */
 const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
-  { id: "general", label: "General", icon: <SlidersHorizontal size={16} /> },
+  { id: "general", label: "Bridging & tray", icon: <Radio size={16} /> },
   { id: "shortcuts", label: "Shortcuts", icon: <Keyboard size={16} /> },
   { id: "chords", label: "Chords", icon: <Grid3x3 size={16} /> },
   { id: "gestures", label: "Gestures", icon: <Hand size={16} /> },
@@ -21,8 +23,11 @@ const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "remote", label: "Remote mode", icon: <MousePointer2 size={16} /> },
   { id: "lightbar", label: "Lightbar", icon: <Lightbulb size={16} /> },
   { id: "battery", label: "Battery", icon: <BatteryWarning size={16} /> },
+  { id: "notifications", label: "Notifications", icon: <Bell size={16} /> },
   { id: "controllers", label: "Controllers", icon: <Gamepad2 size={16} /> },
 ];
+/* Tabs that need no action registry (they edit top-level config only). */
+const PLAIN_TABS: Tab[] = ["general", "notifications", "controllers"];
 
 /* The form edits a working copy of the document and Save POSTs it whole;
    the server merges + coerces + saves atomically through the config module. */
@@ -40,7 +45,16 @@ export default function SettingsPanel() {
   const tab: Tab = TABS.some((t) => t.id === tabRaw) ? (tabRaw as Tab) : "general";
   const ref = useRef<HTMLElement>(null);
 
-  useEffect(() => { ref.current?.scrollIntoView({ behavior: "smooth", block: "start" }); }, []);
+  // Scroll the panel into view -- and again once the live view above has
+  // arrived and settled (a ?settings= deep link mounts the panel before the
+  // first state frame; the pad card then mounts above it and pushes it down).
+  const hasPads = useStore((s) => Object.keys(s.state.controllers).length > 0);
+  useEffect(() => {
+    const go = () => ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    go();
+    const ts = [450, 1200].map((ms) => setTimeout(go, ms));
+    return () => ts.forEach(clearTimeout);
+  }, [hasPads]);
 
   const input = (() => {
     if (!cfg) return null;
@@ -85,7 +99,7 @@ export default function SettingsPanel() {
         <div className="mt-4 grid gap-4 md:grid-cols-[200px_minmax(0,1fr)]">
           {/* category nav */}
           <nav className="flex gap-1 overflow-x-auto md:flex-col md:overflow-visible" aria-label="settings sections">
-            {TABS.filter((t) => actions || t.id === "general" || t.id === "controllers").map((t) => (
+            {TABS.filter((t) => actions || PLAIN_TABS.includes(t.id)).map((t) => (
               <button key={t.id} onClick={() => setTab(t.id)} aria-current={tab === t.id ? "page" : undefined}
                       className={"relative flex flex-none items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] transition-colors " +
                         (tab === t.id ? "text-ink" : "text-ink-2 hover:bg-panel-2 hover:text-ink")}>
@@ -104,6 +118,7 @@ export default function SettingsPanel() {
             <motion.div key={tab} initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }}
                         transition={{ duration: 0.18 }} className="min-w-0">
               {tab === "general" && <GeneralSection />}
+              {tab === "notifications" && <NotificationsSection />}
               {tab === "controllers" && <ControllersSection />}
               {input}
             </motion.div>
@@ -112,8 +127,9 @@ export default function SettingsPanel() {
       )}
 
       <p className="mt-4 text-[12px] text-ink-3">
-        Saved to the same config.json the tray uses (atomic write). Bridging switches apply when the tray notices; input
-        and shortcut settings reach running bridges within a few seconds; ports and the dashboard port apply at the next start.
+        Saved to the same config.json the tray uses (atomic write). Bridging and tray switches apply as soon as they are
+        saved; input and shortcut settings reach running bridges within a few seconds; ports and the dashboard port apply
+        at the next start.
       </p>
     </motion.section>
   );

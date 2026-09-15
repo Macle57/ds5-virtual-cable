@@ -63,14 +63,33 @@ export interface Aggregate {
   master_enabled?: boolean;
 }
 
+/* /api/state.update -- the tray's updater (1.0 backend; absent before, and
+   the page then hides the row and disables the buttons). */
+export interface UpdateInfo {
+  available?: string | null;        // "1.0.1" when a newer release is known
+  url?: string | null;
+  checked_at?: number | null;       // unix seconds of the last check
+  installing?: boolean;
+  error?: string | null;
+}
+/* /api/state.autostart -- how "start with Windows" is installed. */
+export interface AutostartInfo { enabled?: boolean; mode?: "task" | "service" | "none" | string }
+
 export interface LiveState {
   ts: number;
   controllers: Record<string, Controller>;
   aggregate: Aggregate;
+  update?: UpdateInfo;
+  autostart?: AutostartInfo;
 }
 
 /* /api/actions */
 export interface ActionSpec { name: string; doc: string; repeatable: boolean }
+/* One row of the Gestures tab, in the engine's order. `group`: taps (2-finger
+   tap / click), unpressed (slides, swipes, pinch with the pad NOT clicked),
+   pressed (the same while the pad is held clicked). */
+export type GestureGroup = "taps" | "unpressed" | "pressed";
+export interface GestureRow { key: string; label: string; help: string; group: GestureGroup | string }
 export interface ActionsMeta {
   actions: ActionSpec[];
   chord_buttons: string[];
@@ -79,6 +98,7 @@ export interface ActionsMeta {
   macro_keys?: string[];          // the key vocabulary a user macro may use
   engine_actions?: { name: string; doc: string }[];   // pad power / lightbar
   remote_keys?: string[];         // keys input.remote.chords accepts (falls back to chord_keys + gesture_keys)
+  gestures?: GestureRow[];        // the Gestures tab's rows (1.0 backend; a hard-coded table stands in)
   defaults: { chords: Record<string, string>; remote_chords?: Record<string, string> };
 }
 
@@ -87,3 +107,11 @@ export interface ActionsMeta {
 export type Json = string | number | boolean | null | Json[] | { [k: string]: Json };
 export type ConfigDoc = { [k: string]: Json };
 export interface ConfigResponse { path: string; config: ConfigDoc; error?: string }
+
+/* POST /api/action {"op"} -> {"ok","text"} (1.0 backend; 404 before). */
+export type ActionOp = "rescan" | "unhide_all" | "update_check" | "update_install" | "open_logs";
+export interface ActionResponse { ok: boolean; text?: string }
+
+/* input.macros.<name>.repeat: a bool in 0.5 (true = hold), an object in 1.0. */
+export type RepeatMode = "once" | "hold" | "toggle";
+export interface MacroRepeat { mode: RepeatMode; interval_ms: number; max_runs: number }

@@ -119,10 +119,13 @@ export function Card({ title, tag, hint, children, className = "" }:
   );
 }
 
-export function Row({ label, keyName, help, unit, stack, children }:
-  { label: string; keyName?: string; help?: string; unit?: string; stack?: boolean; children: React.ReactNode }) {
+/* `root` is the section `keyName` lives under in config.json ("input" for
+   the shortcut engine's rows; "" for a top-level key). */
+export function Row({ label, keyName, help, unit, stack, root = "input", children }:
+  { label: string; keyName?: string; help?: string; unit?: string; stack?: boolean; root?: string; children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
   const id = useId();
+  const fullKey = keyName ? (root ? root + "." + keyName : keyName) : "";
   return (
     <div className="py-2.5">
       <div className={"flex gap-3 " + (stack ? "flex-col items-stretch" : "items-center justify-between")}>
@@ -149,7 +152,7 @@ export function Row({ label, keyName, help, unit, stack, children }:
                       exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden">
             <div className="mt-2 rounded-lg border border-line border-l-[3px] border-l-cross bg-well px-3 py-2 text-[12.5px] leading-relaxed text-ink-2">
               {help}
-              {keyName && !stack && <div className="mono mt-1.5 text-[10.5px] text-ink-3">config key: input.{keyName}</div>}
+              {keyName && !stack && <div className="mono mt-1.5 text-[10.5px] text-ink-3">config key: {fullKey}</div>}
             </div>
           </motion.div>
         )}

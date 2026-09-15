@@ -1,36 +1,41 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, ArrowRight, MousePointer2 } from "lucide-react";
+import { AlertTriangle, ArrowRight, Hand, MousePointer2 } from "lucide-react";
 import { getPath, setPath, useRemoteColor, useStore } from "../../lib/store";
-import type { ActionsMeta, ConfigDoc, Json } from "../../lib/types";
+import type { ActionsMeta, ConfigDoc, GestureRow, Json } from "../../lib/types";
 import {
-  CTRL_FIELDS, GLOBAL_FIELDS, HELP, KNOWN_BATTERY, KNOWN_CTRL, KNOWN_GLOBAL, KNOWN_INPUT,
-  KNOWN_LIGHTBAR, KNOWN_REMOTE, keyLabel,
+  ADVANCED_FIELDS, CTRL_FIELDS, GESTURE_FALLBACK, GESTURE_GROUPS, HELP, KNOWN_BATTERY, KNOWN_CTRL, KNOWN_GLOBAL, KNOWN_INPUT,
+  KNOWN_LIGHTBAR, KNOWN_REMOTE, isGestureKey, keyLabel,
 } from "./help";
 import { Card, ColorField, JsonField, NumberField, RangeField, Row, SelectField, TextField, Toggle } from "./controls";
 import GenericRows from "./GenericRows";
 import ButtonGlyph from "./ButtonGlyph";
 import ActionPickerUI from "./ActionPicker";
+import BridgingSection from "./BridgingSection";
 export { MacrosSection } from "./MacrosSection";
+export { default as NotificationsSection } from "./NotificationsSection";
 
 const useCfg = () => useStore((s) => s.cfg as ConfigDoc);
 const asObj = (v: unknown): Record<string, Json> =>
   v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, Json>) : {};
 
-/* ---- General ------------------------------------------------------------ */
+/* ---- General: the tray's switches, then the rarely-touched rest ---------- */
 export function GeneralSection() {
   const cfg = useCfg();
   return (
-    <Card title="General" hint="Bridging switches apply when the tray notices; ports and the dashboard port apply at the next start.">
-      {GLOBAL_FIELDS.map(([key, label, kind]) => (
-        <Row key={key} label={label}>
-          {kind === "bool" ? <Toggle path={[key]} />
-            : kind === "number" ? <NumberField path={[key]} dflt={null} nullable width={130} />
-            : <TextField path={[key]} width={220} />}
-        </Row>
-      ))}
-      <GenericRows path={[]} obj={cfg} known={KNOWN_GLOBAL} />
-    </Card>
+    <div className="grid gap-4">
+      <BridgingSection />
+      <Card title="Advanced" hint="Ports and paths. These apply at the next start of the tray.">
+        {ADVANCED_FIELDS.map(([key, label, kind]) => (
+          <Row key={key} label={label} keyName={key} root="">
+            {kind === "bool" ? <Toggle path={[key]} />
+              : kind === "number" ? <NumberField path={[key]} dflt={null} nullable width={130} />
+              : <TextField path={[key]} width={220} />}
+          </Row>
+        ))}
+        <GenericRows path={[]} obj={cfg} known={KNOWN_GLOBAL} />
+      </Card>
+    </div>
   );
 }
 
@@ -89,8 +94,8 @@ function ActionPicker({ chordKey, actions, table }: { chordKey: string; actions:
   );
 }
 
-function BindingCard({ chordKey, actions, help, table = CHORD_TABLE }:
-  { chordKey: string; actions: ActionsMeta; help?: string; table?: Table }) {
+function BindingCard({ chordKey, actions, help, label, table = CHORD_TABLE }:
+  { chordKey: string; actions: ActionsMeta; help?: string; label?: string; table?: Table }) {
   const bound = useStore((s) => getPath(s.cfg, [...table.path, chordKey]));
   const isBound = boundName(bound, table.defaults[chordKey]) !== "none";
   const accent = table.accent;
@@ -102,7 +107,7 @@ function BindingCard({ chordKey, actions, help, table = CHORD_TABLE }:
       <div className="mb-2 flex items-center gap-2.5">
         <ButtonGlyph name={chordKey} />
         <div className="min-w-0 leading-tight">
-          <div className="display text-[14px]">{keyLabel(chordKey)}</div>
+          <div className="display text-[14px]">{label ?? keyLabel(chordKey)}</div>
           <div className="mono text-[10.5px] text-ink-3">{chordKey}</div>
         </div>
       </div>
@@ -124,8 +129,9 @@ export function ChordsSection({ actions }: { actions: ActionsMeta }) {
     listed.add(key); keys.push(key);
   }
   // bindings for keys this build's vocabulary doesn't list: keep them editable
+  // (the gestures have their own tab)
   for (const key of Object.keys(chords).sort()) {
-    if (listed.has(key) || key === chordButton || actions.gesture_keys.includes(key)) continue;
+    if (listed.has(key) || key === chordButton || isGestureKey(key)) continue;
     keys.push(key);
   }
   return (
@@ -140,74 +146,154 @@ export function ChordsSection({ actions }: { actions: ActionsMeta }) {
   );
 }
 
-/* Whether remote mode reuses the chord table. Absent = true (the engine's
-   default), so an older config reads exactly as it behaves. */
+/* Whether remote mode reuses the chord table's BUTTON rows / GESTURE rows.
+   Absent = true (the engine's default), so an older config reads exactly as
+   it behaves. */
 const useSameBindings = () =>
   useStore((s) => getPath(s.cfg, ["input", "remote", "same_bindings"]) !== false);
+const useSameGestures = () =>
+  useStore((s) => getPath(s.cfg, ["input", "remote", "same_gestures"]) !== false);
 
-/* ---- Remote mode bindings: the second table ------------------------------ */
+/* The remote table, as the engine keeps it: written rows over
+   `defaults.remote_chords` (a 0.5 backend serves only the button defaults
+   plus the horizontal slide; the 1.0 one serves every gesture's). */
+function useRemoteTable(actions: ActionsMeta): Table {
+  const color = useRemoteColor();
+  return { path: ["input", "remote", "chords"], accent: color,
+           defaults: actions.defaults.remote_chords ?? actions.defaults.chords };
+}
+
+/* The collapsible second table both remote cards share. */
+function RemoteTable({ open, id, intro, children }: { open: boolean; id: string; intro: React.ReactNode; children: React.ReactNode }) {
+  const color = useRemoteColor();
+  return (
+    <AnimatePresence initial={false}>
+      {open && (
+        <motion.div key={id} initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className="overflow-hidden !border-t-0">
+          <div className="my-2 flex items-start gap-3 rounded-xl border px-3.5 py-3 text-[12.5px] leading-relaxed text-ink-2"
+               style={{ borderColor: `color-mix(in oklab, ${color} 55%, transparent)`, background: `color-mix(in oklab, ${color} 8%, transparent)` }}>
+            <MousePointer2 size={18} className="mt-0.5 flex-none" style={{ color }} />
+            <div>{intro}</div>
+          </div>
+          {children}
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+/* ---- Remote mode bindings: the second BUTTON table ------------------------ */
 export function RemoteBindingsSection({ actions }: { actions: ActionsMeta }) {
   const cfg = useCfg();
   const inp = asObj(cfg.input);
   const same = useSameBindings();
+  const sameGestures = useSameGestures();
+  const setTab = useStore((s) => s.setSettingsTab);
   const color = useRemoteColor();
   // Until the engine serves the remote vocabulary, the chord vocabulary
   // (minus the arming button -- a double-press of it is the mode toggle)
-  // plus the gestures is the best description of what remote mode can bind.
+  // is the best description of what remote mode can bind. Gestures live on
+  // their own tab under their own switch (input.remote.same_gestures).
   const chordButton = actions.chord_buttons.includes(String(inp.chord_button)) ? String(inp.chord_button) : "ps";
-  const vocab = actions.remote_keys ?? [...actions.chord_keys.filter((k) => k !== chordButton), ...actions.gesture_keys];
-  const table: Table = { path: ["input", "remote", "chords"], accent: color,
-                         defaults: actions.defaults.remote_chords ?? actions.defaults.chords };
+  const vocab = (actions.remote_keys ?? actions.chord_keys.filter((k) => k !== chordButton)).filter((k) => !isGestureKey(k));
+  const table = useRemoteTable(actions);
   const written = asObj(asObj(inp.remote).chords);
   const keys = [...vocab];
-  for (const key of Object.keys(written).sort()) if (!vocab.includes(key)) keys.push(key);   // a newer build's key: keep it editable
+  for (const key of Object.keys(written).sort()) if (!vocab.includes(key) && !isGestureKey(key)) keys.push(key);   // a newer build's key: keep it editable
   return (
     <Card title="Remote mode bindings"
-          hint="What a button or gesture does while the pad is in remote mode (double-press the chord button). Saved as input.remote.same_bindings and input.remote.chords.">
+          hint="What a button does while the pad is in remote mode (double-press the chord button). Saved as input.remote.same_bindings and input.remote.chords.">
       <Row label="Remote mode uses the same bindings" keyName="remote.same_bindings" help={HELP.same_bindings}>
         <Toggle path={["input", "remote", "same_bindings"]} dflt />
       </Row>
-      <AnimatePresence initial={false}>
-        {!same && (
-          <motion.div key="remote-table" initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className="overflow-hidden !border-t-0">
-            <div className="my-2 flex items-start gap-3 rounded-xl border px-3.5 py-3 text-[12.5px] leading-relaxed text-ink-2"
-                 style={{ borderColor: `color-mix(in oklab, ${color} 55%, transparent)`, background: `color-mix(in oklab, ${color} 8%, transparent)` }}>
-              <MousePointer2 size={18} className="mt-0.5 flex-none" style={{ color }} />
-              <div>
-                <b style={{ color }}>No chord button in remote mode.</b> Nothing reaches the game while remote mode is on, so
-                each button or gesture below fires its action <b className="text-ink">directly, on its own</b> — no button held
-                first. This table is the whole truth: the defaults spell out the classic remote map (Cross clicks, d-pad
-                arrows, Circle is Esc, Options is Enter), so a row set to <b className="text-ink">none</b> makes that button do
-                nothing in remote mode. Only the touchpad and stick pointer controls are fixed.
-              </div>
-            </div>
-            <div className="grid gap-3 pb-2 pt-1 sm:grid-cols-2 xl:grid-cols-3">
-              {keys.map((k) => <BindingCard key={k} chordKey={k} actions={actions} table={table}
-                                            help={actions.gesture_keys.includes(k) ? HELP[k] : undefined} />)}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <RemoteTable open={!same} id="remote-table" intro={<>
+        <b style={{ color }}>No chord button in remote mode.</b> Nothing reaches the game while remote mode is on, so
+        each button below fires its action <b className="text-ink">directly, on its own</b> — no button held
+        first. This table is the whole truth: the defaults spell out the classic remote map (Cross clicks, d-pad
+        arrows, Circle is Esc, Options is Enter), so a row set to <b className="text-ink">none</b> makes that button do
+        nothing in remote mode. Only the touchpad and stick pointer controls are fixed.
+      </>}>
+        <div className="grid gap-3 pb-2 pt-1 sm:grid-cols-2 xl:grid-cols-3">
+          {keys.map((k) => <BindingCard key={k} chordKey={k} actions={actions} table={table} />)}
+        </div>
+      </RemoteTable>
+      <button type="button" onClick={() => setTab("gestures")}
+              className="flex items-center gap-1.5 py-2.5 text-[12.5px] text-ink-2 hover:text-cross">
+        <Hand size={13} /> Touchpad gestures {sameGestures ? "follow the Gestures tab" : "have their own remote table"} — edit them there <ArrowRight size={13} />
+      </button>
     </Card>
   );
 }
 
-export function GesturesSection({ actions }: { actions: ActionsMeta }) {
-  const same = useSameBindings();
-  const setTab = useStore((s) => s.setSettingsTab);
+/* ---- Gestures: chording table + the remote table under its own switch ---- */
+
+/* The rows: the engine's list (1.0), else the hard-coded vocabulary; plus
+   any `touch_*` key a table has written that neither lists, kept editable. */
+function gestureRows(actions: ActionsMeta, ...tables: Record<string, Json>[]): GestureRow[] {
+  const rows = actions.gestures?.length ? [...actions.gestures] : [...GESTURE_FALLBACK];
+  const have = new Set(rows.map((r) => r.key));
+  for (const t of tables) {
+    for (const key of Object.keys(t).sort()) {
+      if (isGestureKey(key) && !have.has(key)) { have.add(key); rows.push({ key, label: keyLabel(key), help: HELP[key] ?? "", group: "other" }); }
+    }
+  }
+  return rows;
+}
+
+function GestureGrid({ rows, actions, table }: { rows: GestureRow[]; actions: ActionsMeta; table?: Table }) {
+  const groups = [...GESTURE_GROUPS, { id: "other", title: "Other gestures", hint: "keys from a newer build" }];
   return (
-    <Card title="Touch gestures — while chording" hint="Two-finger touchpad gestures, active while the chord button is held.">
-      <div className="grid gap-3 pt-2 sm:grid-cols-2 xl:grid-cols-3">
-        {actions.gesture_keys.map((k) => <BindingCard key={k} chordKey={k} actions={actions} help={HELP[k]} />)}
-      </div>
-      {!same && (
-        <button type="button" onClick={() => setTab("chords")}
-                className="mt-3 flex items-center gap-1.5 text-[12.5px] text-ink-2 hover:text-cross">
-          Remote mode has its own gesture bindings — edit them under Chords <ArrowRight size={13} />
-        </button>
-      )}
-    </Card>
+    <div className="grid gap-4 pb-2 pt-1">
+      {groups.map((g) => {
+        const items = rows.filter((r) => (GESTURE_GROUPS.some((x) => x.id === r.group) ? r.group : "other") === g.id);
+        if (!items.length) return null;
+        return (
+          <div key={g.id}>
+            <div className="mb-2 flex items-center gap-2">
+              <span className="eyebrow text-cyan">{g.title}</span>
+              <span className="text-[11px] text-ink-3">{g.hint}</span>
+              <span className="h-px flex-1 bg-line" />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              {items.map((r) => <BindingCard key={r.key} chordKey={r.key} actions={actions} table={table}
+                                             label={r.label || keyLabel(r.key)} help={r.help || HELP[r.key]} />)}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function GesturesSection({ actions }: { actions: ActionsMeta }) {
+  const cfg = useCfg();
+  const inp = asObj(cfg.input);
+  const same = useSameGestures();
+  const color = useRemoteColor();
+  const table = useRemoteTable(actions);
+  const rows = gestureRows(actions, asObj(inp.chords), asObj(asObj(inp.remote).chords));
+  return (
+    <div className="grid gap-4">
+      <Card title="Touch gestures — while chording"
+            hint="Two-finger touchpad gestures, active while the chord button is held. Saved in input.chords.">
+        <GestureGrid rows={rows} actions={actions} />
+      </Card>
+      <Card title="Remote mode gestures"
+            hint="What the same gestures do while the pad is in remote mode. Saved as input.remote.same_gestures and input.remote.chords.">
+        <Row label="Remote mode uses the same gestures" keyName="remote.same_gestures" help={HELP.same_gestures}>
+          <Toggle path={["input", "remote", "same_gestures"]} dflt />
+        </Row>
+        <RemoteTable open={!same} id="remote-gestures" intro={<>
+          <b style={{ color }}>Gestures in remote mode need no chord button.</b> A two-finger slide, swipe, tap or pinch
+          fires its action <b className="text-ink">directly</b> while the pad drives the OS. The one-finger pointer, tap-to-click
+          and the stick / trigger scroll are what remote mode <i>is</i> and are not bindings. A row set
+          to <b className="text-ink">none</b> makes that gesture do nothing in remote mode.
+        </>}>
+          <GestureGrid rows={rows} actions={actions} table={table} />
+        </RemoteTable>
+      </Card>
+    </div>
   );
 }
 
@@ -220,6 +306,7 @@ export function RemoteSection() {
   // desktop translation is a real, observed confusion.
   const [warn, setWarn] = useState(false);
   const same = useSameBindings();
+  const sameGestures = useSameGestures();
   const setTab = useStore((s) => s.setSettingsTab);
   return (
     <Card title="Remote mode">
@@ -251,6 +338,12 @@ export function RemoteSection() {
           {same ? "Bindings" : "Remote bindings"} <ArrowRight size={13} />
         </button>
         <Toggle path={["input", "remote", "same_bindings"]} dflt />
+      </Row>
+      <Row label="Remote mode uses the same gestures" keyName="remote.same_gestures" help={HELP.same_gestures}>
+        <button type="button" className="btn !px-3 !py-1 !text-[12px]" onClick={() => setTab("gestures")}>
+          {sameGestures ? "Gestures" : "Remote gestures"} <ArrowRight size={13} />
+        </button>
+        <Toggle path={["input", "remote", "same_gestures"]} dflt />
       </Row>
       <GenericRows path={["input", "remote"]} obj={asObj(inp.remote)} known={KNOWN_REMOTE} />
     </Card>
