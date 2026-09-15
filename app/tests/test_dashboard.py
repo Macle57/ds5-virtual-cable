@@ -259,6 +259,21 @@ class DashboardCase(unittest.TestCase):
         self.assertIn("volume_up", names)
         self.assertNotIn("pad_power_off", names)        # engine-special, the
         # page adds it (and "(none)") itself -- it is not an OS action.
+        # ... except show_battery, which the page lists as an ordinary pick
+        # (v1 dashboard interface note), so it is served in both lists.
+        self.assertIn("show_battery", names)
+        self.assertIn("show_battery", [e["name"] for e in doc["engine_actions"]])
+        # the v1 gesture rows and the continuous actions
+        self.assertEqual([g["key"] for g in doc["gestures"]],
+                         list(K.CHORD_GESTURES))
+        for g in doc["gestures"]:
+            self.assertIn(g["group"], ("taps", "unpressed", "pressed"))
+        for name in ("scroll", "scroll_horizontal", "ctrl_zoom", "pinch_zoom"):
+            self.assertIn(name, names)
+        for key in ("touch_click_2f", "touch_tap_2f", "touch_slide_vertical",
+                    "touch_pinch", "touch_pinch_pressed",
+                    "touch_slide_horizontal_pressed"):
+            self.assertIn(key, doc["defaults"]["remote_chords"], key)
         self.assertEqual(doc["chord_buttons"], list(K.CHORD_BUTTONS))
         self.assertEqual(doc["chord_keys"], list(K.CHORD_BUTTONS))
         self.assertEqual(doc["gesture_keys"], list(K.CHORD_GESTURES))
