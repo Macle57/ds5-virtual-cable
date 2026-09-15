@@ -764,5 +764,28 @@ class TestDownloadResume(unittest.TestCase):
             self.assertEqual(self.requests, [])
 
 
+@unittest.skipUnless(sys.platform == "win32", "powershell.exe")
+class TestHelperSpawn(unittest.TestCase):
+    """The helper must actually RUN when started the way `spawn_installer`
+    starts it. A real powershell.exe, because the 2026-09-15 failure (a
+    DETACHED_PROCESS powershell that exits 0 without running the script)
+    is invisible to anything that fakes Popen."""
+
+    def test_a_script_started_with_the_helper_flags_runs(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            script = os.path.join(d, "probe.ps1")
+            marker = os.path.join(d, "ran.txt")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write(f'Set-Content -Path "{marker}" -Value ok\r\n')
+            p = U.spawn_detached(["powershell.exe", "-NoProfile",
+                                  "-ExecutionPolicy", "Bypass", "-File", script])
+            p.wait(60)
+            self.assertTrue(os.path.exists(marker),
+                            "powershell.exe exited without running the script")
+            self.assertFalse(U.helper_creation_flags()
+                             & subprocess.DETACHED_PROCESS)
+
+
 if __name__ == "__main__":
     unittest.main()

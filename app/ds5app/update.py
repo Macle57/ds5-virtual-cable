@@ -1067,30 +1067,49 @@ def helper_command(helper: str, root: str, setup_exe: str, version: str,
     return cmd
 
 
+def helper_creation_flags() -> int:
+    """The `creationflags` the helper is started with -- and why NOT
+    DETACHED_PROCESS, which is what this used to be.
+
+    Measured 2026-09-15, the first real automatic update: with
+    DETACHED_PROCESS set, `powershell.exe -File apply-update.ps1` exits 0
+    at once without running a line of the script (Windows PowerShell wants a
+    console; a detached process has none and it gives up silently). The tray
+    had already exited "so the helper can run", the service supervisor read
+    that as a quit and stopped, and the machine sat with a verified installer
+    on disk and nothing bridging. CREATE_NO_WINDOW gives the helper its own
+    console that is never shown, which is what "detached" was meant to buy:
+    the helper outlives the tray (no job object ties them) and no window
+    flashes. CREATE_NEW_PROCESS_GROUP keeps a Ctrl+C aimed at the tray's
+    console from reaching it. Tested in test_update.py with a real
+    powershell.exe, because this is exactly the kind of thing a mock hides.
+    """
+    if os.name != "nt":
+        return 0
+    return subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+
+
+def spawn_detached(cmd: list[str]) -> "subprocess.Popen":
+    """Start `cmd` so that it survives this process and shows no window."""
+    return subprocess.Popen(
+        cmd, creationflags=helper_creation_flags(),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, close_fds=True)
+
+
 def spawn_installer(root: str, setup_exe: str, version: str,
                     service: str | None = None) -> None:
-    """Start the helper detached, then it is the caller's job to exit.
+    """Start the helper, then it is the caller's job to exit.
 
     `service`: the Windows service this tray is the child of, which the
     helper stops before installing and restarts if the install is refused.
 
-    DETACHED_PROCESS + CREATE_NO_WINDOW so the helper survives this process
-    (it must -- it is waiting for this process to die) and never flashes a
-    console at the user. `-ExecutionPolicy Bypass` because the helper is a
-    local unsigned script and the machine's policy is whatever it is. The
-    helper inherits this process's token, which is the elevated one, so the
-    installer it starts shows no UAC prompt.
+    `-ExecutionPolicy Bypass` because the helper is a local unsigned script
+    and the machine's policy is whatever it is. The helper inherits this
+    process's token, which is the elevated one, so the installer it starts
+    shows no UAC prompt. See `helper_creation_flags` for how it is started.
     """
     helper = write_helper(root)
-    flags = 0
-    if os.name == "nt":
-        flags = (subprocess.DETACHED_PROCESS
-                 | subprocess.CREATE_NO_WINDOW
-                 | subprocess.CREATE_NEW_PROCESS_GROUP)
-    subprocess.Popen(
-        helper_command(helper, root, setup_exe, version, os.getpid(), service),
-        creationflags=flags,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True)
+    spawn_detached(helper_command(helper, root, setup_exe, version,
+                                  os.getpid(), service))
     log.info("update helper started; exiting so it can run %s", setup_exe)

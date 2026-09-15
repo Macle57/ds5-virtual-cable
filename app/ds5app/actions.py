@@ -337,23 +337,25 @@ def run_powershell(script: str, timeout: float = 10.0) -> bool:
         return False
 
 
-_DETACHED_PROCESS = 0x00000008 if sys.platform == "win32" else 0
 _CREATE_NEW_PROCESS_GROUP = 0x00000200 if sys.platform == "win32" else 0
 
 
 def launch_command(cmd: str) -> bool:
     """Start a program the way the Run box would, and forget about it.
 
-    Used only by user macros of the `run` kind. The child is detached (its
-    own process group, no console inherited from a windowless tray) and its
-    handles point at NUL, so a chatty command can neither block the engine's
-    dispatch thread nor outlive it as a zombie. True when it started.
+    Used only by user macros of the `run` kind. The child gets its own
+    hidden console (CREATE_NO_WINDOW, its own process group) and its handles
+    point at NUL, so a chatty command can neither block the engine's dispatch
+    thread nor outlive it as a zombie. True when it started. Not
+    DETACHED_PROCESS: a console program started that way (cmd.exe here,
+    powershell.exe in update.py, where it was measured on 2026-09-15) can
+    exit at once without doing anything, because it has no console at all.
     """
     try:
         subprocess.Popen(cmd, shell=True, close_fds=True,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL,
-                         creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP)
+                         creationflags=_CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP)
         return True
     except Exception as e:  # noqa: BLE001
         log.warning("macro command did not start (%s): %s", cmd[:80], e)
