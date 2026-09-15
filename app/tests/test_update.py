@@ -285,8 +285,9 @@ class TestCheckNow(unittest.TestCase):
 
 
 class _Cfg:
-    def __init__(self, update_check):
+    def __init__(self, update_check, update_auto_install=True):
         self.update_check = update_check
+        self.update_auto_install = update_auto_install
 
 
 class TestTrayHelpers(unittest.TestCase):
@@ -516,6 +517,97 @@ class TestInstallerHandOff(unittest.TestCase):
             self.assertIn("ds5bridge-tray.exe", text)
             # And nothing of the old zip swap remains.
             self.assertNotIn("Move-Item", text)
+            # Under the service: stop it first, start it again on a refusal.
+            self.assertIn("[string]$Service", text)
+            self.assertIn("sc.exe stop $Service", text)
+            self.assertIn("sc.exe start $Service", text)
+
+    def test_helper_command_names_the_service_only_when_there_is_one(self):
+        root = r"C:\u\ds5bridge"
+        plain = U.helper_command("h.ps1", root, "s.exe", "1.0.0", 42)
+        self.assertNotIn("-Service", plain)
+        self.assertEqual(plain[plain.index("-WaitPid") + 1], "42")
+        svc = U.helper_command("h.ps1", root, "s.exe", "1.0.0", 42, service="ds5bridge")
+        self.assertEqual(svc[svc.index("-Service") + 1], "ds5bridge")
+        self.assertEqual(svc[:-2], plain)
+
+    def test_service_name_comes_from_the_child_flag(self):
+        argv = sys.argv
+        try:
+            sys.argv = ["ds5bridge-tray.exe", "tray", "--service-child"]
+            self.assertEqual(U.service_name_if_child(), "ds5bridge")
+            sys.argv = ["ds5bridge-tray.exe", "tray"]
+            self.assertIsNone(U.service_name_if_child())
+        finally:
+            sys.argv = argv
+
+
+class TestAutoInstall(unittest.TestCase):
+    """`update_auto_install`: the decision, the act, and once per version."""
+
+    def info(self):
+        return U.evaluate_release(release("v0.5.0"), "0.4.0")
+
+    def test_off_by_config(self):
+        up = U.Updater(current_version="0.4.0", auto_install=False,
+                       install_fn=lambda: None)
+        self.assertFalse(up.should_auto_install(self.info()))
+
+    def test_nothing_to_install_or_nothing_to_call(self):
+        up = U.Updater(current_version="0.4.0", auto_install=True,
+                       install_fn=lambda: None)
+        self.assertFalse(up.should_auto_install(None))
+        self.assertFalse(U.Updater(current_version="0.4.0", auto_install=True)
+                         .should_auto_install(self.info()))
+
+    def test_installs_once_per_version(self):
+        calls = []
+        up = U.Updater(current_version="0.4.0", auto_install=True,
+                       install_fn=lambda: calls.append(1))
+        info = self.info()
+        self.assertTrue(up.should_auto_install(info))
+        self.assertTrue(up.run_auto_install(info))
+        self.assertEqual(calls, [1])
+        # The daily check finds the same version again: no second attempt.
+        self.assertFalse(up.should_auto_install(info))
+        self.assertFalse(up.run_auto_install(info))
+        self.assertEqual(calls, [1])
+
+    def test_an_install_already_under_way_is_not_started_twice(self):
+        up = U.Updater(current_version="0.4.0", auto_install=True,
+                       install_fn=lambda: None)
+        up.installing = True
+        self.assertFalse(up.should_auto_install(self.info()))
+
+    def test_a_failing_install_is_reported_and_not_retried(self):
+        seen = []
+
+        def boom():
+            raise RuntimeError("no disk")
+        up = U.Updater(current_version="0.4.0", auto_install=True, install_fn=boom,
+                       notify=lambda t, b: seen.append((t, b)))
+        self.assertFalse(up.run_auto_install(self.info()))
+        self.assertEqual(seen[0][0], "Update failed")
+        self.assertFalse(up.should_auto_install(self.info()))
+
+    def test_start_if_enabled_wires_the_config_and_the_callable(self):
+        up = U.start_if_enabled(_Cfg(True, True), install_fn=lambda: None)
+        try:
+            self.assertTrue(up.auto_install)
+        finally:
+            up.stop()
+        up = U.start_if_enabled(_Cfg(True, False), install_fn=lambda: None)
+        try:
+            self.assertFalse(up.auto_install)
+        finally:
+            up.stop()
+        # No callable: nothing automatic, whatever the config says.
+        up = U.start_if_enabled(_Cfg(True, True))
+        try:
+            self.assertFalse(up.auto_install)
+        finally:
+            up.stop()
+        self.assertEqual(up.auto_delay_s, U.AUTO_INSTALL_DELAY_S)
 
 
 if __name__ == "__main__":

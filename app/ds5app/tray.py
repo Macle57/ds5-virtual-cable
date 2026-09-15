@@ -1591,13 +1591,18 @@ def _service_already_running(args) -> bool:
             "service first (right-click the icon > Quit, or "
             "`ds5bridge.exe service stop`).")
     print("  " + text.replace("\n\n", " "), flush=True)
+    _message_box(text, "ds5bridge")
+    return True
+
+
+def _message_box(text: str, title: str) -> None:
+    """A modal information box -- module-level so tests can replace it."""
     try:
         import ctypes
 
-        ctypes.windll.user32.MessageBoxW(None, text, "ds5bridge", 0x40)
+        ctypes.windll.user32.MessageBoxW(None, text, title, 0x40)
     except Exception:  # noqa: BLE001
         pass
-    return True
 
 
 def run_tray(args) -> int:

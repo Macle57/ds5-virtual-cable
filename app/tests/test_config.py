@@ -624,5 +624,21 @@ class AutostartReadTests(unittest.TestCase):
             AUTO.enable()
 
 
+
+class UpdateAutoInstallTests(unittest.TestCase):
+    """`update_auto_install` (the SERVICE agent's key): on by default,
+    round-trips, tolerates a hand-edited value."""
+
+    def test_default_and_round_trip(self):
+        self.assertTrue(CFG.Config().update_auto_install)
+        cfg = CFG.Config.from_dict({"update_auto_install": False})
+        self.assertFalse(cfg.update_auto_install)
+        self.assertFalse(CFG.Config.from_dict(cfg.to_dict()).update_auto_install)
+        self.assertIn("update_auto_install", CFG.Config().to_dict())
+
+    def test_garbage_is_the_default(self):
+        self.assertTrue(CFG.Config.from_dict({"update_auto_install": "maybe"}).update_auto_install)
+
+
 if __name__ == "__main__":
     unittest.main()

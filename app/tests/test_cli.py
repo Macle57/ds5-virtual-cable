@@ -126,5 +126,87 @@ class HardenStreams(unittest.TestCase):
         self.assertIs(sys.stderr, real)
 
 
+
+class ServiceVerbTests(unittest.TestCase):
+    """`ds5bridge service <action>` reaches winsvc with the right call; the
+    module's own functions are replaced so no SCM is touched."""
+
+    def setUp(self):
+        from ds5app import winsvc as W
+
+        self.W = W
+        self.calls = []
+        self.saved = {n: getattr(W, n) for n in
+                      ("install", "uninstall", "start", "stop", "query",
+                       "migrate_user_config", "run_service", "bin_path")}
+        W.install = lambda exe=None, start_at_boot=True: self.calls.append(
+            ("install", exe, start_at_boot))
+        W.uninstall = lambda: self.calls.append(("uninstall",))
+        W.start = lambda wait_s=30.0: self.calls.append(("start",))
+        W.stop = lambda wait_s=75.0: self.calls.append(("stop",))
+        W.query = lambda name="ds5bridge": {"state": "RUNNING", "start": "AUTO_START",
+                                            "binpath": '"x" service'}
+        W.migrate_user_config = lambda src=None, dst=None: self.calls.append(
+            ("migrate", src)) or []
+        W.run_service = lambda: self.calls.append(("run",)) or 0
+        W.bin_path = lambda exe=None: '"x" service'
+        # A failing verb pauses for Enter when the process owns its console
+        # (a double-clicked exe); a test runner must never wait on stdin.
+        self._owns = C._owns_console
+        C._owns_console = lambda: False
+
+    def tearDown(self):
+        for n, f in self.saved.items():
+            setattr(self.W, n, f)
+        C._owns_console = self._owns
+
+    def run_cli(self, argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = C.main(argv)
+        return code, out.getvalue()
+
+    def test_bare_service_is_the_scm_entry(self):
+        code, _ = self.run_cli(["service"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls, [("run",)])
+
+    def test_install_registers_and_migrates(self):
+        code, out = self.run_cli(["service", "install"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls, [("install", None, True), ("migrate", None)])
+        self.assertIn("registered", out)
+
+    def test_install_options(self):
+        self.run_cli(["service", "install", "--manual", "--no-migrate",
+                      "--exe", r"C:\x\ds5bridge.exe", "--start"])
+        self.assertEqual(self.calls, [("install", r"C:\x\ds5bridge.exe", False),
+                                      ("start",)])
+
+    def test_the_other_verbs(self):
+        for verb in ("uninstall", "start", "stop"):
+            self.calls.clear()
+            self.assertEqual(self.run_cli(["service", verb])[0], 0)
+            self.assertEqual(self.calls, [(verb,)])
+
+    def test_status_prints_the_state(self):
+        code, out = self.run_cli(["service", "status"])
+        self.assertEqual(code, 0)
+        self.assertIn("running", out)
+
+    def test_a_service_error_is_a_fail_line_not_a_traceback(self):
+        def refuse(exe=None, start_at_boot=True):
+            raise self.W.ServiceError("needs an administrator")
+        self.W.install = refuse
+        code, out = self.run_cli(["service", "install"])
+        self.assertEqual(code, 1)
+        self.assertIn("[FAIL] needs an administrator", out)
+
+    def test_the_tray_accepts_the_service_child_flag(self):
+        args = C.build_parser().parse_args(["tray", "--service-child"])
+        self.assertTrue(args.service_child)
+        self.assertFalse(C.build_parser().parse_args(["tray"]).service_child)
+
+
 if __name__ == "__main__":
     unittest.main()

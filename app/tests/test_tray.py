@@ -1187,5 +1187,70 @@ class LowBatteryToastTests(unittest.TestCase):
         self.assertEqual(app.notes, [])
 
 
+
+class ServiceChildTests(unittest.TestCase):
+    """The tray under the Windows service: what Quit means, and the exit code
+    the supervisor reads."""
+
+    def app(self, service_child):
+        app = app_with([controller(A, enabled=True)])
+        app.service_child = service_child
+        app._shutdown_icon = lambda: None
+        return app
+
+    def test_quit_label_says_what_it_does(self):
+        self.assertEqual(self.app(True)._quit_label(), "Quit (stops the ds5bridge service)")
+        self.assertEqual(self.app(False)._quit_label(), "Quit")
+
+    def test_the_menu_quit_stops_the_service(self):
+        app = self.app(True)
+        app._quit()
+        settle()
+        self.assertEqual(app._exit_code, T.W.EXIT_STOP_SERVICE)
+        self.assertIn(("close",), app.mgr.calls)
+
+    def test_a_stop_from_the_service_exits_zero(self):
+        app = self.app(True)
+        app._quit_for_service()
+        settle()
+        self.assertEqual(app._exit_code, 0)
+        self.assertIn(("close",), app.mgr.calls)
+
+    def test_a_standalone_tray_never_uses_the_service_code(self):
+        app = self.app(False)
+        app._quit()
+        settle()
+        self.assertEqual(app._exit_code, 0)
+
+    def test_a_close_message_is_a_quiet_quit(self):
+        app = self.app(True)
+        app.icon = _FakeIcon()
+        app._install_close_handler()
+        handler = app.icon._message_handlers[0x0010]
+        self.assertEqual(handler(0, 0), 0)
+        settle()
+        self.assertEqual(app._exit_code, 0)
+        self.assertIn(("close",), app.mgr.calls)
+
+    def test_a_second_tray_next_to_a_running_service_declines(self):
+        saved = T.W.is_running, T._message_box
+        boxes = []
+        try:
+            T.W.is_running = lambda: True
+            T._message_box = lambda text, title: boxes.append(title)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(T._service_already_running(
+                    types.SimpleNamespace(service_child=False)))
+            # The service's own child, of course, is not a second instance.
+            self.assertFalse(T._service_already_running(
+                types.SimpleNamespace(service_child=True)))
+            T.W.is_running = lambda: False
+            self.assertFalse(T._service_already_running(
+                types.SimpleNamespace(service_child=False)))
+            self.assertEqual(boxes, ["ds5bridge"])
+        finally:
+            T.W.is_running, T._message_box = saved
+
+
 if __name__ == "__main__":
     unittest.main()
