@@ -160,6 +160,56 @@ class ClickVersusTap(EngineCase):
 
 
 @unittest.skipIf(A is None, "the app package is not importable here")
+class ChordGesturesInsideRemoteMode(EngineCase):
+    """Chords stay active in remote mode, and so do the chord-held gestures:
+    remote mode's per-frame release of what it holds must not end a contact
+    the chord context began (with `same_gestures` both use the same table
+    object, so the tracker tags the contact with its context)."""
+
+    def enter(self):
+        self.feed(report(buttons=("ps",)), report())
+        self.clock.advance(0.15)
+        self.feed(report(buttons=("ps",)), report())
+        self.batches.clear()
+
+    def test_a_pressed_slide_under_the_chord_in_remote_mode_holds_alt_tab(self):
+        self.make(remote={"enabled": True})
+        self.enter()
+        self.assertTrue(self.eng.remote_mode)
+        self.clock.advance(1.0)
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=PSC, touches=two(500)),
+                  report(buttons=PSC, touches=two(660)),
+                  report(buttons=PSC, touches=two(820)))
+        self.assertTrue(self.acts.alt_tab_open)
+        self.feed(report(buttons=("ps",)))                    # fingers off
+        self.assertFalse(self.acts.alt_tab_open)
+
+    def test_an_unpressed_scroll_under_the_chord_in_remote_mode(self):
+        self.make(remote={"enabled": True})
+        self.enter()
+        self.clock.advance(1.0)
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(900, 300)),
+                  report(buttons=("ps",), touches=two(900, 400)),
+                  report(buttons=("ps",), touches=two(900, 500)))
+        self.assertTrue([e for e in self.events if e[0] == "wheel"])
+        self.assertTrue(self.eng._tf_active)
+        self.assertEqual(self.eng._tf_context, "chord")
+        self.feed(report(buttons=("ps",)))
+        self.assertFalse(self.eng._tf_active)
+
+    def test_a_chord_press_still_ends_a_remote_contact(self):
+        self.make_remote()
+        self.enter()
+        self.feed(report(touches=two(900, 300)),
+                  report(touches=two(900, 400)))
+        self.assertEqual(self.eng._tf_context, "remote")
+        self.feed(report(buttons=("ps",), touches=two(900, 400)))
+        self.assertFalse(self.eng._tf_active)
+
+
+@unittest.skipIf(A is None, "the app package is not importable here")
 class PressedVersusUnpressed(EngineCase):
     def test_the_same_vertical_travel_scrolls_unpressed_and_swipes_pressed(self):
         self.make()

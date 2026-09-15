@@ -363,6 +363,11 @@ class InputInterceptor:
         #: "cont" = a continuous action (`_tf_cont`) is tracking the fingers.
         self._tf_active = False
         self._tf_table: dict = {}
+        #: "chord" or "remote": which context began the contact. A remote
+        #: contact ends when the chord button goes down; a chord contact is
+        #: left alone by remote mode's per-frame release (the two tables can
+        #: be the same object under `same_gestures`, so identity is no test).
+        self._tf_context = ""
         self._tf_at = 0.0
         self._tf_start: tuple[float, float] = (0.0, 0.0)
         self._tf_spread0 = 0.0
@@ -961,11 +966,11 @@ class InputInterceptor:
 
     def _chord_gestures(self, frame: _Frame, now: float, thunks: list) -> None:
         """Chord held: the 2-finger tracker over the chord table."""
-        if self._two_finger(frame, now, thunks, self.cfg.chords):
+        if self._two_finger(frame, now, thunks, self.cfg.chords, "chord"):
             self._chord_used = True
 
     def _two_finger(self, frame: _Frame, now: float, thunks: list,
-                    table: dict) -> bool:
+                    table: dict, context: str) -> bool:
         """Feed one frame to the tracker. -> True if a gesture fired or is
         tracking (the caller marks the chord used)."""
         fingers, c = self._centroid(frame)
@@ -982,6 +987,7 @@ class InputInterceptor:
             # 1-finger mousing can never pre-load a gesture.
             self._tf_active = True
             self._tf_table = table
+            self._tf_context = context
             self._tf_at = now
             self._tf_start = self._tf_last = c
             self._tf_spread0 = self._tf_spread_last = spread
@@ -1201,10 +1207,11 @@ class InputInterceptor:
         self._run_spec(name, spec, now, thunks)
         return True
 
-    def _end_gesture(self, thunks: list) -> None:
+    def _end_gesture(self, thunks: list, context: str | None = None) -> None:
         """The context ended under the fingers (chord released, a config
-        change, a mode switch): commit / end what is open, fire no tap."""
-        if self._tf_active:
+        change, a mode switch): commit / end what is open, fire no tap.
+        With `context`, only a contact that context began."""
+        if self._tf_active and context in (None, self._tf_context):
             self._tf_end(self.clock(), thunks, lifted=False)
 
     def _engine_action(self, name: str, now: float, thunks: list) -> None:
@@ -1303,7 +1310,7 @@ class InputInterceptor:
         # lifting the fingers would -- leaving Alt down (or two synthetic
         # touch contacts) across a mode change is the stuck-input failure
         # actions.py is built to avoid.
-        self._end_gesture(thunks)
+        self._end_gesture(thunks, context="remote")
         self._rm_touch_fingers = 0
         self._rm_touch_max_fingers = 0
 
@@ -1432,7 +1439,7 @@ class InputInterceptor:
                                        a.mouse_button("left", False)))
             self._rm_touch_max_fingers = 0
         self._rm_touch_fingers = fingers
-        self._two_finger(frame, now, thunks, self._remote_gestures)
+        self._two_finger(frame, now, thunks, self._remote_gestures, "remote")
 
         # -- sticks and triggers ----------------------------------------------
         self._stick_rates(frame, now, thunks, triggers=True)
