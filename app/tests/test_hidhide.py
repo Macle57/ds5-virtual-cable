@@ -1426,6 +1426,7 @@ class TestDoctorRows(_Temp):
         cfg.set_hide_bluetooth(SERIAL, True)
         with mock.patch.object(HH.HidHide, "detect", return_value=make()), \
                 mock.patch.object(HH, "bt_parent_for_serial", lambda s: PARENT), \
+                mock.patch.object(HH, "bt_connected", lambda s: None), \
                 mock.patch.object(HH, "devnode_present", lambda i: True):
             out, problems = self.render(cfg, visible=False)
         self.assertIn("cannot be enumerated", out)
@@ -1439,7 +1440,8 @@ class TestDoctorRows(_Temp):
         cfg.set_hide_bluetooth(SERIAL, True)
         with mock.patch.object(HH.HidHide, "detect", return_value=make()), \
                 mock.patch.object(HH, "bt_parent_for_serial", lambda s: PARENT), \
-                mock.patch.object(HH, "devnode_present", lambda i: False):
+                mock.patch.object(HH, "bt_connected", lambda s: False), \
+                mock.patch.object(HH, "devnode_present", lambda i: True):
             out, problems = self.render(cfg, visible=False)
         self.assertNotIn("cannot be enumerated", out)
         self.assertEqual(problems, 0)
@@ -1720,7 +1722,8 @@ class TestRevive(unittest.TestCase):
         for name, fn in (("pad_visible", pad_visible),
                          ("_reenumerate", _reenumerate),
                          ("_pnputil_restart", _pnputil_restart),
-                         ("devnode_present", lambda i: connected),
+                         ("bt_connected", lambda s: connected),
+                         ("devnode_present", lambda i: True),
                          ("is_elevated", lambda: elevated),
                          ("bt_parent_for_serial", lambda s: parent)):
             p = mock.patch.object(HH, name, fn)
@@ -1848,6 +1851,50 @@ class TestRevive(unittest.TestCase):
         with mock.patch.object(HH, "pad_visible", boom):
             self.assertEqual(HH.revive_serial(SERIAL, settle=0.0)["action"],
                              "none")
+
+    def test_a_pad_that_is_off_is_never_restarted_even_though_its_node_is_present(self):
+        """The 2026-09-16 uninstaller hang, in one test.
+
+        On this machine a paired pad's BTHENUM nodes stay present whether it
+        is on or off, so "node present" said "connected" for a pad in a
+        drawer; `unhide` then re-enumerated and restarted that node, the
+        process sat in the kernel for minutes, and the uninstaller waited on
+        it. The Bluetooth stack's own `fConnected` is the witness now, and a
+        pad it calls disconnected is left completely alone.
+        """
+        self._patch(visible=[False], connected=False, elevated=True)
+        r = HH.revive_serial(SERIAL, settle=0.0)
+        self.assertEqual(r["action"], "disconnected")
+        self.assertEqual(self.seen["reenum"], [])
+        self.assertEqual(self.seen["pnputil"], [])
+
+    def test_without_a_bluetooth_answer_the_devnode_decides(self):
+        """No pairing record / not Windows: the older witness still applies."""
+        self._patch(visible=[False, False, False, True], connected=None)
+        with mock.patch.object(HH, "devnode_present", lambda i: False):
+            self.assertEqual(HH.revive_serial(SERIAL, settle=0.0)["action"],
+                             "disconnected")
+        with mock.patch.object(HH, "devnode_present", lambda i: True):
+            r = HH.revive_serial(SERIAL, settle=0.0)
+        self.assertEqual(r["action"], "reenumerate")
+        self.assertTrue(r["visible"])
+
+
+class TestBtConnected(unittest.TestCase):
+    def test_garbage_is_no_answer(self):
+        self.assertIsNone(HH.bt_connected(""))
+        self.assertIsNone(HH.bt_connected("not-a-bdaddr"))
+        self.assertIsNone(HH.bt_connected("d42f4ba148"))     # 10 hex digits
+
+    def test_pad_connected_prefers_the_bluetooth_stack(self):
+        with mock.patch.object(HH, "bt_connected", lambda s: False),                 mock.patch.object(HH, "devnode_present", lambda i: True):
+            self.assertFalse(HH.pad_connected(SERIAL, PARENT))
+        with mock.patch.object(HH, "bt_connected", lambda s: True),                 mock.patch.object(HH, "devnode_present", lambda i: False):
+            self.assertTrue(HH.pad_connected(SERIAL, PARENT))
+        with mock.patch.object(HH, "bt_connected", lambda s: None),                 mock.patch.object(HH, "devnode_present", lambda i: True):
+            self.assertTrue(HH.pad_connected(SERIAL, PARENT))
+        with mock.patch.object(HH, "bt_connected", lambda s: None),                 mock.patch.object(HH, "bt_parent_for_serial", lambda s: ""):
+            self.assertFalse(HH.pad_connected(SERIAL))
 
 
 class TestParentMatching(unittest.TestCase):

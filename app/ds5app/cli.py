@@ -511,7 +511,7 @@ def _doctor_visibility(HH, cfg) -> int:
         if HH.pad_visible(serial) is not False:
             continue                       # visible, or hidapi cannot say
         parent = HH.bt_parent_for_serial(serial)
-        if parent and HH.devnode_present(parent):
+        if parent and HH.pad_connected(serial, parent):
             stuck.append(serial)
     if not stuck:
         return 0
@@ -930,13 +930,25 @@ def _owns_console() -> bool:
 
         buf = (ctypes.c_uint * 8)()
         n = ctypes.windll.kernel32.GetConsoleProcessList(buf, 8)
-        return n == 1
+        if n != 1:
+            return False
+        # Alone on a console nobody can see (CREATE_NO_WINDOW: the installer's
+        # helper, the service, a scheduled task) is not "double-clicked": there
+        # is no window to keep open, and a pause here waits for a keypress
+        # that never comes -- 2026-09-16, the uninstaller's `unhide` step.
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        return bool(hwnd) and bool(ctypes.windll.user32.IsWindowVisible(hwnd))
     except Exception:  # noqa: BLE001
         return False
 
 
 def _pause_if_double_clicked() -> None:
     if not _owns_console():
+        return
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return
+    except Exception:  # noqa: BLE001
         return
     try:
         input("\nPress Enter to close this window ...")

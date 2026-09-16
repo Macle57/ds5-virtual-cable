@@ -210,10 +210,18 @@ even without `/NORESTART` — and reports the same facts as `[reboot]` lines in
 Before anything is deleted the uninstaller stops the service (its tray tears
 down on the way out) or the tray, removes the service and the start-at-login
 task (and a pre-0.5.0 Run value) and the dashboard shortcuts, runs
-`ds5bridge cleanup` and `ds5bridge unhide` (for the user's settings and the
-service's), stops usbip's auto-re-attach (`usbip attach -X`) and
-detaches every attached device, and removes ds5bridge's own entries from
-HidHide's whitelist and hide list. When HidHide
+`ds5bridge cleanup` for the user's settings and the service's, and
+`ds5bridge unhide` for whichever of the two still holds a hide record (with
+none there is nothing owed, and the verb's optional rescue work -- reading
+HidHide's lists, restarting the device node of a pad left invisible -- is
+skipped: on one machine it sat inside a driver call for minutes and could not
+be interrupted, and an uninstall must not wait on it), stops usbip's
+auto-re-attach (`usbip attach -X`) and detaches every attached device, and
+removes ds5bridge's own entries from HidHide's whitelist and hide list. Every
+line the helper reports is shown on the progress form as it happens, so a
+slow step (a device restart, a vendor uninstaller) is seen to be moving. The
+result dialog names any known controller that has no HID device at that
+moment and the fix when it is switched on: power-cycle it. When HidHide
 itself is being removed, its whole hide list is cleared and the cloak turned
 off first, so no device can be left invisible. Then the vendors' own
 uninstallers run silently, HidHide first

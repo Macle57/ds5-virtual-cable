@@ -943,3 +943,96 @@ after sign-in ("ds5bridge -- 2 of 2 bridged", both pads listed): pystray's
 The updater found nothing newer (1.0.1 is latest). Seen: every tray.log line
 is written twice under the service child (two handlers on the same logger) --
 cosmetic, not fixed here.
+
+## 2026-09-16 00:41-02:00 -- "the uninstaller is stuck" (coordinator)
+
+What the user saw: the 1.0.1 uninstaller (interactive, from Settings > Apps,
+service mode, tray quit at 00:27, pad "cameo" a0fa switched off, pad "blue"
+d42f on) sat at "Stopping ds5bridge and detaching the virtual controller ..."
+with the bar not moving; they ended it and tried again, three times
+(00:41:44, 00:45:40, 00:46:32 -- the third while the second was still
+running).
+
+What the leftovers proved (`%TEMP%\is-*.tmp\helper-teardown.txt`, one per
+run, written 00:43:46 / 00:47:42 / 00:48:42; `service.log`, `tray.log`):
+
+* every run's teardown took **2 min 02 s**, of which `ds5bridge unhide`
+  (once per settings directory) was **60 s + 60 s, both timed out** by the
+  helper's `Run` (`exit -2: timed out after 60s`); the helper then finished
+  its verb and wrote the file -- after the user had already killed the
+  uninstaller (no `helper-service-uninstall.txt` in any run, and Inno's
+  `{tmp}` directories survive only a killed run);
+* the two killed `ds5bridge.exe unhide` processes of run 1 were **still
+  alive at 00:45:40** ("stopped (2 process(es))" in run 2's teardown): a
+  process inside a kernel call dies only when that call returns;
+* the journal was empty both times (`Nothing is hidden by ds5bridge`), so
+  the verb was on its no-record path: `_report_foreign_entries` (HidHide
+  list reads) and `_revive_known` -> `revive_serial` for **every controller
+  in config.json**, whose "is it connected" test was `devnode_present(BTHENUM
+  parent)` -- true for a paired pad that is OFF on this machine (measured
+  2026-09-15, `hid_child_present` docstring), so the off pad got a synchronous
+  `CM_Reenumerate_DevNode` and an elevated `pnputil /restart-device` too.
+
+Experiments (scratchpad `innopipe\`, `revive_timing.py`):
+
+* Inno `ExecAndLogOutput` returns as soon as the helper exits even when a
+  grandchild still holds the pipe, and the helper's children get EOF on
+  stdin -- neither is a hang source. Plain `Exec` (no pipes) DOES let a
+  console child sit on `input()` (6 s for a 5 s timeout in the test).
+* `HidHideCLI --dev-hide` on the connected pad's HID child **blocked inside
+  the kernel for 14 minutes** (thread wait reason `Executive`, no child
+  process, PnP queries from other processes answering in <1 s, every other
+  HidHide client getting `Access is denied` meanwhile), then completed and
+  applied. A HidHide control-device call is the one thing on this machine
+  that has been seen to hold a process unkillably for minutes -- the same
+  shape as the user's `unhide` orphans (the verb reads HidHide's lists
+  through that device).
+* Silent and interactive uninstalls of the SAME 1.0.1 build at 01:28 and
+  01:41 (pads in the same on/off state) finished in 18 s and 20 s: whatever
+  blocked at 00:41 was a transient driver-side state, not deterministic.
+* How it passed testing: every recorded uninstall test ran with the pads
+  on and just unhidden by the tray (journal empty, pads visible -> no
+  revive) or with no pads; the 2026-09-05 note "`ds5bridge.exe unhide`
+  timed out after 60 s during teardown ... INFO only" was this bug, seen
+  once and not chased.
+
+Fixes (1.1.0):
+
+* `hidhide.bt_connected()` (bthprops `BluetoothGetDeviceInfo`, ~1 ms) and
+  `pad_connected()`: `revive_serial` and `doctor` now ask the Bluetooth
+  stack whether the link is up; a pad it calls disconnected is never
+  re-enumerated or restarted (test
+  `test_a_pad_that_is_off_is_never_restarted_even_though_its_node_is_present`).
+* `cli._owns_console`: no "Press Enter to close this window" pause on a
+  hidden console (CREATE_NO_WINDOW) or a non-tty stdin.
+* `setup-helper.ps1 Run`: stdin is a pipe closed at start; after a timeout
+  kill it waits 5 s and reports a process that is still running instead of
+  claiming it ended.
+* `Invoke-Teardown`: `ds5bridge unhide` only for a settings directory whose
+  journal holds a record; `Invoke-VerifyRemoved` names known controllers
+  with no HID device and the power-cycle fix.
+* `ds5bridge.iss RunHelper`: `ExecAndLogOutput` with an `OnLog` callback
+  (`HelperLine`) that logs every helper line (Inno does not log them itself
+  once a callback is given) and puts its label on the progress form
+  (`UninstallProgressForm` / `WizardForm` `StatusLabel`), so a slow step is
+  visible as such.
+
+Verification of the 1.1.0 build on this machine (2026-09-16):
+
+* Uninstall, interactive, "remove HidHide" + "remove usbip-win2" ticked,
+  settings kept (`scratchpad\repro\new-remove.log` + screenshots in the
+  session scratchpad): 37 s end to end, every step visible on the progress
+  form, `unhide` skipped ("no hide records; nothing owed"), HidHide MSI exit 0,
+  usbip stage A (exit 3, logon task scheduled), result dialog "All checks
+  passed" + "A RESTART IS REQUIRED", the pad that was off named with the
+  power-cycle hint. Its restart prompt rebooted the machine (02:01); stage B
+  ran from the logon task (devnode removed, vendor uninstaller exit 0).
+* Install, interactive, from `dist\ds5bridge-setup-1.1.0-bundled.exe` with
+  defaults: preflight refused ("driver services of a previous install are
+  marked for deletion"), the wizard's restart question was answered "restart
+  now" (10:27), RunOnce relaunched Setup after logon on its own (the
+  2026-09-06 restart-and-resume path, now proven), preflight PASS, usbip-win2
+  and HidHide installed from the bundle, HidHide filter attached to 2 pads
+  without a reboot, service registered and started, "Installation check" all
+  PASS, Finished (10:30). Service RUNNING, `tray.version` 1.1.0, `autostart`
+  service; the first pad switched on was bridged and hidden within a minute.

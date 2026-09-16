@@ -445,6 +445,35 @@ begin
   Log('summary: ' + Line);
 end;
 
+// Each helper output line as it happens: into the log, and its label onto
+// the progress form, so a step that takes a minute (a device restart, a
+// vendor uninstaller) is seen to be moving rather than stuck on the caption
+// its caller set before it started (2026-09-16: an uninstall that showed
+// "Stopping ds5bridge ..." for three minutes was ended by hand three times).
+procedure HelperLine(const S: String; const Error, FirstLine: Boolean);
+var
+  P: Integer;
+  Rest, Text: String;
+begin
+  Log('helper| ' + S);
+  P := Pos('|', S);
+  if P = 0 then Exit;
+  Rest := Copy(S, P + 1, Length(S));
+  P := Pos('|', Rest);
+  if P > 0 then
+    Text := Copy(Rest, 1, P - 1) + ': ' + Copy(Rest, P + 1, Length(Rest))
+  else
+    Text := Rest;
+  if Length(Text) > 120 then Text := Copy(Text, 1, 117) + '...';
+  try
+    if IsUninstaller then
+      UninstallProgressForm.StatusLabel.Caption := Text
+    else
+      WizardForm.StatusLabel.Caption := Text;
+  except
+  end;
+end;
+
 // Run one helper verb, fold its result lines into the summary. Returns the
 // helper's exit code (1 when it wrote a FAIL line).
 function RunHelper(const Verb, ExtraArgs: String): Integer;
@@ -464,9 +493,10 @@ begin
   Log('helper: powershell.exe ' + Args);
   RC := -1;
   try
-    // Its stdout goes to the setup log line by line as it happens.
+    // Its stdout goes to the setup log and the progress form line by line
+    // as it happens (HelperLine).
     if not ExecAndLogOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Args, '',
-                            SW_HIDE, ewWaitUntilTerminated, RC, nil) then
+                            SW_HIDE, ewWaitUntilTerminated, RC, @HelperLine) then
       RC := -1;
   except
     Log('helper: ' + GetExceptionMessage);

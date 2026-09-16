@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     The worker behind ds5bridge-setup.exe and its uninstaller.
 
@@ -261,10 +261,14 @@ function Run([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec = 120, [switch
     # exactly like a driver fault, and the report must still be written.
     # -NoKill: on timeout leave the process running (a vendor uninstaller
     # mid-way through a device removal must not be shot) and return -2.
+    # Stdin is a pipe closed at once: no child ever waits on a keyboard (a
+    # console tool's "press Enter to close" pause, a prompt) -- there is no
+    # keyboard here, and a child that waits for one waits out the timeout.
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
     $psi.Arguments = ($Arguments | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
     $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
@@ -273,11 +277,20 @@ function Run([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec = 120, [switch
     } catch {
         return @{ Code = -1; Out = "could not start: $_" }
     }
+    try { $p.StandardInput.Close() } catch { }
     $stdout = $p.StandardOutput.ReadToEndAsync()
     $stderr = $p.StandardError.ReadToEndAsync()
     if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-        if (-not $NoKill) { try { $p.Kill() } catch { } }
-        return @{ Code = -2; Out = "timed out after ${TimeoutSec}s"; Pid = $p.Id }
+        $note = "timed out after ${TimeoutSec}s"
+        if (-not $NoKill) {
+            try { $p.Kill() } catch { }
+            # A process inside a device call dies only when that call
+            # returns; say so, because "ended" would be a lie the summary
+            # reader acts on (2026-09-16: two such `unhide` runs outlived
+            # their kill by minutes).
+            if (-not $p.WaitForExit(5000)) { $note += "; ended, but still running (pid $($p.Id)) -- it is inside a device call and goes away when that returns" }
+        }
+        return @{ Code = -2; Out = $note; Pid = $p.Id }
     }
     $p.WaitForExit()
     return @{ Code = $p.ExitCode; Out = ($stdout.Result + $stderr.Result) }
@@ -879,6 +892,20 @@ function Invoke-Teardown {
             $where = if ($d) { " ($d)" } else { '' }
             $r = Invoke-AppVerb @('cleanup') $d 60
             Emit INFO "ds5bridge cleanup$where" ("exit {0}: {1}" -f $r.Code, ($r.Out -replace '\s+', ' ').Trim())
+            # `unhide` only when there is a hide debt to repay -- a record in
+            # this settings directory's journal. With none, the verb would
+            # only read HidHide's lists and try to revive every known pad:
+            # rescue work that on 2026-09-16 sat inside a driver call for
+            # minutes, could not be interrupted, and held three uninstalls at
+            # "Stopping ds5bridge ..." until the user gave up. The journal is
+            # cleared by hidhide-clear below in any case; a pad that is left
+            # not showing is named by verify-removed with the power-cycle fix.
+            $jd = if ($d) { Join-Path $d 'hidden' } else { $JournalDir }
+            $records = @(Get-ChildItem $jd -Filter '*.json' -ErrorAction SilentlyContinue)
+            if ($records.Count -eq 0) {
+                Emit INFO "ds5bridge unhide$where" 'no hide records; nothing owed'
+                continue
+            }
             $r = Invoke-AppVerb @('unhide') $d 60
             Emit INFO "ds5bridge unhide$where" ("exit {0}: {1}" -f $r.Code, ($r.Out -replace '\s+', ' ').Trim())
         }
@@ -1490,6 +1517,32 @@ function Invoke-VerifyRemoved {
     if ($pads.Count -eq 0) { Emit INFO 'Bluetooth DualSense' 'none connected right now' }
     elseif ($bad.Count -gt 0) { Emit WARN 'Bluetooth DualSense' ("{0} present, {1} not OK: {2}" -f $pads.Count, $bad.Count, (($bad | ForEach-Object { "$($_.InstanceId)=$($_.Status)" }) -join '; ')) }
     else { Emit PASS 'Bluetooth DualSense' "$($pads.Count) present and OK" }
+    # A known controller with no HID device is off -- or, after an unhide
+    # that HidHide did not apply, a phantom until it is power-cycled. The
+    # teardown no longer tries to repair that (it could not be interrupted
+    # when it hung); this says which pads it applies to and what fixes it.
+    $known = @()
+    foreach ($cfg in @((Join-Path $env:APPDATA 'ds5bridge\config.json'), (Join-Path $ServiceConfigDir 'config.json'))) {
+        try {
+            $j = Get-Content -Raw $cfg -ErrorAction Stop | ConvertFrom-Json
+            if ($j.controllers) { $known += @($j.controllers.PSObject.Properties.Name) }
+        } catch { }
+    }
+    $known = @($known | ForEach-Object { "$_".ToLower() } | Sort-Object -Unique)
+    if ($known.Count -gt 0) {
+        $withChild = @()
+        foreach ($k in @($pads | Where-Object { $_.InstanceId -like 'HID\*' })) {
+            try {
+                $par = (Get-PnpDeviceProperty -InstanceId $k.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop).Data
+                if ("$par" -match '([0-9A-Fa-f]{12})_C00000000') { $withChild += $Matches[1].ToLower() }
+            } catch { }
+        }
+        $missing = @($known | Where-Object { $withChild -notcontains $_ })
+        if ($missing.Count -gt 0) {
+            Emit INFO 'Bluetooth DualSense' ("no HID device right now for " + ($missing -join ', ') +
+                " -- normal for a controller that is switched off; if one is ON and does not work, switch it off (hold PS ~10 s) and on again")
+        }
+    }
     return $(if ($script:Fails -gt 0) { 1 } else { 0 })
 }
 

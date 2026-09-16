@@ -1540,6 +1540,75 @@ def _wait_visible(serial: str, settle: float) -> bool | None:
     return False
 
 
+def bt_connected(serial: str) -> bool | None:
+    """Is the radio link to this controller UP, as the Bluetooth stack sees it?
+
+    True/False from `BluetoothGetDeviceInfo` (bthprops.cpl) for a paired
+    address; None when it cannot say (not Windows, no such pairing, the call
+    failed). About a millisecond, and no PnP involved.
+
+    The witness `revive_serial` needed all along. A paired pad's BTHENUM nodes
+    stay PRESENT whether it is on or off (`devnode_present`, measured
+    2026-09-15), so presence could not tell a pad in a drawer from a connected
+    pad whose HID child has gone phantom. On 2026-09-16 that cost the
+    uninstaller: `ds5bridge unhide` re-enumerated and restarted the Bluetooth
+    node of a switched-OFF pad, the process sat in that call for minutes and
+    could not be killed, and the uninstaller waited on it. `fConnected` is the
+    link itself, which is the only thing that separates the two states.
+    """
+    if sys.platform != "win32":
+        return None
+    mac = _hex_only(serial)
+    if len(mac) != 12:
+        return None
+    try:
+        W = wintypes
+
+        class _SYSTEMTIME(ctypes.Structure):
+            _fields_ = [(n, W.WORD) for n in (
+                "wYear", "wMonth", "wDayOfWeek", "wDay", "wHour", "wMinute",
+                "wSecond", "wMilliseconds")]
+
+        class _BLUETOOTH_DEVICE_INFO(ctypes.Structure):
+            _fields_ = [("dwSize", W.DWORD), ("Address", ctypes.c_ulonglong),
+                        ("ulClassofDevice", W.ULONG), ("fConnected", W.BOOL),
+                        ("fRemembered", W.BOOL), ("fAuthenticated", W.BOOL),
+                        ("stLastSeen", _SYSTEMTIME), ("stLastUsed", _SYSTEMTIME),
+                        ("szName", W.WCHAR * 248)]
+
+        bt = ctypes.WinDLL("bthprops.cpl")
+        fn = bt.BluetoothGetDeviceInfo
+        fn.argtypes = [W.HANDLE, ctypes.POINTER(_BLUETOOTH_DEVICE_INFO)]
+        fn.restype = W.DWORD
+        info = _BLUETOOTH_DEVICE_INFO()
+        info.dwSize = ctypes.sizeof(info)
+        info.Address = int(mac, 16)
+        # A NULL radio handle asks every local radio (measured 2026-09-16:
+        # ERROR_SUCCESS with fConnected set for the pad that was on, clear
+        # for the one that was off, ERROR_NOT_FOUND for an unpaired address).
+        if fn(None, ctypes.byref(info)) != 0:
+            return None
+        return bool(info.fConnected)
+    except Exception:  # noqa: BLE001
+        log.debug("BluetoothGetDeviceInfo for %s failed", serial, exc_info=True)
+        return None
+
+
+def pad_connected(serial: str, parent_id: str = "") -> bool:
+    """Is this controller connected right now?
+
+    The Bluetooth stack's answer (`bt_connected`) when it has one; only when it
+    has none, whether the BTHENUM parent is present -- which on a machine that
+    keeps paired nodes present forever says "connected" for a pad that is off,
+    so it is the fallback and never the first word.
+    """
+    linked = bt_connected(serial)
+    if linked is not None:
+        return linked
+    parent = parent_id or bt_parent_for_serial(serial)
+    return bool(parent) and devnode_present(parent)
+
+
 def power_cycle_hint(serial: str) -> str:
     return (f"{serial} is unhidden but Windows still is not showing it. "
             f"Switch the controller OFF (hold the PS button for ~10 s) and on "
@@ -1595,12 +1664,15 @@ def revive_serial(serial: str, parent_id: str = "", log_fn=None,
 
         # IS THE CONTROLLER EVEN CONNECTED? A pad that is switched off is not
         # broken and cannot be repaired, and this is the difference between the
-        # two states (`devnode_present`). Silent on purpose: switching a
-        # controller off is the most ordinary thing a user does, it is how most
-        # of this program's teardowns begin, and being told to power-cycle it
-        # every single time would train them to ignore the one message that
-        # matters.
-        if not devnode_present(parent):
+        # two states (`pad_connected`: the Bluetooth link, not the BTHENUM
+        # node, which stays present for a pad that is off). Silent on purpose:
+        # switching a controller off is the most ordinary thing a user does,
+        # it is how most of this program's teardowns begin, and being told to
+        # power-cycle it every single time would train them to ignore the one
+        # message that matters. And never re-enumerate or restart the node of
+        # a pad that is off: that call sits in the kernel for minutes and the
+        # process cannot even be killed while it does (2026-09-16).
+        if not pad_connected(serial, parent):
             out["action"] = "disconnected"
             out["visible"] = False
             log.debug("%s is not connected over Bluetooth; nothing to revive",
