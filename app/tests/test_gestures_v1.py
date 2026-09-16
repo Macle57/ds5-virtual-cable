@@ -118,7 +118,8 @@ class ClickVersusTap(EngineCase):
 
     def test_a_tap_that_moved_is_not_a_tap(self):
         self.make(chords={"touch_tap_2f": "middle_click",
-                          "touch_slide_horizontal": "none"})
+                          "touch_slide_left": "none",
+                          "touch_slide_right": "none"})
         self.feed(report(buttons=("ps",)),
                   report(buttons=("ps",), touches=two(900)),
                   report(buttons=("ps",), touches=two(960)))
@@ -252,29 +253,138 @@ class PressedVersusUnpressed(EngineCase):
                   report(buttons=PSC, touches=two(900, 630)))
         self.assertIn(("key", A.VK_LWIN, True), self.events)
 
-    def test_the_compat_swipes_fire_only_while_the_vertical_slide_is_none(self):
-        self.make(chords={"touch_swipe_up": "task_view"})
+    def test_the_gesture_rows_of_older_builds_are_ignored(self):
+        # A 1.0 / 0.5 file's rows do not carry over: the directional rows
+        # keep their defaults (the unpressed slide scrolls), so every
+        # install has the documented gesture map.
+        self.make(chords={"touch_swipe_up": "task_view",
+                          "touch_slide_vertical": "none",
+                          "touch_slide_horizontal": "alt_tab"})
         self.feed(report(buttons=("ps",)),
                   report(buttons=("ps",), touches=two(900, 700)),
                   report(buttons=("ps",), touches=two(900, 450)),
                   report(buttons=("ps",)))
-        self.assertNotIn(("key", A.VK_LWIN, True), self.events)   # scrolled
+        self.assertNotIn(("key", A.VK_LWIN, True), self.events)
+        self.assertTrue([e for e in self.events if e[0] == "wheel"])
         self.batches.clear()
-        self.eng.update_config(K.InputConfig.from_dict(
-            {"chords": {"touch_swipe_up": "task_view",
-                        "touch_slide_vertical": "none"}}))
-        self.feed(report(buttons=("ps",), touches=two(900, 700)),
-                  report(buttons=("ps",), touches=two(900, 450)),
+        self.feed(report(buttons=("ps",), touches=two(500)),
+                  report(buttons=("ps",), touches=two(700)),
                   report(buttons=("ps",)))
+        self.assertFalse(self.acts.alt_tab_open)
+        self.assertTrue([e for e in self.events if e[0] == "hwheel"])
+
+
+@unittest.skipIf(A is None, "the app package is not importable here")
+class ClickOutranksUnpressed(EngineCase):
+    """The pressed family takes over the moment the pad goes down: an
+    unpressed scroll or pinch in progress ends, and the pressed rows are
+    measured from the click point."""
+
+    def wheels(self):
+        return [e for e in self.events if e[0] in ("wheel", "hwheel")]
+
+    def test_a_click_mid_scroll_ends_the_scroll_and_the_pressed_slide_wins(self):
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(500, 300)),
+                  report(buttons=("ps",), touches=two(500, 400)),
+                  report(buttons=("ps",), touches=two(500, 500)))
+        self.assertTrue(self.wheels())
+        self.batches.clear()
+        # the pad goes down, then the fingers slide sideways
+        self.feed(report(buttons=PSC, touches=two(500, 500)),
+                  report(buttons=PSC, touches=two(600, 520)),
+                  report(buttons=PSC, touches=two(700, 540)))
+        self.assertTrue(self.acts.alt_tab_open)
+        self.assertEqual(self.wheels(), [])
+        self.feed(report(buttons=("ps",)))
+        self.assertFalse(self.acts.alt_tab_open)
+
+    def test_a_click_mid_pinch_lifts_the_pinch_and_the_pressed_swipe_wins(self):
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(900, 700, 100)))
+        self.clock.advance(0.2)
+        self.feed(report(buttons=("ps",), touches=two(900, 700, 200)),
+                  report(buttons=("ps",), touches=two(900, 700, 300)))
+        self.assertTrue(self.acts.pinch_active)
+        self.feed(report(buttons=PSC, touches=two(900, 700, 300)))
+        self.assertFalse(self.acts.pinch_active)
+        self.feed(report(buttons=PSC, touches=two(900, 450, 300)))
+        self.assertIn(("key", A.VK_LWIN, True), self.events)     # task_view
+        self.assertTrue(self.touch.frames)                       # it was live
+        self.assertFalse(self.acts.pinch_active)
+
+    def test_pressed_travel_counts_from_the_click_not_the_landing(self):
+        # 150 px of unpressed horizontal travel (scrolling sideways), then
+        # the click: the switcher needs its own 150 px from HERE.
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(500)),
+                  report(buttons=("ps",), touches=two(650)),
+                  report(buttons=PSC, touches=two(650)),
+                  report(buttons=PSC, touches=two(730)))       # 80 px since
+        self.assertFalse(self.acts.alt_tab_open)
+        self.feed(report(buttons=PSC, touches=two(810)))       # 160 px
+        self.assertTrue(self.acts.alt_tab_open)
+
+    def test_a_click_and_release_after_a_scroll_is_the_two_finger_click(self):
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(500, 300)),
+                  report(buttons=("ps",), touches=two(500, 500)),
+                  report(buttons=PSC, touches=two(500, 500)),
+                  report(buttons=("ps",), touches=two(500, 505)),
+                  report(buttons=("ps",)))
+        self.assertIn(("button", "right", True), self.events)
+
+    def test_a_spent_one_shot_is_still_interrupted_by_the_click(self):
+        self.make(chords={"touch_slide_up": "volume_mute",
+                          "touch_slide_down": "none"})
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(900, 700)),
+                  report(buttons=("ps",), touches=two(900, 450)))
+        self.assertIn(("key", A.VK_VOLUME_MUTE, True), self.events)
+        self.batches.clear()
+        self.feed(report(buttons=PSC, touches=two(900, 450)),
+                  report(buttons=PSC, touches=two(900, 200)))
+        self.assertIn(("key", A.VK_LWIN, True), self.events)     # task_view
+
+    def test_an_unpressed_one_shot_needs_the_swipe_threshold(self):
+        # A one-shot on a slide row is a swipe, whatever the family: 100 px
+        # (over slide_px) is not enough, 250 px (over swipe_px) is.
+        self.make(chords={"touch_slide_up": "task_view",
+                          "touch_slide_down": "none"})
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(900, 700)),
+                  report(buttons=("ps",), touches=two(900, 600)))
+        self.assertNotIn(("key", A.VK_LWIN, True), self.events)
+        self.feed(report(buttons=("ps",), touches=two(900, 450)))
         self.assertIn(("key", A.VK_LWIN, True), self.events)
-        self.assertFalse([e for e in self.events if e[0] == "wheel"])
+        self.assertFalse(self.wheels())
+
+    def test_each_direction_is_its_own_row(self):
+        self.make(chords={"touch_slide_up": "volume_up",
+                          "touch_slide_down": "volume_down",
+                          "touch_slide_left": "media_prev",
+                          "touch_slide_right": "media_next"})
+        for (x0, y0, x1, y1), vk in (((900, 700, 900, 450), A.VK_VOLUME_UP),
+                                     ((900, 300, 900, 550), A.VK_VOLUME_DOWN),
+                                     ((900, 500, 650, 500), A.VK_MEDIA_PREV_TRACK),
+                                     ((700, 500, 950, 500), A.VK_MEDIA_NEXT_TRACK)):
+            self.batches.clear()
+            self.feed(report(buttons=("ps",)),
+                      report(buttons=("ps",), touches=two(x0, y0)),
+                      report(buttons=("ps",), touches=two(x1, y1)),
+                      report(buttons=("ps",)))
+            self.assertIn(("key", vk, True), self.events, vk)
 
 
 @unittest.skipIf(A is None, "the app package is not importable here")
 class Scrolling(EngineCase):
     def scroll(self, ys, speed=None, **over):
         if speed is not None:
-            over.setdefault("remote", {})["scroll_speed"] = speed
+            over.setdefault("gestures", {})["scroll_sensitivity"] = speed
         self.make(**over)
         self.feed(report(buttons=("ps",)),
                   report(buttons=("ps",), touches=two(900, ys[0])))
@@ -291,10 +401,49 @@ class Scrolling(EngineCase):
         self.assertTrue(all(e[1] % 40 == 0 for e in self.events
                             if e[0] == "wheel"))
 
-    def test_scroll_speed_scales_it(self):
+    def test_scroll_sensitivity_scales_it(self):
         slow = self.scroll([300, 400, 500, 600])
         fast = self.scroll([300, 400, 500, 600], speed=2.0)
         self.assertAlmostEqual(fast / slow, 2.0, delta=0.4)
+
+    def test_remote_scroll_speed_is_the_sticks_knob_not_the_touchpads(self):
+        base = self.scroll([300, 400, 500, 600])
+        same = self.scroll([300, 400, 500, 600],
+                           remote={"scroll_speed": 3.0})
+        self.assertEqual(same, base)
+
+    def test_scroll_reverse_flips_the_sign(self):
+        down = self.scroll([300, 400, 500, 600])
+        flipped = self.scroll([300, 400, 500, 600],
+                              gestures={"scroll_reverse": True})
+        self.assertLess(down, 0)
+        self.assertGreater(flipped, 0)
+
+    def test_a_horizontal_slide_scrolls_sideways(self):
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(300)),
+                  report(buttons=("ps",), touches=two(400)),
+                  report(buttons=("ps",), touches=two(500)),
+                  report(buttons=("ps",)))
+        h = [e for e in self.events if e[0] == "hwheel"]
+        self.assertTrue(h)
+        self.assertGreater(sum(e[1] for e in h), 0)
+        self.assertFalse([e for e in self.events if e[0] == "wheel"])
+
+    def test_a_scroll_that_began_vertically_ignores_later_sideways_travel(self):
+        # One contact = one gesture: the axis is decided once. A vertical
+        # scroll that drifts sideways keeps scrolling vertically, never
+        # switching to the horizontal rows.
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(500, 300)),
+                  report(buttons=("ps",), touches=two(500, 400)),
+                  report(buttons=("ps",), touches=two(700, 400)),
+                  report(buttons=("ps",), touches=two(900, 400)),
+                  report(buttons=("ps",)))
+        self.assertTrue([e for e in self.events if e[0] == "wheel"])
+        self.assertFalse([e for e in self.events if e[0] == "hwheel"])
 
     def test_px_per_notch_is_tunable(self):
         coarse = self.scroll([300, 400, 500, 600])
@@ -306,11 +455,14 @@ class Scrolling(EngineCase):
         self.assertGreater(self.scroll([600, 500, 400, 300]), 0)
 
     def test_a_button_bound_to_scroll_does_one_notch(self):
-        self.make(chords={"cross": "scroll", "circle": "scroll_horizontal"})
-        self.feed(report(buttons=("ps",)), report(buttons=("ps", "cross")),
-                  report(buttons=("ps",)), report(buttons=("ps", "circle")))
+        self.make(chords={"cross": "scroll_down", "circle": "scroll_right",
+                          "square": "scroll_up", "triangle": "scroll_left"})
+        for b in ("cross", "circle", "square", "triangle"):
+            self.feed(report(buttons=("ps",)), report(buttons=("ps", b)))
         self.assertIn(("wheel", -120), self.events)
         self.assertIn(("hwheel", 120), self.events)
+        self.assertIn(("wheel", 120), self.events)
+        self.assertIn(("hwheel", -120), self.events)
 
 
 @unittest.skipIf(A is None, "the app package is not importable here")
@@ -321,6 +473,9 @@ class Pinch(EngineCase):
         self.feed(report(buttons=("ps",)),
                   report(buttons=btn, touches=two(900, 500, spreads[0])))
         for s in spreads[1:]:
+            # real time passes between frames: a pinch waits out
+            # `pinch_delay_ms` (scroll priority) before it commits
+            self.clock.advance(0.05)
             self.feed(report(buttons=btn, touches=two(900, 500, s)))
         self.feed(report(buttons=("ps",)))
 
@@ -353,13 +508,20 @@ class Pinch(EngineCase):
         self.assertEqual(self.touch.frames, [])
 
     def test_pinch_gain_is_tunable(self):
-        self.pinch([100, 200, 300])
+        self.pinch([100, 200, 300, 400])
         base = self.spread_of(self.touch.frames[-2])
-        self.pinch([100, 200, 300], gestures={"pinch_gain": 2.0})
+        self.pinch([100, 200, 300, 400], gestures={"pinch_gain": 2.0})
         self.assertGreater(self.spread_of(self.touch.frames[-2]), base)
 
-    def test_spreading_pressed_is_ctrl_wheel_in_whole_notches(self):
+    CTRL = {"chords": {"touch_pinch_pressed": "ctrl_zoom"}}
+
+    def test_the_pressed_pinch_is_unbound_by_default(self):
         self.pinch([100, 180, 260, 340], pressed=True)
+        self.assertEqual(self.touch.frames, [])
+        self.assertEqual(self.events, [])
+
+    def test_spreading_pressed_is_ctrl_wheel_in_whole_notches(self):
+        self.pinch([100, 180, 260, 340], pressed=True, **self.CTRL)
         self.assertEqual(self.touch.frames, [])
         zooms = [b for b in self.batches if b and b[0] == ("key", A.VK_CONTROL, True)]
         self.assertTrue(zooms)
@@ -370,16 +532,37 @@ class Pinch(EngineCase):
             self.assertEqual(b[1][1] % 120, 0)
 
     def test_closing_pressed_zooms_out(self):
-        self.pinch([340, 260, 180, 100], pressed=True)
+        self.pinch([340, 260, 180, 100], pressed=True, **self.CTRL)
         wheels = [b[1][1] for b in self.batches
                   if b and b[0] == ("key", A.VK_CONTROL, True)]
         self.assertTrue(wheels and all(w < 0 for w in wheels))
 
+    def last_spread(self):
+        moves = [f for f in self.touch.frames if f[0] == "move"]
+        return self.spread_of(moves[-1])
+
+    def test_zoom_reverse_flips_both_zooms(self):
+        self.pinch([100, 200, 300, 400], gestures={"zoom_reverse": True})
+        self.assertLess(self.last_spread(),
+                        self.spread_of(self.touch.frames[0]))
+        self.pinch([100, 180, 260, 340], pressed=True,
+                   gestures={"zoom_reverse": True}, **self.CTRL)
+        wheels = [b[1][1] for b in self.batches
+                  if b and b[0] == ("key", A.VK_CONTROL, True)]
+        self.assertTrue(wheels and all(w < 0 for w in wheels))
+
+    def test_zoom_sensitivity_scales_the_pinch(self):
+        self.pinch([100, 200, 300, 400])
+        base = self.last_spread()
+        self.pinch([100, 200, 300, 400], gestures={"zoom_sensitivity": 2.0})
+        self.assertGreater(self.last_spread(), base)
+
     def test_a_pinch_ends_when_the_chord_is_released(self):
         self.make()
         self.feed(report(buttons=("ps",)),
-                  report(buttons=("ps",), touches=two(900, 500, 100)),
-                  report(buttons=("ps",), touches=two(900, 500, 300)))
+                  report(buttons=("ps",), touches=two(900, 500, 100)))
+        self.clock.advance(0.2)
+        self.feed(report(buttons=("ps",), touches=two(900, 500, 300)))
         self.assertTrue(self.acts.pinch_active)
         self.feed(report(touches=two(900, 500, 300)))
         self.assertFalse(self.acts.pinch_active)
@@ -389,8 +572,9 @@ class Pinch(EngineCase):
         for how in ("disable", "close"):
             self.make()
             self.feed(report(buttons=("ps",)),
-                      report(buttons=("ps",), touches=two(900, 500, 100)),
-                      report(buttons=("ps",), touches=two(900, 500, 300)))
+                      report(buttons=("ps",), touches=two(900, 500, 100)))
+            self.clock.advance(0.2)
+            self.feed(report(buttons=("ps",), touches=two(900, 500, 300)))
             self.assertTrue(self.acts.pinch_active)
             if how == "disable":
                 self.eng.update_config(K.InputConfig.from_dict({"enabled": False}))
@@ -403,6 +587,67 @@ class Pinch(EngineCase):
         self.feed(report(buttons=("ps",)), report(buttons=("ps", "cross")))
         self.assertEqual([f[0] for f in self.touch.frames], ["down", "move", "up"])
         self.assertFalse(self.acts.pinch_active)
+
+
+@unittest.skipIf(A is None, "the app package is not importable here")
+class ScrollBeatsPinch(EngineCase):
+    """The Windows touchpad rule: an ambiguous opening is a scroll. A pinch
+    commits only after `pinch_delay_ms`, and only while the spread change
+    clearly beats the travel."""
+
+    def frames(self, seq, dt=0.02, **over):
+        """`seq`: (spread, cy) per frame at `dt` intervals, PS held."""
+        self.make(**over)
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=two(900, seq[0][1], seq[0][0])))
+        for s, cy in seq[1:]:
+            self.clock.advance(dt)
+            self.feed(report(buttons=("ps",), touches=two(900, cy, s)))
+
+    def test_a_spread_wobble_at_the_start_of_a_scroll_is_a_scroll(self):
+        # 90 px of spread in the first 40 ms (over pinch_px), but the fingers
+        # then travel: no pinch, and the scroll starts once travel dominates.
+        self.frames([(100, 500), (190, 510), (200, 520), (200, 560),
+                     (200, 620), (200, 700), (200, 800)])
+        self.assertFalse(self.acts.pinch_active)
+        self.assertEqual(self.touch.frames, [])
+        self.assertTrue([e for e in self.events if e[0] == "wheel"])
+
+    def test_nothing_commits_inside_the_window(self):
+        self.frames([(100, 500), (200, 500), (300, 500)], dt=0.03)   # 60 ms
+        self.assertFalse(self.acts.pinch_active)
+        self.assertEqual(self.events, [])
+
+    def test_a_clean_pinch_commits_once_the_window_has_passed(self):
+        self.frames([(100, 500), (200, 500), (300, 500), (320, 500)], dt=0.05)
+        self.assertTrue(self.acts.pinch_active)
+
+    def test_both_fingers_sliding_while_drifting_apart_is_a_scroll(self):
+        # spread grows 120 while the centroid travels 100: not clearly a
+        # pinch (PINCH_DOMINANCE), so the slide row has it
+        self.frames([(100, 500), (160, 550), (220, 600)], dt=0.1)
+        self.assertFalse(self.acts.pinch_active)
+        self.assertTrue([e for e in self.events if e[0] == "wheel"])
+
+    def test_the_window_is_tunable(self):
+        self.frames([(100, 500), (200, 500), (300, 500)], dt=0.03,
+                    gestures={"pinch_delay_ms": 0})
+        self.assertTrue(self.acts.pinch_active)
+
+    def test_the_injected_pinch_is_smoothed_and_never_reverses_on_wobble(self):
+        # The raw spread wobbles by +-3 points a report while the fingers
+        # open: the injected contacts must only ever move apart.
+        seq = [(100, 500)]
+        for i in range(1, 60):
+            seq.append((100 + i * 4 + (3 if i % 2 else -3), 500))
+        self.frames(seq, dt=0.004)
+        self.assertTrue(self.acts.pinch_active)
+        moves = [f for f in self.touch.frames if f[0] == "move"]
+        spreads = [p[1][0] - p[0][0] for _, p in moves]
+        self.assertTrue(all(b >= a for a, b in zip(spreads, spreads[1:])),
+                        spreads)
+        # ... and at no more than ~120 moves a second
+        self.assertLessEqual(len(moves), 0.24 / (1 / 120.0) + 2)
 
 
 @unittest.skipIf(A is None, "the app package is not importable here")
@@ -509,7 +754,7 @@ class MacroRepeat(EngineCase):
     def test_toggle_from_a_remote_button_and_a_gesture(self):
         self.make_remote(macros=self.TOGGLE,
                          remote={"chords": {"square": "auto",
-                                            "touch_swipe_up_pressed": "auto"}})
+                                            "touch_slide_up_pressed": "auto"}})
         self.feed(report(buttons=("ps",)), report())
         self.clock.advance(0.15)
         self.feed(report(buttons=("ps",)), report())

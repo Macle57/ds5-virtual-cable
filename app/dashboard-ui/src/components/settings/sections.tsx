@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, ArrowRight, Hand, MousePointer2 } from "lucide-react";
+import { AlertTriangle, ArrowRight, Hand, Link2, MousePointer2 } from "lucide-react";
 import { getPath, setPath, useRemoteColor, useStore } from "../../lib/store";
 import type { ActionsMeta, ConfigDoc, GestureRow, Json } from "../../lib/types";
+import { pairing } from "../../lib/actionMeta";
 import {
-  ADVANCED_FIELDS, CTRL_FIELDS, GESTURE_FALLBACK, GESTURE_GROUPS, HELP, KNOWN_BATTERY, KNOWN_CTRL, KNOWN_GLOBAL, KNOWN_INPUT,
-  KNOWN_LIGHTBAR, KNOWN_REMOTE, isGestureKey, keyLabel,
+  ADVANCED_FIELDS, CTRL_FIELDS, GESTURE_FALLBACK, GESTURE_GROUPS, HELP, KNOWN_BATTERY, KNOWN_CTRL, KNOWN_GESTURES, KNOWN_GLOBAL,
+  KNOWN_INPUT, KNOWN_LIGHTBAR, KNOWN_REMOTE, isGestureKey, keyLabel,
 } from "./help";
 import { Card, ColorField, JsonField, NumberField, RangeField, Row, SelectField, TextField, Toggle } from "./controls";
 import GenericRows from "./GenericRows";
@@ -58,7 +59,7 @@ export function ShortcutsSection({ actions }: { actions: ActionsMeta }) {
       <Row label="Rumble strength" keyName="haptic_strength" help={HELP.haptic_strength} stack>
         <RangeField path={["input", "haptic_strength"]} dflt={25} min={0} max={100} step={1} fmt={(v) => v + "%"} />
       </Row>
-      <Row label="Stick moves mouse while chording" keyName="stick_mouse_in_chord" help={HELP.stick_mouse_in_chord}><Toggle path={["input", "stick_mouse_in_chord"]} dflt /></Row>
+      <Row label="Stick and touchpad move the mouse while chording" keyName="stick_mouse_in_chord" help={HELP.stick_mouse_in_chord}><Toggle path={["input", "stick_mouse_in_chord"]} dflt /></Row>
       {inp.actions && Object.keys(asObj(inp.actions)).length > 0 && (
         <Row label="actions (per-action parameters)" stack><JsonField path={["input", "actions"]} /></Row>
       )}
@@ -83,21 +84,39 @@ const boundName = (raw: unknown, dflt?: string) =>
 
 /* "(none)" serializes as the string "none" -- InputConfig.to_dict's contract
    for a removed default binding (absent would resurrect the default on the
-   next load). */
-function ActionPicker({ chordKey, actions, table }: { chordKey: string; actions: ActionsMeta; table: Table }) {
+   next load).
+
+   A slide row has a `pair` (the row sharing its axis) and a `dir`. Picking a
+   PAIRED action (scroll up / down / left / right, Alt+Tab) on one row binds
+   the partner to its pair -- the two rows are one gesture. Picking anything
+   else while the partner holds a paired action unbinds the partner: an axis
+   is either one paired gesture or two independent one-shots (either of
+   which may be unbound), never "scroll up" one way and something else the
+   other. */
+function ActionPicker({ chordKey, actions, table, pair, dir }:
+  { chordKey: string; actions: ActionsMeta; table: Table; pair?: string; dir?: string }) {
   const bound = useStore((s) => getPath(s.cfg, [...table.path, chordKey]));
   const macros = useStore((s) => getPath(s.cfg, ["input", "macros"]));
   const patch = useStore((s) => s.patchConfig);
   return (
-    <ActionPickerUI value={boundName(bound, table.defaults[chordKey])} meta={actions} macros={macros}
-                    onChange={(name) => patch((cfg) => setPath(cfg, [...table.path, chordKey], name))} />
+    <ActionPickerUI value={boundName(bound, table.defaults[chordKey])} meta={actions} macros={macros} dir={dir}
+                    onChange={(name) => patch((cfg) => {
+                      setPath(cfg, [...table.path, chordKey], name);
+                      if (!pair) return;
+                      const mirror = pairing(name, actions).pair;
+                      const partner = boundName(getPath(cfg, [...table.path, pair]), table.defaults[pair]);
+                      if (mirror) setPath(cfg, [...table.path, pair], mirror);
+                      else if (pairing(partner, actions).pair) setPath(cfg, [...table.path, pair], "none");
+                    })} />
   );
 }
 
-function BindingCard({ chordKey, actions, help, label, table = CHORD_TABLE }:
-  { chordKey: string; actions: ActionsMeta; help?: string; label?: string; table?: Table }) {
+function BindingCard({ chordKey, actions, help, label, table = CHORD_TABLE, pair, dir }:
+  { chordKey: string; actions: ActionsMeta; help?: string; label?: string; table?: Table; pair?: string; dir?: string }) {
   const bound = useStore((s) => getPath(s.cfg, [...table.path, chordKey]));
-  const isBound = boundName(bound, table.defaults[chordKey]) !== "none";
+  const name = boundName(bound, table.defaults[chordKey]);
+  const isBound = name !== "none";
+  const paired = !!pair && !!pairing(name, actions).pair;
   const accent = table.accent;
   return (
     <motion.div layout className={"rounded-xl border p-3 transition-colors " +
@@ -106,12 +125,18 @@ function BindingCard({ chordKey, actions, help, label, table = CHORD_TABLE }:
                                      background: `color-mix(in oklab, ${accent} 6%, transparent)` } : undefined}>
       <div className="mb-2 flex items-center gap-2.5">
         <ButtonGlyph name={chordKey} />
-        <div className="min-w-0 leading-tight">
+        <div className="min-w-0 flex-1 leading-tight">
           <div className="display text-[14px]">{label ?? keyLabel(chordKey)}</div>
           <div className="mono text-[10.5px] text-ink-3">{chordKey}</div>
         </div>
+        {paired && (
+          <span className="flex flex-none items-center gap-1 rounded-md border border-cyan/40 bg-cyan/10 px-1.5 py-0.5 text-[10px] text-cyan"
+                title={`One gesture with ${keyLabel(pair!)}: the two rows are set together`}>
+            <Link2 size={11} /> paired
+          </span>
+        )}
       </div>
-      <ActionPicker chordKey={chordKey} actions={actions} table={table} />
+      <ActionPicker chordKey={chordKey} actions={actions} table={table} pair={pair} dir={dir} />
       {help && <p className="mt-2 text-[11.5px] leading-relaxed text-ink-3">{help}</p>}
     </motion.div>
   );
@@ -256,7 +281,7 @@ function GestureGrid({ rows, actions, table }: { rows: GestureRow[]; actions: Ac
               <span className="h-px flex-1 bg-line" />
             </div>
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-              {items.map((r) => <BindingCard key={r.key} chordKey={r.key} actions={actions} table={table}
+              {items.map((r) => <BindingCard key={r.key} chordKey={r.key} actions={actions} table={table} pair={r.pair} dir={r.dir}
                                              label={r.label || keyLabel(r.key)} help={r.help || HELP[r.key]} />)}
             </div>
           </div>
@@ -273,11 +298,24 @@ export function GesturesSection({ actions }: { actions: ActionsMeta }) {
   const color = useRemoteColor();
   const table = useRemoteTable(actions);
   const rows = gestureRows(actions, asObj(inp.chords), asObj(asObj(inp.remote).chords));
+  const G = (k: string) => ["input", "gestures", k];
   return (
     <div className="grid gap-4">
       <Card title="Touch gestures — while chording"
             hint="Two-finger touchpad gestures, active while the chord button is held. Saved in input.chords.">
         <GestureGrid rows={rows} actions={actions} />
+      </Card>
+      <Card title="Scrolling & zoom feel"
+            hint="How far a two-finger slide scrolls and a pinch zooms, and which way. Applies while chording and in remote mode. Saved in input.gestures.">
+        <Row label="Scroll sensitivity" keyName="gestures.scroll_sensitivity" help={HELP.scroll_sensitivity} stack>
+          <RangeField path={G("scroll_sensitivity")} dflt={1} min={0.25} max={4} step={0.05} fmt={(v) => v.toFixed(2) + "×"} />
+        </Row>
+        <Row label="Reverse scroll direction" keyName="gestures.scroll_reverse" help={HELP.scroll_reverse}><Toggle path={G("scroll_reverse")} /></Row>
+        <Row label="Zoom sensitivity" keyName="gestures.zoom_sensitivity" help={HELP.zoom_sensitivity} stack>
+          <RangeField path={G("zoom_sensitivity")} dflt={1} min={0.25} max={4} step={0.05} fmt={(v) => v.toFixed(2) + "×"} />
+        </Row>
+        <Row label="Reverse pinch direction" keyName="gestures.zoom_reverse" help={HELP.zoom_reverse}><Toggle path={G("zoom_reverse")} /></Row>
+        <GenericRows path={["input", "gestures"]} obj={asObj(inp.gestures)} known={KNOWN_GESTURES} />
       </Card>
       <Card title="Remote mode gestures"
             hint="What the same gestures do while the pad is in remote mode. Saved as input.remote.same_gestures and input.remote.chords.">
@@ -331,7 +369,7 @@ export function RemoteSection() {
         )}
       </AnimatePresence>
       <Row label="Pointer speed" keyName="remote.mouse_speed" unit="×" help={HELP.mouse_speed}><NumberField path={["input", "remote", "mouse_speed"]} dflt={1.6} step={0.1} /></Row>
-      <Row label="Scroll speed" keyName="remote.scroll_speed" unit="×" help={HELP.scroll_speed}><NumberField path={["input", "remote", "scroll_speed"]} dflt={1.0} step={0.1} /></Row>
+      <Row label="Scroll speed (stick & triggers)" keyName="remote.scroll_speed" unit="×" help={HELP.scroll_speed}><NumberField path={["input", "remote", "scroll_speed"]} dflt={1.0} step={0.1} /></Row>
       <Row label="Lightbar colour in remote mode" keyName="remote.lightbar_color" help={HELP.remote_lightbar}><ColorField path={["input", "remote", "lightbar_color"]} dflt={[255, 120, 0]} /></Row>
       <Row label="Remote mode uses the same bindings" keyName="remote.same_bindings" help={HELP.same_bindings}>
         <button type="button" className="btn !px-3 !py-1 !text-[12px]" onClick={() => setTab("chords")}>

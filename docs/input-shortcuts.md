@@ -58,14 +58,15 @@ captured length), `0x53`-seeded CRC32 in the last 4.
 Chords fire while the chord button (PS) is held; a short haptic pulse acks
 each accepted chord (`haptic_ack` to silence it, `haptic_strength` 0–100 for
 how hard it hits, default 25). **Everything digital is swallowed while PS is
-held** — buttons, dpad, touchpad; triggers still pass. The sticks are lent to
-the OS by default (`stick_mouse_in_chord`): left stick moves the pointer,
-right stick scrolls, at the same `remote.*` speeds as remote mode, and the
-game sees them centred for the duration of the hold — the "major controls"
-mean the same thing whether PS is held or remote mode is on. The cost is a
-camera frozen while reaching for a shortcut; set
-`"stick_mouse_in_chord": false` to restore pure stick passthrough during
-chords.
+held** — buttons, dpad, touchpad; triggers still pass. The pointer controls
+are lent to the OS by default (`stick_mouse_in_chord`): left stick moves the
+pointer, right stick scrolls, at the same `remote.*` speeds as remote mode,
+and the game sees them centred for the duration of the hold; a **1-finger
+touchpad drag moves the pointer and a short 1-finger tap clicks**, exactly
+as in remote mode — the "major controls" mean the same thing whether PS is
+held or remote mode is on. The cost is a camera frozen while reaching for a
+shortcut; set `"stick_mouse_in_chord": false` to restore pure stick
+passthrough during chords (the 1-finger touchpad is then swallowed too).
 
 | input (with PS held) | action | notes |
 |---|---|---|
@@ -82,11 +83,12 @@ chords.
 | Touchpad click (1 finger) | `keyboard` | the pad-driven on-screen keyboard (below); press again to close |
 | Mute (the mic button) | `dictation` | Windows voice typing, listening through the **pad's** microphone (below) |
 | 2-finger click | `right_click` | the pad physically clicked with two fingers on it, like a Windows touchpad |
-| 2-finger slide, pad **not** clicked | `scroll` / `scroll_horizontal` | continuous, proportional to travel, like a precision touchpad |
-| 2-finger pinch / spread, not clicked | `pinch_zoom` | a real touch-screen pinch (Chrome zooms its viewport) |
-| 2-finger horizontal slide **while clicked** | `alt_tab` | **hold semantics**: switcher opens on ~150 px of travel, each further 150 px steps (slide back = step back), lifting the fingers or releasing PS commits (Alt-up) |
-| 2-finger swipe up / down while clicked | `task_view` / `minimize_all` | Win+Tab / Win+M |
-| 2-finger pinch while clicked | `ctrl_zoom` | Ctrl + wheel, one notch per 80 px of spread |
+| 2-finger slide up / down, pad **not** clicked | `scroll_up` / `scroll_down` | one continuous scroll, proportional to travel, like a precision touchpad (`gestures.scroll_sensitivity`, `scroll_reverse`) |
+| 2-finger slide left / right, not clicked | `scroll_left` / `scroll_right` | the same, sideways |
+| 2-finger pinch / spread, not clicked | `pinch_zoom` | a real touch-screen pinch (Chrome zooms its viewport), low-passed and paced at ~120 moves/s so the pad's coordinate wobble never reads as jitter; `gestures.zoom_sensitivity`, `zoom_reverse` |
+| 2-finger slide left / right **while clicked** | `alt_tab` (both rows) | **hold semantics**: switcher opens on ~150 px of travel, each further 150 px steps (slide back = step back), lifting the fingers or releasing PS commits (Alt-up) |
+| 2-finger slide up / down while clicked | `task_view` / `minimize_all` | Win+Tab / Win+M, after ~200 px |
+| 2-finger pinch while clicked | *(none)* | `ctrl_zoom` (Ctrl + wheel) is the natural pick |
 
 The full gesture vocabulary, with the remote-mode column, is in
 [Two-finger gestures](#two-finger-gestures) below.
@@ -114,7 +116,7 @@ the table above can be re-bound without guessing:
 | shell | `show_desktop` (Win+D) `minimize_all` (Win+M) `task_view` (Win+Tab) `alt_tab` `projection_cycle` (Win+P chooser) |
 | projection, no chooser | `display_extend` (`DisplaySwitch.exe /extend`) `display_second_only` (`/external`) `display_pc_only` (`/internal`) `display_duplicate` (`/clone`) `display_cycle` — PC only → duplicate → extend → second only → …, remembering where it is for the life of the bridge (an explicit `display_*` moves the cycle too) |
 | mouse and keys | `left_click` `right_click` `middle_click` `escape` `enter` `arrow_up` `arrow_down` `arrow_left` `arrow_right` — from a chord these tap; in remote mode they are **held** for the length of the press (Cross = drag) and the arrows re-trigger every 300 ms |
-| continuous (follow the fingers) | `scroll` `scroll_horizontal` (wheel events proportional to travel, `remote.scroll_speed` applies) `ctrl_zoom` (Ctrl + wheel, whole notches) `pinch_zoom` (Windows touch injection: two synthetic contacts spread or close around the pointer — Chrome/Edge zoom the **visual viewport** the way a precision-touchpad pinch does, which is not the Ctrl zoom level). Bound to a *button* they do one step (`input.actions.<name>.step` notches) |
+| continuous (follow the fingers) | `scroll_up` `scroll_down` `scroll_left` `scroll_right` (wheel events proportional to travel; `gestures.scroll_sensitivity` / `scroll_reverse` apply) `ctrl_zoom` (Ctrl + wheel, whole notches) `pinch_zoom` (Windows touch injection: two synthetic contacts spread or close around the pointer — Chrome/Edge zoom the **visual viewport** the way a precision-touchpad pinch does, which is not the Ctrl zoom level; `gestures.zoom_sensitivity` / `zoom_reverse`). Bound to a *button* they do one step (`input.actions.<name>.step` notches) in the named direction. The scroll directions are **paired** (`pair` / `dir` on `/api/actions`): on a slide axis `scroll_up` + `scroll_down` is one scroll that follows the fingers both ways, and the dashboard sets the two rows together |
 | voice typing | `dictation` — see below |
 | the engine's own (`engine_actions`) | `pad_power_off` `pad_lightbar_toggle` `keyboard` `show_battery` |
 
@@ -130,14 +132,31 @@ which is what the dashboard's Gestures tab renders.
 |---|---|---|---|
 | `touch_tap_2f` | two fingers touch briefly, **no** click | *(none)* | `right_click` |
 | `touch_click_2f` | click the pad with two fingers resting on it | `right_click` | `right_click` |
-| `touch_slide_horizontal` | 2-finger horizontal slide, pad not clicked | `scroll_horizontal` | `scroll_horizontal` |
-| `touch_slide_vertical` | 2-finger vertical slide, pad not clicked | `scroll` | `scroll` |
-| `touch_swipe_up` / `touch_swipe_down` | compatibility flick (200 px), unpressed — fires **only while `touch_slide_vertical` is `none`** | *(none)* | *(none)* |
+| `touch_slide_up` / `touch_slide_down` | 2-finger slide up / down, pad not clicked (a pair) | `scroll_up` / `scroll_down` | `scroll_up` / `scroll_down` |
+| `touch_slide_left` / `touch_slide_right` | 2-finger slide left / right, pad not clicked (a pair) | `scroll_left` / `scroll_right` | `scroll_left` / `scroll_right` |
 | `touch_pinch` | fingers apart / together, pad not clicked | `pinch_zoom` | `pinch_zoom` |
-| `touch_slide_horizontal_pressed` | horizontal slide **while the pad is clicked** | `alt_tab` | `alt_tab` |
-| `touch_swipe_up_pressed` | swipe up while clicked | `task_view` | `task_view` |
-| `touch_swipe_down_pressed` | swipe down while clicked | `minimize_all` | `minimize_all` |
-| `touch_pinch_pressed` | pinch / spread while clicked | `ctrl_zoom` | `ctrl_zoom` |
+| `touch_slide_up_pressed` / `touch_slide_down_pressed` | slide up / down **while the pad is clicked** (a pair) | `task_view` / `minimize_all` | `task_view` / `minimize_all` |
+| `touch_slide_left_pressed` / `touch_slide_right_pressed` | slide left / right while clicked (a pair) | `alt_tab` / `alt_tab` | `alt_tab` / `alt_tab` |
+| `touch_pinch_pressed` | pinch / spread while clicked | *(none)* | *(none)* |
+
+The two rows of a slide axis are a **pair**. A *paired* action (`scroll_up`
+↔ `scroll_down`, `scroll_left` ↔ `scroll_right`, `alt_tab` ↔ itself; served
+as `pair` / `dir` on `/api/actions`) takes the axis whole: picking it on one
+row binds the partner to its pair, and the pair is one gesture that follows
+the fingers both ways. Anything else on a row is an independent one-shot,
+and picking it while the partner holds a paired action unbinds the partner
+— so an axis is either one paired gesture or two one-shots (either may be
+unbound), never "scroll up" one way and Task View the other. The dashboard
+enforces this and offers a directional action only on its own row; the
+engine reads the rows literally.
+
+The rows of older builds (`touch_slide_vertical`, `touch_slide_horizontal`,
+`touch_swipe_up` / `_down`, and their `_pressed` forms) are **dropped** on
+load, with one log line: today's rows keep their defaults whatever an older
+file said, so every install has the gesture map above, and the file loses
+the old rows on its next save. The old action names `scroll` /
+`scroll_horizontal` are unknown too (a row or button bound to one is ignored
+with a log line).
 
 One contact is exactly **one** gesture:
 
@@ -147,29 +166,49 @@ One contact is exactly **one** gesture:
   the right click.
 - A contact that becomes a slide or pinch fires neither tap.
 - Travel is measured from the moment the second finger lands, so 1-finger
-  mousing in remote mode cannot pre-load a gesture.
-- Rows bound to `alt_tab` open the switcher with hold semantics; rows bound
-  to a continuous action (`scroll*`, `*_zoom`) track the fingers until they
-  lift; anything else fires once and the contact is spent. An unbound row
-  leaves the contact undecided, so a later, bound direction can still win.
+  mousing cannot pre-load a gesture.
+- The dominant motion picks the row — the pinch when the spread change
+  clearly beats both travel components (1.5×) **and** `pinch_delay_ms` has
+  passed since the second finger landed, else the larger travel component's
+  direction. Before the window closes the contact waits, so a slide that
+  opens with a little spread wobble comes out a slide: **scrolling wins an
+  ambiguous start**, the way a Windows touchpad prefers it. What the row
+  names decides the travel it takes to commit: a
+  continuous action (`scroll_*`, `*_zoom`) commits at `slide_px` and then
+  tracks the fingers until they lift; `alt_tab` at `alt_tab_step_px`, with
+  hold semantics; anything else at `swipe_px`, fired once, and the contact
+  is spent. An unbound row leaves the contact undecided, so a later, bound
+  direction can still win. Once decided, the contact stays that gesture: a
+  scroll that began vertically ignores later sideways drift.
+- **The click outranks the unpressed family.** The moment the pad goes down
+  mid-contact, whatever the fingers were doing unpressed ends (a scroll or
+  pinch ends, an open switcher commits) and travel is measured afresh from
+  the click point against the `_pressed` rows only — a click-and-release
+  with no travel from there is the 2-finger click. A contact that started
+  clicked is a pressed gesture from its first frame.
 - Under PS, a 2-finger click is **not** the `touchpad_click` chord (that
   needs one finger or none). In remote mode a 1-finger physical click is the
   intrinsic left mouse button, held for the press (drag).
 
-Thresholds live in `input.gestures` (touchpad points, 1920 × 1080 over
-~52 × 23 mm), and apply live:
+Thresholds and feel live in `input.gestures` (touchpad points, 1920 × 1080
+over ~52 × 23 mm), and apply live:
 
 | key | default | meaning |
 |---|---|---|
+| `scroll_sensitivity` | 1.0 | multiplier on how far a 2-finger slide scrolls (the touchpad only — `remote.scroll_speed` is the sticks' and triggers') |
+| `scroll_reverse` | false | flip the scroll direction of a slide |
+| `zoom_sensitivity` | 1.0 | multiplier on how much a pinch zooms (`pinch_zoom` and `ctrl_zoom`) |
+| `zoom_reverse` | false | flip the pinch: apart = out |
 | `tap_ms` | 250 | a touch shorter than this that moved less than `tap_move_px` is a tap |
 | `tap_move_px` | 40 | … and the most a tap or a 2-finger click may travel |
-| `slide_px` | 40 | unpressed travel at which a contact becomes a slide (scrolling starts) |
-| `swipe_px` | 200 | vertical travel for the swipes (pressed, and the compat flicks) |
+| `slide_px` | 40 | travel at which a row bound to a continuous action commits (scrolling starts) |
+| `swipe_px` | 200 | travel at which a row bound to a one-shot fires |
 | `alt_tab_step_px` | 150 | horizontal travel that opens Alt-Tab, and per further step |
-| `pinch_px` | 80 | spread change at which a contact becomes a pinch |
-| `scroll_px_per_notch` | 100 | finger travel per wheel notch (120 units), before `remote.scroll_speed` |
-| `zoom_px_per_notch` | 80 | spread change per Ctrl+wheel notch |
-| `pinch_gain` | 1.0 | screen px the injected contacts move per point of spread change |
+| `pinch_px` | 80 | spread change at which a contact becomes a pinch … |
+| `pinch_delay_ms` | 120 | … but never before this long after the second finger landed (scroll priority) |
+| `scroll_px_per_notch` | 100 | finger travel per wheel notch (120 units), before `scroll_sensitivity` |
+| `zoom_px_per_notch` | 80 | spread change per Ctrl+wheel notch, before `zoom_sensitivity` |
+| `pinch_gain` | 1.0 | screen px the injected contacts move per point of spread change, before `zoom_sensitivity` |
 
 ### Dictation through the pad's microphone
 
@@ -267,10 +306,11 @@ this feature shipped with, plus the gesture rows:
   | `options` | `enter` |
   | `dpad_up` / `dpad_down` / `dpad_left` / `dpad_right` | `arrow_up` … `arrow_right` (held; re-trigger every 300 ms) |
   | `touch_tap_2f` / `touch_click_2f` | `right_click` |
-  | `touch_slide_horizontal` / `touch_slide_vertical` | `scroll_horizontal` / `scroll` |
-  | `touch_pinch` / `touch_pinch_pressed` | `pinch_zoom` / `ctrl_zoom` |
-  | `touch_slide_horizontal_pressed` | `alt_tab` (hold semantics, as under a chord) |
-  | `touch_swipe_up_pressed` / `touch_swipe_down_pressed` | `task_view` / `minimize_all` |
+  | `touch_slide_up` / `touch_slide_down` | `scroll_up` / `scroll_down` |
+  | `touch_slide_left` / `touch_slide_right` | `scroll_left` / `scroll_right` |
+  | `touch_pinch` | `pinch_zoom` (`touch_pinch_pressed` unbound) |
+  | `touch_slide_left_pressed` / `touch_slide_right_pressed` | `alt_tab` (hold semantics, as under a chord) |
+  | `touch_slide_up_pressed` / `touch_slide_down_pressed` | `task_view` / `minimize_all` |
 
 Note that with the default `same_gestures: true` the chord table governs,
 where `touch_tap_2f` is unbound — a 2-finger **click** right-clicks in both
@@ -381,9 +421,10 @@ excluded (gyro noise never sleeps; a pad face-down on the couch must idle).
   "stick_mouse_in_chord": true,
   "off_timer_minutes": 15.0,
   "chords": { "triangle": "pad_power_off", "r3": "show_battery",
-              "touch_click_2f": "right_click", "touch_slide_vertical": "scroll",
-              "touch_pinch": "pinch_zoom",
-              "touch_slide_horizontal_pressed": "alt_tab",
+              "touch_click_2f": "right_click", "touch_slide_up": "scroll_up",
+              "touch_slide_down": "scroll_down", "touch_pinch": "pinch_zoom",
+              "touch_slide_left_pressed": "alt_tab",
+              "touch_slide_right_pressed": "alt_tab",
               "...": "see the tables above" },
   "actions": { "volume_up": {"step": 1} },
   "macros": { "task_manager": { "keys": ["ctrl", "shift", "esc"],
@@ -399,8 +440,11 @@ excluded (gyro noise never sleeps; a pad face-down on the couch must idle).
   "lightbar": { "dim_after_minutes": 0.0, "dim_level": 0.3 },
   "gestures": { "tap_ms": 250, "tap_move_px": 40, "slide_px": 40,
                 "swipe_px": 200, "alt_tab_step_px": 150, "pinch_px": 80,
+                "pinch_delay_ms": 120,
                 "scroll_px_per_notch": 100, "zoom_px_per_notch": 80,
-                "pinch_gain": 1.0 },
+                "pinch_gain": 1.0,
+                "scroll_sensitivity": 1.0, "scroll_reverse": false,
+                "zoom_sensitivity": 1.0, "zoom_reverse": false },
   "remote": { "enabled": false, "mouse_speed": 1.6, "scroll_speed": 1.0,
               "lightbar_color": [255, 120, 0],
               "same_bindings": true, "same_gestures": true,
@@ -410,13 +454,15 @@ excluded (gyro noise never sleeps; a pad face-down on the couch must idle).
                           "dpad_right": "arrow_right",
                           "touch_tap_2f": "right_click",
                           "touch_click_2f": "right_click",
-                          "touch_slide_horizontal": "scroll_horizontal",
-                          "touch_slide_vertical": "scroll",
+                          "touch_slide_up": "scroll_up",
+                          "touch_slide_down": "scroll_down",
+                          "touch_slide_left": "scroll_left",
+                          "touch_slide_right": "scroll_right",
                           "touch_pinch": "pinch_zoom",
-                          "touch_slide_horizontal_pressed": "alt_tab",
-                          "touch_swipe_up_pressed": "task_view",
-                          "touch_swipe_down_pressed": "minimize_all",
-                          "touch_pinch_pressed": "ctrl_zoom" } }
+                          "touch_slide_left_pressed": "alt_tab",
+                          "touch_slide_right_pressed": "alt_tab",
+                          "touch_slide_up_pressed": "task_view",
+                          "touch_slide_down_pressed": "minimize_all" } }
 }
 ```
 

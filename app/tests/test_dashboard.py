@@ -268,12 +268,25 @@ class DashboardCase(unittest.TestCase):
                          list(K.CHORD_GESTURES))
         for g in doc["gestures"]:
             self.assertIn(g["group"], ("taps", "unpressed", "pressed"))
-        for name in ("scroll", "scroll_horizontal", "ctrl_zoom", "pinch_zoom"):
+        for name in ("scroll_up", "scroll_down", "scroll_left", "scroll_right",
+                     "ctrl_zoom", "pinch_zoom"):
             self.assertIn(name, names)
-        for key in ("touch_click_2f", "touch_tap_2f", "touch_slide_vertical",
-                    "touch_pinch", "touch_pinch_pressed",
-                    "touch_slide_horizontal_pressed"):
+        for key in ("touch_click_2f", "touch_tap_2f", "touch_slide_up",
+                    "touch_slide_down", "touch_pinch",
+                    "touch_slide_left_pressed", "touch_slide_right_pressed"):
             self.assertIn(key, doc["defaults"]["remote_chords"], key)
+        # the paired actions carry their partner and direction, the rest ""
+        by_name = {a["name"]: a for a in doc["actions"]}
+        self.assertEqual(by_name["scroll_up"]["pair"], "scroll_down")
+        self.assertEqual(by_name["scroll_up"]["dir"], "up")
+        self.assertEqual(by_name["scroll_left"]["pair"], "scroll_right")
+        self.assertEqual(by_name["alt_tab"]["pair"], "alt_tab")
+        self.assertEqual(by_name["alt_tab"]["dir"], "")
+        self.assertEqual(by_name["task_view"]["pair"], "")
+        rows = {g["key"]: g for g in doc["gestures"]}
+        self.assertEqual(rows["touch_slide_up"]["pair"], "touch_slide_down")
+        self.assertEqual(rows["touch_slide_up"]["dir"], "up")
+        self.assertNotIn("pair", rows["touch_pinch"])
         self.assertEqual(doc["chord_buttons"], list(K.CHORD_BUTTONS))
         self.assertEqual(doc["chord_keys"], list(K.CHORD_BUTTONS))
         self.assertEqual(doc["gesture_keys"], list(K.CHORD_GESTURES))

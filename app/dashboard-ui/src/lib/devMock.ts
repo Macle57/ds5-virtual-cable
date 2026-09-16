@@ -76,8 +76,10 @@ export function mockActions(meta: ActionsMeta): ActionsMeta {
     ["left_click", "click the mouse"],
     ["right_click", "right-click the mouse"],
     ["middle_click", "middle-click the mouse"],
-    ["scroll", "scroll wheel, proportional to the slide (precision-touchpad style)"],
-    ["scroll_horizontal", "horizontal scroll, proportional to the slide"],
+    ["scroll_up", "scroll wheel following the fingers (a button: one notch up)"],
+    ["scroll_down", "scroll wheel following the fingers (a button: one notch down)"],
+    ["scroll_left", "sideways scroll following the fingers (a button: one notch left)"],
+    ["scroll_right", "sideways scroll following the fingers (a button: one notch right)"],
     ["pinch_zoom", "touch-injected pinch: zooms like a precision touchpad"],
     ["ctrl_zoom", "Ctrl + wheel zoom"],
     ["show_battery", "toast this pad's battery level"],
@@ -93,9 +95,10 @@ export function mockActions(meta: ActionsMeta): ActionsMeta {
     defaults: {
       ...meta.defaults,
       chords: {
-        ...meta.defaults.chords, touch_tap_2f: "none", touch_click_2f: "right_click", touch_slide_horizontal: "scroll_horizontal",
-        touch_slide_vertical: "scroll", touch_swipe_up: "none", touch_swipe_down: "none", touch_slide_horizontal_pressed: "alt_tab",
-        touch_swipe_up_pressed: "task_view", touch_swipe_down_pressed: "minimize_all", touch_pinch: "pinch_zoom", touch_pinch_pressed: "ctrl_zoom",
+        ...meta.defaults.chords, touch_tap_2f: "none", touch_click_2f: "right_click",
+        touch_slide_up: "scroll_up", touch_slide_down: "scroll_down", touch_slide_left: "scroll_left", touch_slide_right: "scroll_right",
+        touch_slide_left_pressed: "alt_tab", touch_slide_right_pressed: "alt_tab",
+        touch_slide_up_pressed: "task_view", touch_slide_down_pressed: "minimize_all", touch_pinch: "pinch_zoom", touch_pinch_pressed: "none",
         r3: "show_battery",
       },
       remote_chords: meta.defaults.remote_chords ?? {

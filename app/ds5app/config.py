@@ -202,20 +202,32 @@ CHORD_BUTTONS = ("cross", "circle", "square", "triangle",
 #: `input.remote.chords`). Three groups (`GESTURE_META`): "taps" -- a short
 #: 2-finger touch and a physical click with two fingers down; "unpressed" --
 #: 2-finger movement while the pad is NOT clicked; "pressed" -- the same
-#: movement while the pad IS clicked, the way Alt-Tab / Task View /
-#: minimize-all moved when unpressed slides became scrolling. A contact is
-#: exactly one of these: a click never doubles as a tap, a slide never fires
-#: the tap, a clicked-then-slid contact fires only its `_pressed` gesture.
+#: movement while the pad IS clicked. A contact is exactly one of these: a
+#: click never doubles as a tap, a slide never fires the tap, and the click
+#: OUTRANKS the unpressed family -- the moment the pad goes down, whatever
+#: unpressed gesture the contact was making ends and the travel is measured
+#: afresh from the click, against the `_pressed` rows only.
+#:
+#: The four slide directions are separate rows so the dashboard can offer
+#: "scroll up" on the up row and "scroll down" on the down row -- and they
+#: come in PAIRS (`GESTURE_META[...]["pair"]`): the two rows of an axis are
+#: either bound to one paired action (`ActionSpec.pair`: the scroll pairs,
+#: `alt_tab` with itself) or to independent one-shots. The engine reads the
+#: rows literally; the pairing is a dashboard rule that keeps a config
+#: sane (docs/input-shortcuts.md, "Two-finger gestures").
 CHORD_GESTURES = (
     "touch_tap_2f", "touch_click_2f",
-    "touch_slide_horizontal", "touch_slide_vertical",
-    "touch_swipe_up", "touch_swipe_down", "touch_pinch",
-    "touch_slide_horizontal_pressed", "touch_swipe_up_pressed",
-    "touch_swipe_down_pressed", "touch_pinch_pressed",
+    "touch_slide_up", "touch_slide_down",
+    "touch_slide_left", "touch_slide_right", "touch_pinch",
+    "touch_slide_up_pressed", "touch_slide_down_pressed",
+    "touch_slide_left_pressed", "touch_slide_right_pressed",
+    "touch_pinch_pressed",
 )
 
 #: What /api/actions serves as `gestures` -- the dashboard renders its
-#: Gestures tab from this list, verbatim and in this order.
+#: Gestures tab from this list, verbatim and in this order. `pair` names the
+#: row that shares the axis; `dir` is the direction a paired action must
+#: match (`ActionSpec.dir`) to be offered on that row.
 GESTURE_META = (
     {"key": "touch_tap_2f", "group": "taps",
      "label": "Two-finger tap",
@@ -224,35 +236,59 @@ GESTURE_META = (
      "label": "Two-finger click",
      "help": "click the pad while two fingers rest on it (a Windows "
              "touchpad's right click)"},
-    {"key": "touch_slide_horizontal", "group": "unpressed",
-     "label": "Two-finger horizontal slide",
-     "help": "two fingers slide left/right, pad not clicked"},
-    {"key": "touch_slide_vertical", "group": "unpressed",
-     "label": "Two-finger vertical slide",
-     "help": "two fingers slide up/down, pad not clicked"},
-    {"key": "touch_swipe_up", "group": "unpressed",
-     "label": "Two-finger swipe up",
-     "help": "a quick 2-finger flick up; fires only while the vertical "
-             "slide row is 'none'"},
-    {"key": "touch_swipe_down", "group": "unpressed",
-     "label": "Two-finger swipe down",
-     "help": "a quick 2-finger flick down; fires only while the vertical "
-             "slide row is 'none'"},
+    {"key": "touch_slide_up", "group": "unpressed",
+     "pair": "touch_slide_down", "dir": "up",
+     "label": "Two-finger slide up",
+     "help": "two fingers slide up, pad not clicked; paired with slide down"},
+    {"key": "touch_slide_down", "group": "unpressed",
+     "pair": "touch_slide_up", "dir": "down",
+     "label": "Two-finger slide down",
+     "help": "two fingers slide down, pad not clicked; paired with slide up"},
+    {"key": "touch_slide_left", "group": "unpressed",
+     "pair": "touch_slide_right", "dir": "left",
+     "label": "Two-finger slide left",
+     "help": "two fingers slide left, pad not clicked; paired with slide "
+             "right"},
+    {"key": "touch_slide_right", "group": "unpressed",
+     "pair": "touch_slide_left", "dir": "right",
+     "label": "Two-finger slide right",
+     "help": "two fingers slide right, pad not clicked; paired with slide "
+             "left"},
     {"key": "touch_pinch", "group": "unpressed",
      "label": "Pinch / spread",
      "help": "two fingers move apart or together, pad not clicked"},
-    {"key": "touch_slide_horizontal_pressed", "group": "pressed",
-     "label": "Horizontal slide while clicked",
-     "help": "two fingers slide left/right with the pad held down"},
-    {"key": "touch_swipe_up_pressed", "group": "pressed",
-     "label": "Swipe up while clicked",
-     "help": "two fingers swipe up with the pad held down"},
-    {"key": "touch_swipe_down_pressed", "group": "pressed",
-     "label": "Swipe down while clicked",
-     "help": "two fingers swipe down with the pad held down"},
+    {"key": "touch_slide_up_pressed", "group": "pressed",
+     "pair": "touch_slide_down_pressed", "dir": "up",
+     "label": "Slide up while clicked",
+     "help": "two fingers slide up with the pad held down"},
+    {"key": "touch_slide_down_pressed", "group": "pressed",
+     "pair": "touch_slide_up_pressed", "dir": "down",
+     "label": "Slide down while clicked",
+     "help": "two fingers slide down with the pad held down"},
+    {"key": "touch_slide_left_pressed", "group": "pressed",
+     "pair": "touch_slide_right_pressed", "dir": "left",
+     "label": "Slide left while clicked",
+     "help": "two fingers slide left with the pad held down"},
+    {"key": "touch_slide_right_pressed", "group": "pressed",
+     "pair": "touch_slide_left_pressed", "dir": "right",
+     "label": "Slide right while clicked",
+     "help": "two fingers slide right with the pad held down"},
     {"key": "touch_pinch_pressed", "group": "pressed",
      "label": "Pinch / spread while clicked",
      "help": "two fingers move apart or together with the pad held down"},
+)
+
+#: The gesture rows of 1.0 and 0.5. They are DROPPED on load, not carried
+#: over: the directional rows above start from their defaults whatever an
+#: older file said, so every install gets the same, documented gesture map
+#: (the old rows' meanings never mapped cleanly -- the unpressed flicks
+#: were dead beside a scrolling vertical slide, and a 0.5 file still lists
+#: them). The file loses them on its next save.
+LEGACY_GESTURE_KEYS = (
+    "touch_slide_vertical", "touch_slide_horizontal",
+    "touch_swipe_up", "touch_swipe_down",
+    "touch_swipe_up_pressed", "touch_swipe_down_pressed",
+    "touch_slide_horizontal_pressed",
 )
 
 
@@ -286,15 +322,17 @@ DEFAULT_CHORDS = {
     "create": "show_desktop",
     # Gestures. Unpressed 2-finger movement behaves like a precision
     # touchpad (scroll, pinch-zoom); the shell gestures live on the CLICKED
-    # variants. `touch_tap_2f` and the two unpressed swipes are unbound here.
+    # variants. `touch_tap_2f` and the clicked pinch are unbound here.
     "touch_click_2f": "right_click",
-    "touch_slide_horizontal": "scroll_horizontal",
-    "touch_slide_vertical": "scroll",
+    "touch_slide_up": "scroll_up",
+    "touch_slide_down": "scroll_down",
+    "touch_slide_left": "scroll_left",
+    "touch_slide_right": "scroll_right",
     "touch_pinch": "pinch_zoom",
-    "touch_slide_horizontal_pressed": "alt_tab",
-    "touch_swipe_up_pressed": "task_view",
-    "touch_swipe_down_pressed": "minimize_all",
-    "touch_pinch_pressed": "ctrl_zoom",
+    "touch_slide_left_pressed": "alt_tab",
+    "touch_slide_right_pressed": "alt_tab",
+    "touch_slide_up_pressed": "task_view",
+    "touch_slide_down_pressed": "minimize_all",
     # Two buttons nothing else claimed: the touchpad click opens the pad-driven
     # on-screen keyboard, the mute button (the one with the microphone on it)
     # starts voice typing through the pad's own microphone.
@@ -324,13 +362,15 @@ DEFAULT_REMOTE_CHORDS = {
     # row: in remote mode a 1-finger physical click is the left mouse button.
     "touch_tap_2f": "right_click",
     "touch_click_2f": "right_click",
-    "touch_slide_horizontal": "scroll_horizontal",
-    "touch_slide_vertical": "scroll",
+    "touch_slide_up": "scroll_up",
+    "touch_slide_down": "scroll_down",
+    "touch_slide_left": "scroll_left",
+    "touch_slide_right": "scroll_right",
     "touch_pinch": "pinch_zoom",
-    "touch_slide_horizontal_pressed": "alt_tab",
-    "touch_swipe_up_pressed": "task_view",
-    "touch_swipe_down_pressed": "minimize_all",
-    "touch_pinch_pressed": "ctrl_zoom",
+    "touch_slide_left_pressed": "alt_tab",
+    "touch_slide_right_pressed": "alt_tab",
+    "touch_slide_up_pressed": "task_view",
+    "touch_slide_down_pressed": "minimize_all",
 }
 
 
@@ -339,22 +379,32 @@ def merge_chords(defaults: dict, raw: object, where: str) -> dict:
 
     The one merge rule both binding tables live by: naming a key changes that
     key and keeps the rest; ""/"none"/"off" removes a default. Keys and action
-    names are lowercased so a hand-edited "Cross" still binds.
+    names are lowercased so a hand-edited "Cross" still binds. The gesture
+    rows of older builds (`LEGACY_GESTURE_KEYS`) are dropped, with one log
+    line, so today's rows keep their defaults.
     """
     out = dict(defaults)
     if raw is not None and not isinstance(raw, dict):
         log.warning("'%s' is %s, not an object -- keeping the defaults",
                     where, type(raw).__name__)
         raw = None
+    dropped = []
     for key, action in (raw or {}).items():
         key = str(key).strip().lower()
         if not key:
+            continue
+        if key in LEGACY_GESTURE_KEYS:
+            dropped.append(key)
             continue
         name = action.strip().lower() if isinstance(action, str) else ""
         if name in ("", "none", "off"):
             out.pop(key, None)
         else:
             out[key] = name
+    if dropped:
+        log.info("%s: ignoring the gesture rows of an older build (%s); "
+                 "the current rows keep their defaults", where,
+                 ", ".join(sorted(dropped)))
     return out
 
 
@@ -462,7 +512,9 @@ class LightbarPolicy:
 
 _GESTURES_KNOWN = ("tap_ms", "tap_move_px", "slide_px", "swipe_px",
                    "alt_tab_step_px", "pinch_px", "scroll_px_per_notch",
-                   "zoom_px_per_notch", "pinch_gain")
+                   "zoom_px_per_notch", "pinch_gain", "pinch_delay_ms",
+                   "scroll_sensitivity", "scroll_reverse",
+                   "zoom_sensitivity", "zoom_reverse")
 
 
 @dataclass
@@ -484,8 +536,13 @@ class GestureTuning:
     swipe_px: int = 200
     #: Horizontal travel that opens Alt-Tab, and per further step through it.
     alt_tab_step_px: int = 150
-    #: Change in finger spread at which a contact commits to a pinch.
+    #: Change in finger spread at which a contact commits to a pinch ...
     pinch_px: int = 80
+    #: ... but never before this long after the second finger landed, and
+    #: only while the spread change clearly beats the travel: a scroll that
+    #: starts with a little spread wobble is a scroll (the Windows touchpad
+    #: rule -- scrolling wins the ambiguous opening of a contact).
+    pinch_delay_ms: int = 120
     #: Finger travel per wheel notch (120 units) for the `scroll` actions,
     #: before `remote.scroll_speed`.
     scroll_px_per_notch: int = 100
@@ -494,6 +551,16 @@ class GestureTuning:
     #: Screen pixels the injected touch contacts move per point of finger
     #: spread change, for `pinch_zoom`.
     pinch_gain: float = 1.0
+    #: The user-facing knobs on the two continuous families, applied on top
+    #: of the per-notch figures above: a multiplier on how far a slide
+    #: scrolls (`scroll_*` rows) and on how much a pinch zooms (`pinch_zoom`
+    #: and `ctrl_zoom`), and a direction flip for each. Touch scrolling is
+    #: NOT scaled by `remote.scroll_speed` -- that knob is the sticks' and
+    #: the triggers'.
+    scroll_sensitivity: float = 1.0
+    scroll_reverse: bool = False
+    zoom_sensitivity: float = 1.0
+    zoom_reverse: bool = False
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -507,11 +574,18 @@ class GestureTuning:
             swipe_px=_as_int(data.get("swipe_px"), 200, 20, 1000),
             alt_tab_step_px=_as_int(data.get("alt_tab_step_px"), 150, 20, 1000),
             pinch_px=_as_int(data.get("pinch_px"), 80, 10, 1000),
+            pinch_delay_ms=_as_int(data.get("pinch_delay_ms"), 120, 0, 1000),
             scroll_px_per_notch=_as_int(data.get("scroll_px_per_notch"),
                                         100, 5, 2000),
             zoom_px_per_notch=_as_int(data.get("zoom_px_per_notch"),
                                       80, 5, 2000),
             pinch_gain=_as_float(data.get("pinch_gain"), 1.0, 0.05),
+            scroll_sensitivity=min(10.0, _as_float(
+                data.get("scroll_sensitivity"), 1.0, 0.05)),
+            scroll_reverse=_as_bool(data.get("scroll_reverse"), False),
+            zoom_sensitivity=min(10.0, _as_float(
+                data.get("zoom_sensitivity"), 1.0, 0.05)),
+            zoom_reverse=_as_bool(data.get("zoom_reverse"), False),
         )
         g.extra = {k: v for k, v in data.items() if k not in _GESTURES_KNOWN}
         return g
@@ -522,9 +596,14 @@ class GestureTuning:
                    slide_px=int(self.slide_px), swipe_px=int(self.swipe_px),
                    alt_tab_step_px=int(self.alt_tab_step_px),
                    pinch_px=int(self.pinch_px),
+                   pinch_delay_ms=int(self.pinch_delay_ms),
                    scroll_px_per_notch=int(self.scroll_px_per_notch),
                    zoom_px_per_notch=int(self.zoom_px_per_notch),
-                   pinch_gain=float(self.pinch_gain))
+                   pinch_gain=float(self.pinch_gain),
+                   scroll_sensitivity=float(self.scroll_sensitivity),
+                   scroll_reverse=bool(self.scroll_reverse),
+                   zoom_sensitivity=float(self.zoom_sensitivity),
+                   zoom_reverse=bool(self.zoom_reverse))
         return out
 
 
@@ -667,11 +746,14 @@ class InputConfig:
     #: first hardware test found even 1/3 strength startling in a quiet room.
     #: `haptic_ack` stays the on/off switch; this is only the volume knob.
     haptic_strength: int = 25
-    #: While the chord button is held, lend the sticks to the OS: left stick
-    #: moves the pointer, right stick scrolls, with the same `remote.*` speeds
-    #: as remote mode -- and the game sees them centred. The cost is a frozen
-    #: camera for as long as the chord is held, which is why this is a switch:
-    #: turning it off restores pure stick passthrough during chords.
+    #: While the chord button is held, lend the pointer controls to the OS:
+    #: left stick moves the pointer, right stick scrolls, with the same
+    #: `remote.*` speeds as remote mode -- and the game sees them centred --
+    #: and a ONE-finger touchpad drag moves the pointer too (a short 1-finger
+    #: tap clicks), exactly as in remote mode. The cost is a frozen camera
+    #: for as long as the chord is held, which is why this is a switch:
+    #: turning it off restores pure stick passthrough during chords and
+    #: leaves the 1-finger touchpad to the 2-finger tracker alone.
     stick_mouse_in_chord: bool = True
     #: Minutes without input activity before the pad is powered off
     #: (feature 0x08, the same mechanism as PS+Triangle). 0 disables.

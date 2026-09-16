@@ -50,8 +50,25 @@ export interface ActionInfo {
   Icon: IconType;
   color: string;      // a theme token colour
   repeatable: boolean;
+  pair: string;       // the action the partner row of a slide axis gets ("" = not paired)
+  dir: string;        // the row direction this action belongs on ("" = any)
   macro?: MacroDef;
   unknown?: boolean;  // bound in config, but not in this build's vocabulary
+}
+
+/* The paired actions, for a server that predates `pair`/`dir` on
+   /api/actions: the scroll directions pair across an axis, Alt+Tab takes
+   both rows of one. */
+const BUILTIN_PAIRS: Record<string, { pair: string; dir: string }> = {
+  scroll_up: { pair: "scroll_down", dir: "up" }, scroll_down: { pair: "scroll_up", dir: "down" },
+  scroll_left: { pair: "scroll_right", dir: "left" }, scroll_right: { pair: "scroll_left", dir: "right" },
+  alt_tab: { pair: "alt_tab", dir: "" },
+};
+export function pairing(name: string, meta: ActionsMeta | null): { pair: string; dir: string } {
+  const n = name.trim().toLowerCase();
+  const spec = meta?.actions.find((a) => a.name === n);
+  if (spec && spec.pair !== undefined) return { pair: spec.pair || "", dir: spec.dir || "" };
+  return BUILTIN_PAIRS[n] ?? { pair: "", dir: "" };
 }
 
 export const GROUPS: { id: Group; title: string; color: string }[] = [
@@ -94,8 +111,10 @@ const BUILTIN: Record<string, { label: string; group: Group; Icon: IconType }> =
   left_click:       { label: "Left click",         group: "mouse",   Icon: MousePointerClick },
   right_click:      { label: "Right click",        group: "mouse",   Icon: MousePointer },
   middle_click:     { label: "Middle click",       group: "mouse",   Icon: Mouse },
-  scroll:           { label: "Scroll",             group: "mouse",   Icon: MoveVertical },
-  scroll_horizontal: { label: "Scroll sideways",   group: "mouse",   Icon: MoveHorizontal },
+  scroll_up:        { label: "Scroll up",          group: "mouse",   Icon: MoveVertical },
+  scroll_down:      { label: "Scroll down",        group: "mouse",   Icon: MoveVertical },
+  scroll_left:      { label: "Scroll left",        group: "mouse",   Icon: MoveHorizontal },
+  scroll_right:     { label: "Scroll right",       group: "mouse",   Icon: MoveHorizontal },
   pinch_zoom:       { label: "Pinch zoom",         group: "mouse",   Icon: Maximize2 },
   ctrl_zoom:        { label: "Ctrl + wheel zoom",  group: "mouse",   Icon: ZoomIn },
   dictation:        { label: "Voice typing",       group: "voice",   Icon: Mic },
@@ -125,8 +144,10 @@ const BUILTIN_DOC: Record<string, string> = {
   middle_click: "middle-click where the pointer is",
   dictation: "Win+H: start / stop voice typing",
   keyboard: "show / hide the on-screen keyboard",
-  scroll: "wheel scroll, proportional to the slide",
-  scroll_horizontal: "sideways wheel scroll, proportional to the slide",
+  scroll_up: "wheel scroll following the fingers (a button: one notch up)",
+  scroll_down: "wheel scroll following the fingers (a button: one notch down)",
+  scroll_left: "sideways scroll following the fingers (a button: one notch left)",
+  scroll_right: "sideways scroll following the fingers (a button: one notch right)",
   pinch_zoom: "zoom the way a precision-touchpad pinch does",
   ctrl_zoom: "Ctrl + wheel: the app's zoom level",
   show_battery: "the battery toast: this pad's charge as a notification",
@@ -165,7 +186,7 @@ export function describeMacro(name: string, m: MacroDef): ActionInfo {
   return {
     name, label: m.label?.trim() || name, doc: macroSummary(m), group: "macro",
     Icon: isRun ? Terminal : Keyboard, color: groupColor("macro"),
-    repeatable: macroRepeat(m).mode !== "once" && !isRun, macro: m,
+    repeatable: macroRepeat(m).mode !== "once" && !isRun, pair: "", dir: "", macro: m,
   };
 }
 
@@ -176,17 +197,18 @@ export function describeAction(name: string, meta: ActionsMeta | null, macros: u
   const spec = meta?.actions.find((a) => a.name === n)
     ?? engineActions(meta).find((a) => a.name === n);
   const b = BUILTIN[n];
+  const { pair, dir } = pairing(n, meta);
   if (b) {
     return { name: n, label: b.label, doc: spec?.doc ?? BUILTIN_DOC[n] ?? "", group: b.group,
-             Icon: b.Icon, color: groupColor(b.group), repeatable: !!(spec as { repeatable?: boolean } | undefined)?.repeatable };
+             Icon: b.Icon, color: groupColor(b.group), repeatable: !!(spec as { repeatable?: boolean } | undefined)?.repeatable, pair, dir };
   }
   if (spec) {
     // in the registry, unknown to this page: a plain card with its doc
     return { name: n, label: n.replace(/_/g, " "), doc: spec.doc, group: "other",
-             Icon: HelpCircle, color: groupColor("other"), repeatable: !!(spec as { repeatable?: boolean }).repeatable };
+             Icon: HelpCircle, color: groupColor("other"), repeatable: !!(spec as { repeatable?: boolean }).repeatable, pair, dir };
   }
   return { name: n, label: n, doc: "unknown to this build; kept as written", group: "other",
-           Icon: HelpCircle, color: groupColor("other"), repeatable: false, unknown: true };
+           Icon: HelpCircle, color: groupColor("other"), repeatable: false, pair: "", dir: "", unknown: true };
 }
 
 /* Everything a chord may bind to, in picker order: unbound, the pad, then

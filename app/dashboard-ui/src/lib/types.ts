@@ -84,12 +84,16 @@ export interface LiveState {
 }
 
 /* /api/actions */
-export interface ActionSpec { name: string; doc: string; repeatable: boolean }
+/* `pair` / `dir` (1.1): a paired action takes a slide axis whole -- choosing
+   it on one row sets its `pair` on the partner row -- and `dir` is the row
+   direction it is offered on ("" = any). Absent from older servers. */
+export interface ActionSpec { name: string; doc: string; repeatable: boolean; pair?: string; dir?: string }
 /* One row of the Gestures tab, in the engine's order. `group`: taps (2-finger
-   tap / click), unpressed (slides, swipes, pinch with the pad NOT clicked),
-   pressed (the same while the pad is held clicked). */
+   tap / click), unpressed (slides, pinch with the pad NOT clicked), pressed
+   (the same while the pad is held clicked). `pair` names the row sharing
+   this one's axis (slide up <-> slide down), `dir` its direction. */
 export type GestureGroup = "taps" | "unpressed" | "pressed";
-export interface GestureRow { key: string; label: string; help: string; group: GestureGroup | string }
+export interface GestureRow { key: string; label: string; help: string; group: GestureGroup | string; pair?: string; dir?: string }
 export interface ActionsMeta {
   actions: ActionSpec[];
   chord_buttons: string[];

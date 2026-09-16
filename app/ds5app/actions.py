@@ -567,6 +567,13 @@ class ActionSpec:
     `repeat` object: `repeatable` stays the flag the engine's hold-repeat
     reads (True for "hold"), `repeat_interval_s` None means the engine's
     `repeat_ms`, "toggle" is driven by the engine's own timer.
+
+    `pair` / `dir` describe the PAIRED actions, the ones a two-row gesture
+    axis takes as a whole (config.GESTURE_META): `pair` is the action the
+    other row of the axis gets when this one is chosen (`scroll_up` <->
+    `scroll_down`; `alt_tab` pairs with itself), `dir` the row direction
+    this one belongs on ("up" / "down" / "left" / "right", "" for any).
+    The engine reads rows literally; the dashboard enforces the pairing.
     """
 
     name: str
@@ -578,6 +585,8 @@ class ActionSpec:
     repeat_mode: str = "once"
     repeat_interval_s: float | None = None
     max_runs: int = 0
+    pair: str = ""
+    dir: str = ""
 
 
 #: The synthetic pinch starts with its two contacts this far apart (screen
@@ -910,7 +919,8 @@ class OsActions:
                        "Win+Tab Task View"),
             ActionSpec("alt_tab",
                        lambda p: a.tap(VK_MENU, VK_TAB), False,
-                       "one Alt+Tab step (the gesture uses hold semantics)"),
+                       "one Alt+Tab step (the gesture uses hold semantics)",
+                       pair="alt_tab"),
             # -- mouse buttons and plain keys (held for the press in remote
             #    mode, tapped from a chord) -----------------------------------
             ActionSpec("left_click", lambda p: a.click("left"), False,
@@ -921,21 +931,42 @@ class OsActions:
             ActionSpec("middle_click", lambda p: a.click("middle"), False,
                        "middle mouse button", hold=held_button("middle")),
             # -- continuous: scrolling and zooming that follow the fingers.
-            #    From a button they do one step (params `step`: notches) ------
-            ActionSpec("scroll",
+            #    From a button they do one step (params `step`: notches).
+            #    The four scroll directions come in pairs: on a slide axis
+            #    the pair IS one precision-touchpad scroll (the fingers are
+            #    followed both ways); on a button each is one notch its way.
+            ActionSpec("scroll_up",
+                       lambda p: a.wheel(WHEEL_DELTA * _steps(p)), True,
+                       "vertical scroll following the fingers (a button: one "
+                       "notch up)",
+                       continuous=Continuous(lambda: None,
+                                             lambda d: a.wheel(d),
+                                             lambda: None, "wheel", 40),
+                       pair="scroll_down", dir="up"),
+            ActionSpec("scroll_down",
                        lambda p: a.wheel(-WHEEL_DELTA * _steps(p)), True,
                        "vertical scroll following the fingers (a button: one "
                        "notch down)",
                        continuous=Continuous(lambda: None,
                                              lambda d: a.wheel(d),
-                                             lambda: None, "wheel", 40)),
-            ActionSpec("scroll_horizontal",
+                                             lambda: None, "wheel", 40),
+                       pair="scroll_up", dir="down"),
+            ActionSpec("scroll_left",
+                       lambda p: a.wheel(-WHEEL_DELTA * _steps(p), True), True,
+                       "horizontal scroll following the fingers (a button: "
+                       "one notch left)",
+                       continuous=Continuous(lambda: None,
+                                             lambda d: a.wheel(d, True),
+                                             lambda: None, "wheel", 40),
+                       pair="scroll_right", dir="left"),
+            ActionSpec("scroll_right",
                        lambda p: a.wheel(WHEEL_DELTA * _steps(p), True), True,
                        "horizontal scroll following the fingers (a button: "
                        "one notch right)",
                        continuous=Continuous(lambda: None,
                                              lambda d: a.wheel(d, True),
-                                             lambda: None, "wheel", 40)),
+                                             lambda: None, "wheel", 40),
+                       pair="scroll_left", dir="right"),
             ActionSpec("ctrl_zoom",
                        lambda p: a.ctrl_wheel(WHEEL_DELTA * _steps(p)), True,
                        "Ctrl+wheel page zoom following a pinch (a button: "

@@ -32,14 +32,16 @@ see `BridgeBackend.power_off_pad`).
 The chord button (default PS)
 -----------------------------
 While it is held, EVERYTHING digital is swallowed: buttons, dpad, touchpad.
-Triggers and motion still pass -- no chord is built from them. The sticks are
-LENT TO THE OS by default (`stick_mouse_in_chord`): left stick moves the
-pointer, right stick scrolls, with the very same `remote.*` speeds as remote
-mode, and the game sees them centred for the duration of the hold -- the
-"major controls" never change meaning between a held chord and remote mode.
-The cost is a camera frozen mid-aim while the user reaches for a volume
-chord; a user who hates that flips `stick_mouse_in_chord` off and the sticks
-pass through untouched again. What the game sees at chord start is therefore
+Triggers and motion still pass -- no chord is built from them. The pointer
+controls are LENT TO THE OS by default (`stick_mouse_in_chord`): left stick
+moves the pointer, right stick scrolls, with the very same `remote.*` speeds
+as remote mode, and the game sees them centred for the duration of the hold;
+a 1-finger touchpad drag moves the pointer and a short 1-finger tap clicks,
+exactly as in remote mode (`_touch_pointer`, one tracker for both contexts)
+-- the "major controls" never change meaning between a held chord and
+remote mode. The cost is a camera frozen mid-aim while the user reaches for
+a volume chord; a user who hates that flips `stick_mouse_in_chord` off and
+the sticks pass through untouched again. What the game sees at chord start is therefore
 nothing at all: the chord button itself is masked from the first report. A
 plain tap still works because it is REPLAYED -- if the button comes back up
 quickly with no chord fired, the engine waits out the double-press window (a
@@ -184,6 +186,16 @@ SWIPE_PX = 200
 #: A touch shorter than this that moved less than TAP_MOVE_PX is a tap.
 TAP_S = 0.25
 TAP_MOVE_PX = 40
+#: A pinch commits only while the spread change beats the centroid's travel
+#: by this factor (and `pinch_delay_ms` has passed): with both fingers
+#: sliding and drifting apart, the slide wins -- the Windows touchpad rule.
+PINCH_DOMINANCE = 1.5
+#: The injected pinch follows a low-pass of the measured spread (time
+#: constant) and moves its contacts at most this often: the pad's touch
+#: coordinates wobble by a point or two per report, and a contact that
+#: reverses by a pixel 476 times a second reads as jitter on screen.
+PINCH_SMOOTH_S = 0.03
+PINCH_EMIT_S = 1.0 / 120.0
 
 #: What the pad's status nibble says about the battery, in the words the
 #: `show_battery` toast uses.
@@ -373,6 +385,11 @@ class InputInterceptor:
         self._tf_spread0 = 0.0
         self._tf_last: tuple[float, float] = (0.0, 0.0)
         self._tf_spread_last = 0.0
+        #: The low-passed spread a pinch follows (and when it was last
+        #: filtered), and when the pinch last moved its contacts.
+        self._tf_spread_f = 0.0
+        self._tf_filt_at = 0.0
+        self._tf_emit_at = 0.0
         self._tf_pressed0 = False
         self._tf_clicked = False
         self._tf_decided: str | None = None
@@ -480,6 +497,7 @@ class InputInterceptor:
         #: Gesture thresholds (`config.GestureTuning`).
         self._g = cfg.gestures
         self._tap_s = cfg.gestures.tap_ms / 1000.0
+        self._pinch_delay_s = cfg.gestures.pinch_delay_ms / 1000.0
 
     def update_config(self, new_cfg: K.InputConfig) -> None:
         """Adopt a changed config on a RUNNING engine, no bridge restart.
@@ -624,13 +642,18 @@ class InputInterceptor:
                 self._chord_held(frame, now, thunks)
                 self._chord_gestures(frame, now, thunks)
                 if self.cfg.stick_mouse_in_chord:
-                    # The sticks drive the OS during the hold, same speeds as
-                    # remote mode. Deflecting one IS using the chord -- no tap
-                    # replay afterwards, or the game would get a phantom PS
-                    # press right after the user finished mousing.
+                    # The sticks and the 1-finger touchpad drive the OS
+                    # during the hold, same speeds as remote mode. Deflecting
+                    # a stick or moving the pointer IS using the chord -- no
+                    # tap replay afterwards, or the game would get a phantom
+                    # PS press right after the user finished mousing.
                     if frame.stick_active():
                         self._chord_used = True
                     self._stick_rates(frame, now, thunks, triggers=False)
+                    if not self.keyboard_open:
+                        fingers, c = self._centroid(frame)
+                        if self._touch_pointer(frame, now, thunks, fingers, c):
+                            self._chord_used = True
 
             if self._rm_needs_release:
                 self._rm_needs_release = False
@@ -817,7 +840,9 @@ class InputInterceptor:
             self._chord_down = True
             self._chord_down_at = now
             self._repeating = None
+            self._touch_reset()
         elif not down_now and self.chord_button in was:
+            self._touch_reset()
             if self._chord_down:
                 self._end_gesture(thunks)
                 tap = (not self._chord_used
@@ -922,26 +947,39 @@ class InputInterceptor:
     #
     # One contact = one gesture, decided once. From the moment the second
     # finger lands, the centroid's travel (dx, dy) and the change in the
-    # fingers' spread (ds) are measured against `input.gestures`, and whether
-    # the pad is physically CLICKED picks the row family:
+    # fingers' spread (ds) are measured against `input.gestures`. The
+    # dominant motion picks the ROW -- the pinch when the spread change
+    # clearly beats both travel components (PINCH_DOMINANCE) AND
+    # `pinch_delay_ms` has passed since the second finger landed (before
+    # that the contact waits: a slide that opens with a spread wobble must
+    # come out a slide, the way a Windows touchpad prefers scrolling in an
+    # ambiguous start), else the larger travel component's direction
+    # (`touch_slide_up/down/left/right`) -- and whether the pad is
+    # physically CLICKED picks the row family (`_pressed` or not). What the
+    # row names then decides both the travel it takes to COMMIT and the
+    # SHAPE of the gesture (`_commit_px`, `_commit_gesture`):
     #
-    #   clicked:   |ds| >= pinch_px        -> touch_pinch_pressed
-    #              |dx| >= alt_tab_step_px -> touch_slide_horizontal_pressed
-    #              |dy| >= swipe_px        -> touch_swipe_up/down_pressed
-    #   unclicked: |ds| >= pinch_px        -> touch_pinch
-    #              |dx| >= slide_px        -> touch_slide_horizontal
-    #              |dy| >= slide_px        -> touch_slide_vertical, or -- only
-    #                                        while that row is "none" -- the
-    #                                        compatibility flicks
-    #                                        touch_swipe_up/down at swipe_px
+    #   pinch rows                          |ds| >= pinch_px
+    #   a continuous action (scroll, zoom)  slide_px, then the fingers are
+    #                                       tracked until they lift
+    #   `alt_tab`                           alt_tab_step_px, then the
+    #                                       switcher is open with hold
+    #                                       semantics
+    #   anything else                       swipe_px, fired once, contact
+    #                                       spent
     #
-    # (a row bound to `alt_tab` waits for alt_tab_step_px whatever the
-    # family). What the row names decides the SHAPE of the gesture: a
-    # continuous action (`ActionSpec.continuous`: scroll, zoom) tracks the
-    # fingers until they lift, `alt_tab` opens the switcher with hold
-    # semantics, anything else fires once and the contact is spent. An
-    # unbound row leaves the contact undecided so a later, bound direction
-    # can still win.
+    # An unbound row leaves the contact undecided so a later, bound
+    # direction can still win. Once decided, the contact is that gesture
+    # until the fingers lift: a scroll that began vertically is never
+    # re-read as a horizontal one, a spent one-shot fires nothing more.
+    #
+    # The one thing that interrupts a decided contact is the CLICK. The
+    # pressed family outranks the unpressed one: the moment the pad goes
+    # down, whatever the contact was doing unclicked ends (a scroll or
+    # pinch ends, an open switcher commits), and the travel is measured
+    # afresh from the click point against the `_pressed` rows only
+    # (`_tf_restart`). A contact that started clicked is a pressed gesture
+    # from its first frame.
     #
     # A contact that never reached a threshold is, on release, one of two
     # taps: `touch_click_2f` if the pad was clicked during the contact (fired
@@ -991,6 +1029,9 @@ class InputInterceptor:
             self._tf_at = now
             self._tf_start = self._tf_last = c
             self._tf_spread0 = self._tf_spread_last = spread
+            self._tf_spread_f = spread
+            self._tf_filt_at = 0.0
+            self._tf_emit_at = 0.0
             self._tf_pressed0 = pressed
             self._tf_clicked = False
             self._tf_decided = None
@@ -998,7 +1039,11 @@ class InputInterceptor:
             self._tf_acc = 0.0
             return False
         if pressed and not was_pressed:
+            # The click outranks the unpressed family (section comment):
+            # end what the contact was doing and measure the pressed rows
+            # from here.
             self._tf_clicked = True
+            self._tf_restart(c, spread, thunks)
         dx = c[0] - self._tf_start[0]
         dy = c[1] - self._tf_start[1]
         ds = spread - self._tf_spread0
@@ -1021,11 +1066,11 @@ class InputInterceptor:
                     if decided == "cont":
                         # The frame that crossed the threshold moved too:
                         # count it, or a quick slide loses its first step.
-                        self._track_continuous(c, spread, thunks)
+                        self._track_continuous(c, spread, now, thunks)
         elif self._tf_decided == "alt_tab":
             self._alt_hold_track(dx, thunks)
         elif self._tf_decided == "cont":
-            self._track_continuous(c, spread, thunks)
+            self._track_continuous(c, spread, now, thunks)
         self._tf_last = c
         self._tf_spread_last = spread
         return busy
@@ -1041,56 +1086,63 @@ class InputInterceptor:
         tracker's decision, or None while nothing decisive and bound."""
         g = self._g
         ax, ay, aS = abs(dx), abs(dy), abs(ds)
-        if pressed:
-            if aS >= g.pinch_px and aS > max(ax, ay):
-                return self._commit_gesture("touch_pinch_pressed", "spread",
-                                            dx, now, thunks)
-            if ax >= g.alt_tab_step_px and ax > ay:
-                return self._commit_gesture("touch_slide_horizontal_pressed",
-                                            "x", dx, now, thunks)
-            if ay >= g.swipe_px and ay > ax:
-                key = ("touch_swipe_up_pressed" if dy < 0
-                       else "touch_swipe_down_pressed")
-                return self._commit_gesture(key, "y", dx, now, thunks)
-            return None
-        if aS >= g.pinch_px and aS > max(ax, ay):
-            return self._commit_gesture("touch_pinch", "spread", dx, now, thunks)
-        if ax >= g.slide_px and ax > ay:
-            return self._commit_gesture("touch_slide_horizontal", "x", dx,
+        sfx = "_pressed" if pressed else ""
+        if aS >= g.pinch_px and aS > max(ax, ay) * PINCH_DOMINANCE:
+            # A pinch, if it still looks like one once the opening wobble
+            # has had `pinch_delay_ms` to turn into travel (the section
+            # comment: the slide wins the ambiguous start of a contact).
+            if now - self._tf_at < self._pinch_delay_s:
+                return None
+            return self._commit_gesture("touch_pinch" + sfx, "spread", dx,
                                         now, thunks)
-        if ay >= g.slide_px and ay > ax:
-            if self._tf_table.get("touch_slide_vertical"):
-                return self._commit_gesture("touch_slide_vertical", "y", dx,
-                                            now, thunks)
-            if ay >= g.swipe_px:
-                key = "touch_swipe_up" if dy < 0 else "touch_swipe_down"
-                return self._commit_gesture(key, "y", dx, now, thunks)
-        return None
+        if ax > ay:
+            key = ("touch_slide_left" if dx < 0 else "touch_slide_right") + sfx
+            axis, travel = "x", ax
+        elif ay > ax:
+            key = ("touch_slide_up" if dy < 0 else "touch_slide_down") + sfx
+            axis, travel = "y", ay
+        else:
+            return None
+        need = self._commit_px(key)
+        if need is None or travel < need:
+            return None
+        return self._commit_gesture(key, axis, dx, now, thunks)
+
+    def _commit_px(self, key: str):
+        """The travel at which slide row `key` commits: the slide threshold
+        for a continuous action, the switcher's own for `alt_tab`, the swipe
+        threshold for a one-shot -- and None for an unbound row, which never
+        commits (the contact stays undecided)."""
+        name = self._tf_table.get(key)
+        if not name:
+            return None
+        g = self._g
+        if name == "alt_tab":
+            return g.alt_tab_step_px
+        spec = self.registry.get(name)
+        if spec is not None and spec.continuous is not None:
+            return g.slide_px
+        return g.swipe_px
 
     def _commit_gesture(self, key: str, axis: str, dx: float, now: float,
                         thunks: list):
         """The contact IS gesture `key`: start what its row names.
 
-        -> "alt_tab" / "cont" / "spent", or None when the row is unbound (the
-        contact stays undecided) or names `alt_tab` before the switcher's
-        own, larger threshold is met."""
+        -> "alt_tab" / "cont" / "spent", or None when the row is unbound
+        (the contact stays undecided)."""
         table = self._tf_table
         name = table.get(key)
         if not name:
             return None
         spec = self.registry.get(name)
-        if name == "alt_tab" and spec is not None:
-            if abs(dx) < self._g.alt_tab_step_px or axis != "x":
-                # Alt-Tab is a horizontal hold gesture whatever row carries
-                # it; a vertical row bound to it fires the plain step.
-                if axis == "x":
-                    return None
-            else:
-                self.stats["gestures_fired"] += 1
-                if self.cfg.haptic_ack:
-                    self._ack_locked(now)
-                self._alt_hold_begin(dx, thunks)
-                return "alt_tab"
+        if name == "alt_tab" and spec is not None and axis == "x":
+            # Alt-Tab is a horizontal hold gesture; a vertical row bound to
+            # it fires the plain step below.
+            self.stats["gestures_fired"] += 1
+            if self.cfg.haptic_ack:
+                self._ack_locked(now)
+            self._alt_hold_begin(dx, thunks)
+            return "alt_tab"
         if spec is not None and spec.continuous is not None:
             self.stats["gestures_fired"] += 1
             self._tf_cont = spec.continuous
@@ -1102,7 +1154,8 @@ class InputInterceptor:
             self.stats["gestures_fired"] += 1
         return "spent"
 
-    def _track_continuous(self, c, spread: float, thunks: list) -> None:
+    def _track_continuous(self, c, spread: float, now: float,
+                          thunks: list) -> None:
         """One frame of a continuous gesture: the movement since the last
         frame along the decided axis, converted to the action's unit and
         emitted in its step size (third-notches for scrolling, whole notches
@@ -1111,20 +1164,42 @@ class InputInterceptor:
         g = self._g
         # The signed movement, "positive" being what a wheel calls positive:
         # fingers up = wheel up (content scrolls up, the Windows touchpad
-        # default), fingers right = hwheel right, fingers apart = zoom in.
+        # default), fingers right = hwheel right, fingers apart = zoom in --
+        # unless the user flipped that family (`scroll_reverse` /
+        # `zoom_reverse`); then the family's sensitivity scales it.
+        zoom = self._tf_axis == "spread"
         if self._tf_axis == "x":
             d = c[0] - self._tf_last[0]
         elif self._tf_axis == "y":
             d = -(c[1] - self._tf_last[1])
         else:
-            d = spread - self._tf_spread_last
+            # The spread is low-passed (PINCH_SMOOTH_S): the pad's touch
+            # coordinates wobble a point or two per report, and a pinch
+            # that reverses by a pixel every frame is jitter on screen.
+            if self._tf_filt_at:
+                alpha = 1.0 - math.exp(-max(0.0, now - self._tf_filt_at)
+                                       / PINCH_SMOOTH_S)
+                prev = self._tf_spread_f
+                self._tf_spread_f = prev + alpha * (spread - prev)
+                d = self._tf_spread_f - prev
+            else:
+                # the first tracked frame: the threshold-crossing frame's
+                # own movement, unfiltered, so a quick pinch starts at once
+                d = spread - self._tf_spread_last
+                self._tf_spread_f = spread
+            self._tf_filt_at = now
+        if g.zoom_reverse if zoom else g.scroll_reverse:
+            d = -d
         if cont.unit == "wheel":
-            per = (g.zoom_px_per_notch if self._tf_axis == "spread"
-                   else g.scroll_px_per_notch)
-            units = d * 120.0 / max(1, per) * self.cfg.remote.scroll_speed
+            per = g.zoom_px_per_notch if zoom else g.scroll_px_per_notch
+            units = d * 120.0 / max(1, per)
         else:
             units = d * g.pinch_gain
+        units *= g.zoom_sensitivity if zoom else g.scroll_sensitivity
         self._tf_acc += units
+        if cont.unit == "px" and now - self._tf_emit_at < PINCH_EMIT_S:
+            return                        # rate-limited; the movement waits
+        self._tf_emit_at = now
         step = max(1, int(cont.step))
         whole = int(self._tf_acc / step) * step
         if whole:
@@ -1138,16 +1213,37 @@ class InputInterceptor:
                                      table=self._tf_table):
             self.stats["gestures_fired"] += 1
 
-    def _tf_end(self, now: float, thunks: list, lifted: bool) -> None:
-        """The contact is over: commit an open switcher, end a continuous
-        action, or -- if the fingers lifted with nothing decided -- fire
-        the tap it was."""
+    def _tf_settle(self, thunks: list) -> None:
+        """Close what a decided contact holds open: commit an open switcher,
+        end a continuous action. Nothing for an undecided or spent one."""
         decided = self._tf_decided
         if decided == "alt_tab":
             thunks.append(lambda: self.actions.alt_tab_commit())
         elif decided == "cont":
             thunks.append(self._tf_cont.end)
-        elif decided is None and lifted:
+
+    def _tf_restart(self, c, spread: float, thunks: list) -> None:
+        """The pad was clicked mid-contact: the pressed family takes over.
+        Whatever the contact was doing ends, and travel and spread are
+        measured from HERE, so the pressed rows see only what happens with
+        the pad down (and a click-and-release with no travel from here is
+        the 2-finger click, whatever the fingers did before it)."""
+        self._tf_settle(thunks)
+        self._tf_start = c
+        self._tf_spread0 = self._tf_spread_f = spread
+        self._tf_filt_at = 0.0
+        self._tf_emit_at = 0.0
+        self._tf_decided = None
+        self._tf_cont = None
+        self._tf_acc = 0.0
+
+    def _tf_end(self, now: float, thunks: list, lifted: bool) -> None:
+        """The contact is over: commit an open switcher, end a continuous
+        action, or -- if the fingers lifted with nothing decided -- fire
+        the tap it was."""
+        decided = self._tf_decided
+        self._tf_settle(thunks)
+        if decided is None and lifted:
             dx = self._tf_last[0] - self._tf_start[0]
             dy = self._tf_last[1] - self._tf_start[1]
             ds = self._tf_spread_last - self._tf_spread0
@@ -1414,35 +1510,69 @@ class InputInterceptor:
                     entry["next"] = None
 
         # -- touchpad: 1 finger = the pointer, 2 = the gesture tracker --------
+        self._touch_pointer(frame, now, thunks, fingers, c)
+        self._two_finger(frame, now, thunks, self._remote_gestures, "remote")
+
+        # -- sticks and triggers ----------------------------------------------
+        self._stick_rates(frame, now, thunks, triggers=True)
+
+    def _touch_pointer(self, frame: _Frame, now: float, thunks: list,
+                       fingers: int, c) -> bool:
+        """The 1-finger touchpad pointer: a drag moves the mouse at
+        `remote.mouse_speed`, a short still touch that was never clicked is
+        a left click on lift. Remote mode's intrinsic layer, and the chord
+        hold's under `stick_mouse_in_chord` -- one tracker, so a contact
+        that spans the chord edge is adopted where it is (`_touch_reset`).
+        A contact that ever had two fingers is the gesture tracker's and
+        moves nothing. -> True if the pointer moved or a click fired."""
+        used = False
         if fingers and not self._rm_touch_fingers:
+            # A contact the tracker first sees with fingers ALREADY down
+            # (they were resting on the pad when the chord landed, or the
+            # tracker was reset under them) is adopted for moving, but is
+            # never a tap on lift: a thumb on the pad while PS is tapped
+            # must not click.
+            landed = (self._prev is None
+                      or not (self._prev.t0[0] or self._prev.t1[0]))
             self._rm_touch_at = now
             self._rm_touch_start = c
             self._rm_touch_moved = 0.0
-            self._rm_touch_clicked = "touchpad_click" in frame.buttons
+            self._rm_touch_clicked = ("touchpad_click" in frame.buttons
+                                      or not landed)
         if fingers:
+            if "touchpad_click" in frame.buttons:
+                self._rm_touch_clicked = True
             if self._rm_touch_fingers:
                 dx = c[0] - self._rm_touch_last[0]
                 dy = c[1] - self._rm_touch_last[1]
                 self._rm_touch_moved += abs(dx) + abs(dy)
                 if fingers == 1 and self._rm_touch_max_fingers <= 1:
-                    self._rm_mouse(dx, dy, rm.mouse_speed, thunks)
+                    used = self._rm_mouse(dx, dy, self.cfg.remote.mouse_speed,
+                                          thunks)
             self._rm_touch_last = c
             self._rm_touch_max_fingers = max(self._rm_touch_max_fingers, fingers)
         elif self._rm_touch_fingers:
             # Contact ended: a short, still, 1-finger touch was a left click.
-            # (The 2-finger taps and clicks are the tracker's, below.)
+            # (The 2-finger taps and clicks are the gesture tracker's.)
             if (self._rm_touch_max_fingers == 1
                     and now - self._rm_touch_at <= self._tap_s
                     and self._rm_touch_moved <= self._g.tap_move_px
                     and not self._rm_touch_clicked):
+                a = self.actions
                 thunks.append(lambda: (a.mouse_button("left", True),
                                        a.mouse_button("left", False)))
+                used = True
             self._rm_touch_max_fingers = 0
         self._rm_touch_fingers = fingers
-        self._two_finger(frame, now, thunks, self._remote_gestures, "remote")
+        return used
 
-        # -- sticks and triggers ----------------------------------------------
-        self._stick_rates(frame, now, thunks, triggers=True)
+    def _touch_reset(self) -> None:
+        """The pointer contact's context changed under the fingers (a chord
+        edge): forget it. Fingers still down are adopted by the next frame
+        as a fresh contact -- moving from where they are then, never
+        jumping by what went unseen, and never a tap on lift."""
+        self._rm_touch_fingers = 0
+        self._rm_touch_max_fingers = 0
 
     def _stick_rates(self, frame: _Frame, now: float, thunks: list,
                      *, triggers: bool) -> None:
@@ -1469,7 +1599,8 @@ class InputInterceptor:
         self._rm_scroll(sv * rm.scroll_speed, thunks, gain=1.0)
 
     def _rm_mouse(self, dx: float, dy: float, speed: float, thunks: list,
-                  gain: float = MOUSE_GAIN) -> None:
+                  gain: float = MOUSE_GAIN) -> bool:
+        """-> True if a whole pixel of movement was queued."""
         fx, fy = self._rm_mouse_frac
         fx += dx * gain * speed
         fy += dy * gain * speed
@@ -1477,6 +1608,8 @@ class InputInterceptor:
         self._rm_mouse_frac = [fx - ix, fy - iy]
         if ix or iy:
             thunks.append(lambda: self.actions.mouse_move(ix, iy))
+            return True
+        return False
 
     def _rm_scroll(self, dv: float, thunks: list, gain: float = 1.0) -> None:
         """Accumulate vertical scroll from the right stick and triggers --

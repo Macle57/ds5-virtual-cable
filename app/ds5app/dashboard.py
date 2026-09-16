@@ -404,7 +404,10 @@ class DashboardServer:
                 # served here (sorted in) as well as in `engine_actions`.
                 "actions": sorted(
                     [{"name": spec.name, "doc": spec.doc,
-                      "repeatable": bool(spec.repeatable)}
+                      "repeatable": bool(spec.repeatable),
+                      # the paired actions a slide axis takes whole
+                      # (ActionSpec.pair / .dir): "" for the rest
+                      "pair": spec.pair, "dir": spec.dir}
                      for spec in registry.values()]
                     + [{"name": "show_battery",
                         "doc": K.ENGINE_ACTIONS["show_battery"],

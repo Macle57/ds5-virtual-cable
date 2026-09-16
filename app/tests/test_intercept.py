@@ -507,8 +507,44 @@ class Gestures(EngineCase):
         self.assertFalse(self.eng.keyboard_open)
         self.assertIn(("button", "right", True), self.events)
 
-    def test_one_finger_under_the_chord_is_just_swallowed(self):
+    def test_one_finger_under_the_chord_moves_the_pointer_and_is_masked(self):
+        # `stick_mouse_in_chord` (ships ON) lends the 1-finger touchpad to
+        # the OS during the hold, like remote mode; the game sees no touch.
         self.make()
+        out = self.feed(report(buttons=("ps",)),
+                        report(buttons=("ps",), touches=((500, 500),)),
+                        report(buttons=("ps",), touches=((900, 500),)))
+        moves = [e for e in self.events if e[0] == "move"]
+        self.assertTrue(moves)
+        self.assertGreater(sum(m[1] for m in moves), 0)
+        self.assertFalse(P.decode_input(out[1:], usb=True).touch[0].active)
+        # ... and mousing IS using the chord: no PS tap replayed afterwards
+        self.feed(report())
+        self.clock.advance(1.0)
+        self.eng.tick()
+        self.assertEqual(self.eng.stats["taps_replayed"], 0)
+
+    def test_one_finger_tap_under_the_chord_is_a_left_click(self):
+        self.make()
+        self.feed(report(buttons=("ps",)),
+                  report(buttons=("ps",), touches=((500, 500),)))
+        self.clock.advance(0.1)
+        self.feed(report(buttons=("ps",)))
+        self.assertIn(("button", "left", True), self.events)
+        self.assertIn(("button", "left", False), self.events)
+
+    def test_a_finger_resting_on_the_pad_when_the_chord_lands_never_clicks(self):
+        # The contact is adopted mid-way at the chord edge: it may move the
+        # pointer from there, but lifting it soon after is not a tap.
+        self.make()
+        self.feed(report(touches=((500, 500),)),
+                  report(buttons=("ps",), touches=((500, 500),)))
+        self.clock.advance(0.1)
+        self.feed(report(buttons=("ps",)))
+        self.assertNotIn(("button", "left", True), self.events)
+
+    def test_one_finger_under_the_chord_is_swallowed_when_the_flag_is_off(self):
+        self.make(stick_mouse_in_chord=False)
         out = self.feed(report(buttons=("ps",)),
                         report(buttons=("ps",), touches=((500, 500),)),
                         report(buttons=("ps",), touches=((900, 500),)))
@@ -1473,11 +1509,13 @@ class RemoteBindings(EngineCase):
         self.assertEqual((d["dpad_up"], d["dpad_down"], d["dpad_left"],
                           d["dpad_right"]),
                          ("arrow_up", "arrow_down", "arrow_left", "arrow_right"))
-        self.assertEqual(d["touch_slide_horizontal_pressed"], "alt_tab")
-        self.assertEqual(d["touch_slide_horizontal"], "scroll_horizontal")
+        self.assertEqual(d["touch_slide_left_pressed"], "alt_tab")
+        self.assertEqual(d["touch_slide_right_pressed"], "alt_tab")
+        self.assertEqual(d["touch_slide_left"], "scroll_left")
+        self.assertEqual(d["touch_slide_right"], "scroll_right")
         self.assertEqual(d["touch_tap_2f"], "right_click")
         self.assertEqual(d["touch_click_2f"], "right_click")
-        self.assertNotIn("touch_swipe_up", d)
+        self.assertNotIn("touch_pinch_pressed", d)
 
     def test_a_rebound_button_fires_the_new_action_directly(self):
         self.make_remote(remote={"chords": {"cross": "media_play_pause"}})
@@ -1540,9 +1578,9 @@ class RemoteBindings(EngineCase):
                           and b[P.BC_VIBRATION_RIGHT]])
 
     def test_a_remote_swipe_fires_when_bound(self):
-        # The compatibility flick: only while the vertical slide row is off.
-        self.make_remote(remote={"chords": {"touch_swipe_up": "task_view",
-                                            "touch_slide_vertical": "none"}})
+        # An up row bound to a one-shot is a swipe up.
+        self.make_remote(remote={"chords": {"touch_slide_up": "task_view",
+                                            "touch_slide_down": "none"}})
         self.enter()
         self.feed(report(touches=((450, 800), (550, 800))))
         for y in (740, 680, 620, 560, 500):
@@ -1641,7 +1679,7 @@ class RemoteSameBindings(EngineCase):
 
     def test_same_gestures_off_takes_the_remote_tables_gesture_rows(self):
         self.make(remote={"enabled": True, "same_gestures": False,
-                          "chords": {"touch_slide_vertical": "volume_up"}})
+                          "chords": {"touch_slide_down": "volume_up"}})
         self.enter()
         self.feed(report(touches=((500, 500), (600, 500))))
         self.clock.advance(0.1)
@@ -1649,7 +1687,7 @@ class RemoteSameBindings(EngineCase):
         self.assertIn(("button", "right", True), self.events)     # tap_2f
         self.batches.clear()
         self.feed(report(touches=((500, 300), (600, 300))),
-                  report(touches=((500, 400), (600, 400))))
+                  report(touches=((500, 550), (600, 550))))
         self.assertIn(("key", A.VK_VOLUME_UP, True), self.events)
         self.assertFalse([e for e in self.events if e[0] == "wheel"])
         # ... while the buttons still follow `same_bindings` (the chord table)

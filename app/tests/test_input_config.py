@@ -65,15 +65,26 @@ class Defaults(unittest.TestCase):
         self.assertEqual(d["r3"], "show_battery")
         self.assertEqual(d["touch_click_2f"], "right_click")
         self.assertNotIn("touch_tap_2f", d)
-        self.assertEqual(d["touch_slide_horizontal"], "scroll_horizontal")
-        self.assertEqual(d["touch_slide_vertical"], "scroll")
-        self.assertNotIn("touch_swipe_up", d)
-        self.assertNotIn("touch_swipe_down", d)
+        self.assertEqual(d["touch_slide_up"], "scroll_up")
+        self.assertEqual(d["touch_slide_down"], "scroll_down")
+        self.assertEqual(d["touch_slide_left"], "scroll_left")
+        self.assertEqual(d["touch_slide_right"], "scroll_right")
         self.assertEqual(d["touch_pinch"], "pinch_zoom")
-        self.assertEqual(d["touch_slide_horizontal_pressed"], "alt_tab")
-        self.assertEqual(d["touch_swipe_up_pressed"], "task_view")
-        self.assertEqual(d["touch_swipe_down_pressed"], "minimize_all")
-        self.assertEqual(d["touch_pinch_pressed"], "ctrl_zoom")
+        self.assertEqual(d["touch_slide_left_pressed"], "alt_tab")
+        self.assertEqual(d["touch_slide_right_pressed"], "alt_tab")
+        self.assertEqual(d["touch_slide_up_pressed"], "task_view")
+        self.assertEqual(d["touch_slide_down_pressed"], "minimize_all")
+        self.assertNotIn("touch_pinch_pressed", d)
+        # no 1.0 row survives in either default table
+        for table in (CFG.DEFAULT_CHORDS, CFG.DEFAULT_REMOTE_CHORDS):
+            for key in CFG.LEGACY_GESTURE_KEYS:
+                self.assertNotIn(key, table)
+        # every paired row's partner is a row, and the pairs are symmetric
+        meta = {g["key"]: g for g in CFG.GESTURE_META}
+        for key, g in meta.items():
+            if "pair" in g:
+                self.assertEqual(meta[g["pair"]]["pair"], key)
+                self.assertIn(g["dir"], ("up", "down", "left", "right"))
         # every gesture row in either table is a served gesture key
         for table in (CFG.DEFAULT_CHORDS, CFG.DEFAULT_REMOTE_CHORDS):
             for key in table:
@@ -99,6 +110,68 @@ class Defaults(unittest.TestCase):
         self.assertFalse(CFG.InputConfig.from_dict({}).remote.enabled)
         self.assertTrue(
             CFG.RemoteMode.from_dict({"enabled": True}).enabled)
+
+
+class LegacyGestureRows(unittest.TestCase):
+    """The gesture rows of 1.0 / 0.5 files are dropped on load: today's
+    rows keep their defaults, whatever the old file said."""
+
+    def merged(self, chords):
+        return CFG.Config.from_dict({"input": {"chords": chords}}).input.chords
+
+    def test_old_rows_are_dropped_and_the_defaults_hold(self):
+        # This exact table was on a real machine (a 0.5-era file).
+        d = self.merged({"touch_slide_horizontal": "alt_tab",
+                         "touch_swipe_down": "minimize_all",
+                         "touch_swipe_up": "task_view",
+                         "touch_slide_vertical": "none",
+                         "touch_swipe_up_pressed": "show_desktop",
+                         "touch_slide_horizontal_pressed": "none"})
+        for key in CFG.LEGACY_GESTURE_KEYS:
+            self.assertNotIn(key, d)
+        for key in CFG.CHORD_GESTURES:
+            self.assertEqual(d.get(key), CFG.DEFAULT_CHORDS.get(key), key)
+
+    def test_todays_rows_in_the_same_file_still_apply(self):
+        d = self.merged({"touch_slide_vertical": "volume_up",
+                         "touch_slide_down": "volume_down", "cross": "escape"})
+        self.assertEqual(d["touch_slide_up"], "scroll_up")
+        self.assertEqual(d["touch_slide_down"], "volume_down")
+        self.assertEqual(d["cross"], "escape")
+
+    def test_the_remote_table_drops_them_too(self):
+        rm = CFG.Config.from_dict({"input": {"remote": {"chords": {
+            "touch_slide_horizontal": "alt_tab"}}}}).input.remote
+        self.assertEqual(rm.chords["touch_slide_left"], "scroll_left")
+        self.assertNotIn("touch_slide_horizontal", rm.chords)
+
+    def test_the_file_loses_them_on_the_next_save(self):
+        ic = CFG.Config.from_dict({"input": {"chords": {
+            "touch_swipe_up_pressed": "show_desktop"}}}).input
+        out = ic.to_dict()["chords"]
+        for key in CFG.LEGACY_GESTURE_KEYS:
+            self.assertNotIn(key, out)
+        self.assertEqual(out["touch_slide_up_pressed"], "task_view")
+
+    def test_gesture_feel_fields(self):
+        g = CFG.GestureTuning.from_dict({"pinch_delay_ms": 5000})
+        self.assertEqual(g.pinch_delay_ms, 120)           # out of range: default
+        self.assertEqual(CFG.GestureTuning.from_dict({"pinch_delay_ms": 0}).pinch_delay_ms, 0)
+        self.assertEqual(CFG.GestureTuning().pinch_delay_ms, 120)
+        self.assertEqual(CFG.GestureTuning().to_dict()["pinch_delay_ms"], 120)
+        g = CFG.GestureTuning.from_dict({"scroll_sensitivity": "2.5",
+                                         "scroll_reverse": "yes",
+                                         "zoom_sensitivity": 99,
+                                         "zoom_reverse": 0})
+        self.assertEqual(g.scroll_sensitivity, 2.5)
+        self.assertTrue(g.scroll_reverse)
+        self.assertEqual(g.zoom_sensitivity, 10.0)      # capped
+        self.assertFalse(g.zoom_reverse)
+        d = CFG.GestureTuning().to_dict()
+        self.assertEqual(d["scroll_sensitivity"], 1.0)
+        self.assertFalse(d["scroll_reverse"])
+        self.assertEqual(d["zoom_sensitivity"], 1.0)
+        self.assertFalse(d["zoom_reverse"])
 
 
 class Merging(unittest.TestCase):

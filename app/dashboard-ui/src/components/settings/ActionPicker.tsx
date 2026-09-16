@@ -7,9 +7,11 @@ import { useStore } from "../../lib/store";
 
 /* The action picker: a button wearing the bound action's icon, opening a
    searchable, grouped menu. Replaces a <select> of "name — doc" strings,
-   which read as a wall of text once there were fifteen of them. */
-export default function ActionPicker({ value, onChange, meta, macros }:
-  { value: string; onChange: (name: string) => void; meta: ActionsMeta; macros: unknown }) {
+   which read as a wall of text once there were fifteen of them. `dir` is
+   the direction of a slide row: a directional action (scroll up / down /
+   left / right) is offered only on the row it belongs to. */
+export default function ActionPicker({ value, onChange, meta, macros, dir }:
+  { value: string; onChange: (name: string) => void; meta: ActionsMeta; macros: unknown; dir?: string }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [hi, setHi] = useState(0);
@@ -19,10 +21,10 @@ export default function ActionPicker({ value, onChange, meta, macros }:
 
   const current = describeAction(value, meta, macros);
   const all = useMemo(() => {
-    const list = listActions(meta, macros);
+    const list = listActions(meta, macros).filter((a) => !dir || !a.dir || a.dir === dir || a.name === current.name);
     if (current.unknown) list.push(current);
     return list;
-  }, [meta, macros, current.unknown, current.name]);
+  }, [meta, macros, dir, current.unknown, current.name]);
 
   const needle = q.trim().toLowerCase();
   const shown = needle
