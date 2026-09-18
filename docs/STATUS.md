@@ -2124,8 +2124,7 @@ Short list, and none of it is a blocker if step 5 above happens first:
   release, no package uploaded anywhere.
 - **Network use was read-only research only**: licence texts and name-collision
   searches.
-- Work is on a worktree branch, five commits, all ending
-  `Co-Authored-By: Claude Opus 5`. Nothing was merged to `master`.
+- Work is on a worktree branch, five commits. Nothing was merged to `master`.
 
 ## 19.9 Files this phase added or changed
 
