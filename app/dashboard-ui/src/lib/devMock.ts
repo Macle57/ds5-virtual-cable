@@ -34,6 +34,8 @@ export function mockState(state: LiveState): LiveState {
       keyboard_open: remote && (!flip || Math.floor(Date.now() / 4000) % 3 === 0),
     };
   }
+  // P1 is hidden and the filter is attached -- the fault below may override it
+  if (serials[0]) controllers[serials[0]] = { ...controllers[serials[0]], hide_bluetooth: true, hide_effective: true };
   // the hide fault goes on the second pad (`?mock=all`: on the first as well)
   const faulty = mode === "all" ? serials[0] : serials[1];
   if (faulty && mode !== "offline") {
@@ -42,7 +44,6 @@ export function mockState(state: LiveState): LiveState {
       hide_note: "Hidden requested, but the controller is still visible to other apps — HidHide's filter is not attached (restart the device or reboot).",
     };
   }
-  if (serials[0]) controllers[serials[0]] = { ...controllers[serials[0]], hide_bluetooth: true, hide_effective: true };
   let aggregate = state.aggregate;
   if (mode === "offline" && serials.length > 1) {
     // the manager keeps the stale entry (present:false) so the page can show

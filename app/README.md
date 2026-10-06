@@ -59,7 +59,7 @@ End-user instructions are `docs/USER-GUIDE.md`. Build the exe with
 `ds5app/dashboard.html` -- the page the tray's *Dashboard* item opens -- is a
 build product, not a source file. Its source is the Vite + React + Tailwind
 project in `dashboard-ui/`; the build inlines everything (JS, CSS, the
-Rajdhani font) into that one file so the page fetches nothing from anywhere,
+Kalam and Nunito fonts) into that one file so the page fetches nothing from anywhere,
 and the built file is committed so a Python-only checkout still works.
 
 ```powershell

@@ -14,9 +14,9 @@ export default function GenericRows({ path, obj, known }:
         const p = [...path, key];
         if (value !== null && typeof value === "object" && !Array.isArray(value)) {
           return (
-            <div key={key} className="py-2.5">
-              <div className="mono mb-1 text-[11px] uppercase tracking-wider text-ink-3">{key}</div>
-              <div className="rounded-xl border border-line pl-3 pr-1">
+            <div key={key} className="st-row">
+              <div className="st-sub"><span className="st-sub-title">{key.replace(/_/g, " ")}</span></div>
+              <div className="st-nest">
                 <GenericRows path={p} obj={value as Record<string, Json>} />
               </div>
             </div>

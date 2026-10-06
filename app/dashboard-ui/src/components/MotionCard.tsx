@@ -1,6 +1,6 @@
 import { useActiveController } from "../lib/store";
 
-/* Gyro + accel as bipolar bars from the midline, plus an attitude widget:
+/* Gyro + accel as crayon strokes from a midline, plus an attitude doodle:
    the pad's tilt recovered from the gravity vector (accel y ~ +1 g at rest,
    8192 raw). +/-9000 raw shows normal motion well on the bars. */
 export default function MotionCard() {
@@ -12,10 +12,10 @@ export default function MotionCard() {
   const pitch = Math.atan2(a[2], Math.max(1, a[1])) * (180 / Math.PI);
 
   return (
-    <section className="panel p-4">
-      <div className="panel-title mb-3">motion</div>
-      <div className="grid grid-cols-[1fr_auto] gap-4">
-        <div className="grid grid-cols-[44px_1fr_52px] items-center gap-x-2.5 gap-y-1.5 text-[12px]">
+    <section className="panel pop p-4" style={{ "--i": 4 } as React.CSSProperties}>
+      <h2 className="panel-title mb-3">Motion</h2>
+      <div className="flex flex-wrap gap-5 px-1">
+        <div className="grid min-w-[210px] flex-1 grid-cols-[44px_1fr_52px] items-center gap-x-2.5 gap-y-1.5 text-[12px]">
           <Group label="gyro" />
           <Bar name="pitch" v={g[0]} tone="var(--color-cross)" />
           <Bar name="yaw" v={g[1]} tone="var(--color-cross)" />
@@ -32,37 +32,49 @@ export default function MotionCard() {
 }
 
 function Group({ label }: { label: string }) {
-  return <div className="eyebrow col-span-3 mt-1 first:mt-0">{label}</div>;
+  return <div className="eyebrow col-span-3 mt-1.5 first:mt-0">{label}</div>;
 }
 
+/* a crayon stroke from the midline: flat fill, ink outline, slightly uneven ends */
 function Bar({ name, v, tone }: { name: string; v: number; tone: string }) {
   const frac = Math.max(-1, Math.min(1, v / 9000));
+  const w = Math.abs(frac) * 50;
   return (
     <>
-      <span className="text-ink-3">{name}</span>
-      <div className="relative h-2 overflow-hidden rounded-full bg-well ring-1 ring-line">
-        <span className="absolute left-1/2 top-0 h-full w-px bg-line-2" />
-        <div className="absolute top-0 h-full rounded-full transition-[left,width] duration-75"
-             style={{ left: frac < 0 ? 50 + frac * 50 + "%" : "50%", width: Math.abs(frac) * 50 + "%",
-                      background: tone, boxShadow: `0 0 8px ${tone}` }} />
+      <span className="text-[12.5px] text-ink-2">{name}</span>
+      <div className="relative h-[12px]">
+        <span className="absolute inset-x-0 top-1/2 h-[2px] -translate-y-1/2 bg-line-2" />
+        <span className="absolute left-1/2 top-[-3px] h-[18px] w-[2.5px] -translate-x-1/2 bg-line" />
+        <div className="absolute top-0 h-full border-[2px] border-line transition-[left,width] duration-75"
+             style={{ left: frac < 0 ? 50 - w + "%" : "50%", width: w + "%", background: tone, minWidth: w > 0.5 ? 4 : 0,
+                      opacity: w > 0.5 ? 1 : 0,
+                      borderRadius: frac < 0 ? "7px 3px 3px 6px / 6px 3px 3px 7px" : "3px 7px 6px 3px / 3px 6px 7px 3px" }} />
       </div>
-      <span className="num text-right text-ink-2">{v}</span>
+      <span className="num text-right text-[14px] text-ink-2">{v}</span>
     </>
   );
 }
 
+/* the pad doodle tilts with the real thing */
 function Attitude({ roll, pitch }: { roll: number; pitch: number }) {
   return (
-    <div className="flex w-[112px] flex-col items-center justify-center gap-2 rounded-xl border border-line bg-well/60 p-2">
+    <div className="flex w-[118px] flex-col items-center justify-center gap-1 border-[2.5px] border-dashed border-line-2 p-2"
+         style={{ borderRadius: "var(--r-small)" }}>
       <div className="eyebrow">attitude</div>
-      <div className="grid h-[64px] w-[96px] place-items-center" style={{ perspective: 260 }}>
-        <div className="h-[36px] w-[76px] rounded-[10px] border border-cross/60 bg-cross/15 transition-transform duration-100"
-             style={{ transform: `rotateX(${-pitch}deg) rotateZ(${roll}deg)`, boxShadow: "0 0 18px -4px var(--color-cross), inset 0 1px 0 rgba(255,255,255,.15)" }}>
-          <div className="mx-auto mt-2 h-[12px] w-[34px] rounded-[4px] bg-cross/40" />
+      <div className="grid h-[64px] w-[100px] place-items-center" style={{ perspective: 260 }}>
+        <div className="transition-transform duration-100" style={{ transform: `rotateX(${-pitch}deg) rotateZ(${roll}deg)` }}>
+          <svg width="84" height="48" viewBox="0 0 84 48" fill="none" aria-hidden className="sketch">
+            <path d="M22 8h40c8 0 11 6 13 14l4 14c1 4-3 7-7 6-4-1-7-7-10-9H22c-3 2-6 8-10 9-4 1-8-2-7-6l4-14c2-8 5-14 13-14z"
+                  fill="var(--color-cross)" stroke="var(--color-ink)" strokeWidth="3" strokeLinejoin="round" />
+            <circle cx="30" cy="26" r="5" fill="var(--color-circle)" stroke="var(--color-ink)" strokeWidth="2.2" />
+            <circle cx="54" cy="26" r="5" fill="var(--color-circle)" stroke="var(--color-ink)" strokeWidth="2.2" />
+            <circle cx="66" cy="16" r="2.6" fill="var(--color-triangle)" />
+            <circle cx="18" cy="16" r="2.6" fill="var(--color-amber)" />
+          </svg>
         </div>
       </div>
-      <div className="mono flex gap-2 text-[10px] text-ink-3">
-        <span>r {roll.toFixed(0)}°</span><span>p {pitch.toFixed(0)}°</span>
+      <div className="num flex gap-2 text-[12px] text-ink-2">
+        <span>roll {roll.toFixed(0)}°</span><span>pitch {pitch.toFixed(0)}°</span>
       </div>
     </div>
   );

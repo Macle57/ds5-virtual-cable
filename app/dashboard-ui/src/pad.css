@@ -1,0 +1,26 @@
+/* Controller drawing styles (owned by the pad agent). Shared tokens live in index.css. */
+
+#pad {
+  overflow: visible;
+  transform-origin: 50% 62%;
+  animation: pad-breathe 5.2s ease-in-out infinite;
+}
+@keyframes pad-breathe {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50%      { transform: translateY(-7px) rotate(-0.7deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #pad { animation: none; }
+}
+
+/* flat fills swap in a step, never tween through in-between colours */
+#pad .pad-fill { transition: fill .08s steps(2, end), stroke .08s steps(2, end); }
+
+/* the handwritten numbers and labels */
+#pad .pad-label { font: 700 13px var(--font-display); letter-spacing: .02em; }
+#pad .pad-num   { font: 700 22px var(--font-display); font-variant-numeric: tabular-nums; }
+#pad .pad-note  { font: 700 44px var(--font-display); letter-spacing: .01em; }
+
+/* offline: pencil-grey, washed out, the note on top stays dark */
+#pad .pad-art { transition: opacity .35s, filter .35s; }
+#pad.pad-offline .pad-art { opacity: .42; filter: grayscale(1); }

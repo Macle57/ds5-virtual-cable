@@ -1,58 +1,79 @@
 @import "tailwindcss";
 
-/* Rajdhani (OFL), latin woff2 only -- three weights, ~46 KB, inlined into
-   the built page so it fetches nothing. */
+/* ------------------------------------------------------------------------
+   Fonts (OFL, latin woff2 only, inlined into the built page):
+     Kalam 400/700   -- a brush-pen handwriting; titles, labels, numbers
+     Nunito 400/600/700 -- rounded sans for everything you have to read
+   ~93 KB total.
+   ------------------------------------------------------------------------ */
 @font-face {
-  font-family: "Rajdhani"; font-style: normal; font-weight: 500; font-display: swap;
-  src: url("@fontsource/rajdhani/files/rajdhani-latin-500-normal.woff2") format("woff2");
+  font-family: "Kalam"; font-style: normal; font-weight: 400; font-display: swap;
+  src: url("@fontsource/kalam/files/kalam-latin-400-normal.woff2") format("woff2");
 }
 @font-face {
-  font-family: "Rajdhani"; font-style: normal; font-weight: 600; font-display: swap;
-  src: url("@fontsource/rajdhani/files/rajdhani-latin-600-normal.woff2") format("woff2");
+  font-family: "Kalam"; font-style: normal; font-weight: 700; font-display: swap;
+  src: url("@fontsource/kalam/files/kalam-latin-700-normal.woff2") format("woff2");
 }
 @font-face {
-  font-family: "Rajdhani"; font-style: normal; font-weight: 700; font-display: swap;
-  src: url("@fontsource/rajdhani/files/rajdhani-latin-700-normal.woff2") format("woff2");
+  font-family: "Nunito"; font-style: normal; font-weight: 400; font-display: swap;
+  src: url("@fontsource/nunito/files/nunito-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Nunito"; font-style: normal; font-weight: 600; font-display: swap;
+  src: url("@fontsource/nunito/files/nunito-latin-600-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Nunito"; font-style: normal; font-weight: 700; font-display: swap;
+  src: url("@fontsource/nunito/files/nunito-latin-700-normal.woff2") format("woff2");
 }
 
 /* ------------------------------------------------------------------------
-   One deliberate dark look: a HUD for a thing with a lightbar. The palette
-   is PlayStation's own -- the four face-button colours carry meaning
-   everywhere (cross = blue = primary, triangle = green = good, circle = red
-   = bad, square = pink = accent) so the dashboard reads like the pad.
+   The look: crayons on good paper. Every border is a drawn ink line, every
+   colour is a flat fill or a diagonal hatch, shadows are a hard ink offset
+   (the card is a cut-out lying on the page). Nothing fades, nothing blurs.
+   Token NAMES are shared with the settings and pad agents -- do not rename.
    ------------------------------------------------------------------------ */
 @theme {
-  --font-display: "Rajdhani", "Bahnschrift", "Segoe UI", system-ui, sans-serif;
-  --font-body: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-display: "Kalam", "Segoe Print", "Comic Sans MS", cursive;
+  --font-body: "Nunito", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --font-mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
 
-  --color-bg: #05070d;
-  --color-bg-2: #0a0e18;
-  --color-panel: #0f1420;
-  --color-panel-2: #151b2b;
-  --color-well: #080b13;
-  --color-line: #1e2637;
-  --color-line-2: #2a3448;
-  --color-ink: #eef1f7;
-  --color-ink-2: #98a3b8;
-  --color-ink-3: #5f6a80;
+  --color-bg: #FFFDF7;
+  --color-bg-2: #F7F3E8;
+  --color-panel: #FFFFFF;
+  --color-panel-2: #F3EEE2;
+  --color-well: #F3EEE2;
+  --color-line: #1F1A17;
+  --color-line-2: #CFC7B8;
+  --color-ink: #1F1A17;
+  --color-ink-2: #5A524C;
+  --color-ink-3: #8C837A;
 
-  --color-cross: #4d8dff;
-  --color-triangle: #2ee6a6;
-  --color-circle: #ff5c6c;
-  --color-square: #ff7ad9;
-  --color-cyan: #38e0ff;
-  --color-amber: #ffb547;
-  --color-orange: #ff8a3d;   /* picker: mouse actions */
-  --color-violet: #b18cff;   /* picker: voice & typing */
+  --color-cross: #5EB9DA;
+  --color-triangle: #4F9E5F;
+  --color-circle: #E8766F;
+  --color-square: #F29BB8;
+  --color-cyan: #8ED3EA;
+  --color-amber: #F2C94C;
+  --color-orange: #F0A24A;
+  --color-violet: #A58BD9;
 
-  --color-ok: #2ee6a6;
-  --color-warn: #ffb547;
-  --color-bad: #ff5c6c;
-  --color-idle: #5f6a80;
+  --color-ok: #4F9E5F;
+  --color-warn: #F2C94C;
+  --color-bad: #E8766F;
+  --color-idle: #8C837A;
 }
 
-:root { color-scheme: dark; }
+:root {
+  color-scheme: light;
+  /* the hand radii: three shapes so a grid never repeats one outline */
+  --r-hand-1: 255px 18px 225px 18px / 18px 225px 18px 255px;
+  --r-hand-2: 18px 225px 18px 255px / 255px 18px 225px 18px;
+  --r-hand-3: 225px 20px 255px 16px / 16px 255px 20px 225px;
+  --r-small: 12px 6px 10px 6px / 6px 10px 6px 12px;
+  --r-pill: 60px 16px 60px 16px / 16px 60px 16px 60px;
+  --ease-pop: cubic-bezier(.3, 1.4, .5, 1);
+}
 
 html, body { min-height: 100%; }
 body {
@@ -66,160 +87,245 @@ body {
   overflow-x: hidden;
 }
 
-::selection { background: color-mix(in oklab, var(--color-cross) 50%, transparent); }
+::selection { background: var(--color-amber); color: var(--color-ink); }
 
-/* ---- scrollbars that belong to the theme -------------------------------- */
+*:focus-visible { outline: 3px dashed var(--color-cross); outline-offset: 2px; }
+
+/* ---- scrollbars drawn in ink ------------------------------------------- */
 * { scrollbar-width: thin; scrollbar-color: var(--color-line-2) transparent; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--color-line-2); border-radius: 8px; border: 2px solid var(--color-bg); }
 
-/* ---- the atmosphere: aurora blobs + a faint tactical grid --------------- */
+/* ---- the paper ----------------------------------------------------------- */
 .atmosphere {
   position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden;
-  background:
-    radial-gradient(1200px 600px at 15% -10%, color-mix(in oklab, var(--color-cross) 18%, transparent), transparent 60%),
-    radial-gradient(900px 500px at 100% 0%, color-mix(in oklab, var(--color-square) 10%, transparent), transparent 60%),
-    radial-gradient(800px 600px at 60% 110%, color-mix(in oklab, var(--color-cyan) 9%, transparent), transparent 60%),
-    var(--color-bg);
+  background-color: var(--color-bg);
+  /* a quiet dot grid, like a bullet-journal page */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='26' height='26'><circle cx='13' cy='13' r='1.1' fill='%23CFC7B8'/></svg>");
+  background-size: 26px 26px;
 }
-.atmosphere::before {
-  content: ""; position: absolute; inset: 0;
-  background-image:
-    linear-gradient(to right, rgba(255,255,255,.035) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(255,255,255,.035) 1px, transparent 1px);
-  background-size: 48px 48px;
-  mask-image: radial-gradient(ellipse at 50% 0%, black 20%, transparent 75%);
-}
-.atmosphere .orb {
-  position: absolute; border-radius: 50%; filter: blur(70px); opacity: .55;
-  animation: drift 26s ease-in-out infinite alternate;
-}
-@keyframes drift {
-  from { transform: translate3d(0,0,0) scale(1); }
-  to   { transform: translate3d(60px, 40px, 0) scale(1.15); }
-}
-@media (prefers-reduced-motion: reduce) { .atmosphere .orb { animation: none; } }
+/* marginalia only when there IS a margin: the doodles sit in the gutters
+   either side of the 1320px page and vanish when the cards would cover them */
+.atmosphere .doodle { position: absolute; color: var(--color-line-2); display: none; }
+@media (min-width: 1500px) { .atmosphere .doodle { display: block; } }
 
-/* ---- glass panels with a HUD corner bracket ----------------------------- */
+/* ---- cards: cut-outs lying on the page ---------------------------------- */
 .panel {
   position: relative;
-  background: linear-gradient(180deg, rgba(21,27,43,.82), rgba(13,17,28,.86));
-  border: 1px solid var(--color-line);
-  border-radius: 16px;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,.04),
-    0 20px 40px -24px rgba(0,0,0,.8);
-  backdrop-filter: blur(14px);
+  background: var(--color-panel);
+  border: 3px solid var(--color-line);
+  border-radius: var(--r-hand-1);
+  box-shadow: 4px 4px 0 var(--color-line);
 }
-.panel::before, .panel::after {
-  content: ""; position: absolute; width: 14px; height: 14px;
-  border-color: color-mix(in oklab, var(--color-cross) 70%, transparent);
-  border-style: solid; opacity: .8; pointer-events: none;
-}
-.panel::before { top: -1px; left: -1px; border-width: 2px 0 0 2px; border-top-left-radius: 6px; }
-.panel::after  { bottom: -1px; right: -1px; border-width: 0 2px 2px 0; border-bottom-right-radius: 6px; }
-.panel.quiet::before, .panel.quiet::after { display: none; }
+.panel.w2 { border-radius: var(--r-hand-2); }
+.panel.w3 { border-radius: var(--r-hand-3); }
+.panel.quiet { border-width: 2.5px; border-color: var(--color-ink-2); box-shadow: none; }
 
+/* a panel title: handwritten, with one yellow marker stroke behind it */
 .panel-title {
-  font-family: var(--font-display);
-  font-weight: 700; font-size: 13px; letter-spacing: .16em; text-transform: uppercase;
-  color: var(--color-ink-3);
-  display: flex; align-items: center; gap: 8px;
+  position: relative; display: inline-flex; align-items: center; gap: 8px;
+  font-family: var(--font-display); font-weight: 700; font-size: 19px; line-height: 1.1;
+  color: var(--color-ink); padding: 2px 6px 0 4px; isolation: isolate;
 }
-.panel-title::after {
-  content: ""; flex: 1; height: 1px;
-  background: linear-gradient(90deg, var(--color-line-2), transparent);
+.panel-title::before {
+  content: ""; position: absolute; left: -2px; right: -4px; top: 42%; height: 48%;
+  background: var(--color-amber); transform: rotate(-1.2deg) skewX(-6deg);
+  border-radius: 4px 10px 3px 8px; z-index: -1;
 }
 
 /* ---- type ---------------------------------------------------------------- */
-.display { font-family: var(--font-display); font-weight: 700; letter-spacing: .02em; }
-.num { font-family: var(--font-display); font-variant-numeric: tabular-nums; font-weight: 600; }
-.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.display { font-family: var(--font-display); font-weight: 700; }
+.num { font-family: var(--font-display); font-weight: 700; font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: .95em; }
 .eyebrow {
-  font-family: var(--font-display); font-weight: 600; font-size: 11px;
-  letter-spacing: .18em; text-transform: uppercase; color: var(--color-ink-3);
+  font-family: var(--font-display); font-weight: 400; font-size: 13.5px; line-height: 1.2;
+  letter-spacing: 0; text-transform: none; color: var(--color-ink-3);
 }
 
-/* ---- glow helpers -------------------------------------------------------- */
-.glow-cross    { box-shadow: 0 0 18px -2px color-mix(in oklab, var(--color-cross) 70%, transparent); }
-.glow-triangle { box-shadow: 0 0 18px -2px color-mix(in oklab, var(--color-triangle) 70%, transparent); }
-.glow-circle   { box-shadow: 0 0 18px -2px color-mix(in oklab, var(--color-circle) 70%, transparent); }
-.text-glow     { text-shadow: 0 0 14px color-mix(in oklab, currentColor 60%, transparent); }
+/* ---- crayon highlights (the old "glow" names) --------------------------- */
+.glow-cross    { box-shadow: 4px 4px 0 var(--color-cross); }
+.glow-triangle { box-shadow: 4px 4px 0 var(--color-triangle); }
+.glow-circle   { box-shadow: 4px 4px 0 var(--color-circle); }
+.text-glow     { text-shadow: 2px 2px 0 var(--color-bg-2); }
 
-/* ---- buttons ------------------------------------------------------------- */
+/* diagonal crayon hatching -- a tiled SVG stroke, a flat colour on paper */
+.hatch-cross    { background-color: var(--color-panel); background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='%235EB9DA' stroke-width='2.2' stroke-linecap='round'/></svg>"); background-size: 8px 8px; }
+.hatch-triangle { background-color: var(--color-panel); background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='%234F9E5F' stroke-width='2.2' stroke-linecap='round'/></svg>"); background-size: 8px 8px; }
+.hatch-circle   { background-color: var(--color-panel); background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='%23E8766F' stroke-width='2.2' stroke-linecap='round'/></svg>"); background-size: 8px 8px; }
+.hatch-square   { background-color: var(--color-panel); background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='%23F29BB8' stroke-width='2.2' stroke-linecap='round'/></svg>"); background-size: 8px 8px; }
+.hatch-amber    { background-color: var(--color-panel); background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='%23F2C94C' stroke-width='2.2' stroke-linecap='round'/></svg>"); background-size: 8px 8px; }
+.hatch-ink      { background-color: var(--color-panel); background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='%23CFC7B8' stroke-width='1.6' stroke-linecap='round'/></svg>"); background-size: 8px 8px; }
+
+/* hatching in ANY colour (the lightbar colour the engine paints in remote
+   mode comes from the config): the stripes are a mask, the colour is `--hatch` */
+.hatch-tone {
+  background-color: var(--hatch, var(--color-cross));
+  -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='black' stroke-width='2.2' stroke-linecap='round'/></svg>") 0 0 / 8px 8px repeat;
+          mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='black' stroke-width='2.2' stroke-linecap='round'/></svg>") 0 0 / 8px 8px repeat;
+}
+
+/* a note pinned inside a card: white paper, ink box, a crayon stripe down the
+   left in `--tone` (hatched; `.loud` colours it solid). The words stay on
+   white, so any tone -- even a pure red lightbar -- stays legible. */
+.note {
+  --tone: var(--color-cross);
+  position: relative; display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px 10px 28px; border: 2.5px solid var(--color-line); border-radius: var(--r-small);
+  background: var(--color-panel); box-shadow: 3px 3px 0 var(--color-line); overflow: hidden;
+}
+.note::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 15px;
+  background-color: var(--tone);
+  -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='black' stroke-width='2.2' stroke-linecap='round'/></svg>") 0 0 / 8px 8px repeat;
+          mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='black' stroke-width='2.2' stroke-linecap='round'/></svg>") 0 0 / 8px 8px repeat;
+}
+.note.loud::before { -webkit-mask: none; mask: none; }
+.note::after { content: ""; position: absolute; left: 15px; top: 0; bottom: 0; width: 2.5px; background: var(--color-line); }
+
+/* a marker stroke behind a word, in `--hl` (the panel title's yellow one, in any colour) */
+.hl { position: relative; isolation: isolate; padding: 0 4px; --hl: var(--color-amber); }
+.hl::before {
+  content: ""; position: absolute; left: -1px; right: -3px; top: 45%; height: 46%; z-index: -1;
+  background: var(--hl); transform: rotate(-1.2deg) skewX(-6deg); border-radius: 4px 10px 3px 8px;
+}
+
+/* the wobble: a global SVG filter mounted in App.tsx (decorative strokes only) */
+.sketch { filter: url(#crayon); }
+
+/* a hand-drawn underline under a word */
+.scribble { position: relative; display: inline-block; }
+.scribble::after {
+  content: ""; position: absolute; left: -2%; right: -2%; bottom: -5px; height: 7px;
+  background: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 10' preserveAspectRatio='none'><path d='M2 6c20-4 30 2 50-1s30-3 48 0 16-2 18 0' fill='none' stroke='%235EB9DA' stroke-width='3.2' stroke-linecap='round'/></svg>") center / 100% 100% no-repeat;
+}
+.scribble-draw { stroke-dasharray: 400; stroke-dashoffset: 400; animation: draw .9s .35s ease-out forwards; }
+@keyframes draw { to { stroke-dashoffset: 0; } }
+
+/* a paper tag / sticker: ink border, flat fill, slightly askew */
+.sticker {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-display); font-weight: 700; font-size: 12.5px; line-height: 1;
+  padding: 5px 9px 4px; border: 2.5px solid var(--color-line); border-radius: var(--r-small);
+  background: var(--color-panel); color: var(--color-ink);
+  box-shadow: 2px 2px 0 var(--color-line); transform: rotate(-1.5deg); white-space: nowrap;
+}
+.sticker:nth-child(even) { transform: rotate(1.2deg); }
+.sticker.flat { transform: none; }
+.sticker.quiet { border-color: var(--color-line-2); box-shadow: none; color: var(--color-ink-3); background: transparent; }
+
+/* a crayon keycap: a pressed input, a shortcut key, a chord member */
+.keycap {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 28px;
+  font-family: var(--font-display); font-weight: 700; font-size: 13px; line-height: 1;
+  padding: 5px 8px 4px; border: 2.5px solid var(--color-line); border-radius: 7px 5px 8px 4px / 5px 8px 4px 7px;
+  background: var(--color-cross); color: var(--color-ink); box-shadow: 0 3px 0 var(--color-line);
+  white-space: nowrap;
+}
+.keycap.down { transform: translateY(2px); box-shadow: 0 1px 0 var(--color-line); }
+.keycap.quiet { background: var(--color-panel); color: var(--color-ink-2); }
+@keyframes keycap-in { from { transform: scale(.6) rotate(-8deg); opacity: 0; } to { transform: none; opacity: 1; } }
+.keycap-in { animation: keycap-in .28s var(--ease-pop) both; }
+
+/* ---- buttons: a cut-out you can press down ------------------------------ */
 .btn {
-  display: inline-flex; align-items: center; gap: 8px;
-  font-family: var(--font-display); font-weight: 700; font-size: 14px; letter-spacing: .08em;
-  text-transform: uppercase; padding: 8px 16px; border-radius: 10px; cursor: pointer;
-  border: 1px solid var(--color-line-2); background: var(--color-panel-2); color: var(--color-ink);
-  transition: border-color .15s, background .15s, transform .08s, box-shadow .15s;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  font-family: var(--font-display); font-weight: 700; font-size: 15px; line-height: 1;
+  padding: 9px 16px 8px; border-radius: var(--r-pill); cursor: pointer;
+  border: 2.5px solid var(--color-line); background: var(--color-panel); color: var(--color-ink);
+  box-shadow: 3px 3px 0 var(--color-line);
+  transition: transform .12s var(--ease-pop), box-shadow .12s, background-color .15s;
 }
-.btn:hover { border-color: var(--color-cross); box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-cross) 18%, transparent); }
-.btn:active { transform: translateY(1px); }
-.btn:disabled { opacity: .5; cursor: default; box-shadow: none; }
-.btn-primary {
-  background: linear-gradient(180deg, var(--color-cross), color-mix(in oklab, var(--color-cross) 75%, black));
-  border-color: color-mix(in oklab, var(--color-cross) 70%, white); color: white;
-  box-shadow: 0 6px 20px -8px var(--color-cross), inset 0 1px 0 rgba(255,255,255,.25);
-}
-.btn-primary:hover { filter: brightness(1.08); }
+.btn:hover { background: var(--color-bg-2); transform: translate(-1px, -1px) rotate(-.6deg); box-shadow: 4px 4px 0 var(--color-line); }
+.btn:active, .btn[aria-pressed="true"] { transform: translate(2px, 2px) scale(.97); box-shadow: 1px 1px 0 var(--color-line); }
+.btn[aria-pressed="true"] { background: var(--color-amber); }
+.btn:disabled { opacity: .45; cursor: default; box-shadow: none; transform: none; }
+.btn-primary { background: var(--color-cross); color: var(--color-ink); }
+.btn-primary:hover { background: var(--color-cyan); }
 
 /* ---- form controls ------------------------------------------------------- */
 .field {
-  background: var(--color-well); color: var(--color-ink);
-  border: 1px solid var(--color-line); border-radius: 9px;
+  background: var(--color-panel); color: var(--color-ink);
+  border: 2.5px solid var(--color-line); border-radius: var(--r-small);
   padding: 7px 10px; font: inherit; font-size: 13.5px; width: 100%; min-width: 0;
-  transition: border-color .15s, box-shadow .15s;
+  transition: box-shadow .12s, transform .12s var(--ease-pop);
 }
-.field:focus { outline: none; border-color: var(--color-cross); box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-cross) 20%, transparent); }
+.field:hover { box-shadow: 2px 2px 0 var(--color-line); }
+.field:focus { outline: 3px dashed var(--color-cross); outline-offset: 2px; box-shadow: 2px 2px 0 var(--color-line); }
+.field::placeholder { color: var(--color-ink-3); }
+.field:disabled { border-color: var(--color-line-2); color: var(--color-ink-3); background: var(--color-bg-2); }
 select.field {
   appearance: none; padding-right: 30px;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' fill='none' stroke='%2398a3b8' stroke-width='1.8'/></svg>");
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='9' viewBox='0 0 14 9'><path d='M1.5 1.5l5.5 5.5 5.5-5.5' fill='none' stroke='%231F1A17' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   background-repeat: no-repeat; background-position: right 10px center;
 }
 textarea.field { font-family: var(--font-mono); font-size: 12.5px; min-height: 64px; resize: vertical; }
-input[type="color"].field { width: 46px; height: 30px; padding: 2px 3px; cursor: pointer; }
+input[type="color"].field { width: 46px; height: 32px; padding: 2px 3px; cursor: pointer; }
 
-/* range: a lit track */
+/* range: a pencil line with a crayon knob */
 input[type="range"].range {
-  -webkit-appearance: none; appearance: none; width: 100%; height: 22px; background: transparent; cursor: pointer;
+  -webkit-appearance: none; appearance: none; width: 100%; height: 24px; background: transparent; cursor: pointer;
   --pct: 50%;
 }
 input[type="range"].range::-webkit-slider-runnable-track {
-  height: 6px; border-radius: 6px;
-  background: linear-gradient(90deg, var(--color-cross) var(--pct), var(--color-line) var(--pct));
+  height: 3px; border-radius: 3px; background: var(--color-line);
 }
 input[type="range"].range::-webkit-slider-thumb {
-  -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; margin-top: -6px;
-  background: white; border: 3px solid var(--color-cross);
-  box-shadow: 0 0 12px color-mix(in oklab, var(--color-cross) 70%, transparent);
+  -webkit-appearance: none; width: 20px; height: 20px; margin-top: -8.5px;
+  border-radius: 55% 45% 50% 50% / 50% 55% 45% 50%;
+  background: var(--color-cross); border: 2.5px solid var(--color-line);
+  box-shadow: 2px 2px 0 var(--color-line);
+  transition: transform .12s var(--ease-pop);
+}
+input[type="range"].range:active::-webkit-slider-thumb { transform: scale(1.15) rotate(-8deg); }
+input[type="range"].range::-moz-range-track { height: 3px; border-radius: 3px; background: var(--color-line); }
+input[type="range"].range::-moz-range-thumb {
+  width: 15px; height: 15px; border-radius: 55% 45% 50% 50% / 50% 55% 45% 50%;
+  background: var(--color-cross); border: 2.5px solid var(--color-line); box-shadow: 2px 2px 0 var(--color-line);
 }
 
-/* toggle switch */
+/* toggle: an ink pill whose knob hops across */
 .switch {
-  position: relative; width: 44px; height: 24px; border-radius: 999px; flex: none;
-  background: var(--color-line-2); border: 1px solid var(--color-line-2); cursor: pointer;
-  transition: background .18s, border-color .18s, box-shadow .18s;
+  position: relative; width: 46px; height: 26px; border-radius: 999px; flex: none;
+  background: var(--color-panel); border: 2.5px solid var(--color-line); cursor: pointer;
+  transition: background-color .18s;
 }
 .switch::after {
-  content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
-  background: var(--color-ink-2); transition: transform .18s cubic-bezier(.3,1.4,.5,1), background .18s;
+  content: ""; position: absolute; top: 1px; left: 1px; width: 18px; height: 18px;
+  border-radius: 55% 45% 50% 50% / 50% 55% 45% 50%;
+  background: var(--color-panel-2); border: 2.5px solid var(--color-line); box-sizing: border-box;
+  transition: transform .26s var(--ease-pop), background-color .18s;
 }
-.switch[aria-checked="true"] {
-  background: var(--color-cross); border-color: var(--color-cross);
-  box-shadow: 0 0 14px -2px var(--color-cross);
-}
-.switch[aria-checked="true"]::after { transform: translateX(20px); background: white; }
-.switch:focus-visible { outline: 2px solid var(--color-cyan); outline-offset: 2px; }
+.switch[aria-checked="true"] { background: var(--color-cross); }
+.switch[aria-checked="true"]::after { transform: translateX(20px) rotate(90deg); background: var(--color-amber); }
+.switch:active::after { transform: scaleX(1.2); }
+.switch[aria-checked="true"]:active::after { transform: translateX(20px) rotate(90deg) scaleY(1.2); }
+.switch:disabled { opacity: .45; cursor: default; }
 
-/* ---- keyframes shared by components -------------------------------------- */
-@keyframes pulse-dot {
-  0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklab, currentColor 55%, transparent); }
-  70% { box-shadow: 0 0 0 7px transparent; }
+/* ---- motion -------------------------------------------------------------- */
+/* page-load: cards pop onto the page one after another with a little overshoot.
+   Set `--i` on the element to place it in the sequence. */
+.pop { animation: pop .55s var(--ease-pop) both; animation-delay: calc(var(--i, 0) * 80ms); transform-origin: 50% 60%; }
+@keyframes pop {
+  from { opacity: 0; transform: scale(.88) rotate(-1.5deg) translateY(10px); }
+  to   { opacity: 1; transform: none; }
 }
-.pulse { animation: pulse-dot 1.8s ease-out infinite; }
 
-@keyframes scan {
-  from { transform: translateY(-100%); }
-  to   { transform: translateY(100%); }
+/* a dot that breathes (status) -- no shadow rings */
+.pulse { animation: breathe 1.6s ease-in-out infinite; }
+@keyframes breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.3); } }
+
+/* the idle bob the controller frame can borrow */
+.bob { animation: bob 3.2s ease-in-out infinite; }
+@keyframes bob { 0%, 100% { transform: translateY(0) rotate(0); } 50% { transform: translateY(-5px) rotate(.4deg); } }
+
+/* a wobbly ink rule (header bottom, dividers) */
+.rule-ink {
+  height: 6px; width: 100%;
+  background: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 6' preserveAspectRatio='none'><path d='M0 3c40-2 60 1.5 100 .5s60-2 100 0 60 2 100 .5 70-1.5 100 0' fill='none' stroke='%231F1A17' stroke-width='3' stroke-linecap='round'/></svg>") center / 100% 100% no-repeat;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pop, .pulse, .bob, .scribble-draw, .keycap-in { animation: none !important; }
+  .scribble-draw { stroke-dashoffset: 0; }
+  *, *::before, *::after { transition-duration: .01ms !important; }
 }

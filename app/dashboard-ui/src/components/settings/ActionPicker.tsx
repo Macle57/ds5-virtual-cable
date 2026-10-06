@@ -50,49 +50,41 @@ export default function ActionPicker({ value, onChange, meta, macros, dir }:
   };
 
   const Icon = current.Icon;
+  const none = current.group === "none";
   return (
     <div ref={root} className="relative">
       <button type="button" onClick={() => setOpen(!open)} aria-haspopup="listbox" aria-expanded={open}
-              className={"flex w-full items-center gap-2.5 rounded-lg border px-2.5 py-2 text-left transition-colors " +
-                (open ? "border-cross bg-well shadow-[0_0_0_3px_color-mix(in_oklab,var(--color-cross)_20%,transparent)]"
-                      : "border-line bg-well hover:border-line-2")}>
-        <span className="grid h-8 w-8 flex-none place-items-center rounded-md border"
-              style={{ color: current.color, borderColor: `color-mix(in oklab, ${current.color} 45%, transparent)`,
-                       background: `color-mix(in oklab, ${current.color} 12%, transparent)` }}>
-          <Icon size={17} />
+              className={"st-pick" + (none ? " is-none" : "")}>
+        <span className={"st-blob" + (none ? " none" : "")} style={{ "--tone": current.color } as React.CSSProperties}>
+          <Icon size={17} strokeWidth={2.5} />
         </span>
-        <span className="min-w-0 flex-1 leading-tight">
-          <span className={"display block truncate text-[14px] " + (current.group === "none" ? "text-ink-3" : "text-ink")}>
-            {current.label}
-          </span>
-          <span className="block truncate text-[11px] text-ink-3">{current.doc}</span>
+        <span className="min-w-0 flex-1">
+          <span className="st-pick-label">{current.label}</span>
+          <span className="st-pick-doc">{current.doc}</span>
         </span>
-        {current.repeatable && <Repeat size={12} className="flex-none text-ink-3" aria-label="repeats while held" />}
-        <ChevronDown size={15} className={"flex-none text-ink-3 transition-transform " + (open ? "rotate-180" : "")} />
+        {current.repeatable && <Repeat size={14} strokeWidth={2.5} className="flex-none text-ink-2" aria-label="repeats while held" />}
+        <ChevronDown size={17} strokeWidth={2.5} className={"flex-none text-ink transition-transform " + (open ? "rotate-180" : "")} />
       </button>
 
       <AnimatePresence>
         {open && (
-          <motion.div initial={{ opacity: 0, y: -4, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }}
-                      exit={{ opacity: 0, y: -4, scale: 0.98 }} transition={{ duration: 0.14 }}
-                      className="absolute left-0 right-0 top-[calc(100%+6px)] z-40 min-w-[300px] overflow-hidden rounded-xl border border-line-2 bg-panel shadow-[0_24px_48px_-16px_rgba(0,0,0,.9)]"
-                      onKeyDown={onKey}>
-            <div className="flex items-center gap-2 border-b border-line px-3 py-2">
-              <Search size={14} className="text-ink-3" />
+          <motion.div initial={{ opacity: 0, y: -6, rotate: -1.2, scale: 0.97 }} animate={{ opacity: 1, y: 0, rotate: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: -4, scale: 0.98 }} transition={{ type: "spring", stiffness: 520, damping: 26 }}
+                      className="st-menu" style={{ transformOrigin: "30% 0" }} onKeyDown={onKey}>
+            <div className="st-menu-search">
+              <Search size={16} strokeWidth={2.5} className="flex-none text-ink-2" />
               <input ref={search} value={q} onChange={(e) => { setQ(e.target.value); setHi(0); }}
-                     placeholder="Search actions…" className="w-full bg-transparent text-[13px] text-ink outline-none placeholder:text-ink-3" />
+                     placeholder="Search actions" aria-label="Search actions" />
             </div>
-            <div role="listbox" className="max-h-[320px] overflow-y-auto p-1.5">
-              {shown.length === 0 && <div className="px-3 py-4 text-center text-[12.5px] text-ink-3">nothing matches</div>}
+            <div role="listbox" className="st-menu-list">
+              {shown.length === 0 && <div className="st-empty">Nothing matches “{q.trim()}”.</div>}
               {GROUPS.map((g) => {
                 const items = shown.filter((a) => a.group === g.id);
                 if (!items.length) return null;
                 return (
                   <div key={g.id} className="mb-1">
                     {g.title && (
-                      <div className="eyebrow flex items-center gap-2 px-2 pb-1 pt-2 text-[10px]" style={{ color: g.color }}>
-                        {g.title}<span className="h-px flex-1 bg-line" />
-                      </div>
+                      <div className="st-menu-group"><i style={{ background: g.color }} />{g.title}</div>
                     )}
                     {items.map((a) => {
                       const i = shown.indexOf(a);
@@ -101,17 +93,16 @@ export default function ActionPicker({ value, onChange, meta, macros, dir }:
                       return (
                         <button key={a.name} type="button" role="option" aria-selected={selected}
                                 onMouseEnter={() => setHi(i)} onClick={() => pick(a)}
-                                className={"flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors " +
-                                  (i === hi ? "bg-cross/15" : "")}>
-                          <span className="grid h-7 w-7 flex-none place-items-center rounded-md" style={{ color: a.color, background: `color-mix(in oklab, ${a.color} 12%, transparent)` }}>
-                            <AIcon size={15} />
+                                className={"st-opt" + (i === hi ? " hi" : "")}>
+                          <span className={"st-blob sm" + (a.group === "none" ? " none" : "")} style={{ "--tone": a.color } as React.CSSProperties}>
+                            <AIcon size={15} strokeWidth={2.5} />
                           </span>
-                          <span className="min-w-0 flex-1 leading-tight">
-                            <span className="display block truncate text-[13.5px] text-ink">{a.label}</span>
-                            <span className="block truncate text-[11px] text-ink-3">{a.doc}</span>
+                          <span className="min-w-0 flex-1">
+                            <span className="st-opt-label">{a.label}</span>
+                            <span className="st-opt-doc">{a.doc}</span>
                           </span>
-                          {a.repeatable && <Repeat size={11} className="flex-none text-ink-3" />}
-                          {selected && <Check size={14} className="flex-none text-cross" />}
+                          {a.repeatable && <Repeat size={13} strokeWidth={2.5} className="flex-none text-ink-2" aria-label="repeats while held" />}
+                          {selected && <Check size={18} strokeWidth={3} className="flex-none text-triangle" aria-label="current" />}
                         </button>
                       );
                     })}
@@ -119,9 +110,8 @@ export default function ActionPicker({ value, onChange, meta, macros, dir }:
                 );
               })}
             </div>
-            <button type="button" onClick={() => { setOpen(false); setSettingsTab("macros"); }}
-                    className="flex w-full items-center gap-2 border-t border-line px-3 py-2 text-[12.5px] text-triangle hover:bg-triangle/10">
-              <Plus size={14} /> New macro…
+            <button type="button" onClick={() => { setOpen(false); setSettingsTab("macros"); }} className="st-menu-new">
+              <Plus size={16} strokeWidth={2.75} /> Make a new macro
             </button>
           </motion.div>
         )}

@@ -1,6 +1,7 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { Headphones, Mic, MicOff, Eye, EyeOff, Zap, Cable, Clock, MousePointer2, Keyboard, AlertTriangle } from "lucide-react";
+import { Headphones, Mic, MicOff, Eye, EyeOff, Zap, MousePointer2, Keyboard, AlertTriangle } from "lucide-react";
 import { keyboardOpen, remoteMode, useActiveController, useRemoteColor } from "../lib/store";
+import { InkDot } from "./Header";
 
 const HIDE_NOTE_FALLBACK = "Hidden requested, but the controller is still visible to other apps — HidHide's filter is not attached to it (restart the device or reboot).";
 
@@ -10,8 +11,11 @@ const STATE_TONE: Record<string, string> = {
   "stopped": "var(--color-idle)", "error": "var(--color-bad)",
 };
 
+/* How the bridge is doing: the state in big marker letters, a drawn battery,
+   a drawn dial for the input rate, and stickers for the flags. */
 export default function StatusCard() {
   const c = useActiveController();
+  const rc = useRemoteColor();
   if (!c) return null;
   const t = c.telemetry;
   const d = t?.decoded ?? null;
@@ -26,27 +30,24 @@ export default function StatusCard() {
   const up = c.uptime_s ?? 0;
   const remote = remoteMode(c) === true;
   const kb = keyboardOpen(c);
-  const rc = useRemoteColor();
   // hide_bluetooth is what was ASKED for; hide_effective is whether HidHide's
   // filter is verified on the pad's HID device. Only a verified "no" against a
   // request is a fault worth shouting about; null means nobody has checked.
   const hideBroken = c.hide_effective === false && c.hide_bluetooth !== false;
 
   return (
-    <section className="panel p-4">
-      <div className="panel-title mb-3">status</div>
+    <section className="panel w2 pop p-4" style={{ "--i": 2 } as React.CSSProperties}>
+      <h2 className="panel-title mb-3">Status</h2>
 
       {/* bridge state */}
-      <div className="flex items-center gap-3 rounded-xl border border-line bg-well/60 px-3.5 py-3">
-        <span className="relative grid h-9 w-9 place-items-center rounded-lg" style={{ background: `color-mix(in oklab, ${tone} 18%, transparent)` }}>
-          <span className="h-3 w-3 rounded-full pulse" style={{ background: tone, color: tone }} />
-        </span>
+      <div className="flex items-center gap-3 px-1">
+        <InkDot tone={tone} size={18} pulse={st === "running"} />
         <div className="min-w-0 flex-1 leading-tight">
-          <div className="display text-[19px] uppercase tracking-[.08em] text-glow" style={{ color: tone }}>{st}</div>
-          <div className="mt-0.5 flex flex-wrap gap-x-3 text-[12px] text-ink-2">
-            {c.port && <span className="inline-flex items-center gap-1"><Cable size={12} className="text-ink-3" />usbip :{c.port}</span>}
-            {up > 0 && <span className="inline-flex items-center gap-1"><Clock size={12} className="text-ink-3" />{Math.floor(up / 60)}m {Math.floor(up % 60)}s</span>}
-            {c.error && <span className="text-bad">{c.error}</span>}
+          <div className="display text-[24px] leading-none">{st}</div>
+          <div className="mt-1 flex flex-wrap gap-x-3 text-[12.5px] text-ink-2">
+            {c.port && <span>usbip port {c.port}</span>}
+            {up > 0 && <span>up {Math.floor(up / 60)} min {Math.floor(up % 60)} s</span>}
+            {c.error && <span className="font-semibold text-bad">{c.error}</span>}
           </div>
         </div>
       </div>
@@ -57,84 +58,61 @@ export default function StatusCard() {
         {remote && (
           <motion.div key="remote" initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }}
                       exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className="overflow-hidden">
-            <div className="mt-3 flex items-center gap-3 rounded-xl border px-3.5 py-2.5"
-                 style={{ borderColor: rc, background: `color-mix(in oklab, ${rc} 14%, transparent)`, boxShadow: `0 0 28px -10px ${rc}` }}>
-              <span className="grid h-9 w-9 flex-none place-items-center rounded-lg"
-                    style={{ background: `color-mix(in oklab, ${rc} 24%, transparent)`, color: rc }}>
-                <MousePointer2 size={18} />
-              </span>
-              <div className="min-w-0 flex-1 leading-tight">
-                <div className="display text-[17px] uppercase tracking-[.1em] text-glow" style={{ color: rc }}>remote mode</div>
-                <div className="mt-0.5 text-[12px] text-ink-2">the pad drives the OS — the game sees a neutral pad</div>
+            <div className="note mt-3 flex-wrap" style={{ "--tone": rc } as React.CSSProperties}>
+              <MousePointer2 size={22} strokeWidth={2.5} className="flex-none" style={{ color: rc }} />
+              <div className="min-w-0 flex-1 basis-[170px] leading-tight">
+                <div className="display text-[18px] leading-none">Remote mode</div>
+                <div className="mt-1 text-[12.5px] text-ink-2">the pad drives the OS, the game sees a neutral pad</div>
               </div>
               {kb && (
-                <span className="display inline-flex flex-none items-center gap-1.5 rounded-lg border px-2 py-1 text-[11.5px] uppercase tracking-[.08em]"
-                      style={{ borderColor: rc, color: rc, background: `color-mix(in oklab, ${rc} 12%, transparent)` }}>
-                  <Keyboard size={13} /> keyboard open
-                </span>
+                <span className="sticker flat bg-panel"><Keyboard size={13} strokeWidth={2.5} /> keyboard open</span>
               )}
             </div>
           </motion.div>
         )}
       </AnimatePresence>
 
-      <div className="mt-3 grid grid-cols-2 gap-3">
-        {/* battery as a segmented health bar */}
-        <div className="rounded-xl border border-line bg-well/60 p-3">
-          <div className="flex items-baseline justify-between">
-            <span className="eyebrow">battery</span>
-            <span className="text-[11px] text-ink-3">{bstate || (pct == null ? "unknown" : "")}</span>
-          </div>
-          <div className="num mt-1 text-[30px] leading-none" style={{ color: low ? "var(--color-bad)" : "var(--color-ink)" }}>
-            {pct == null ? "—" : pct}<span className="text-[14px] text-ink-2">%</span>
-            {charging && <Zap size={16} className="ml-1 inline text-triangle" />}
-          </div>
-          <div className="mt-2.5 grid grid-cols-10 gap-[3px]">
-            {Array.from({ length: 10 }, (_, i) => {
-              const filled = pct != null && pct >= (i + 1) * 10 - 5;
-              return (
-                <motion.span key={i} initial={false}
-                  animate={{ opacity: filled ? 1 : 0.18, scaleY: filled ? 1 : 0.7 }}
-                  transition={{ delay: i * 0.02 }}
-                  className="h-2.5 rounded-[3px]"
-                  style={{ background: low ? "var(--color-bad)" : charging ? "var(--color-triangle)" : "var(--color-ok)",
-                           boxShadow: filled ? "0 0 8px -1px currentColor" : "none",
-                           color: low ? "var(--color-bad)" : "var(--color-ok)" }} />
-              );
-            })}
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        {/* battery, drawn */}
+        <div className="flex items-center gap-3 px-1">
+          <Battery pct={pct} low={low} charging={charging} />
+          <div className="min-w-0 leading-tight">
+            <div className="eyebrow">battery</div>
+            <div className="num text-[26px] leading-none" style={{ color: low ? "var(--color-bad)" : "var(--color-ink)" }}>
+              {pct == null ? "—" : pct}<span className="text-[15px] text-ink-2">%</span>
+              {charging && <Zap size={16} strokeWidth={2.5} className="ml-1 inline text-triangle" />}
+            </div>
+            <div className="text-[11.5px] text-ink-3">{bstate || (pct == null ? "unknown" : "")}</div>
           </div>
         </div>
 
-        {/* input rate gauge */}
-        <div className="flex items-center gap-3 rounded-xl border border-line bg-well/60 p-3">
-          <RateGauge rate={rate} />
+        {/* input rate dial */}
+        <div className="flex items-center gap-3 px-1">
+          <RateDial rate={rate} />
           <div className="min-w-0 leading-tight">
             <div className="eyebrow">input rate</div>
-            <div className="num text-[24px] leading-none">{rate != null ? Math.round(rate) : "—"}</div>
-            <div className="text-[11px] text-ink-3">reports/s</div>
-            {t?.stale_s != null && (
-              <div className="mono mt-1 text-[10.5px] text-ink-3">{(t.stale_s * 1000).toFixed(0)} ms ago</div>
-            )}
+            <div className="num text-[26px] leading-none">{rate != null ? Math.round(rate) : "—"}</div>
+            <div className="text-[11.5px] text-ink-3">reports a second{t?.stale_s != null && <span className="mono">, {(t.stale_s * 1000).toFixed(0)} ms ago</span>}</div>
           </div>
         </div>
       </div>
 
       {/* flags */}
-      <div className="mt-3 flex flex-wrap gap-2">
-        <Flag on={!!d?.headphone} icon={<Headphones size={13} />} label="headphones" />
-        <Flag on={!!d?.mic} icon={<Mic size={13} />} label="mic" />
-        <Flag on={!!d?.mic_muted} icon={<MicOff size={13} />} label="muted" tone="var(--color-amber)" />
-        <Flag on={!!c.hide_bluetooth || hideBroken} icon={hideBroken ? <Eye size={13} /> : <EyeOff size={13} />}
-              label={hideBroken ? "BT pad NOT hidden" : "BT pad hidden"} tone={hideBroken ? "var(--color-warn)" : "var(--color-square)"} />
+      <div className="mt-4 flex flex-wrap gap-2.5 px-1">
+        <Flag on={!!d?.headphone} icon={<Headphones size={13} strokeWidth={2.5} />} label="headphones" />
+        <Flag on={!!d?.mic} icon={<Mic size={13} strokeWidth={2.5} />} label="mic" />
+        <Flag on={!!d?.mic_muted} icon={<MicOff size={13} strokeWidth={2.5} />} label="muted" tone="var(--color-amber)" />
+        <Flag on={!!c.hide_bluetooth || hideBroken} icon={hideBroken ? <Eye size={13} strokeWidth={2.5} /> : <EyeOff size={13} strokeWidth={2.5} />}
+              label={hideBroken ? "BT pad not hidden" : "BT pad hidden"} tone={hideBroken ? "var(--color-warn)" : "var(--color-square)"} />
       </div>
 
       {/* the requested hide is not in effect: other apps (Steam, the game) can
           still see the Bluetooth pad -- the doubled-controller symptom */}
       {hideBroken && (
-        <div className="mt-3 flex items-start gap-3 rounded-xl border border-warn/70 bg-warn/10 px-3.5 py-3 text-[12.5px] leading-relaxed text-ink-2">
-          <AlertTriangle size={18} className="mt-0.5 flex-none text-warn" />
+        <div className="note loud mt-3 items-start text-[12.5px] leading-relaxed" style={{ "--tone": "var(--color-amber)" } as React.CSSProperties}>
+          <AlertTriangle size={20} strokeWidth={2.5} className="mt-0.5 flex-none" />
           <div>
-            <b className="text-warn">Hide requested, but not in effect.</b> {c.hide_note?.trim() || HIDE_NOTE_FALLBACK}
+            <b className="display hl text-[15px]">Hide requested, but not in effect.</b> {c.hide_note?.trim() || HIDE_NOTE_FALLBACK}
           </div>
         </div>
       )}
@@ -145,29 +123,46 @@ export default function StatusCard() {
 function Flag({ on, icon, label, tone = "var(--color-cross)" }:
   { on: boolean; icon: React.ReactNode; label: string; tone?: string }) {
   return (
-    <span className="display inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] uppercase tracking-[.08em] transition-colors"
-          style={on
-            ? { borderColor: tone, color: tone, background: `color-mix(in oklab, ${tone} 14%, transparent)`, boxShadow: `0 0 12px -4px ${tone}` }
-            : { borderColor: "var(--color-line)", color: "var(--color-ink-3)" }}>
+    <span className={"sticker " + (on ? "" : "quiet")} style={on ? { background: tone } : undefined}>
       {icon}{label}
     </span>
   );
 }
 
-/* 250 Hz is the pad's native rate over the bridge: that is the full arc. */
-function RateGauge({ rate }: { rate: number | null }) {
-  const r = 26, C = 2 * Math.PI * r;
-  const frac = Math.max(0, Math.min(1, (rate ?? 0) / 250));
-  const arc = C * 0.75;
-  const tone = frac > 0.8 ? "var(--color-ok)" : frac > 0.3 ? "var(--color-amber)" : "var(--color-bad)";
+/* a battery drawn in ink, filled with crayon to the level */
+function Battery({ pct, low, charging }: { pct: number | null; low: boolean; charging: boolean }) {
+  const frac = pct == null ? 0 : Math.max(0, Math.min(1, pct / 100));
+  const fill = low ? "var(--color-circle)" : charging ? "var(--color-cross)" : "var(--color-triangle)";
   return (
-    <svg width="68" height="68" viewBox="0 0 68 68" className="flex-none">
-      <circle cx="34" cy="34" r={r} fill="none" stroke="var(--color-line)" strokeWidth="6"
-              strokeDasharray={`${arc} ${C}`} strokeLinecap="round" transform="rotate(135 34 34)" />
-      <motion.circle cx="34" cy="34" r={r} fill="none" stroke={tone} strokeWidth="6" strokeLinecap="round"
-              transform="rotate(135 34 34)" style={{ filter: `drop-shadow(0 0 5px ${tone})` }}
-              initial={false} animate={{ strokeDasharray: `${arc * frac} ${C}` }} transition={{ type: "spring", stiffness: 120, damping: 20 }} />
-      <text x="34" y="38" textAnchor="middle" fill={tone} style={{ font: "700 12px var(--font-display)" }}>{Math.round(frac * 100)}%</text>
+    <svg width="64" height="36" viewBox="0 0 64 36" className="flex-none sketch" aria-hidden>
+      <rect x="3" y="5" width="52" height="26" rx="6" fill="var(--color-panel)" stroke="var(--color-ink)" strokeWidth="3" />
+      <rect x="56" y="12" width="6" height="12" rx="2" fill="var(--color-ink)" />
+      <motion.rect x="8" y="10" height="16" rx="3" fill={fill} initial={false}
+                   animate={{ width: Math.max(0, 42 * frac) }} transition={{ type: "spring", stiffness: 120, damping: 20 }} />
+    </svg>
+  );
+}
+
+/* 250 Hz is the pad's native rate over the bridge: that is the full sweep. */
+function RateDial({ rate }: { rate: number | null }) {
+  const frac = Math.max(0, Math.min(1, (rate ?? 0) / 250));
+  const tone = frac > 0.8 ? "var(--color-triangle)" : frac > 0.3 ? "var(--color-amber)" : "var(--color-circle)";
+  const angle = -120 + 240 * frac;
+  return (
+    <svg width="64" height="56" viewBox="0 0 64 56" className="flex-none" aria-hidden>
+      <g className="sketch">
+        <path d="M10 44A26 26 0 1 1 54 44" fill="none" stroke="var(--color-ink)" strokeWidth="3" strokeLinecap="round" />
+        {[0, 0.25, 0.5, 0.75, 1].map((f) => {
+          const a = (-120 + 240 * f) * Math.PI / 180;
+          return <line key={f} x1={32 + 21 * Math.sin(a)} y1={32 - 21 * Math.cos(a)} x2={32 + 26 * Math.sin(a)} y2={32 - 26 * Math.cos(a)}
+                       stroke="var(--color-ink)" strokeWidth="2.5" strokeLinecap="round" />;
+        })}
+      </g>
+      <motion.g initial={false} animate={{ rotate: angle }} transition={{ type: "spring", stiffness: 90, damping: 16 }} style={{ transformOrigin: "32px 32px" }}>
+        <line x1="32" y1="34" x2="32" y2="12" stroke={tone} strokeWidth="5" strokeLinecap="round" />
+        <line x1="32" y1="34" x2="32" y2="12" stroke="var(--color-ink)" strokeWidth="1.5" strokeLinecap="round" strokeDasharray="0 100" />
+      </motion.g>
+      <circle cx="32" cy="33" r="4.5" fill="var(--color-ink)" />
     </svg>
   );
 }

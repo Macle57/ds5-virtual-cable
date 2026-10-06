@@ -1,6 +1,5 @@
 import { useId, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Info } from "lucide-react";
 import { getPath, setPath, useStore } from "../../lib/store";
 import { hexToRgb, rgbToHex } from "./help";
 
@@ -19,9 +18,10 @@ function useBind<T>(path: string[], dflt: T): [T, (v: T) => void] {
 
 export function Toggle({ path, dflt = false, onChange }: { path: string[]; dflt?: boolean; onChange?: (v: boolean) => void }) {
   const [v, set] = useBind<boolean>(path, dflt);
+  const [touched, setTouched] = useState(false);     // the knob hops only when you flip it, not on mount
   return (
-    <button type="button" role="switch" aria-checked={!!v} className="switch"
-            onClick={() => { set(!v); onChange?.(!v); }} />
+    <button type="button" role="switch" aria-checked={!!v} className="switch" data-flipped={touched || undefined}
+            onClick={() => { setTouched(true); set(!v); onChange?.(!v); }} />
   );
 }
 
@@ -55,31 +55,35 @@ export function SelectField({ path, dflt, options, onChange, width }:
   );
 }
 
+/* A crayon-filled tube with a paper knob: the native range sits on top, so
+   keyboard and screen readers get the real control. */
 export function RangeField({ path, dflt, min, max, step, fmt }:
   { path: string[]; dflt: number; min: number; max: number; step: number; fmt: (v: number) => string }) {
   const [v, set] = useBind<number>(path, dflt);
-  const pct = ((v - min) / (max - min)) * 100;
+  const pct = Math.max(0, Math.min(100, ((v - min) / (max - min)) * 100));
   return (
-    <div className="flex flex-1 items-center gap-3">
-      <input type="range" className="range" min={min} max={max} step={step} value={v}
-             style={{ "--pct": pct + "%" } as React.CSSProperties}
-             onChange={(e) => set(Number(e.target.value))} />
-      <span className="num w-12 text-right text-[14px]">{fmt(v)}</span>
+    <div className="flex w-full flex-1 items-center gap-3">
+      <div className="st-range" style={{ "--pct": pct + "%" } as React.CSSProperties}>
+        <div className="st-range-track"><div className="st-range-fill" /></div>
+        <input type="range" min={min} max={max} step={step} value={v}
+               onChange={(e) => set(Number(e.target.value))} />
+      </div>
+      <span className="st-range-val num">{fmt(v)}</span>
     </div>
   );
 }
 
+/* A dab of paint: the swatch is the control, the native picker sits on it. */
 export function ColorField({ path, dflt }: { path: string[]; dflt: number[] }) {
   const [v, set] = useBind<unknown>(path, dflt);
   const hex = rgbToHex(v);
   return (
-    <label className="flex cursor-pointer items-center gap-2">
-      {/* the glowing swatch is the control; the native picker sits under it */}
-      <span className="relative h-8 w-12 rounded-md border border-line-2" style={{ background: hex, boxShadow: `0 0 14px -2px ${hex}` }}>
+    <label className="flex cursor-pointer items-center gap-2.5">
+      <span className="st-swatch" style={{ background: hex }}>
         <input type="color" className="absolute inset-0 h-full w-full cursor-pointer opacity-0" value={hex}
-               onChange={(e) => set(hexToRgb(e.target.value))} />
+               aria-label="pick a colour" onChange={(e) => set(hexToRgb(e.target.value))} />
       </span>
-      <span className="mono text-[11px] text-ink-3">{hex}</span>
+      <span className="mono text-[12px] text-ink-2">{hex}</span>
     </label>
   );
 }
@@ -90,7 +94,7 @@ export function JsonField({ path }: { path: string[] }) {
   const [text, setText] = useState(() => JSON.stringify(v, null, 1));
   const [bad, setBad] = useState(false);
   return (
-    <textarea className="field" value={text} style={bad ? { borderColor: "var(--color-bad)" } : undefined}
+    <textarea className={"field" + (bad ? " is-bad" : "")} value={text} aria-invalid={bad || undefined}
               onChange={(e) => {
                 setText(e.target.value);
                 try { set(JSON.parse(e.target.value)); setBad(false); } catch { setBad(true); }
@@ -99,23 +103,49 @@ export function JsonField({ path }: { path: string[] }) {
 }
 
 /* ------------------------------------------------------------------------
-   Layout: a section card and a setting row (label line + optional (i) help
-   toggled inline -- a hover title is useless on a touchscreen and invisible
-   to a keyboard) with the control beside it, or beneath it when stacked.
+   Layout: a section (handwritten heading with a scribble under it) and a
+   setting row (label + optional (i) help toggled inline -- a hover title is
+   useless on a touchscreen and invisible to a keyboard) with the control
+   beside it, or beneath it when stacked.
    ------------------------------------------------------------------------ */
+
+/* Something that unrolls open: clipped only while it moves, so the cards'
+   offset shadows, focus rings and an action picker's menu are never cut off
+   once it is open. Render it inside an AnimatePresence. */
+export function Reveal({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  const [moving, setMoving] = useState(true);
+  return (
+    <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.22 }} className={className}
+                onAnimationStart={() => setMoving(true)} onAnimationComplete={() => setMoving(false)}
+                style={{ overflow: moving ? "hidden" : "visible" }}>
+      {children}
+    </motion.div>
+  );
+}
+
+/* The hand-drawn underline: one wobbly crayon stroke that draws itself in. */
+export function Scribble() {
+  return (
+    <svg className="st-scribble" viewBox="0 0 200 12" preserveAspectRatio="none" aria-hidden>
+      <path d="M3 8 C 30 3.5, 52 9.5, 84 6 S 140 3, 168 6.5 S 190 7.5, 197 4.5" pathLength={1}
+            fill="none" stroke="var(--tab, var(--color-cross))" strokeWidth={4.2} strokeLinecap="round" />
+    </svg>
+  );
+}
 
 export function Card({ title, tag, hint, children, className = "" }:
   { title: string; tag?: string; hint?: string; children: React.ReactNode; className?: string }) {
   return (
-    <div className={"rounded-2xl border border-line bg-panel-2/50 p-4 " + className}>
-      <div className="flex items-baseline gap-2">
-        <span className="display text-[15px] uppercase tracking-[.1em] text-cross">{title}</span>
+    <section className={"st-card " + className}>
+      <div className="st-h">
+        <h3 className="st-h-text">{title}<Scribble /></h3>
         {/* serials and the like: mono, so 0/O and 1/l stay apart */}
-        {tag && <span className="mono rounded-md border border-line bg-well px-1.5 text-[12px] text-ink-2">{tag}</span>}
+        {tag && <span className="st-sticker tilt-r mono">{tag}</span>}
       </div>
-      {hint && <p className="mb-2 mt-1 text-[12.5px] leading-relaxed text-ink-3">{hint}</p>}
-      <div className="mt-2 divide-y divide-line/60">{children}</div>
-    </div>
+      {hint && <p className="st-hint">{hint}</p>}
+      <div className="st-rows">{children}</div>
+    </section>
   );
 }
 
@@ -127,32 +157,32 @@ export function Row({ label, keyName, help, unit, stack, root = "input", childre
   const id = useId();
   const fullKey = keyName ? (root ? root + "." + keyName : keyName) : "";
   return (
-    <div className="py-2.5">
-      <div className={"flex gap-3 " + (stack ? "flex-col items-stretch" : "items-center justify-between")}>
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          <label className="min-w-0 text-[13.5px] text-ink-2 [overflow-wrap:anywhere]">{label}</label>
-          {keyName && stack && <span className="mono flex-none text-[10.5px] text-ink-3">{keyName}</span>}
+    <div className="st-row">
+      <div className={"flex gap-x-4 gap-y-2.5 " + (stack ? "flex-col items-stretch" : "flex-wrap items-center justify-between")}>
+        <div className="flex min-w-0 flex-1 items-center gap-2" style={stack ? undefined : { flexBasis: 220 }}>
+          <label className="st-row-label min-w-0">{label}</label>
           {help && (
-            <button type="button" aria-expanded={open} aria-controls={id} aria-label="explain this setting"
-                    onClick={() => setOpen(!open)}
-                    className={"grid h-5 w-5 flex-none place-items-center rounded-full border transition-colors " +
-                      (open ? "border-cross text-cross" : "border-line text-ink-3 hover:border-cross hover:text-cross")}>
-              <Info size={12} />
+            <button type="button" aria-expanded={open} aria-controls={id} aria-label={"Explain: " + label}
+                    onClick={() => setOpen(!open)} className="st-info">
+              <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
+                <path d="M6 5.4 L6 9.6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
+                <circle cx="6" cy="2.6" r="1.35" fill="currentColor" />
+              </svg>
             </button>
           )}
         </div>
-        <div className={"flex items-center gap-2 " + (stack ? "" : "flex-none")}>
+        <div className={"flex items-center gap-2.5 " + (stack ? "" : "flex-none")}>
           {children}
-          {unit && !stack && <span className="w-7 text-[12px] text-ink-3">{unit}</span>}
+          {unit && !stack && <span className="st-unit">{unit}</span>}
         </div>
       </div>
       <AnimatePresence initial={false}>
         {open && help && (
           <motion.div id={id} initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }}
                       exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden">
-            <div className="mt-2 rounded-lg border border-line border-l-[3px] border-l-cross bg-well px-3 py-2 text-[12.5px] leading-relaxed text-ink-2">
+            <div className="st-note">
               {help}
-              {keyName && !stack && <div className="mono mt-1.5 text-[10.5px] text-ink-3">config key: {fullKey}</div>}
+              {keyName && <div className="mt-1.5 text-[12px] text-ink-2">Saved as <span className="mono">{fullKey}</span></div>}
             </div>
           </motion.div>
         )}

@@ -10,10 +10,10 @@ export const HELP: Record<string, string> = {
   ctrl_hide: "Hide this controller's Bluetooth pad (HidHide) while it is bridged, so games and Steam see only the virtual wired one. The pill beside it says whether the hide is actually in effect right now.",
   autostart_on_login: "Start the tray with Windows. Installed as a service it starts before anyone signs in (the pads work on the lock screen too); installed as a scheduled task it starts at sign-in. The installer chooses which; this switch turns whichever is installed on or off.",
   update_check: "Look for a newer release on GitHub once a day and when the tray starts. Off, nothing is ever fetched.",
-  update_auto_install: "Install a newer release on its own: a short while after one is found, the silent installer runs and the tray (or service) restarts itself, with a toast under the 'update' notification. Off, a new release is only announced and installed by hand -- the Install button here or the tray's 'Install update' row.",
+  update_auto_install: "Install a newer release on its own: a short while after one is found, the silent installer runs and the tray (or service) restarts itself, with a toast under the 'update' notification. Off, a new release is only announced and installed by hand, with the Install button here or the tray's 'Install update' row.",
   tray_actions: "The same commands as the tray menu. Rescan looks for pads again right now; Unhide all lifts every HidHide cloak (a rescue when a pad stays invisible after a crash); Open logs opens the log folder.",
   /* notifications */
-  notifications_enabled: "Master switch for every toast this app shows. Off, nothing pops up -- including the battery toast shortcut.",
+  notifications_enabled: "Master switch for every toast this app shows. Off, nothing pops up, including the battery toast shortcut.",
   n_battery_low: "Warn when a pad's battery runs low (the lightbar flashes too, see Battery).",
   n_remote_mode: "'Remote mode on / off (<pad>)' whenever a pad switches between driving the game and driving the OS.",
   n_keyboard: "'On-screen keyboard opened / closed' when the pad-driven keyboard comes and goes. Off by default: it is visible on screen anyway.",
@@ -25,13 +25,13 @@ export const HELP: Record<string, string> = {
   macro_repeat: "Once per press fires the macro each time the chord lands. While held fires it again every interval for as long as the button stays down. Toggle starts repeating on one press and stops on the next (leaving remote mode or turning the engine off stops it too). Max runs caps a hold/toggle run; 0 is unlimited.",
   /* shortcut engine */
   enabled: "Master switch for the whole shortcut engine. Off, the pad is a plain bridged controller: no chords, no gestures, no remote mode, no idle off-timer, no battery flashes.",
-  chord_button: "Hold this button to arm shortcuts: while it is held, other buttons fire their bound actions instead of reaching the game (sticks and triggers still pass -- your aim is never frozen). A quick plain tap is replayed to the game afterwards, so a normal PS press still opens the game's own menu.",
+  chord_button: "Hold this button to arm shortcuts: while it is held, other buttons fire their bound actions instead of reaching the game (sticks and triggers still pass, so your aim never freezes). A quick plain tap is replayed to the game afterwards, so a normal PS press still opens the game's own menu.",
   double_press_ms: "Two presses of the chord button within this window toggle remote mode instead of replaying a tap to the game.",
   tap_replay_ms: "When the chord button is tapped on its own, the press is replayed to the game and held down for this long. The game gets a slightly late press; menus do not care.",
   repeat_ms: "While a chord stays held, repeatable actions (volume, brightness) fire again this often.",
   haptic_ack: "A short rumble pulse whenever a chord is accepted, so you know it landed without looking at the screen.",
   haptic_strength: "How strong the acknowledgement rumble is. 0 is silent, 100 is full motor.",
-  stick_mouse_in_chord: "While the chord button is held, the left stick and a one-finger touchpad drag move the mouse pointer (a short one-finger tap clicks, the right stick scrolls) -- a quick nudge-and-click without switching into remote mode. The game sees the sticks centred for the hold.",
+  stick_mouse_in_chord: "While the chord button is held, the left stick and a one-finger touchpad drag move the mouse pointer (a short one-finger tap clicks, the right stick scrolls). It is a quick nudge-and-click without switching into remote mode. The game sees the sticks centred for the hold.",
   scroll_sensitivity: "How far a two-finger slide scrolls, as a multiplier. 1× is the engine default (about one wheel notch per 100 touchpad points). Only the touchpad: the stick and trigger scroll have their own speed under Remote mode.",
   scroll_reverse: "Flip the scroll direction of a two-finger slide. Off, fingers moving up scroll the content up, the Windows touchpad default.",
   zoom_sensitivity: "How much a pinch zooms, as a multiplier, for both the touch-screen pinch and the Ctrl + wheel zoom.",
@@ -54,10 +54,10 @@ export const HELP: Record<string, string> = {
   remote_enabled: "Double-press the chord button to toggle remote mode: the game is handed a neutral pad while the pad drives the OS. Touchpad drags move the pointer (tap = click, two-finger tap = right click, two-finger horizontal slide = alt-tab), Cross clicks and holds to drag, the left stick moves the pointer, the right stick and triggers scroll, the d-pad is arrow keys, Circle is Esc, Options is Enter. The lightbar holds the colour below while it is on.",
   mouse_speed: "Pointer speed multiplier for touchpad drags and the left stick in remote mode.",
   scroll_speed: "Scroll speed multiplier for the right stick and the triggers (remote mode, and the right stick while chording). The touchpad's two-finger scroll has its own sensitivity under Gestures.",
-  remote_lightbar: "Lightbar colour while remote mode is on -- the visible cue that input is going to the OS, not the game. The dashboard's REMOTE MODE badge wears the same colour.",
+  remote_lightbar: "Lightbar colour while remote mode is on: the visible cue that input is going to the OS, not the game. The dashboard's remote mode badge wears the same colour.",
   same_bindings: "On, remote mode reuses the chord table above: the same button or gesture fires the same action, just without the chord button held. Off, remote mode gets its own table (below), so a button can mean one thing while chording in a game and another while driving the desktop.",
   remote_chords: "In remote mode nothing reaches the game, so there is no chord button to hold: a bound button or gesture fires its action directly, on its own. The defaults spell out the classic remote map (Cross clicks, d-pad arrows, Circle is Esc, Options is Enter); a row set to none makes that button do nothing in remote mode. Only the touchpad and stick pointer controls are fixed.",
-  dim_after_minutes: "Minutes of bridged play before the lightbar dims to save the pad's battery. 0 never dims (the default -- a lightbar going dark unasked reads as a fault). The game's colour is rewritten in flight, so the game's own idea of its lightbar stays untouched.",
+  dim_after_minutes: "Minutes of bridged play before the lightbar dims to save the pad's battery. 0 never dims (the default, because a lightbar going dark unasked looks like a fault). The game's colour is rewritten in flight, so the game's own idea of its lightbar stays untouched.",
   dim_level: "Brightness once dimmed: 0% is fully off, 100% is untouched. Applied as a multiplier on whatever colour the game asked for.",
   battery_enabled: "Flash the lightbar when the pad's battery runs low. The flash overlays the game's colour briefly; nothing the game set is lost.",
   low_percent: "Battery percentage at which the low-battery flashes begin.",
@@ -109,9 +109,9 @@ export const GESTURE_FALLBACK: GestureRow[] = ([
 ] as const).map(([key, group, pair, dir]) => ({ key, group, label: KEY_LABELS[key], help: HELP[key], pair, dir }));
 
 export const GESTURE_GROUPS: { id: string; title: string; hint: string }[] = [
-  { id: "taps", title: "Taps & clicks", hint: "two fingers on the pad" },
-  { id: "unpressed", title: "Slides & pinch", hint: "pad not pressed" },
-  { id: "pressed", title: "While the pad is clicked", hint: "click, hold, then move two fingers — the click always wins over an unpressed gesture in progress" },
+  { id: "taps", title: "Taps and clicks", hint: "Two fingers on the pad." },
+  { id: "unpressed", title: "Slides and pinch", hint: "The pad is not pressed." },
+  { id: "pressed", title: "While the pad is clicked", hint: "Click, hold, then move two fingers. The click wins over any unpressed gesture already under way." },
 ];
 
 /* The feel knobs the Gestures tab draws itself; the thresholds render
@@ -121,7 +121,7 @@ export const KNOWN_GESTURES = new Set(["scroll_sensitivity", "scroll_reverse", "
 /* Keys each level of the config the page owns; anything else (a newer
    build's settings) still renders generically inside the right card. */
 export const GLOBAL_FIELDS: [string, string, "bool" | "number" | "string"][] = [
-  ["enabled", "Bridging enabled (master switch)", "bool"],
+  ["enabled", "Bridging on (master switch)", "bool"],
   ["autostart_on_login", "Start at login", "bool"],
   ["auto_bridge_new", "Bridge new controllers automatically", "bool"],
   ["hide_bluetooth_default", "Hide new controllers' Bluetooth pad", "bool"],
@@ -129,7 +129,7 @@ export const GLOBAL_FIELDS: [string, string, "bool" | "number" | "string"][] = [
   ["update_auto_install", "Install updates automatically", "bool"],
   ["port_base", "First usbip TCP port", "number"],
   ["dashboard_port", "Dashboard port (this page)", "number"],
-  ["hidhide_cli", "HidHideCLI.exe path (blank = auto)", "string"],
+  ["hidhide_cli", "HidHideCLI.exe path (leave blank to find it)", "string"],
 ];
 /* The rows the Bridging & tray card does NOT cover: the Advanced card. */
 export const ADVANCED_FIELDS = GLOBAL_FIELDS.filter(([k]) => ["port_base", "dashboard_port", "hidhide_cli"].includes(k));
@@ -148,7 +148,7 @@ export const CTRL_FIELDS: [string, string, "bool" | "number" | "string" | "choic
   ["label", "Label", "string"],
   ["audio_target", "Audio target", "choice", ["speaker", "headphone"]],
   ["hide_bluetooth", "Hide Bluetooth pad while bridged", "bool"],
-  ["port", "usbip TCP port (blank = automatic)", "number"],
+  ["port", "usbip TCP port (leave blank for automatic)", "number"],
 ];
 export const KNOWN_GLOBAL = new Set([...GLOBAL_FIELDS.map((f) => f[0]), "controllers", "input", "notifications"]);
 export const KNOWN_CTRL = new Set(CTRL_FIELDS.map((f) => f[0]));

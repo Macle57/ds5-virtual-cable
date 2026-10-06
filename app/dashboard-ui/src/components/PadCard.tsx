@@ -3,6 +3,9 @@ import { Keyboard, MousePointer2 } from "lucide-react";
 import { keyboardOpen, remoteMode, useActiveController, useRemoteColor, useStore } from "../lib/store";
 import Pad from "./Pad";
 
+/* The frame around the drawing: a big card, the title in marker, stickers
+   for what mode the pad is in, and a row of crayon keycaps for what is
+   pressed right now. The pad itself is Pad.tsx. */
 export default function PadCard() {
   const c = useActiveController();
   const active = useStore((s) => s.active);
@@ -15,46 +18,44 @@ export default function PadCard() {
   const rc = useRemoteColor();
 
   return (
-    <section className="panel flex flex-col p-3 pb-2">
-      <div className="flex flex-wrap items-center justify-between gap-y-2 px-2 pt-1">
-        <div className="panel-title flex-1">controller</div>
-        <div className="ml-3 flex items-center gap-2">
-          {/* remote mode: the same colour the lightbar is showing right now */}
+    <section className="panel pop flex flex-col p-4 pb-3" style={{ "--i": 1 } as React.CSSProperties}>
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-1">
+        <h2 className="panel-title">Controller</h2>
+        <div className="flex flex-wrap items-center gap-2.5">
           <AnimatePresence>
             {remote && (
-              <motion.span key="remote" initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }}
-                           className="display inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[12px] uppercase tracking-[.14em]"
-                           style={{ borderColor: rc, color: rc, background: `color-mix(in oklab, ${rc} 16%, transparent)`, boxShadow: `0 0 14px -4px ${rc}` }}>
-                <span className="h-2 w-2 rounded-full pulse" style={{ background: rc, color: rc }} />
-                <MousePointer2 size={12} /> remote mode
+              <motion.span key="remote" initial={{ scale: 0.6, rotate: -10, opacity: 0 }} animate={{ scale: 1, rotate: -2, opacity: 1 }}
+                           exit={{ scale: 0.6, opacity: 0 }} transition={{ type: "spring", stiffness: 500, damping: 22 }}
+                           className="sticker flat" style={{ background: rc }} title="remote mode: this pad is driving the OS">
+                <MousePointer2 size={13} strokeWidth={2.5} /> remote mode
               </motion.span>
             )}
             {kb && (
-              <motion.span key="kb" initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }}
-                           className="display inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] uppercase tracking-[.12em]"
-                           style={{ borderColor: `color-mix(in oklab, ${rc} 55%, transparent)`, color: rc }}>
-                <Keyboard size={12} /> keyboard open
+              <motion.span key="kb" initial={{ scale: 0.6, rotate: 8, opacity: 0 }} animate={{ scale: 1, rotate: 1.5, opacity: 1 }}
+                           exit={{ scale: 0.6, opacity: 0 }} transition={{ type: "spring", stiffness: 500, damping: 22 }}
+                           className="sticker flat bg-panel">
+                <Keyboard size={13} strokeWidth={2.5} /> keyboard open
               </motion.span>
             )}
           </AnimatePresence>
-          <span className="eyebrow">serial</span>
-          <span className="mono rounded-md border border-line bg-well px-2 py-0.5 text-[12px] text-ink-2">{active}</span>
+          <span className="flex items-baseline gap-1.5">
+            <span className="eyebrow">serial</span>
+            <span className="mono text-[12.5px] text-ink-2" style={{ textDecoration: "underline dotted var(--color-ink-3) 2px", textUnderlineOffset: 4 }}>{active}</span>
+          </span>
         </div>
       </div>
 
-      <div className="relative flex flex-1 items-center px-1 pt-2">
+      <div className="relative flex flex-1 items-center justify-center px-1 pt-3">
         <Pad t={t} lightbar={remote ? rc : undefined} />
       </div>
 
-      {/* pressed-input ticker: the names, as decoded, so a debug session can
-          read the exact bits the game is being fed */}
-      <div className="flex min-h-[34px] flex-wrap items-center gap-1.5 px-2 pb-1">
-        <span className="eyebrow mr-1">input</span>
-        {pressed.length === 0 && <span className="text-[12px] text-ink-3">idle</span>}
+      {/* what is pressed right now, as keycaps -- the exact names the decoder
+          uses, so a debug session reads the same bits the game gets */}
+      <div className="flex min-h-[38px] flex-wrap items-center gap-2 px-1 pt-1">
+        <span className="eyebrow mr-1">pressing</span>
+        {pressed.length === 0 && <span className="display text-[13.5px] text-ink-3">nothing</span>}
         {pressed.map((n) => (
-          <span key={n} className="display rounded-md border border-cross/50 bg-cross/15 px-2 py-0.5 text-[12px] uppercase tracking-wider text-cross">
-            {n}
-          </span>
+          <span key={n} className="keycap keycap-in">{n}</span>
         ))}
       </div>
     </section>

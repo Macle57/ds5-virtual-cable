@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { AlertTriangle, Keyboard, Pencil, Plus, Repeat, Terminal, ToggleRight, Trash2, X } from "lucide-react";
 import type { ActionsMeta, Json, MacroRepeat, RepeatMode } from "../../lib/types";
@@ -9,13 +9,14 @@ import {
 } from "../../lib/actionMeta";
 import { HELP, keyLabel } from "./help";
 import ButtonGlyph from "./ButtonGlyph";
-import { Row } from "./controls";
+import { Reveal, Row, Scribble } from "./controls";
 
 type Kind = "keys" | "run";
 interface Draft { name: string; label: string; kind: Kind; keys: string[]; run: string; repeat: MacroRepeat }
 
 const asObj = (v: unknown): Record<string, Json> =>
   v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, Json>) : {};
+const IC = { strokeWidth: 2.5 };
 
 const fresh = (): Draft => ({ name: "", label: "", kind: "keys", keys: [], run: "", repeat: { ...DEFAULT_REPEAT } });
 const fromDef = (name: string, m: MacroDef): Draft => ({
@@ -29,7 +30,10 @@ export function MacrosSection({ actions }: { actions: ActionsMeta }) {
   const rawChords = useStore((s) => getPath(s.cfg, ["input", "chords"]));
   const rawRemote = useStore((s) => getPath(s.cfg, ["input", "remote", "chords"]));
   const patch = useStore((s) => s.patchConfig);
-  const macros = useMemo(() => macroList(rawMacros), [rawMacros]);
+  // Not memoised on rawMacros: patchConfig mutates input.macros in place (only
+  // the top-level document is re-spread), so its reference never changes and a
+  // memo would keep showing the list from before the add/delete.
+  const macros = macroList(rawMacros);
   const chords = asObj(rawChords);
   const remote = asObj(rawRemote);
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -70,81 +74,80 @@ export function MacrosSection({ actions }: { actions: ActionsMeta }) {
   };
 
   return (
-    <div className="rounded-2xl border border-line bg-panel-2/50 p-4">
-      <div className="flex flex-wrap items-center gap-3">
+    <section className="st-card">
+      <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
         <div className="min-w-0 flex-1">
-          <div className="display text-[15px] uppercase tracking-[.1em] text-cross">Custom macros</div>
-          <p className="mt-1 text-[12.5px] leading-relaxed text-ink-3">
-            Your own actions: a keyboard shortcut sent as one atomic press, or a program to launch. Once saved they
-            appear in every chord and gesture picker under “Your macros”.
+          <div className="st-h"><h3 className="st-h-text">Your macros<Scribble /></h3></div>
+          <p className="st-hint">
+            Your own actions: a keyboard shortcut sent as one press, or a program to launch. Once saved, they show up
+            in every chord and gesture picker under “Your macros”.
           </p>
         </div>
         {!draft && (
           <button className="btn btn-primary" onClick={() => { setDraft(fresh()); setEditing(null); }}>
-            <Plus size={15} /> New macro
+            <Plus size={16} strokeWidth={2.75} /> New macro
           </button>
         )}
       </div>
 
       <AnimatePresence initial={false}>
         {draft && (
-          <motion.div key="editor" initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }}
-                      exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden">
+          <Reveal key="editor">
             <MacroEditor draft={draft} setDraft={setDraft} editing={editing} keys={actions.macro_keys ?? []}
                          taken={new Set(macros.map(([n]) => n))} reserved={reserved}
                          onSave={save} onCancel={() => { setDraft(null); setEditing(null); }} />
-          </motion.div>
+          </Reveal>
         )}
       </AnimatePresence>
 
       {macros.length === 0 && !draft && (
-        <div className="mt-4 grid place-items-center rounded-xl border border-dashed border-line-2 py-10 text-center">
-          <Keyboard size={28} className="mb-2 text-ink-3" />
-          <div className="display text-[15px] text-ink-2">No macros yet</div>
-          <div className="mt-1 max-w-[380px] text-[12.5px] text-ink-3">
-            Try Ctrl+Shift+Esc for Task Manager, Win+Shift+S for a screenshot, or launch your music player.
-          </div>
+        <div className="st-empty-card">
+          <span className="st-blob mb-3" style={{ "--tone": "var(--color-orange)", width: 46, height: 46, transform: "rotate(-8deg)" } as React.CSSProperties}>
+            <Keyboard size={22} {...IC} />
+          </span>
+          <div className="st-bind-name">No macros yet</div>
+          <p className="st-small mt-1 max-w-[46ch]">
+            Try Ctrl+Shift+Esc for Task Manager, Win+Shift+S for a screenshot, or a macro that opens your music player.
+          </p>
         </div>
       )}
 
       {macros.length > 0 && (
-        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        <div className="st-grid wide mt-4">
           {macros.map(([name, m]) => {
             const isRun = !(Array.isArray(m.keys) && m.keys.length);
             const Icon = isRun ? Terminal : Keyboard;
             const bound = boundTo(name);
             const rep = macroRepeat(m);
             return (
-              <motion.div layout key={name}
-                          className={"rounded-xl border p-3 " + (editing === name ? "border-triangle/60 bg-triangle/[.06]" : "border-line bg-well/50")}>
+              <motion.div layout="position" key={name} className={"st-bind" + (editing === name ? " is-editing" : "")}
+                          style={{ "--accent": "var(--color-orange)" } as React.CSSProperties}>
                 <div className="flex items-start gap-2.5">
-                  <span className="grid h-9 w-9 flex-none place-items-center rounded-md border border-triangle/40 bg-triangle/10 text-triangle">
-                    <Icon size={18} />
+                  <span className="st-blob" style={{ "--tone": "var(--color-triangle)" } as React.CSSProperties}>
+                    <Icon size={17} {...IC} />
                   </span>
-                  <div className="min-w-0 flex-1 leading-tight">
-                    <div className="display flex items-center gap-2 text-[14.5px]">
-                      <span className="truncate">{m.label?.trim() || name}</span>
-                      {rep.mode !== "once" && !isRun && <RepeatPill rep={rep} />}
-                    </div>
-                    <div className="mono text-[10.5px] text-ink-3">{name}</div>
+                  <div className="min-w-0 flex-1">
+                    <div className="st-bind-name truncate">{m.label?.trim() || name}</div>
+                    <div className="mono text-[12px] text-ink-2" title="The name a chord binds to">{name}</div>
                   </div>
-                  <button className="rounded-md p-1.5 text-ink-3 hover:bg-panel-2 hover:text-ink" aria-label="edit macro"
-                          onClick={() => { setDraft(fromDef(name, m)); setEditing(name); }}><Pencil size={14} /></button>
-                  <button className="rounded-md p-1.5 text-ink-3 hover:bg-circle/15 hover:text-circle" aria-label="delete macro"
-                          onClick={() => remove(name)}><Trash2 size={14} /></button>
+                  <button className="st-iconbtn" aria-label={"Edit macro " + (m.label?.trim() || name)} title="Edit"
+                          onClick={() => { setDraft(fromDef(name, m)); setEditing(name); }}><Pencil size={16} {...IC} /></button>
+                  <button className="st-iconbtn danger" aria-label={"Delete macro " + (m.label?.trim() || name)} title="Delete"
+                          onClick={() => remove(name)}><Trash2 size={16} {...IC} /></button>
                 </div>
-                <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                <div className="mt-3 flex flex-wrap items-center gap-1.5">
                   {isRun
-                    ? <code className="mono truncate rounded-md border border-line bg-well px-2 py-1 text-[12px] text-ink-2">{macroSummary(m)}</code>
+                    ? <code className="st-code">{macroSummary(m)}</code>
                     : (m.keys ?? []).map((k, i) => <KeyCap key={i} name={k} />)}
+                  {rep.mode !== "once" && !isRun && <RepeatPill rep={rep} />}
                 </div>
-                <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-[11px] text-ink-3">
-                  {bound.length === 0 ? "not bound yet" : <>
-                    <span>bound to</span>
-                    {bound.map(({ k, remote: r }) => (
-                      <span key={(r ? "r:" : "") + k} className="inline-flex items-center gap-1 rounded-md border border-line bg-well px-1.5 py-0.5 text-ink-2"
+                <div className="mt-3 flex flex-wrap items-center gap-1.5 st-small">
+                  {bound.length === 0 ? "Not bound to a button yet." : <>
+                    <span>Bound to</span>
+                    {bound.map(({ k, remote: r }, i) => (
+                      <span key={(r ? "r:" : "") + k} className={"st-sticker" + (i % 2 ? " tilt-r" : "")}
                             title={r ? "in remote mode" : "while chording"}>
-                        <ButtonGlyph name={k} size={14} /> {keyLabel(k)}{r && <span className="text-ink-3"> · remote</span>}
+                        <ButtonGlyph name={k} size={16} /> {keyLabel(k)}{r && <span className="font-normal text-ink-2">(remote)</span>}
                       </span>
                     ))}
                   </>}
@@ -154,17 +157,17 @@ export function MacrosSection({ actions }: { actions: ActionsMeta }) {
           })}
         </div>
       )}
-    </div>
+    </section>
   );
 }
 
-/* "hold · 50 ms" / "toggle · 50 ms · ×20" */
+/* "While held, every 50 ms" / "Toggle, every 50 ms, 20 times at most" */
 function RepeatPill({ rep }: { rep: MacroRepeat }) {
   const Icon = rep.mode === "toggle" ? ToggleRight : Repeat;
+  const mode = REPEAT_MODES.find((r) => r.value === rep.mode);
   return (
-    <span className="inline-flex flex-none items-center gap-1 rounded-md border border-line bg-well px-1.5 py-0.5 text-[10.5px] font-normal text-ink-3"
-          title={REPEAT_MODES.find((r) => r.value === rep.mode)?.doc}>
-      <Icon size={11} /> {rep.mode} · {rep.interval_ms} ms{rep.max_runs > 0 && ` · ×${rep.max_runs}`}
+    <span className="st-sticker tilt-r ml-1" style={{ "--tone": "var(--color-cyan)" } as React.CSSProperties} title={mode?.doc}>
+      <Icon size={12} {...IC} /> {mode?.label ?? rep.mode}, every {rep.interval_ms} ms{rep.max_runs > 0 && `, ${rep.max_runs} times at most`}
     </span>
   );
 }
@@ -173,13 +176,10 @@ function RepeatPill({ rep }: { rep: MacroRepeat }) {
 function KeyCap({ name, onRemove }: { name: string; onRemove?: () => void }) {
   const mod = MODIFIERS.includes(name);
   return (
-    <span className={"display inline-flex h-7 items-center gap-1 rounded-md border px-2 text-[12.5px] tracking-wide " +
-        (mod ? "border-cross/50 bg-cross/10 text-cross" : "border-line-2 bg-panel-2 text-ink")}
-          style={{ boxShadow: "inset 0 -2px 0 rgba(0,0,0,.45)" }}>
+    <span className={"st-keycap" + (mod ? " mod" : "")}>
       {keyCap(name)}
       {onRemove && (
-        <button type="button" aria-label={"remove " + name} onClick={onRemove}
-                className="-mr-1 rounded p-0.5 text-ink-3 hover:text-circle"><X size={11} /></button>
+        <button type="button" aria-label={"Remove " + keyCap(name)} onClick={onRemove}><X size={12} strokeWidth={3} /></button>
       )}
     </span>
   );
@@ -201,14 +201,14 @@ function MacroEditor({ draft, setDraft, editing, keys, taken, reserved, onSave, 
   const setLabel = (label: string) => up(nameTouched ? { label } : { label, name: slugify(label) });
 
   const problems: string[] = [];
-  if (!draft.name) problems.push("give it a name");
-  else if (!/^[a-z][a-z0-9_]{0,39}$/.test(draft.name)) problems.push("name: letters, digits and _ only, starting with a letter");
-  else if (reserved.has(draft.name)) problems.push(`"${draft.name}" is a built-in action`);
-  else if (!editing && taken.has(draft.name)) problems.push(`a macro named "${draft.name}" already exists`);
-  if (draft.kind === "keys" && draft.keys.length === 0) problems.push("press a shortcut or add keys");
-  if (draft.kind === "keys" && draft.keys.length > 8) problems.push("at most 8 keys");
-  if (draft.kind === "keys" && draft.repeat.mode !== "once" && !(draft.repeat.interval_ms >= 10)) problems.push("repeat interval: at least 10 ms");
-  if (draft.kind === "run" && !draft.run.trim()) problems.push("what should it launch?");
+  if (!draft.name) problems.push("Give it a name.");
+  else if (!/^[a-z][a-z0-9_]{0,39}$/.test(draft.name)) problems.push("Names use lowercase letters, digits and _, and start with a letter.");
+  else if (reserved.has(draft.name)) problems.push(`“${draft.name}” is a built-in action. Pick another name.`);
+  else if (!editing && taken.has(draft.name)) problems.push(`A macro named “${draft.name}” already exists.`);
+  if (draft.kind === "keys" && draft.keys.length === 0) problems.push("Press a shortcut or add keys.");
+  if (draft.kind === "keys" && draft.keys.length > 8) problems.push("Use 8 keys at most.");
+  if (draft.kind === "keys" && draft.repeat.mode !== "once" && !(draft.repeat.interval_ms >= 10)) problems.push("Repeat every 10 ms or more.");
+  if (draft.kind === "run" && !draft.run.trim()) problems.push("Type the program to launch.");
 
   const onCapture = (e: React.KeyboardEvent<HTMLDivElement>) => {
     e.preventDefault(); e.stopPropagation();
@@ -223,33 +223,30 @@ function MacroEditor({ draft, setDraft, editing, keys, taken, reserved, onSave, 
 
   const repeating = draft.repeat.mode !== "once";
   return (
-    <div className="mt-4 rounded-xl border border-triangle/50 bg-well/60 p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <span className="display text-[14px] uppercase tracking-[.12em] text-triangle">{editing ? "Edit macro" : "New macro"}</span>
-        <span className="h-px flex-1 bg-line" />
+    <div className="st-editor">
+      <div className="st-sub mt-0">
+        <span className="st-sub-title">{editing ? "Edit macro" : "New macro"}</span>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+      <div className="grid gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
         {/* identity */}
-        <div className="grid gap-3">
-          <label className="grid gap-1">
-            <span className="eyebrow">Label</span>
+        <div className="grid content-start gap-4">
+          <label className="grid gap-1.5">
+            <span className="st-label">Label</span>
             <input className="field" value={draft.label} placeholder="Task Manager" autoFocus
                    onChange={(e) => setLabel(e.target.value)} />
           </label>
-          <label className="grid gap-1">
-            <span className="eyebrow">Name <span className="normal-case tracking-normal text-ink-3">(what a chord binds to)</span></span>
+          <label className="grid gap-1.5">
+            <span className="st-label">Name <small>(what a chord binds to)</small></span>
             <input className="field mono" value={draft.name} placeholder="task_manager" disabled={!!editing}
                    onChange={(e) => { setNameTouched(true); up({ name: e.target.value.toLowerCase() }); }} />
           </label>
-          <div className="grid gap-1">
-            <span className="eyebrow">Kind</span>
-            <div className="flex gap-1 rounded-lg border border-line bg-well p-1">
-              {([["keys", Keyboard, "Key combo"], ["run", Terminal, "Launch program"]] as const).map(([k, I, t]) => (
-                <button key={k} type="button" onClick={() => up({ kind: k })}
-                        className={"display flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-1.5 text-[13px] transition-colors " +
-                          (draft.kind === k ? "bg-cross/15 text-cross" : "text-ink-2 hover:text-ink")}>
-                  <I size={15} /> {t}
+          <div className="grid gap-1.5">
+            <span className="st-label" id="macro-kind">What it does</span>
+            <div className="st-seg" role="group" aria-labelledby="macro-kind">
+              {([["keys", Keyboard, "Press keys"], ["run", Terminal, "Launch a program"]] as const).map(([k, I, t]) => (
+                <button key={k} type="button" aria-pressed={draft.kind === k} onClick={() => up({ kind: k })}>
+                  <I size={16} {...IC} /> {t}
                 </button>
               ))}
             </div>
@@ -260,43 +257,49 @@ function MacroEditor({ draft, setDraft, editing, keys, taken, reserved, onSave, 
         <div className="grid content-start gap-3">
           {draft.kind === "keys" ? (
             <>
-              <div className="grid gap-1">
-                <span className="eyebrow">Shortcut</span>
-                <div tabIndex={0} role="textbox" aria-label="press the shortcut"
+              <div className="grid gap-1.5">
+                <span className="st-label">Shortcut</span>
+                <div tabIndex={0} role="textbox" aria-label="Press the shortcut"
                      onFocus={() => setCapturing(true)} onBlur={() => { setCapturing(false); setPending([]); }}
                      onKeyDown={onCapture}
-                     className={"flex min-h-[46px] flex-wrap items-center gap-1.5 rounded-lg border px-3 py-2 outline-none transition-colors " +
-                       (capturing ? "border-cross bg-well shadow-[0_0_0_3px_color-mix(in_oklab,var(--color-cross)_20%,transparent)]" : "border-line bg-well")}>
+                     className={"st-capture" + (capturing ? " on" : "")}>
                   {pending.length > 0
-                    ? <>{pending.map((k) => <KeyCap key={k} name={k} />)}<span className="text-[12px] text-ink-3">+ …</span></>
+                    ? <>{pending.map((k) => <KeyCap key={k} name={k} />)}<span className="st-plus">+</span></>
                     : draft.keys.length === 0
-                      ? <span className="text-[12.5px] text-ink-3">{capturing ? "press the shortcut now…" : "click here, then press the shortcut"}</span>
-                      : draft.keys.map((k, i) => <KeyCap key={i} name={k} onRemove={() => up({ keys: draft.keys.filter((_, j) => j !== i) })} />)}
+                      ? <span className="text-[13.5px] text-ink-2">{capturing ? "Press the shortcut now" : "Click here, then press the shortcut"}</span>
+                      : draft.keys.map((k, i) => (
+                          <span key={i} className="inline-flex items-center gap-1.5">
+                            {i > 0 && <span className="st-plus">+</span>}
+                            <KeyCap name={k} onRemove={() => up({ keys: draft.keys.filter((_, j) => j !== i) })} />
+                          </span>
+                        ))}
                 </div>
               </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <select className="field w-auto flex-1" value=""
+              <div className="flex flex-wrap items-center gap-2.5">
+                <select className="field w-auto flex-1" value="" aria-label="Add a key"
                         onChange={(e) => { if (e.target.value) up({ keys: [...draft.keys, e.target.value] }); }}>
-                  <option value="">Add a key…</option>
+                  <option value="">Add a key</option>
                   {keyGroups(keys).map(([g, ks]) => (
                     <optgroup key={g} label={g}>{ks.map((k) => <option key={k} value={k}>{keyCap(k)} ({k})</option>)}</optgroup>
                   ))}
                 </select>
                 {draft.keys.length > 0 && <button className="btn" onClick={() => up({ keys: [] })}>Clear</button>}
               </div>
-              <p className="text-[11.5px] leading-relaxed text-ink-3">
-                Some combinations never reach the page (Win+E, Ctrl+Alt+Del, media keys): build those with “Add a key”.
+              <p className="st-small">
+                Some combinations never reach this page, like Win+E, Ctrl+Alt+Del and media keys. Build those with
+                “Add a key”.
               </p>
             </>
           ) : (
             <>
-              <label className="grid gap-1">
-                <span className="eyebrow">Command</span>
+              <label className="grid gap-1.5">
+                <span className="st-label">Command</span>
                 <input className="field mono" value={draft.run} placeholder='notepad.exe   or   "C:\Games\launcher.exe" --big'
                        onChange={(e) => up({ run: e.target.value })} />
               </label>
-              <p className="text-[11.5px] leading-relaxed text-ink-3">
-                Anything the Run box accepts. It starts detached, without a console, and the chord never waits for it.
+              <p className="st-small">
+                Anything the Windows Run box accepts. It starts on its own, without a console window, and the chord never
+                waits for it.
               </p>
             </>
           )}
@@ -305,43 +308,42 @@ function MacroEditor({ draft, setDraft, editing, keys, taken, reserved, onSave, 
 
       {/* repeat: saved as input.macros.<name>.repeat = {mode, interval_ms, max_runs} */}
       {draft.kind === "keys" && (
-        <div className="mt-3 rounded-lg border border-line bg-well/60 px-3">
+        <div className="mt-5">
           <Row label="Repeat" keyName={`macros.${draft.name || "<name>"}.repeat`} help={HELP.macro_repeat} stack>
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="flex gap-1 rounded-lg border border-line bg-well p-1">
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-3">
+              <div className="st-seg" role="group" aria-label="Repeat">
                 {REPEAT_MODES.map((r) => (
-                  <button key={r.value} type="button" onClick={() => upRepeat({ mode: r.value as RepeatMode })} title={r.doc}
-                          className={"display flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[12.5px] transition-colors " +
-                            (draft.repeat.mode === r.value ? "bg-cross/15 text-cross" : "text-ink-2 hover:text-ink")}>
-                    {r.value === "toggle" ? <ToggleRight size={13} /> : r.value === "hold" ? <Repeat size={13} /> : null}{r.label}
+                  <button key={r.value} type="button" aria-pressed={draft.repeat.mode === r.value}
+                          onClick={() => upRepeat({ mode: r.value as RepeatMode })} title={r.doc}>
+                    {r.value === "toggle" ? <ToggleRight size={15} {...IC} /> : r.value === "hold" ? <Repeat size={15} {...IC} /> : null}{r.label}
                   </button>
                 ))}
               </div>
-              <label className={"flex items-center gap-2 text-[12.5px] text-ink-2 transition-opacity " + (repeating ? "" : "opacity-40")}>
-                every
+              <label className={"flex items-center gap-2 text-[13.5px] text-ink-2 transition-opacity " + (repeating ? "" : "opacity-45")}>
+                Every
                 <input type="number" className="field num" style={{ width: 84 }} min={10} step={10} disabled={!repeating}
                        value={draft.repeat.interval_ms} onChange={(e) => upRepeat({ interval_ms: Number(e.target.value) })} />
                 ms
               </label>
-              <label className={"flex items-center gap-2 text-[12.5px] text-ink-2 transition-opacity " + (repeating ? "" : "opacity-40")}>
-                max runs
+              <label className={"flex items-center gap-2 text-[13.5px] text-ink-2 transition-opacity " + (repeating ? "" : "opacity-45")}>
+                At most
                 <input type="number" className="field num" style={{ width: 84 }} min={0} step={1} disabled={!repeating}
                        value={draft.repeat.max_runs} onChange={(e) => upRepeat({ max_runs: Math.max(0, Math.round(Number(e.target.value) || 0)) })} />
-                <span className="text-ink-3">(0 = unlimited)</span>
+                times <span className="text-ink-3">(0 for no limit)</span>
               </label>
             </div>
           </Row>
         </div>
       )}
 
-      <div className="mt-4 flex flex-wrap items-center gap-3">
+      <div className="mt-5 flex flex-wrap items-center gap-3">
         {problems.length > 0 && (
-          <span className="flex items-center gap-1.5 text-[12px] text-amber"><AlertTriangle size={13} /> {problems[0]}</span>
+          <span className="st-problem"><AlertTriangle size={15} {...IC} /> {problems[0]}</span>
         )}
         <span className="flex-1" />
         <button className="btn" onClick={onCancel}>Cancel</button>
         <button className="btn btn-primary" disabled={problems.length > 0} onClick={() => onSave(draft)}>
-          {editing ? "Apply" : "Add macro"}
+          {editing ? "Update macro" : "Add macro"}
         </button>
       </div>
     </div>
