@@ -85,7 +85,7 @@ function PadRow({ index, serial, c }: { index: number; serial: string; c: Contro
   const status = !c ? "not connected" : c.present === false ? "disconnected" : c.state ?? "telemetry";
   return (
     <div className="st-padrow">
-      <span className="st-pnum" style={{ background: PAD_TONES[(index - 1) % PAD_TONES.length] }}>P{index}</span>
+      <span className="st-pnum" style={{ background: PAD_TONES[(index - 1) % PAD_TONES.length], color: "var(--color-ink-on)" }}>P{index}</span>
       <span className="min-w-0 flex-1">
         <span className="st-padname block truncate">{name}</span>
         <span className="st-mini flex flex-wrap items-center gap-x-2">
@@ -148,7 +148,7 @@ function UpdateRow() {
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5">
         <div className="min-w-0 flex-1" style={{ flexBasis: 220 }}>
           <label className="st-row-label">Updates</label>
-          <div className={"mt-0.5 text-[13px] " + (update?.error ? "font-semibold text-[#B4463F]" : available ? "font-semibold text-triangle" : "text-ink-2")}>
+          <div className={"mt-0.5 text-[13px] " + (update?.error ? "font-semibold text-bad-ink" : available ? "font-semibold text-triangle" : "text-ink-2")}>
             {status}
             {available && update?.url && (
               <> <a className="st-inline-link" href={update.url} target="_blank" rel="noreferrer">Read the release notes</a></>

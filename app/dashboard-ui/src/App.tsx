@@ -79,7 +79,7 @@ export default function App() {
      (`fill="url(#hatch-cross)"`). The CSS twins are `.hatch-<colour>`. */
 const HATCH: [string, string][] = [
   ["cross", "#5EB9DA"], ["triangle", "#4F9E5F"], ["circle", "#E8766F"],
-  ["square", "#F29BB8"], ["amber", "#F2C94C"], ["ink", "#1F1A17"],
+  ["square", "#F29BB8"], ["amber", "#F2C94C"], ["ink", "var(--color-ink)"],
 ];
 
 function CrayonDefs() {

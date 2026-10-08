@@ -55,6 +55,9 @@ function Bar({ name, v, tone }: { name: string; v: number; tone: string }) {
   );
 }
 
+/* whole degrees with no "-0" (atan2 of a tiny negative rounds to -0) */
+const deg = (v: number) => `${Math.round(v) || 0}°`;
+
 /* the pad doodle tilts with the real thing */
 function Attitude({ roll, pitch }: { roll: number; pitch: number }) {
   return (
@@ -73,8 +76,13 @@ function Attitude({ roll, pitch }: { roll: number; pitch: number }) {
           </svg>
         </div>
       </div>
-      <div className="num flex gap-2 text-[12px] text-ink-2">
-        <span>roll {roll.toFixed(0)}°</span><span>pitch {pitch.toFixed(0)}°</span>
+      {/* two fixed columns, so a sign or a third digit never reflows the
+          doodle above: label on top, the number under it, never wrapping */}
+      <div className="grid w-full grid-cols-2 text-center leading-tight">
+        <span className="eyebrow text-[12px]">roll</span>
+        <span className="eyebrow text-[12px]">pitch</span>
+        <span className="num whitespace-nowrap text-[13px] text-ink-2">{deg(roll)}</span>
+        <span className="num whitespace-nowrap text-[13px] text-ink-2">{deg(pitch)}</span>
       </div>
     </div>
   );

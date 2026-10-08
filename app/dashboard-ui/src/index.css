@@ -61,7 +61,15 @@
   --color-ok: #4F9E5F;
   --color-warn: #F2C94C;
   --color-bad: #E8766F;
+  --color-bad-ink: #B4463F;   /* "bad" as running text, dark enough to read on paper */
   --color-idle: #8C837A;
+
+  /* text that sits ON a crayon fill (keycaps, pressed buttons, stickers,
+     sticky notes) is always the dark ink -- the crayons do not change in the
+     dark theme, so the words on them must not either */
+  --color-ink-on: #1F1A17;
+  /* the marker stroke behind a title: yellow on paper, mustard on slate */
+  --color-marker: #F2C94C;
 }
 
 :root {
@@ -73,6 +81,42 @@
   --r-small: 12px 6px 10px 6px / 6px 10px 6px 12px;
   --r-pill: 60px 16px 60px 16px / 16px 60px 16px 60px;
   --ease-pop: cubic-bezier(.3, 1.4, .5, 1);
+}
+
+/* ------------------------------------------------------------------------
+   Dark: the same crayons on a slate. Paper becomes a warm near-black, the
+   ink becomes chalk, the quiet rules a dusty grey. Only the flat tones move;
+   the crayon colours stay, so a coral stick is coral in both.
+   `data-theme` is set on <html> by lib/theme.ts (user choice, else the OS).
+   ------------------------------------------------------------------------ */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --color-bg: #221E1B;
+  --color-bg-2: #2B2622;
+  --color-panel: #2E2925;
+  --color-panel-2: #3B352F;
+  --color-well: #3B352F;
+  --color-line: #F3EEE2;
+  --color-line-2: #5A524A;
+  --color-ink: #F3EEE2;
+  --color-ink-2: #CFC5B8;
+  --color-ink-3: #9A9086;
+  --color-bad-ink: #F49A93;
+  --color-marker: #6B5716;
+}
+/* the four strokes that live in data-URIs cannot read a variable, so they
+   are redrawn here in the dark values */
+html[data-theme="dark"] .atmosphere {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='26' height='26'><circle cx='13' cy='13' r='1.1' fill='%235A524A'/></svg>");
+}
+html[data-theme="dark"] .hatch-ink {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M-2 2L2 -2M0 8L8 0M6 10L10 6' stroke='%235A524A' stroke-width='1.6' stroke-linecap='round'/></svg>");
+}
+html[data-theme="dark"] select.field {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='9' viewBox='0 0 14 9'><path d='M1.5 1.5l5.5 5.5 5.5-5.5' fill='none' stroke='%23F3EEE2' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+}
+html[data-theme="dark"] .rule-ink {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 6' preserveAspectRatio='none'><path d='M0 3c40-2 60 1.5 100 .5s60-2 100 0 60 2 100 .5 70-1.5 100 0' fill='none' stroke='%23F3EEE2' stroke-width='3' stroke-linecap='round'/></svg>");
 }
 
 html, body { min-height: 100%; }
@@ -87,7 +131,7 @@ body {
   overflow-x: hidden;
 }
 
-::selection { background: var(--color-amber); color: var(--color-ink); }
+::selection { background: var(--color-amber); color: var(--color-ink-on); }
 
 *:focus-visible { outline: 3px dashed var(--color-cross); outline-offset: 2px; }
 
@@ -129,7 +173,7 @@ body {
 }
 .panel-title::before {
   content: ""; position: absolute; left: -2px; right: -4px; top: 42%; height: 48%;
-  background: var(--color-amber); transform: rotate(-1.2deg) skewX(-6deg);
+  background: var(--color-marker); transform: rotate(-1.2deg) skewX(-6deg);
   border-radius: 4px 10px 3px 8px; z-index: -1;
 }
 
@@ -183,7 +227,7 @@ body {
 .note::after { content: ""; position: absolute; left: 15px; top: 0; bottom: 0; width: 2.5px; background: var(--color-line); }
 
 /* a marker stroke behind a word, in `--hl` (the panel title's yellow one, in any colour) */
-.hl { position: relative; isolation: isolate; padding: 0 4px; --hl: var(--color-amber); }
+.hl { position: relative; isolation: isolate; padding: 0 4px; --hl: var(--color-marker); }
 .hl::before {
   content: ""; position: absolute; left: -1px; right: -3px; top: 45%; height: 46%; z-index: -1;
   background: var(--hl); transform: rotate(-1.2deg) skewX(-6deg); border-radius: 4px 10px 3px 8px;
@@ -209,6 +253,8 @@ body {
   background: var(--color-panel); color: var(--color-ink);
   box-shadow: 2px 2px 0 var(--color-line); transform: rotate(-1.5deg); white-space: nowrap;
 }
+/* a sticker painted a crayon colour (inline style) keeps dark words */
+.sticker[style*="background"] { color: var(--color-ink-on); }
 .sticker:nth-child(even) { transform: rotate(1.2deg); }
 .sticker.flat { transform: none; }
 .sticker.quiet { border-color: var(--color-line-2); box-shadow: none; color: var(--color-ink-3); background: transparent; }
@@ -218,7 +264,7 @@ body {
   display: inline-flex; align-items: center; justify-content: center; min-width: 28px;
   font-family: var(--font-display); font-weight: 700; font-size: 13px; line-height: 1;
   padding: 5px 8px 4px; border: 2.5px solid var(--color-line); border-radius: 7px 5px 8px 4px / 5px 8px 4px 7px;
-  background: var(--color-cross); color: var(--color-ink); box-shadow: 0 3px 0 var(--color-line);
+  background: var(--color-cross); color: var(--color-ink-on); box-shadow: 0 3px 0 var(--color-line);
   white-space: nowrap;
 }
 .keycap.down { transform: translateY(2px); box-shadow: 0 1px 0 var(--color-line); }
@@ -237,9 +283,9 @@ body {
 }
 .btn:hover { background: var(--color-bg-2); transform: translate(-1px, -1px) rotate(-.6deg); box-shadow: 4px 4px 0 var(--color-line); }
 .btn:active, .btn[aria-pressed="true"] { transform: translate(2px, 2px) scale(.97); box-shadow: 1px 1px 0 var(--color-line); }
-.btn[aria-pressed="true"] { background: var(--color-amber); }
+.btn[aria-pressed="true"] { background: var(--color-amber); color: var(--color-ink-on); }
 .btn:disabled { opacity: .45; cursor: default; box-shadow: none; transform: none; }
-.btn-primary { background: var(--color-cross); color: var(--color-ink); }
+.btn-primary { background: var(--color-cross); color: var(--color-ink-on); }
 .btn-primary:hover { background: var(--color-cyan); }
 
 /* ---- form controls ------------------------------------------------------- */

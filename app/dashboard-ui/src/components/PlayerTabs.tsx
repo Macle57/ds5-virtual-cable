@@ -68,7 +68,7 @@ function PlayerTab({ index, serial, c, active, onSelect }:
         </motion.svg>
       )}
       <span className={"display grid h-9 w-9 place-items-center border-[2.5px] border-line text-[16px] leading-none " +
-        (active ? "bg-amber" : "bg-panel-2 text-ink-2")}
+        (active ? "bg-amber text-ink-on" : "bg-panel-2 text-ink-2")}
         style={{ borderRadius: "50% 45% 55% 45% / 45% 55% 45% 55%" }}>
         P{index}
       </span>
@@ -80,7 +80,7 @@ function PlayerTab({ index, serial, c, active, onSelect }:
       </span>
       <span className="ml-1 flex items-center gap-2.5">
         {remote && (
-          <span className="sticker" style={{ background: rc, color: "var(--color-ink)" }} title="remote mode: this pad is driving the OS">
+          <span className="sticker" style={{ background: rc, color: "var(--color-ink-on)" }} title="remote mode: this pad is driving the OS">
             {keyboardOpen(c) ? <Keyboard size={12} strokeWidth={2.5} /> : <MousePointer2 size={12} strokeWidth={2.5} />} remote
           </span>
         )}

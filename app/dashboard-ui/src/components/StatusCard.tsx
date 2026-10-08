@@ -123,7 +123,7 @@ export default function StatusCard() {
 function Flag({ on, icon, label, tone = "var(--color-cross)" }:
   { on: boolean; icon: React.ReactNode; label: string; tone?: string }) {
   return (
-    <span className={"sticker " + (on ? "" : "quiet")} style={on ? { background: tone } : undefined}>
+    <span className={"sticker " + (on ? "" : "quiet")} style={on ? { background: tone, color: "var(--color-ink-on)" } : undefined}>
       {icon}{label}
     </span>
   );

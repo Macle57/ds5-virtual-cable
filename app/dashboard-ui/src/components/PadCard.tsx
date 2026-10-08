@@ -1,6 +1,6 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { Keyboard, MousePointer2 } from "lucide-react";
-import { keyboardOpen, remoteMode, useActiveController, useRemoteColor, useStore } from "../lib/store";
+import { keyboardOpen, remoteMode, useActiveController, useRemoteColor } from "../lib/store";
 import Pad from "./Pad";
 
 /* The frame around the drawing: a big card, the title in marker, stickers
@@ -8,7 +8,6 @@ import Pad from "./Pad";
    pressed right now. The pad itself is Pad.tsx. */
 export default function PadCard() {
   const c = useActiveController();
-  const active = useStore((s) => s.active);
   const t = c?.telemetry;
   const d = t?.decoded;
   const pressed = d ? Object.entries(d.buttons).filter(([, v]) => v).map(([k]) => k) : [];
@@ -38,10 +37,6 @@ export default function PadCard() {
               </motion.span>
             )}
           </AnimatePresence>
-          <span className="flex items-baseline gap-1.5">
-            <span className="eyebrow">serial</span>
-            <span className="mono text-[12.5px] text-ink-2" style={{ textDecoration: "underline dotted var(--color-ink-3) 2px", textUnderlineOffset: 4 }}>{active}</span>
-          </span>
         </div>
       </div>
 

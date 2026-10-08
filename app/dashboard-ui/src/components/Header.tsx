@@ -1,4 +1,5 @@
-import { Settings2, MousePointer2 } from "lucide-react";
+import { Settings2, MousePointer2, Sun, Moon } from "lucide-react";
+import { useTheme } from "../lib/theme";
 import { useRemoteColor, useRemoteCount, useStore } from "../lib/store";
 
 const LINK_LABEL = {
@@ -16,6 +17,7 @@ export default function Header() {
   const remoteCount = useRemoteCount();
   const rc = useRemoteColor();
   const on = link === "live" || link === "snapshot";
+  const [theme, toggleTheme] = useTheme();
 
   return (
     <header className="sticky top-0 z-20 bg-bg">
@@ -46,6 +48,10 @@ export default function Header() {
           {LINK_LABEL[link]}
         </div>
 
+        <button className="btn px-3" onClick={toggleTheme} title={theme === "dark" ? "Switch to light" : "Switch to dark"}
+                aria-label={theme === "dark" ? "Switch to light" : "Switch to dark"}>
+          {theme === "dark" ? <Sun size={17} strokeWidth={2.5} /> : <Moon size={17} strokeWidth={2.5} />}
+        </button>
         <button className="btn" onClick={() => toggleSettings()} aria-pressed={settingsOpen}>
           <Settings2 size={17} strokeWidth={2.5} /> Settings
         </button>

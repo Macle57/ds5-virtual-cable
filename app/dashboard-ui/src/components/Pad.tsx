@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import type { ButtonName, Decoded, Telemetry } from "../lib/types";
+import type { Decoded, Telemetry } from "../lib/types";
 
 /* ------------------------------------------------------------------------
    The controller, drawn like a crayon cartoon: a chunky sky-blue body with
@@ -11,8 +11,8 @@ import type { ButtonName, Decoded, Telemetry } from "../lib/types";
    follow daidr/dualsense-tester, see docs/provenance.md.
 
    Pressed = the same flat colour with an ink crayon scribble over it (and a
-   nudge), never black; paper keys turn crayon-yellow. Every rising edge
-   also gets a "bonk" burst of short rays.
+   nudge), never black; paper keys turn crayon-yellow. No burst on press:
+   the scribble is the whole effect.
    ------------------------------------------------------------------------ */
 
 const W = 1000, H = 620;
@@ -33,28 +33,10 @@ const SKY = "var(--color-cross)";
 const LIT = "var(--color-amber)";           // a paper key, pressed
 const HATCH_INK = "url(#hatch-pad-ink)";
 
-/* Where each button lives, for the press pop. */
-const BURST_AT: Partial<Record<ButtonName | "dpad", [number, number]>> = {
-  tri: [FACE.cx, FACE.cy - FACE.off], o: [FACE.cx + FACE.off, FACE.cy],
-  x: [FACE.cx, FACE.cy + FACE.off], sq: [FACE.cx - FACE.off, FACE.cy],
-  L1: [SHOULDER.l, 118], R1: [SHOULDER.r, 118], L2: [SHOULDER.l, 66], R2: [SHOULDER.r, 66],
-  create: [PILL.l, PILL.y], options: [PILL.r, PILL.y], PS: [500, 412], mute: [500, 452],
-  touchpad: [500, 178], L3: [...STICK.l], R3: [...STICK.r], dpad: [DPAD.cx, DPAD.cy],
-};
-
 const FACE_COLOR: Record<"tri" | "o" | "x" | "sq", string> = {
   tri: "var(--color-triangle)", o: "var(--color-circle)",
   x: "var(--color-cross)", sq: "var(--color-square)",
 };
-const POP_COLOR: Partial<Record<string, string>> = {
-  ...FACE_COLOR, L1: LIT, R1: LIT, L2: SKY, R2: SKY,
-  L3: "var(--color-circle)", R3: "var(--color-circle)",
-  create: LIT, options: LIT, PS: LIT, mute: LIT, dpad: LIT, touchpad: SKY,
-};
-
-interface Burst { id: number; x: number; y: number; color: string }
-let burstSeq = 0;
-
 export default function Pad({ t, lightbar }: { t?: Telemetry; lightbar?: string }) {
   const d = t?.decoded ?? null;
   const stale = !t || t.connected === false || (t.age_s ?? 99) > 2.5 ||
@@ -62,27 +44,6 @@ export default function Pad({ t, lightbar }: { t?: Telemetry; lightbar?: string 
   const offline = !d || stale;
   const offlineText = !d ? "no telemetry" :
       (t?.connected === false ? "Bluetooth link lost" : "telemetry stalled");
-
-  /* press pops: a hand-drawn burst on every rising edge */
-  const prev = useRef<Partial<Record<string, boolean>>>({});
-  const [bursts, setBursts] = useState<Burst[]>([]);
-  useEffect(() => {
-    if (!d) return;
-    const now: Partial<Record<string, boolean>> = { ...d.buttons, dpad: d.dpad !== "-" && !!d.dpad };
-    const fresh: Burst[] = [];
-    for (const [name, on] of Object.entries(now)) {
-      if (on && !prev.current[name]) {
-        const at = BURST_AT[name as ButtonName];
-        if (at) fresh.push({ id: ++burstSeq, x: at[0], y: at[1], color: POP_COLOR[name] ?? SKY });
-      }
-    }
-    prev.current = now;
-    if (fresh.length) {
-      setBursts((b) => [...b, ...fresh]);
-      const ids = fresh.map((f) => f.id);
-      setTimeout(() => setBursts((b) => b.filter((x) => !ids.includes(x.id))), 600);
-    }
-  }, [d]);
 
   /* touch trails: last ~14 positions per finger */
   const trails = useRef<Record<number, [number, number][]>>({});
@@ -232,10 +193,6 @@ export default function Pad({ t, lightbar }: { t?: Telemetry; lightbar?: string 
         <Stick cx={STICK.l[0]} cy={STICK.l[1]} dx={off(d?.lx ?? 128)} dy={off(d?.ly ?? 128)} on={!!B.L3} />
         <Stick cx={STICK.r[0]} cy={STICK.r[1]} dx={off(d?.rx ?? 128)} dy={off(d?.ry ?? 128)} on={!!B.R3} />
 
-        {/* press pops */}
-        <AnimatePresence>
-          {bursts.map((b) => <Pop key={b.id} x={b.x} y={b.y} color={b.color} />)}
-        </AnimatePresence>
       </g>
 
       {/* offline: the pad goes pencil-grey and the reason is written across it */}
@@ -399,26 +356,6 @@ function Stick({ cx, cy, dx, dy, on }: { cx: number; cy: number; dx: number; dy:
               stroke={INK} strokeWidth={4} strokeLinecap="round" opacity={0.45} />
       </g>
     </g>
-  );
-}
-
-/* The press pop: short radiating lines in ink and the button's colour,
-   scaling out and fading, the way a cartoonist draws "bonk". */
-function Pop({ x, y, color }: { x: number; y: number; color: string }) {
-  const rays = [15, 75, 135, 195, 255, 315].map((deg, i) => {
-    const a = (deg * Math.PI) / 180, r0 = 30, r1 = i % 2 ? 46 : 52;
-    return <line key={deg} x1={x + Math.cos(a) * r0} y1={y + Math.sin(a) * r0}
-                 x2={x + Math.cos(a) * r1} y2={y + Math.sin(a) * r1} stroke={i % 2 ? color : INK} />;
-  });
-  return (
-    <motion.g initial={{ opacity: 1, scale: 0.55 }} animate={{ opacity: 0, scale: 1.25 }} exit={{ opacity: 0 }}
-              transition={{ duration: 0.5, ease: "easeOut" }} pointerEvents="none"
-              style={{ transformOrigin: `${x}px ${y}px`, transformBox: "view-box" }}
-              strokeWidth={5} strokeLinecap="round">
-      {rays}
-      <circle cx={x + 44} cy={y - 36} r={4} fill={color} stroke="none" />
-      <circle cx={x - 40} cy={y + 40} r={3.5} fill={INK} stroke="none" />
-    </motion.g>
   );
 }
 
