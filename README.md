@@ -20,6 +20,11 @@ Every binding is editable in the dashboard, and changes apply live.
 
 ![The dashboard's Chords tab](docs/images/dashboard-chords.png)
 
+The dashboard follows the OS theme, and the sun/moon button in the header
+switches it by hand.
+
+![The same tab in dark mode](docs/images/dashboard-chords-dark.png)
+
 ### Remote mode
 
 Double-press PS and the pad stops driving the game and drives the PC instead:
