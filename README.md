@@ -20,11 +20,6 @@ Every binding is editable in the dashboard, and changes apply live.
 
 ![The dashboard's Chords tab](docs/images/dashboard-chords.png)
 
-The dashboard follows the OS theme, and the sun/moon button in the header
-switches it by hand.
-
-![The same tab in dark mode](docs/images/dashboard-chords-dark.png)
-
 ### Remote mode
 
 Double-press PS and the pad stops driving the game and drives the PC instead:
@@ -39,6 +34,8 @@ back to the game. It ships off; switch it on from the dashboard.
 The full keymap, every gesture and how the engine hooks in are in
 [`docs/input-shortcuts.md`](docs/input-shortcuts.md).
 
+Ps: next feature acoustic echo cancellation, so u can talk to your friends while playing games on your tv's speaker via controller's mic without echo 
+
 ## How it works
 
 Inspired by [daidr/dualsense-tester](https://github.com/daidr/dualsense-tester)
@@ -50,6 +47,9 @@ been possible, as demonstrated by daidr over Bluetooth on Windows; just an
 appropriate driver layer was missing. That layer is USB/IP, through
 [usbip-win2](https://github.com/vadimgrn/usbip-win2)'s Microsoft-signed driver.
 Everything else is a user-mode Python program.
+Note: After making this, I also found out https://github.com/hbashton/DS4Windows is a good alternative, providing similar emulation layer.
+It focuses more on dual sense expect, providing more vibe toogles, vibe from audio etc.
+My focus is more on remote expert, so you can use your television like a ps with minimum effort
 
 ## To get started
 
@@ -171,29 +171,15 @@ game's terms of service.** Here is what I actually know:
 - What distinguishes it, if anything looks: the parent host controller is
   `ROOT\USB\0000` with service `usbip2_ude` rather than a PCI controller, and
   the devnode has no `LocationPaths`. A kernel anti-cheat that enumerates the
-  USB tree **can** see this.
-- **I make no evasion claims and have implemented nothing to hide it.** This
-  project exists to enable features on hardware you already own, not to
-  misrepresent input. It does not synthesise, modify, remap or automate any
-  input into a game — every button, stick and trigger value the game sees is
-  your controller's own, forwarded unchanged. The chords and remote mode only
-  ever *remove* presses from what the game sees; they never add any.
-- No anti-cheat system has been tested against it. If you try one, say so in an
-  issue.
+  USB tree **can** see this, and is intentionally not hidden by me, don't cheat bozos.
+- Didn't check against any Anti Cheat, if it causes an issue, feel free to raise an issue.
 
 **What about latency? Is it as good as a cable?**
-**Unknown, and I would rather say so than guess.** End-to-end latency has not
-been measured. What *is* measured: the Bluetooth link delivers input at ~480 Hz,
-faster than the 250 Hz a wired DualSense is polled at, so the input path is not
-starved. The audio path buffers deliberately — about 43 ms of encoded audio
-queued toward the controller, and 10–90 ms in the microphone jitter buffer —
-because Bluetooth delivery is bursty and dropped audio is worse than delayed
-audio. Expect a cable to still be better for audio. For buttons and sticks, the
-extra hop is a translation and a memcpy.
-
+So I tested the latency with 2 Bluetooth devices connected, and measured a latency of around 3ms consistently. 
+Similar to any wired connection, turns out bluetooth is pretty fast, although be warned with a full stack i.e. multiple devices, it can drop significantly.
+I plan to add bluetooth dongle support so u can connect some devices via dongle and other via inbuilt bluetooth
 **Does it work over USB, i.e. is it useful when the controller is plugged in?**
-No, and it would be pointless — a plugged-in DualSense already *is* a wired
-DualSense. This bridges Bluetooth specifically.
+What? Why???? the entire purpose to emulate wired connection over bluetooth!
 
 **Does it modify my controller, or my games?**
 No. Feature *writes* to the controller — the reports that re-pair it or touch
@@ -201,16 +187,15 @@ its firmware — are deliberately blocked and never forwarded, even if a host
 asks. The only writes allowed through are the two transient audio test
 commands (the "play a tone" pair that tools like dualsense-tester send),
 which change nothing persistent. Feature reads are served from a small cache
-primed at startup.
+primed at startup. So your controllers are fully safe.
 
 **Will Sony break this in a firmware update?**
-Possibly. It speaks the controller's existing Bluetooth protocol, which Sony has
+Unlikely. It speaks the controller's existing Bluetooth protocol, which Sony has
 no obligation to keep stable. Two firmware revisions have been tested.
 
 **My controller feels flaky / audio glitches / reports stop.**
 **Check the battery first.** A dying DualSense produces failure modes that look
-exactly like protocol bugs — this cost me real debugging time during
-development, twice. Read the battery level, charge it, try again.
+exactly like protocol bugs, or you have multiple devices connected.
 
 ## Documentation
 
