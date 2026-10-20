@@ -18,7 +18,9 @@ driven by the pad, and the mic button starts Windows voice typing listening
 through the controller's own microphone. A plain PS tap still reaches the game.
 Every binding is editable in the dashboard, and changes apply live.
 
-![The dashboard's Chords tab](docs/images/dashboard-chords.png)
+![The dashboard's live view](docs/images/dashboard-live-dark.png)
+
+![The dashboard's Chords tab](docs/images/dashboard-chords-dark.png)
 
 ### Remote mode
 
