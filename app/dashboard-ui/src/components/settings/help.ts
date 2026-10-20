@@ -9,7 +9,7 @@ export const HELP: Record<string, string> = {
   ctrl_enabled: "Bridge this controller: run a virtual wired pad for it whenever it is connected. Off, the pad stays a plain Bluetooth controller.",
   ctrl_hide: "Hide this controller's Bluetooth pad (HidHide) while it is bridged, so games and Steam see only the virtual wired one. The pill beside it says whether the hide is actually in effect right now.",
   autostart_on_login: "Start the tray with Windows. Installed as a service it starts before anyone signs in (the pads work on the lock screen too); installed as a scheduled task it starts at sign-in. The installer chooses which; this switch turns whichever is installed on or off.",
-  update_check: "Look for a newer release on GitHub once a day and when the tray starts. Off, nothing is ever fetched.",
+  update_check: "Look for a newer release on GitHub every 6 hours and when the tray starts. Off, nothing is ever fetched.",
   update_auto_install: "Install a newer release on its own: a short while after one is found, the silent installer runs and the tray (or service) restarts itself, with a toast under the 'update' notification. Off, a new release is only announced and installed by hand, with the Install button here or the tray's 'Install update' row.",
   tray_actions: "The same commands as the tray menu. Rescan looks for pads again right now; Unhide all lifts every HidHide cloak (a rescue when a pad stays invisible after a crash); Open logs opens the log folder.",
   /* notifications */

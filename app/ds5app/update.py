@@ -178,7 +178,11 @@ REPO = os.environ.get("DS5_UPDATE_REPO", "Macle57/ds5-virtual-cable")
 ASSET_RE = re.compile(r"^ds5bridge-setup-[0-9][^/\\]*-bundled\.exe$")
 SUMS_NAME = "SHA256SUMS"
 
-CHECK_INTERVAL_S = 24 * 3600.0     # "at startup + daily"
+#: "At startup + every 6 hours". Every push to main is a release
+#: (.github/workflows/release.yml), so a daily check left a fix sitting
+#: unshipped for up to a day; 4 conditional (ETag) requests a day are far
+#: inside GitHub's 60/hour unauthenticated limit.
+CHECK_INTERVAL_S = 6 * 3600.0
 STARTUP_DELAY_S = 20.0             # let the tray finish coming up first
 #: How long after a check finds a newer release the automatic install
 #: starts. Long enough for the "Updating to ..." toast to be read and for
@@ -508,12 +512,12 @@ def check_now(current_version: str | None = None,
 
 
 class Updater:
-    """Startup + daily checks on a daemon thread; the newest answer, held.
+    """Startup + periodic (CHECK_INTERVAL_S) checks on a daemon thread; the newest answer, held.
 
     `available` is read from menu lambdas on the tray's threads and written
     from this one, so it sits behind a lock. The notification fires once per
-    version per process: a check every day of a two-week tray session must not
-    nag daily, and a restart renotifying is the correct reminder.
+    version per process: a check every few hours of a two-week tray session
+    must not nag each time, and a restart renotifying is the correct reminder.
     """
 
     def __init__(self, current_version: str | None = None,
@@ -628,7 +632,7 @@ class Updater:
                 # The install runs on its own thread and, when it works, ends
                 # this process. So: while it is still going, keep waiting;
                 # once it has given up (`installing` cleared), try again after
-                # a pause, up to the attempt limit; then fall back to daily.
+                # a pause, up to the attempt limit; then fall back to the regular interval.
                 while True:
                     if self._stop.wait(self.auto_retry_s):
                         return
