@@ -65,6 +65,16 @@ if ((Test-Path (Join-Path $ui 'node_modules')) -and (Get-Command npm -ErrorActio
     Write-Host '--- dashboard page: no node_modules, packaging the committed ds5app\dashboard.html ---'
 }
 
+# The echo canceller's native core (emulator\native: vendored speexdsp MDF +
+# ds5aec.c), built from source every time so the bundle never carries a stale
+# or foreign binary. Needs Visual Studio's C++ build tools.
+Write-Host '--- echo canceller DLL ---'
+Push-Location (Join-Path $repo 'emulator')
+try {
+    & $py native\build.py
+    if ($LASTEXITCODE -ne 0) { throw "ds5aec build failed ($LASTEXITCODE)" }
+} finally { Pop-Location }
+
 $env:DS5_ONEFILE = if ($OneFile) { '1' } else { '0' }
 Write-Host "--- building ($(if ($OneFile) {'one-file'} else {'one-dir'})) ---"
 

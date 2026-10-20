@@ -241,6 +241,22 @@ def _unhide_everything(HH, args) -> int:
     return 0 if ok else 1
 
 
+def _doctor_echo() -> int:
+    """The software echo canceller's native core (ds5aec.dll) loads and
+    initialises. Without it the pad still cancels its own speaker, but sound
+    from the PC's other speakers reaches the voice chat."""
+    try:
+        from ds5emu import aec as AEC
+        AEC.NativeCanceller().close()
+        AEC.NativeStage(2).close()
+        print(f"{'[ok]':7}echo cancel  {AEC._dll_path()} (interface {AEC.NATIVE_VERSION})")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"{'[warn]':7}echo canceller unavailable ({e}) -- the pad still "
+              f"cancels its own speaker, the PC's other speakers are not cancelled")
+        return 1
+
+
 def cmd_doctor(args) -> int:
     problems = 0
     print(BANNER.strip() + f"   v{VERSION}\n")
@@ -312,6 +328,7 @@ def cmd_doctor(args) -> int:
         print(f"{'[ok]':7}autostart  {A.describe()}")
 
     problems += _doctor_hidhide(cfg, live)
+    problems += _doctor_echo()
 
     print()
     print("no problems found" if not problems else f"{problems} thing(s) to fix")
@@ -648,6 +665,15 @@ def cmd_run(args) -> int:
     hide = bool(getattr(args, "hide_bluetooth", False))
     if not hide and args.serial:
         hide = cfg.should_hide(args.serial)
+    # The pad's echo canceller: the flag, else this controller's setting, else ON.
+    # No flag from the manager on purpose -- the child reads the setting here
+    # and keeps following it live through the config watcher, so the
+    # dashboard switch applies to a running bridge.
+    echo = getattr(args, "echo_cancel", None)
+    if echo is None:
+        echo = cfg.should_echo_cancel(args.serial) if args.serial else True
+    else:
+        echo = echo == "on"
 
     svc = S.BridgeService(serial=args.serial, port=args.port, usbip_exe=args.usbip,
                           audio_target=args.audio_target,
@@ -657,6 +683,8 @@ def cmd_run(args) -> int:
                                        or cfg.hidhide_cli),
                           telemetry_port=getattr(args, "telemetry_port", None),
                           input_config=cfg.input,
+                          echo_cancel=echo,
+                          follow_echo_config=getattr(args, "echo_cancel", None) is None,
                           on_event=_log)
     try:
         svc.start()
@@ -838,6 +866,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "leaves it hidden, `ds5bridge unhide` gets it back")
     r.add_argument("--hidhide-cli", default=None, metavar="PATH",
                    help="path to HidHideCLI.exe, if it is somewhere unusual")
+    r.add_argument("--echo-cancel", choices=("on", "off"), default=None,
+                   help="remove what this PC plays from the pad's microphone: "
+                        "the pad's own speaker (the pad's canceller) and other "
+                        "speakers the pad can hear (the bridge's). Default: the "
+                        "controller's `echo_cancel` setting, which ships on. "
+                        "Giving the flag pins it for this run; without it, a "
+                        "change in the dashboard applies live")
     r.add_argument("--telemetry-port", type=int, default=None, metavar="PORT",
                    help="publish live input state (buttons, sticks, touch) as "
                         "UDP datagrams to 127.0.0.1:PORT at up to 60 Hz, for "

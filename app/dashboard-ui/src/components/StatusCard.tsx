@@ -1,7 +1,9 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { Headphones, Mic, MicOff, Eye, EyeOff, Zap, MousePointer2, Keyboard, AlertTriangle } from "lucide-react";
+import { Headphones, Mic, MicOff, Eye, EyeOff, Zap, MousePointer2, Keyboard, AlertTriangle, Ear, EarOff } from "lucide-react";
 import { keyboardOpen, remoteMode, useActiveController, useRemoteColor } from "../lib/store";
 import { InkDot } from "./Header";
+
+const ECHO_NOTE_FALLBACK = "the bridge's echo canceller is not running";
 
 const HIDE_NOTE_FALLBACK = "Hidden requested, but the controller is still visible to other apps — HidHide's filter is not attached to it (restart the device or reboot).";
 
@@ -34,6 +36,10 @@ export default function StatusCard() {
   // filter is verified on the pad's HID device. Only a verified "no" against a
   // request is a fault worth shouting about; null means nobody has checked.
   const hideBroken = c.hide_effective === false && c.hide_bluetooth !== false;
+  // echo cancellation: "degraded" means the pad still cancels its own speaker
+  // but the PC's other speakers (TV, desktop speakers) reach the voice chat.
+  const echoBroken = c.echo === "degraded";
+  const echoOn = c.echo === "on" || c.echo === "idle";
 
   return (
     <section className="panel w2 pop p-4" style={{ "--i": 2 } as React.CSSProperties}>
@@ -104,6 +110,10 @@ export default function StatusCard() {
         <Flag on={!!d?.mic_muted} icon={<MicOff size={13} strokeWidth={2.5} />} label="muted" tone="var(--color-amber)" />
         <Flag on={!!c.hide_bluetooth || hideBroken} icon={hideBroken ? <Eye size={13} strokeWidth={2.5} /> : <EyeOff size={13} strokeWidth={2.5} />}
               label={hideBroken ? "BT pad not hidden" : "BT pad hidden"} tone={hideBroken ? "var(--color-warn)" : "var(--color-square)"} />
+        {c.echo != null && (
+          <Flag on={echoOn || echoBroken} icon={echoBroken || c.echo === "off" ? <EarOff size={13} strokeWidth={2.5} /> : <Ear size={13} strokeWidth={2.5} />}
+                label={echoBroken ? "echo cancel degraded" : "echo cancel"} tone={echoBroken ? "var(--color-warn)" : "var(--color-ok)"} />
+        )}
       </div>
 
       {/* the requested hide is not in effect: other apps (Steam, the game) can
@@ -113,6 +123,19 @@ export default function StatusCard() {
           <AlertTriangle size={20} strokeWidth={2.5} className="mt-0.5 flex-none" />
           <div>
             <b className="display hl text-[15px]">Hide requested, but not in effect.</b> {c.hide_note?.trim() || HIDE_NOTE_FALLBACK}
+          </div>
+        </div>
+      )}
+
+      {/* echo cancellation is on but the software canceller is not working:
+          sound from the PC's other speakers reaches the voice chat */}
+      {echoBroken && (
+        <div className="note loud mt-3 items-start text-[12.5px] leading-relaxed" style={{ "--tone": "var(--color-amber)" } as React.CSSProperties}>
+          <EarOff size={20} strokeWidth={2.5} className="mt-0.5 flex-none" />
+          <div>
+            <b className="display hl text-[15px]">Echo cancellation only partly working.</b> The controller still removes its own
+            speaker from the mic, but game sound from your TV or other speakers can be heard in voice chat
+            ({c.echo_note?.trim() || ECHO_NOTE_FALLBACK}). Restarting the bridge usually fixes it.
           </div>
         </div>
       )}

@@ -137,10 +137,10 @@ class DualSense:
 
     def send_report_36(self, opus: bytes, haptic: bytes, frame_counter: int,
                        target: str = "speaker", volume: int = 0x4B,
-                       mic_active: bool = False) -> int:
+                       mic_active: bool = False, echo_cancel: bool = True) -> int:
         return self.write_raw(
             P.build_report_36(opus, haptic, self._next_seq(), frame_counter, target,
-                              volume, mic_active)
+                              volume, mic_active, echo_cancel=echo_cancel)
         )
 
     def send_report_39(self, opus2: tuple[bytes, bytes], hap2: tuple[bytes, bytes],
@@ -152,9 +152,10 @@ class DualSense:
         )
 
     def send_mic_state(self, active: bool, muted: bool = False,
-                       headset_plugged: bool = False) -> int:
+                       headset_plugged: bool = False, echo_cancel: bool = True) -> int:
         return self.write_raw(
-            P.build_bt_mic_state(self._next_seq(), active, muted, headset_plugged)
+            P.build_bt_mic_state(self._next_seq(), active, muted, headset_plugged,
+                                 echo_cancel=echo_cancel)
         )
 
     def send_mic_control(self, active: bool) -> int:

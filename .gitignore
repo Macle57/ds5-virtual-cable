@@ -45,3 +45,6 @@ ds5*_stats.json
 
 # Bundle installer: pinned vendor installers are downloaded at build time
 app/packaging/bundle/vendor/
+
+# Native build output (emulator/native/build.py)
+emulator/ds5emu/_native/

@@ -521,6 +521,9 @@ def parse_toast_event(text: str):
 _MODE_RE = re.compile(r"^remote (?P<remote>on|off)\s+keyboard "
                       r"(?P<keyboard>open|closed)\s*$")
 
+#: `service.echo_line()`: the echo canceller's state (and why, if degraded).
+_ECHO_RE = re.compile(r"^echo (?P<state>[a-z]+)(?:\s\s+(?P<note>.*))?$")
+
 #: `controller.battery_note()` as the child prints it on its "battery" and
 #: "warn" lines: `battery 40%`, `battery 40% (charging)`, `battery 20% --
 #: LOW. ...`. Only the number and the charging state matter here.
@@ -633,7 +636,8 @@ class ChildBridge:
                 "last_event": "", "offline_since": None,
                 # the chord engine's modes, from the child's "mode" lines;
                 # None until the child has said (or when it never will)
-                "remote_mode": None, "keyboard_open": None}
+                "remote_mode": None, "keyboard_open": None,
+                "echo": None, "echo_note": ""}
 
     # -- state, and who is told about it -----------------------------------
 
@@ -878,7 +882,14 @@ class ChildBridge:
             self._changed()
 
     def _note_mode(self, text: str) -> None:
-        """A `service.mode_line()`: record the engine's two modes."""
+        """A `service.mode_line()` (the engine's two modes) or a
+        `service.echo_line()` (the echo canceller's state): record it."""
+        e = _ECHO_RE.match(text)
+        if e:
+            with self._lock:
+                self._snap["echo"] = e.group("state")
+                self._snap["echo_note"] = (e.group("note") or "").strip()
+            return
         m = _MODE_RE.match(text)
         if not m:
             return
@@ -1993,6 +2004,7 @@ class BridgeManager:
                     "battery_percent": None, "reports_per_s": 0.0,
                     "uptime_s": 0, "attached": False, "last_event": "",
                     "remote_mode": None, "keyboard_open": None,
+                    "echo": None, "echo_note": "",
                     "enabled": enabled.get(serial, default_enabled),
                     "hide_bluetooth": hide.get(serial, hide_default),
                     **(_hide_status(serial) if hide.get(serial, hide_default)
