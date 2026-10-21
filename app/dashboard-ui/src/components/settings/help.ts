@@ -10,7 +10,7 @@ export const HELP: Record<string, string> = {
   ctrl_hide: "Hide this controller's Bluetooth pad (HidHide) while it is bridged, so games and Steam see only the virtual wired one. The pill beside it says whether the hide is actually in effect right now.",
   autostart_on_login: "Start the tray with Windows. Installed as a service it starts before anyone signs in (the pads work on the lock screen too); installed as a scheduled task it starts at sign-in. The installer chooses which; this switch turns whichever is installed on or off.",
   update_check: "Look for a newer release on GitHub every 6 hours and when the tray starts. Off, nothing is ever fetched.",
-  update_auto_install: "Install a newer release on its own: a short while after one is found, the silent installer runs and the tray (or service) restarts itself, with a toast under the 'update' notification. Off, a new release is only announced and installed by hand, with the Install button here or the tray's 'Install update' row.",
+  update_auto_install: "Ask before installing a newer release: when one is found, a Yes/No box names the version and warns that the bridge restarts (every connected controller drops out for about a minute). Yes runs the silent installer and the tray (or service) restarts itself; No keeps this version until the Install button here or the tray's 'Install update' row, and asks again the next time ds5bridge starts. Off, a new release is only announced.",
   tray_actions: "The same commands as the tray menu. Rescan looks for pads again right now; Unhide all lifts every HidHide cloak (a rescue when a pad stays invisible after a crash); Open logs opens the log folder.",
   /* notifications */
   notifications_enabled: "Master switch for every toast this app shows. Off, nothing pops up, including the battery toast shortcut.",
@@ -126,7 +126,7 @@ export const GLOBAL_FIELDS: [string, string, "bool" | "number" | "string"][] = [
   ["auto_bridge_new", "Bridge new controllers automatically", "bool"],
   ["hide_bluetooth_default", "Hide new controllers' Bluetooth pad", "bool"],
   ["update_check", "Check for updates", "bool"],
-  ["update_auto_install", "Install updates automatically", "bool"],
+  ["update_auto_install", "Ask to install updates", "bool"],
   ["port_base", "First usbip TCP port", "number"],
   ["dashboard_port", "Dashboard port (this page)", "number"],
   ["hidhide_cli", "HidHideCLI.exe path (leave blank to find it)", "string"],

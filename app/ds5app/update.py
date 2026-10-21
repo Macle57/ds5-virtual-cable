@@ -99,18 +99,28 @@ A source checkout has no `app` directory to update, so `install_root()`
 answers None and "update now" degrades to opening the release page in the
 browser -- the person running from source updates with `git pull` anyway.
 
-Installing on its own (`update_auto_install`, 1.0)
---------------------------------------------------
+Asking before installing (`update_auto_install`)
+------------------------------------------------
 With `config.update_auto_install` true (the default) the same "Update now"
-runs WITHOUT a click: `AUTO_INSTALL_DELAY_S` after a check finds a newer
-release, once per version per process, with a "Updating to x.y.z" toast
-first. The decision (`Updater.should_auto_install`) and the act
-(`Updater.run_auto_install`, which calls the injected `install_fn`) are
-separate and tested without a network or a tray; the tray injects
+runs without a click on the menu -- but never without a yes.
+`AUTO_INSTALL_DELAY_S` after a check finds a newer release, the injected
+`ask(info)` puts the question to the person (the tray: a Yes/No box naming
+the version and warning that the bridge restarts), once per version per
+process. Yes runs the install. No, a closed box or a prompt that raises
+keeps this version until the menu row or the dashboard button, and the
+question returns at the next start (`_told`-style once-per-version
+bookkeeping: a two-week session is not nagged every check). The decision
+(`Updater.should_auto_install`), the question (`ask_user`) and the act
+(`run_auto_install`, which calls the injected `install_fn`) are separate
+and tested without a network or a tray; the tray injects
 `lambda: install(self.updater, ...)` so the automatic path IS the manual
-path. A failure ends in a notification and the version is not retried
-until the next start (`_told`-style once-per-version bookkeeping), so a
-broken release cannot make the tray download it every day.
+path. A failed install is retried without asking twice (the yes stands),
+up to AUTO_INSTALL_ATTEMPTS, then waits for the next start. Without an
+`ask` there is no automatic path at all, whatever the config says.
+
+Until 1.2 the install simply ran a minute after the toast, which pulled the
+controller out from under a game in progress. The key kept its name so
+saved configs stay valid.
 
 Under the Windows service (winsvc.py)
 -------------------------------------
@@ -184,11 +194,10 @@ SUMS_NAME = "SHA256SUMS"
 #: inside GitHub's 60/hour unauthenticated limit.
 CHECK_INTERVAL_S = 6 * 3600.0
 STARTUP_DELAY_S = 20.0             # let the tray finish coming up first
-#: How long after a check finds a newer release the automatic install
-#: starts. Long enough for the "Updating to ..." toast to be read and for
-#: a person mid-game to notice; short enough that "it updates itself" is
-#: true the same day.
-AUTO_INSTALL_DELAY_S = 60.0
+#: How long after a check finds a newer release the question is asked:
+#: long enough for the "Update available" toast to be read first, so the
+#: box does not come out of nowhere.
+AUTO_INSTALL_DELAY_S = 15.0
 #: An automatic install that failed (a download that kept stalling, an
 #: installer that refused) is tried again this much later, up to
 #: AUTO_INSTALL_ATTEMPTS times per version per process. Measured 2026-09-15:
@@ -523,7 +532,8 @@ class Updater:
     def __init__(self, current_version: str | None = None,
                  cache_file: str | None = None,
                  notify=None, auto_install: bool = False, install_fn=None,
-                 auto_delay_s: float = AUTO_INSTALL_DELAY_S, http_get=None):
+                 auto_delay_s: float = AUTO_INSTALL_DELAY_S, http_get=None,
+                 ask=None):
         self._current = current_version or app_version()
         self._cache_file = cache_file
         #: The tests' seam: `check_now`'s `http_get`. None = the real one.
@@ -538,6 +548,11 @@ class Updater:
         #: would do; `auto_install` is `config.update_auto_install`.
         self.auto_install = bool(auto_install)
         self._install_fn = install_fn
+        #: `ask(info) -> bool`, the question; called on the check thread,
+        #: may block there. None = no one to ask = nothing automatic.
+        self._ask = ask
+        #: Versions the person said no to in this process.
+        self._declined: set[str] = set()
         self.auto_delay_s = float(auto_delay_s)
         #: version -> automatic attempts made in this process (each one a
         #: failed install; a successful one ends the process).
@@ -551,12 +566,33 @@ class Updater:
         self.installing = False
 
     def should_auto_install(self, info: "UpdateInfo | None") -> bool:
-        """The decision, pure: on, an update in hand, something to call, not
-        already started, and attempts left for this version in this process."""
+        """The decision, pure: on, an update in hand, something to call and
+        someone to ask, not already started, not declined, and attempts left
+        for this version in this process."""
         return bool(self.auto_install and info is not None
-                    and self._install_fn is not None and not self.installing
+                    and self._install_fn is not None and self._ask is not None
+                    and not self.installing
+                    and info.version not in self._declined
                     and self._auto_tried.get(info.version, 0)
                     < self.auto_attempts)
+
+    def ask_user(self, info: "UpdateInfo") -> bool:
+        """The question: True only on a plain yes. A no, a closed box or a
+        prompt that raises all mean "not now": the version is remembered as
+        declined, so this process does not ask about it again; the next
+        start does, and the menu row and the dashboard button are there
+        meanwhile."""
+        try:
+            yes = bool(self._ask(info))
+        except Exception:  # noqa: BLE001 -- never install on a broken prompt
+            log.exception("the update prompt failed; treating it as no")
+            yes = False
+        if not yes:
+            with self._lock:
+                self._declined.add(info.version)
+            log.info("update %s declined; the question returns at the next "
+                     "start", info.version)
+        return yes
 
     def run_auto_install(self, info: "UpdateInfo") -> bool:
         """The act, one attempt. True when `install_fn` was called."""
@@ -566,7 +602,7 @@ class Updater:
                 return False
             self._auto_tried[info.version] = \
                 self._auto_tried.get(info.version, 0) + 1
-        log.info("installing %s automatically (update_auto_install)", info.version)
+        log.info("installing %s after a yes (update_auto_install)", info.version)
         try:
             self._install_fn()
         except Exception:  # noqa: BLE001 -- the loop must survive anything
@@ -628,19 +664,24 @@ class Updater:
             if self.should_auto_install(info):
                 if self._stop.wait(self.auto_delay_s):
                     return
-                self.run_auto_install(info)
-                # The install runs on its own thread and, when it works, ends
-                # this process. So: while it is still going, keep waiting;
-                # once it has given up (`installing` cleared), try again after
-                # a pause, up to the attempt limit; then fall back to the regular interval.
-                while True:
-                    if self._stop.wait(self.auto_retry_s):
-                        return
-                    if self.installing:
-                        continue
-                    if not self.should_auto_install(info):
-                        break
+                # The question blocks this thread until it is answered,
+                # which is fine: there is nothing else for it to do.
+                if self.ask_user(info):
                     self.run_auto_install(info)
+                    # The install runs on its own thread and, when it works,
+                    # ends this process. So: while it is still going, keep
+                    # waiting; once it has given up (`installing` cleared),
+                    # try again after a pause -- the yes stands, no second
+                    # question -- up to the attempt limit; then fall back
+                    # to the regular interval.
+                    while True:
+                        if self._stop.wait(self.auto_retry_s):
+                            return
+                        if self.installing:
+                            continue
+                        if not self.should_auto_install(info):
+                            break
+                        self.run_auto_install(info)
             if self._stop.wait(CHECK_INTERVAL_S):
                 return
 
@@ -648,17 +689,20 @@ class Updater:
 # -- the four tray-facing helpers, all None-safe (see the module docstring) --
 
 
-def start_if_enabled(cfg, notify=None, install_fn=None) -> Updater | None:
+def start_if_enabled(cfg, notify=None, install_fn=None, ask=None) -> Updater | None:
     """The tray's one constructor call. None when the config says no.
 
     `install_fn` is what the automatic path calls -- the tray passes the
-    same thing its "Install update" row does; without it there is no
-    automatic install whatever the config says."""
+    same thing its "Install update" row does -- and `ask` is how it gets
+    the yes first; without either there is no automatic install whatever
+    the config says."""
     if not getattr(cfg, "update_check", True):
         log.info("update checks are off (update_check: false)")
         return None
-    auto = bool(getattr(cfg, "update_auto_install", True)) and install_fn is not None
-    return Updater(notify=notify, auto_install=auto, install_fn=install_fn).start()
+    auto = (bool(getattr(cfg, "update_auto_install", True))
+            and install_fn is not None and ask is not None)
+    return Updater(notify=notify, auto_install=auto, install_fn=install_fn,
+                   ask=ask).start()
 
 
 def menu_visible(updater: Updater | None) -> bool:
