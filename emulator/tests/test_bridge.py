@@ -1303,5 +1303,163 @@ class InterceptorSeamTests(unittest.TestCase):
         self.assertIn((0x08, b"\x08\x02" + bytes(46)), self.be.feature_writes)
 
 
+
+
+@unittest.skipUnless(HAVE_DEPS, "numpy / PyAV / hidapi not available")
+class PadAudioControlTests(unittest.TestCase):
+    """The pad's own mic DSP rides in the audioControl byte (SetState body
+    byte 7): bit 2 its echo canceller, bit 3 its noise suppressor. MEASURED
+    2026-10-05 (scratchpad/aec round 3): with the canceller on, the pad's
+    speaker echo in its mic fell to the noise floor; the noise suppressor
+    expanded the mic's dynamics and degraded voices and other-device sound.
+    Every write of the byte must therefore carry the same policy."""
+
+    from ds5bridge import protocol as P
+
+    class MicDev(_FakeDev):
+        def __init__(self):
+            super().__init__()
+            self.mic_states: list = []
+
+        def send_mic_state(self, active, muted=False, headset_plugged=False,
+                           echo_cancel=True):
+            self.mic_states.append((active, echo_cancel))
+            from ds5bridge import protocol as P
+            return self.write_raw(P.build_bt_mic_state(self._next_seq(), active, muted,
+                                                      headset_plugged, echo_cancel=echo_cancel))
+
+        def send_mic_control(self, active):
+            return 0
+
+    def test_the_byte_never_enables_the_noise_suppressor(self):
+        P = self.P
+        for path in (0x30, 0x00):
+            for ec in (True, False):
+                for hs in (True, False):
+                    v = P.audio_control(path, echo_cancel=ec, headset_plugged=hs)
+                    self.assertFalse(v & P.AC_NOISE_CANCEL)
+                    self.assertEqual(bool(v & P.AC_ECHO_CANCEL), ec)
+                    self.assertEqual(v & 0xF0, path)
+        self.assertEqual(P.audio_control(0x30), 0x35)
+        self.assertEqual(P.audio_control(0x30, echo_cancel=False), 0x31)
+
+    def test_volume_and_mic_arming_carry_the_policy(self):
+        P = self.P
+        self.assertEqual(P.SetState().speaker_volume(0x60).body[P.AUDIO_CONTROL], 0x35)
+        self.assertEqual(P.SetState().speaker_volume(0x60, echo_cancel=False)
+                         .body[P.AUDIO_CONTROL], 0x31)
+        self.assertEqual(P.SetState().headphone_volume(0x60).body[P.AUDIO_CONTROL], 0x05)
+        rep = P.build_bt_mic_state(0, True)
+        self.assertEqual(rep[1 + 2 + P.AUDIO_CONTROL], 0x05)       # id, seq, tag
+        rep = P.build_bt_mic_state(0, True, echo_cancel=False)
+        self.assertEqual(rep[1 + 2 + P.AUDIO_CONTROL], 0x01)
+
+    def test_the_bridge_arms_the_mic_with_its_setting(self):
+        be = B.BridgeBackend(echo_cancel=False)
+        be._dev = dev = self.MicDev()
+        be._arm_mic_now(True)
+        self.assertEqual(dev.mic_states, [(True, False)])
+
+    def test_a_host_setstate_cannot_switch_the_dsp(self):
+        P = self.P
+        be = B.BridgeBackend()
+        body = bytearray(47)
+        body[P.VALID_FLAG0] = P.F0_AUDIO_CONTROL
+        body[P.AUDIO_CONTROL] = 0x39                  # NC on, EC off, internal mic
+        self.assertEqual(be._audio_policy(bytes(body))[P.AUDIO_CONTROL], 0x35)
+        be.echo_cancel = False
+        self.assertEqual(be._audio_policy(bytes(body))[P.AUDIO_CONTROL], 0x31)
+        body[P.VALID_FLAG0] = 0                       # not asking: untouched
+        self.assertEqual(be._audio_policy(bytes(body)), bytes(body))
+
+    def test_switching_live_sends_the_new_byte(self):
+        P = self.P
+        be = B.BridgeBackend()
+        sent: list = []
+        be._write_setstate_body = sent.append
+        be.set_echo_cancel(False)
+        self.assertFalse(be.echo_cancel)
+        self.assertEqual(sent[-1][P.AUDIO_CONTROL], 0x31)
+        self.assertTrue(sent[-1][P.VALID_FLAG0] & P.F0_AUDIO_CONTROL)
+        be.set_echo_cancel(True)
+        self.assertEqual(sent[-1][P.AUDIO_CONTROL], 0x35)
+
+    def test_switching_live_changes_only_the_dsp_bits(self):
+        # The host routed audio to the headphone jack with the automatic mic
+        # and its own volumes; the switch must not undo any of that.
+        P = self.P
+        be = B.BridgeBackend()
+        body = bytearray(47)
+        body[P.VALID_FLAG0] = P.F0_AUDIO_CONTROL | P.F0_HEADPHONE_VOLUME
+        body[P.AUDIO_CONTROL] = 0x00
+        body[P.HEADPHONE_VOLUME] = 0x40
+        be.write_output_report(bytes([0x02]) + bytes(body))
+        sent: list = []
+        be._write_setstate_body = sent.append
+        be.set_echo_cancel(True)
+        out = sent[-1]
+        self.assertEqual(out[P.AUDIO_CONTROL], 0x04)          # path/mic kept, EC on
+        self.assertEqual(out[P.VALID_FLAG0], P.F0_AUDIO_CONTROL)   # no volume write
+        be.set_echo_cancel(False)
+        self.assertEqual(sent[-1][P.AUDIO_CONTROL], 0x00)
+
+    def test_the_reconnect_replay_goes_through_the_policy(self):
+        # After a reconnect the host's folded SetState is replayed; a host
+        # body asking for the noise suppressor must not slip through there.
+        P = self.P
+        be = B.BridgeBackend()
+        body = bytearray(47)
+        body[P.VALID_FLAG0] = P.F0_AUDIO_CONTROL
+        body[P.AUDIO_CONTROL] = 0x39
+        be.write_output_report(bytes([0x02]) + bytes(body))
+        be._dev = dev = _FakeDev()
+        be._prime_setstate()
+        self.assertGreaterEqual(len(dev.writes), 2)
+        replay = dev.writes[-1]
+        self.assertEqual(replay[3 + P.AUDIO_CONTROL] & P.AC_DSP_MASK, P.AC_ECHO_CANCEL)
+
+    def test_the_audio_report_36_carries_the_callers_policy(self):
+        P = self.P
+        op, hp = bytes(200), bytes(64)
+        on = P.build_report_36(op, hp, 0, 0)
+        off = P.build_report_36(op, hp, 0, 0, echo_cancel=False)
+        # report id, then payload: audioControl at payload index 10
+        self.assertEqual(on[1 + 10], 0x05)
+        self.assertEqual(off[1 + 10], 0x01)
+
+    def test_disarming_carries_the_setting(self):
+        be = B.BridgeBackend(echo_cancel=False)
+        be._dev = dev = self.MicDev()
+        be._arm_mic_now(False)
+        self.assertEqual(dev.mic_states, [(False, False)])
+
+    def test_the_connect_prime_carries_the_policy(self):
+        P = self.P
+        be = B.BridgeBackend()
+        be._dev = dev = _FakeDev()
+        be._prime_setstate()
+        # BT 0x31 SetState: [0x31][seq/tag][0x10][body...]
+        self.assertEqual(dev.writes[-1][3 + P.AUDIO_CONTROL], 0x35)
+
+    class _Dec:
+        def decode(self, opus):
+            import numpy as np
+            return np.full(480, 0.25, np.float32)
+
+    def _mic_level(self, echo_cancel):
+        import numpy as np
+        be = B.BridgeBackend(echo_cancel=echo_cancel)
+        be._on_mic_payload(self._Dec(), bytes(200))
+        pcm = np.frombuffer(be._mic_ring.read_exact(480 * B.USB_IN_FRAME_BYTES), "<i2")
+        return float(np.abs(pcm[0::2]).mean())
+
+    def test_the_mic_level_is_the_same_with_the_canceller_on(self):
+        # The pad lowers its mic 1.9 dB when its canceller is on; the bridge
+        # puts it back, so the switch never changes how loud a voice is.
+        import math
+        on, off = self._mic_level(True), self._mic_level(False)
+        self.assertAlmostEqual(20 * math.log10(on / off), B.PAD_EC_MAKEUP_DB, delta=0.05)
+
+
 if __name__ == "__main__":
     unittest.main()

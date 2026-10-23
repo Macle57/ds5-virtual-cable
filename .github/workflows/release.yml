@@ -77,7 +77,16 @@ jobs:
         run: |
           python -m venv prototype\.venv
           prototype\.venv\Scripts\python.exe -m pip install --upgrade pip
-          prototype\.venv\Scripts\python.exe -m pip install hidapi numpy av pystray pillow pyinstaller
+          prototype\.venv\Scripts\python.exe -m pip install setuptools hidapi numpy av pystray pillow pyinstaller
+
+      # The echo canceller's native core, built from the vendored source; the
+      # spec bundles it and the canceller tests below run against it.
+      - name: Build the echo canceller DLL
+        run: |
+          Push-Location emulator
+          ..\prototype\.venv\Scripts\python.exe native\build.py
+          if ($LASTEXITCODE -ne 0) { throw "ds5aec build failed" }
+          Pop-Location
 
       # No release from a red tree. The app tests include the updater's
       # decision logic -- the code that will evaluate THIS release's JSON.

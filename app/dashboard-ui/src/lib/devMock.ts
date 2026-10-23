@@ -35,13 +35,14 @@ export function mockState(state: LiveState): LiveState {
     };
   }
   // P1 is hidden and the filter is attached -- the fault below may override it
-  if (serials[0]) controllers[serials[0]] = { ...controllers[serials[0]], hide_bluetooth: true, hide_effective: true };
+  if (serials[0]) controllers[serials[0]] = { ...controllers[serials[0]], hide_bluetooth: true, hide_effective: true, echo: "on" };
   // the hide fault goes on the second pad (`?mock=all`: on the first as well)
   const faulty = mode === "all" ? serials[0] : serials[1];
   if (faulty && mode !== "offline") {
     controllers[faulty] = {
       ...controllers[faulty], hide_bluetooth: true, hide_effective: false,
       hide_note: "Hidden requested, but the controller is still visible to other apps — HidHide's filter is not attached (restart the device or reboot).",
+      echo: "degraded", echo_note: "no native canceller: ds5aec.dll not found",
     };
   }
   let aggregate = state.aggregate;

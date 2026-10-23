@@ -27,7 +27,7 @@ from loopback_test import capture, spectrum, band_energy
 
 FREQ=250.0; SECS=3.0
 d = D.DualSense(D.pick("BT")).open()
-d.send_mic_state(True); time.sleep(0.05); d.send_mic_control(True); time.sleep(0.4)
+d.send_mic_state(True, echo_cancel=False); time.sleep(0.05); d.send_mic_control(True); time.sleep(0.4)
 d.send_setstate(P.SetState().haptic_volume(0xFF)); time.sleep(0.05)
 
 print(f"[base] {SECS}s baseline (no haptics)")
@@ -45,13 +45,13 @@ def run():
             if due==0: pc.sleep_until_next(); continue
             for _ in range(due):
                 if pc.emitted>=len(hf): break
-                d.send_report_36(so, hf[pc.emitted], fc, "speaker", 0, mic_active=True)
+                d.send_report_36(so, hf[pc.emitted], fc, "speaker", 0, mic_active=True, echo_cancel=False)
                 fc=(fc+1)&0xFF; sent[0]+=1; pc.commit(1)
 t=threading.Thread(target=run,daemon=True); t.start(); time.sleep(0.3)
 tone,na2,_ = capture(d, SECS); stop.set(); t.join(timeout=2)
 print(f"   {na2} payloads {tone.size} samples, {sent[0]} reports sent")
 for _ in range(3):
-    d.send_report_36(A.silent_opus_frame(), A.silent_haptic_frame(),0,"speaker",0,mic_active=True)
+    d.send_report_36(A.silent_opus_frame(), A.silent_haptic_frame(),0,"speaker",0,mic_active=True,echo_cancel=False)
     time.sleep(A.FRAME_MS/1000)
 d.send_mic_control(False); time.sleep(0.02); d.send_mic_state(False); d.close()
 

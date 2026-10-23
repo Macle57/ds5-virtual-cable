@@ -32,7 +32,7 @@ hidden = [
     #   ds5emu.backend.__getattr__ -> ds5emu.bridge
     "ds5emu.bridge", "ds5emu.server", "ds5emu.timing", "ds5emu.backend",
     "ds5emu.device", "ds5emu.translate", "ds5emu.descriptors", "ds5emu.uac",
-    "ds5emu.wire", "ds5emu._bootstrap",
+    "ds5emu.wire", "ds5emu._bootstrap", "ds5emu.aec", "ds5emu.loopback",
     "ds5bridge.protocol", "ds5bridge.device", "ds5bridge.audio",
     "ds5bridge.pacing", "ds5bridge.crc",
     "ds5app.tray", "ds5app.cli", "ds5app.service", "ds5app.controller",
@@ -63,9 +63,22 @@ hidden = [
 # runtime "codec not found" three weeks later.
 binaries = collect_dynamic_libs("av") + collect_dynamic_libs("numpy")
 
+# The echo canceller's native core, built by build.ps1 from emulator/native
+# (vendored speexdsp MDF + resampler, BSD, + ds5aec.c) just before this runs.
+# ds5emu/aec.py loads it with ctypes from ds5emu/_native next to itself, so it
+# is placed there; a missing DLL is a build error, not a silent no-cancel.
+_aec_dll = REPO / "emulator" / "ds5emu" / "_native" / "ds5aec.dll"
+if not _aec_dll.is_file():
+    raise SystemExit(f"{_aec_dll} is missing: run emulator\\native\\build.py first")
+binaries += [(str(_aec_dll), "ds5emu/_native")]
+
 # The dashboard page is one self-contained HTML file served from next to
 # ds5app/dashboard.py; ship it at the same relative spot inside the bundle.
 datas = [(str(APP_DIR / "ds5app" / "dashboard.html"), "ds5app")]
+# ...and the licence notices for what is compiled into the echo canceller's
+# DLL (SpeexDSP, KISS FFT: BSD, "reproduce ... in the materials provided with
+# the distribution").
+datas += [(str(REPO / "app" / "packaging" / "bundle" / "THIRD-PARTY-NOTICES.txt"), ".")]
 
 excludes = [
     # Nothing here draws a plot or opens a notebook (the dashboard serves its

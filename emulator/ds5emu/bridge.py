@@ -101,6 +101,18 @@ Hardware gotchas honoured here (docs/STATUS.md §8)
     `pass` never releases the GIL and starves the other three threads.
   * `hid.write()`'s return value is meaningless on Windows (it returns the
     padded buffer size), so it is never used to validate a write.
+  * the audioControl byte (SetState body byte 7) also carries the pad's own mic
+    DSP switches. Every write of it goes through one policy (`echo_cancel`):
+    the pad's echo canceller for its speaker per the setting, its noise
+    suppressor always off. See `ds5bridge.protocol.audio_control`.
+
+Echo cancellation (`echo_cancel`) has two halves: the pad's own canceller for
+ITS speaker (above), and `aec.EchoCanceller` for every other speaker the PC
+drives. The latter runs on its own `ds5-aec` thread while the mic is armed:
+the reader hands it each decoded mic packet with its sequence number (an
+append that never waits) and it writes finished frames into `_mic_ring`
+itself, one frame (10 ms) later. If it is stalled, missing or broken the
+reader writes the mic directly, exactly as without it.
 """
 
 from __future__ import annotations
@@ -112,6 +124,7 @@ import time
 from collections import deque
 
 from . import _bootstrap  # noqa: F401  (sys.path side effect)
+from . import aec as AEC
 from . import descriptors as D
 from . import translate as T
 from .backend import Backend
@@ -213,6 +226,15 @@ SETSTATE_REFRESH = 0.0
 #: the gap rather than disproving it. The host's own replayed lightbar, if it
 #: has one, follows straight after and wins. docs/FINDINGS.md "lightbar setup".
 PRIME_LIGHTBAR_FADE_OUT = True
+
+#: Gain put back on the microphone while the pad's echo canceller is on.
+#: MEASURED 2026-10-05 (four takes on cameo, external speech
+#: from another device, nothing playing on the PC): with audioControl bit 2
+#: set the pad delivers its mic 1.9 dB quieter, flat from 100 Hz to 12 kHz
+#: (+-0.3 dB over four takes) -- a gain change, not processing. Without this,
+#: switching echo cancellation on would make every voice 1.9 dB quieter.
+PAD_EC_MAKEUP_DB = 1.9
+PAD_EC_MAKEUP = 10.0 ** (PAD_EC_MAKEUP_DB / 20.0)
 
 # --- factory-test feature reports 0x80 / 0x81 (Phase 4c) --------------------
 # The DualSense's whole factory-diagnostics channel is one request/response
@@ -690,6 +712,7 @@ class BridgeBackend(Backend):
         reconnect: bool = True,
         keep_raw: bool = False,
         distinct_wired_mac: bool = True,
+        echo_cancel: bool = True,
     ):
         self.transport = transport
         self.device_index = device_index
@@ -726,6 +749,20 @@ class BridgeBackend(Backend):
         #: can still reach the raw Bluetooth pad will power it off the moment
         #: they see a wired pad with the identical MAC. See WIRED_MAC_LA_BIT.
         self.distinct_wired_mac = distinct_wired_mac
+        #: Echo cancellation: the pad's own canceller for its speaker
+        #: (audioControl bit 2) and the software canceller for the PC's other
+        #: speakers (aec.py). ON by default. Switchable live with
+        #: `set_echo_cancel`.
+        self.echo_cancel = echo_cancel
+        #: usbip ports this bridge's virtual pad is attached on (set by the
+        #: service after attach): how the software canceller recognises this
+        #: pad's own speaker endpoint and leaves it to the pad.
+        self.own_usb_ports: set | None = None
+        #: Where the software canceller remembers each speaker's delay for
+        #: this pad (None: it re-finds them every run). Set by the service.
+        self.aec_store_path: str | None = None
+        self._aec: AEC.EchoCanceller | None = None
+        self._aec_lock = threading.Lock()
 
         if report_id != 0x39:
             raise ValueError("only report 0x39 (two frames per report) is implemented")
@@ -956,6 +993,9 @@ class BridgeBackend(Backend):
         if stuck:
             log.warning("threads still running after stop(): %s", stuck)
         self._threads.clear()
+        aec, self._aec = self._aec, None
+        if aec is not None:
+            aec.stop(timeout=0.5)
         self._disarm_mic_best_effort()
         with self._dev_lock:
             if self._dev is not None:
@@ -1073,9 +1113,9 @@ class BridgeBackend(Backend):
         """
         st = P.SetState()
         if self.target == "headphone":
-            st.headphone_volume(self.speaker_volume)
+            st.headphone_volume(self.speaker_volume, echo_cancel=self.echo_cancel)
         else:
-            st.speaker_volume(self.speaker_volume)
+            st.speaker_volume(self.speaker_volume, echo_cancel=self.echo_cancel)
         st.haptic_volume(self.haptic_volume)
         if PRIME_LIGHTBAR_FADE_OUT:
             st.lightbar_setup(P.LIGHTBAR_SETUP_LIGHT_OUT)
@@ -1088,7 +1128,7 @@ class BridgeBackend(Backend):
             self.stats["setstate_replayed"] += 1
             log.info("replaying the host's SetState state after connect (flags %s)",
                      T.setstate_flags(host))
-            self._write_raw(T.usb02_to_bt31(host, self._next_bt_seq()))
+            self._write_raw(T.usb02_to_bt31(self._audio_policy(host), self._next_bt_seq()))
 
     def _next_bt_seq(self) -> int:
         dev = self._dev
@@ -1481,6 +1521,14 @@ class BridgeBackend(Backend):
             return
         if mono.size == 0:
             return
+        if self.echo_cancel:
+            mono = mono * PAD_EC_MAKEUP
+        # The software canceller when it runs. Payload byte 1 numbers the
+        # mic packets; it fills a lost one with silence so the echo never
+        # slips against its reference. False = not taken: write directly.
+        aec = self._aec
+        if aec is not None and aec.push_mic(mono, payload[1] if len(payload) > 1 else None):
+            return
         # mono -> the 2-channel USB IN stream: the real wired controller
         # duplicates the single capsule to L and R (FINDINGS: "USB mic IN: 2ch
         # descriptor, mono duplicated to L/R").
@@ -1703,7 +1751,7 @@ class BridgeBackend(Backend):
             # dim/flash, remote-mode colour). `body` -- the HOST's bytes --
             # stays the coalescing key and what `_setstate_last` remembers,
             # so a time-varying override never masquerades as host state.
-            wire_body = self._intercept_setstate(body)
+            wire_body = self._audio_policy(self._intercept_setstate(body))
             if self._write_raw(T.usb02_to_bt31(wire_body, self._next_bt_seq())):
                 self.stats["setstate_sent"] += 1
                 self._setstate_last = body
@@ -2108,9 +2156,9 @@ class BridgeBackend(Backend):
             )
             self.speaker_volume = vol
             if self.target == "headphone":
-                st.headphone_volume(vol)
+                st.headphone_volume(vol, echo_cancel=self.echo_cancel)
             else:
-                st.speaker_volume(vol)
+                st.speaker_volume(vol, echo_cancel=self.echo_cancel)
         elif unit == D.UNIT_FU_MIC:
             if selector == FU_MUTE_CONTROL:
                 self._defer(self._arm_mic_now, self._mic_armed.is_set(), bool(value))
@@ -2131,6 +2179,50 @@ class BridgeBackend(Backend):
         self._write_raw(P.build_bt_setstate(body, self._next_bt_seq()))
 
     # =====================================================================
+    # the pad's own mic DSP (echo canceller / noise suppressor)
+    # =====================================================================
+
+    def set_echo_cancel(self, on: bool) -> None:
+        """Switch the pad's echo canceller live (the config watcher calls
+        this). Safe from any thread: the SetState carrying the new
+        audioControl byte goes out on the writer thread."""
+        self.echo_cancel = bool(on)
+        if not on:
+            self._aec_pause()
+        self._defer(self._write_setstate_body, self._dsp_only_body())
+        self._defer(self._aec_apply)
+
+    def _dsp_only_body(self) -> bytes:
+        """A SetState that changes ONLY the DSP bits of audioControl: no
+        volume, and the output path and mic select the host last set (or, if
+        it never set them, the ones this bridge primed)."""
+        st = P.SetState()
+        with self._setstate_lock:
+            host = self._setstate_host
+        if (host is not None and len(host) > P.AUDIO_CONTROL
+                and host[P.VALID_FLAG0] & P.F0_AUDIO_CONTROL):
+            current = host[P.AUDIO_CONTROL]
+        else:
+            current = P.audio_control(0x00 if self.target == "headphone" else 3 << 4)
+        st.body[P.AUDIO_CONTROL] = ((current & ~P.AC_DSP_MASK & 0xFF)
+                                    | (P.AC_ECHO_CANCEL if self.echo_cancel else 0))
+        st.flag0(P.F0_AUDIO_CONTROL)
+        return bytes(st.body)
+
+    def _audio_policy(self, body: bytes) -> bytes:
+        """A host SetState that sets audioControl keeps its mic-select and
+        output-path bits, but the pad's echo canceller and noise suppressor
+        follow `echo_cancel` -- a game cannot switch the noise suppressor on
+        (it eats the sounds a voice chat should carry) or the echo canceller
+        off behind the user's setting."""
+        if len(body) <= P.AUDIO_CONTROL or not body[P.VALID_FLAG0] & P.F0_AUDIO_CONTROL:
+            return body
+        out = bytearray(body)
+        out[P.AUDIO_CONTROL] = ((out[P.AUDIO_CONTROL] & ~P.AC_DSP_MASK & 0xFF)
+                                | (P.AC_ECHO_CANCEL if self.echo_cancel else 0))
+        return bytes(out)
+
+    # =====================================================================
     # microphone arming
     # =====================================================================
 
@@ -2149,9 +2241,52 @@ class BridgeBackend(Backend):
             self._mic_armed.set()
         else:
             self._mic_armed.clear()
+            self._aec_pause()
             self._mic_ring.clear()
             self._mic_primed = False
-        self._defer(self._arm_mic_now, on, muted)
+        self._defer(self._arm_mic_job, on, muted)
+
+    def _arm_mic_job(self, on: bool, muted: bool = False) -> None:
+        """The deferred half of `arm_mic`: the Bluetooth arming pair, then the
+        software canceller brought in line. One job per SET_INTERFACE."""
+        self._arm_mic_now(on, muted)
+        self._aec_apply()
+
+    def _aec_apply(self) -> None:
+        """Run the software canceller exactly while it is wanted: echo
+        cancellation on, the mic armed, the backend started. Created on the
+        first arm, then paused and resumed (each speaker's delay and filter
+        survive). Writer thread, or inline with no threads,
+        where nothing starts."""
+        want = (self.echo_cancel and self._mic_armed.is_set()
+                and bool(self._threads) and not self._stop.is_set())
+        with self._aec_lock:
+            if want and self._aec is None:
+                store = AEC.DelayStore(self.aec_store_path) if self.aec_store_path else None
+                eng = AEC.EchoCanceller(self._mic_ring.write,
+                                        own_usb_ports=lambda: self.own_usb_ports,
+                                        delay_store=store, pad_id=lambda: self.serial)
+                eng.start()
+                self._aec = eng
+                log.info("software echo cancellation on")
+            elif want and not self._aec.active:
+                self._aec.resume()
+            elif not want:
+                self._aec_pause()
+
+    def _aec_pause(self) -> None:
+        """Stop feeding the canceller now (never waits; any thread)."""
+        aec = self._aec
+        if aec is not None and aec.active:
+            aec.pause()
+
+    def echo_status(self) -> dict:
+        """The software canceller's state, as JSON-able data."""
+        aec = self._aec
+        if aec is None:
+            return {"enabled": bool(self.echo_cancel),
+                    "mode": "idle" if self.echo_cancel else "off"}
+        return {"enabled": bool(self.echo_cancel), **aec.status()}
 
     def _arm_mic_now(self, on: bool, muted: bool = False) -> None:
         """The Phase-1 arming pair: 0x31 mic-state then 0x32 mic-control."""
@@ -2162,13 +2297,14 @@ class BridgeBackend(Backend):
                                     f"(0x31 mic-state + 0x32 mic-control pair)")
         try:
             if on:
-                dev.send_mic_state(True, muted=muted, headset_plugged=False)
+                dev.send_mic_state(True, muted=muted, headset_plugged=False,
+                                   echo_cancel=self.echo_cancel)
                 time.sleep(0.02)
                 dev.send_mic_control(True)
             else:
                 dev.send_mic_control(False)
                 time.sleep(0.02)
-                dev.send_mic_state(False)
+                dev.send_mic_state(False, echo_cancel=self.echo_cancel)
             log.info("microphone %s", "armed" if on else "disarmed")
         except Exception as e:  # noqa: BLE001
             log.warning("mic arming failed: %s", e)

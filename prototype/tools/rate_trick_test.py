@@ -51,7 +51,7 @@ def measure(d, frames, volume, target, seconds) -> tuple[float, np.ndarray]:
     player.join(timeout=2.0)
     for _ in range(3):
         d.send_report_36(A.silent_opus_frame(), A.silent_haptic_frame(), 0,
-                         target, volume, mic_active=True)
+                         target, volume, mic_active=True, echo_cancel=False)
         time.sleep(A.FRAME_MS / 1000)
     f, m = spectrum(pcm)
     if f.size == 0:
@@ -74,7 +74,7 @@ def main() -> int:
     info = D.pick("BT")
     print(f"[dev] {D.describe(info)}")
     d = D.DualSense(info).open()
-    d.send_mic_state(True)
+    d.send_mic_state(True, echo_cancel=False)  # this test listens for the speaker
     time.sleep(0.05)
     d.send_mic_control(True)
     time.sleep(0.4)
