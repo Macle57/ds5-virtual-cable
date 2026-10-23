@@ -342,6 +342,42 @@ class CancellerTests(unittest.TestCase):
         # least 5 of those 7 dB must go (what is left is the noise, not the echo)
         self.assertLess(db(out[steady], mic[steady]), -5.0)
 
+    def test_a_speaker_that_plays_both_channels_stays_on_the_mix(self):
+        # One speaker that plays both channels of L != R content (a single
+        # driver fed L + R): neither channel alone beats the mix by
+        # PROBE_VIEW_MARGIN, so the arrival pattern is taken on the mix.
+        sim = Sim()
+        n = 16 * FS
+        L, R = speechlike(n, 2, rate=5.1), speechlike(n, 3, rate=4.3)
+        noise = np.random.default_rng(7).standard_normal(n).astype(np.float32)
+        e = echo_of(0.5 * (L + R), room(6, 0.5), 40)
+        mic = e + noise * np.float32(0.3 * np.sqrt(np.mean(e ** 2)))
+        out = aligned(sim.run(mic, ref=np.stack([L, R], 1)), n)
+        r = sim.eng._refs["Speakers (Test)"]
+        self.assertEqual(sim.eng.status()["slots"], ["Speakers (Test)"])
+        self.assertEqual(AEC.VIEW_NAMES[r.view], "mix")
+        self.assertEqual(r.describe()["view"], "mix")
+        steady = slice(10 * FS, 15 * FS)
+        self.assertLess(db(out[steady], mic[steady]), -9.0)    # the room noise: -10.5
+
+    def test_a_speaker_that_plays_only_the_left_channel_is_found(self):
+        # The mix weights left 1.0 : right 0.67, so a left-only speaker's
+        # left / mix ratio is only ~1.15: it mostly stays on the mix (which
+        # costs little) and may move to left by noise. Never to right.
+        sim = Sim()
+        n = 18 * FS
+        L, R = speechlike(n, 2, rate=5.1), speechlike(n, 3, rate=4.3)
+        noise = np.random.default_rng(9).standard_normal(n).astype(np.float32)
+        el = echo_of(L, room(6, 0.5), 40)
+        mic = el + noise * np.float32(0.5 * np.sqrt(np.mean(el ** 2)))
+        out = aligned(sim.run(mic, ref=np.stack([L, R], 1)), n)
+        r = sim.eng._refs["Speakers (Test)"]
+        self.assertEqual(sim.eng.status()["slots"], ["Speakers (Test)"])
+        self.assertIn(AEC.VIEW_NAMES[r.view], ("mix", "left"))
+        steady = slice(10 * FS, 17 * FS)
+        # as for the right-only speaker: the room noise is 7 dB under the mic
+        self.assertLess(db(out[steady], mic[steady]), -5.0)
+
     @staticmethod
     def _one_channel_take(sim, seed, mono, noise, n=14 * FS, shift_ms=None):
         """A speaker that plays only the RIGHT channel of its stereo endpoint,

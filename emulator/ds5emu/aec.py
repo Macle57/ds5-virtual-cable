@@ -151,12 +151,15 @@ PROBE_CONFIRM_PEAK = 8.0
 #: tells them apart (review of round 8: the plain best peak picked mix, left,
 #: right 158 / 42 / 0 times in 200), so the margin keeps the mix, and a slot
 #: taken on mono content moves to the right channel by itself once the
-#: content turns stereo. MEASURED: a speaker playing one channel of L != R
-#: content, live (round 8, wired DualSense, right channel only): peak 0.12 /
-#: 0.20 / 0.23 against that channel, 0.05-0.10 against the mix, i.e. ~2x;
-#: synthetic (240 windows per case, room noise 0.5-2x the echo): channel / mix
-#: median 1.62-1.66, 5th percentile 1.26-1.34; mono content exactly 1.000;
-#: unrelated audio 95th percentile 1.25 (it never votes anyway).
+#: content turns stereo. MEASURED (these are the probe's confidences, peak /
+#: RMS, the numbers `_choose_view` compares): a speaker playing one channel
+#: of L != R content, live (round 8b, wired DualSense, right channel only,
+#: first probe of a session): channel / mix 12.2 / 9.3 = 1.31, 13.3 / 5.9 =
+#: 2.25, and 17.9 / 12.7 = 1.41 on a replayed dump; synthetic (240 windows per
+#: case, room noise 0.5-2x the echo): median 1.62-1.66, 5th percentile
+#: 1.26-1.34; mono content exactly 1.000; unrelated audio 95th percentile 1.25
+#: (it never votes anyway). So the live headroom over the margin can be as
+#: thin as 1.31; a switch that misses simply retries at the next probe.
 PROBE_VIEW_MARGIN = 1.25
 PROBE_VOTES = 2
 #: Two arrivals of similar strength (see `_pair_vote`): both peaks at least
@@ -708,8 +711,14 @@ def _probe_views(ref: np.ndarray) -> list:
     RIGHT channel of its stereo endpoint. With different content left and
     right the mix halved the correlation peak (0.05-0.10 against 0.12, 0.20
     and 0.23 for the right channel alone, three takes) and two 18 s takes of
-    stereo speech were never cancelled from a cold start. One speaker of a
-    pair that the pad hears and the other it does not is the same case."""
+    stereo speech were never cancelled from a cold start.
+
+    The mix is NOT symmetric (`_probe_mix` weights left 1.0 : right 0.67), so
+    a speaker that plays only the LEFT channel is a milder case: its left /
+    mix confidence ratio is only ~1.15 (synthetic: median 1.15, 5th
+    percentile 1.08; 7% of windows reach PROBE_VIEW_MARGIN). It mostly stays
+    on the mix, which costs little at that ratio, and may move to left by
+    noise at a later probe."""
     return [_probe_view(ref, v) for v in range(1 if ref.shape[1] == 1 else 1 + ref.shape[1])]
 
 
@@ -800,6 +809,7 @@ class Ref:
     def describe(self) -> dict:
         return {"id": self.id, "name": self.name, "channels": self.nch,
                 "slotted": self.slotted, "provisional": self.provisional,
+                "view": VIEW_NAMES[self.view],
                 "delay_ms": None if self.delay is None else round((self.delay + self.adj) * 1000 / FS, 2),
                 "conf": round(self.lag_conf, 1), "anchors": self.timeline.anchors,
                 "echo_share_db": None if self.est_share_db is None else round(self.est_share_db, 1),
