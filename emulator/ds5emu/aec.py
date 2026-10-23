@@ -668,6 +668,26 @@ def _probe_mix(ref: np.ndarray) -> np.ndarray:
     return (ref @ w / w.sum()).astype(np.float32)
 
 
+#: The views of a reference the probe correlates the mic with (`_probe_views`).
+VIEW_NAMES = ("mix", "left", "right")
+
+
+def _probe_views(ref: np.ndarray) -> list:
+    """(n, nch) -> the signals the delay probe tries: the mix and, for two
+    channels, each channel on its own. The best peak wins; a slotted endpoint
+    keeps the view it was found with for its arrival pattern (`Ref.view`).
+
+    MEASURED round 8 (2026-10-23): a DualSense on a USB cable plays only the
+    RIGHT channel of its stereo endpoint. With different content left and
+    right the mix halved the correlation peak (0.09-0.10 against 0.20-0.23 for
+    the right channel alone, three takes) and two 18 s takes of stereo speech
+    were never cancelled from a cold start. One speaker of a pair that the pad
+    hears and the other it does not is the same case."""
+    if ref.shape[1] == 1:
+        return [ref[:, 0]]
+    return [_probe_mix(ref)] + [np.ascontiguousarray(ref[:, c]) for c in range(ref.shape[1])]
+
+
 class Ref:
     """One render endpoint seen on loopback."""
 
@@ -704,6 +724,9 @@ class Ref:
         self.stored_ms: float | None = None
         self.stored_at = -math.inf
         self.probe_ok_at = -math.inf
+        #: Which `_probe_views` view found the echo (0: the mix); the arrival
+        #: pattern is taken on it. Set when slotted by a probe.
+        self.view = 0
         self._clear_fine()
         self._clear_windows()
 
@@ -1291,6 +1314,7 @@ class EchoCanceller:
             ref.stage.close()
             ref.stage = None
         ref.delay = None
+        ref.view = 0
         ref.votes = []
         ref.track_votes = []
         ref._clear_windows()
@@ -1351,31 +1375,35 @@ class EchoCanceller:
         A = PROBE_LEAD_MS * FS // 1000
         base = REF_BASE_MS * FS // 1000
         mic = self.mic_hist.read(P - W, W)
-        refx = _probe_mix(ref.timeline.read(P - W - base - M, W + M + A))
-        if (float(np.sqrt(np.mean(refx[M:M + W] ** 2))) < LOUD_RMS
+        views = _probe_views(ref.timeline.read(P - W - base - M, W + M + A))
+        if (float(np.sqrt(np.mean(views[0][M:M + W] ** 2))) < LOUD_RMS
                 or float(np.sqrt(np.mean(mic ** 2))) < LOUD_RMS):
             return
         ref.last_probe_pos = P
         self.stats["probes"] += 1
+        view = 0
         if ref.slotted:
             # is the echo still where the filter has it? A peak inside the
             # filter's window is far less likely by chance than the highest
             # peak over the whole search range, so a lower bar confirms it
             exp = ref.delay + ref.adj + EARLY_MS * FS // 1000
-            lag, conf, local = estimate_lag(
-                mic, refx, M, A, near=(exp - TRACK_EARLY_MS * FS // 1000,
-                                       exp + TRACK_LATE_MS * FS // 1000))
-            if local >= PROBE_CONFIRM_PEAK:
+            near = (exp - TRACK_EARLY_MS * FS // 1000, exp + TRACK_LATE_MS * FS // 1000)
+            res = [estimate_lag(mic, v, M, A, near=near) for v in views]
+            lag, conf, _ = max(res, key=lambda r: r[1])
+            if max(r[2] for r in res) >= PROBE_CONFIRM_PEAK:
                 ref.heard = True
                 ref.probe_ok_at = now
         else:
-            lag, conf, lag2, conf2 = estimate_lag(mic, refx, M, A, second=True)
+            res = [estimate_lag(mic, v, M, A, second=True) for v in views]
+            view = max(range(len(res)), key=lambda i: res[i][1])
+            lag, conf, lag2, conf2 = res[view]
         ref.lag_conf = conf
         agree = PROBE_AGREE_MS * FS // 1000
         if conf < PROBE_MIN_PEAK:
             if not ref.slotted:
                 ref.votes = []
                 if self._pair_vote(ref, lag, conf, lag2, conf2, agree):
+                    ref.view = view
                     return
             ref.track_votes = []
             return
@@ -1385,8 +1413,10 @@ class EchoCanceller:
             if len(ref.votes) >= PROBE_VOTES or conf >= PROBE_SURE_PEAK:
                 ref.delay = float(np.median(ref.votes))
                 if self._slot(ref):
-                    log.info("echo of %s found %.1f ms behind its reference (peak %.1f) "
-                             "-- cancelling it", ref.name, lag * 1000 / FS, conf)
+                    ref.view = view
+                    log.info("echo of %s found %.1f ms behind its reference (peak %.1f%s) "
+                             "-- cancelling it", ref.name, lag * 1000 / FS, conf,
+                             f", {VIEW_NAMES[view]} channel" if view else "")
                     self._remember(ref)
                 else:
                     ref.delay = None
@@ -1437,7 +1467,7 @@ class EchoCanceller:
         # the reference at the exact (fractional) mapping, so must this
         phi = self.mic.off_f - round(self.mic.off_f)
         q = (P - W) + phi - base - ref.delay - ref.adj
-        x = _probe_mix(ref.timeline.read(q - E - S, W + 2 * S))
+        x = _probe_views(ref.timeline.read(q - E - S, W + 2 * S))[ref.view]
         if (float(np.sqrt(np.mean(x[S:S + W] ** 2))) < LOUD_RMS
                 or float(np.sqrt(np.mean(mic ** 2))) < LOUD_RMS):
             return

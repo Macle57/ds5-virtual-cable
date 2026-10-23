@@ -323,6 +323,39 @@ class CancellerTests(unittest.TestCase):
         steady = slice(10 * FS, 15 * FS)
         self.assertLess(db(out[steady], mic[steady]), -25.0)
 
+    def test_a_speaker_that_plays_one_channel_of_a_stereo_endpoint_is_found(self):
+        # MEASURED round 8: a DualSense on a cable plays only the RIGHT channel
+        # of its stereo endpoint. With different content left and right, the
+        # probe's L-weighted mix halved the correlation peak and two 18 s takes
+        # of stereo speech were never cancelled from a cold start.
+        sim = Sim()
+        n = 18 * FS
+        L, R = speechlike(n, 2, rate=5.1), speechlike(n, 3, rate=4.3)
+        noise = np.random.default_rng(5).standard_normal(n).astype(np.float32)
+        er = echo_of(R, room(8, 0.5), 40)
+        mic = er + noise * np.float32(0.5 * np.sqrt(np.mean(er ** 2)))
+        out = aligned(sim.run(mic, ref=np.stack([L, R], 1)), n)
+        self.assertEqual(sim.eng.status()["slots"], ["Speakers (Test)"])
+        self.assertEqual(AEC.VIEW_NAMES[sim.eng._refs["Speakers (Test)"].view], "right")
+        steady = slice(10 * FS, 17 * FS)
+        # what is left is the room noise (-6 dB under the echo), not the echo
+        self.assertLess(db(out[steady], mic[steady]), -5.0)
+
+    def test_a_stereo_reference_the_mic_cannot_hear_is_not_slotted(self):
+        # the probe takes the best of three views (mix, left, right): unrelated
+        # audio on either channel must still never qualify -- headphones, with
+        # someone talking in the room
+        sim = Sim()
+        n = 40 * FS
+        L, R = speechlike(n, 2, rate=5.1), speechlike(n, 3, rate=4.3)
+        mic = speechlike(n, 9, rate=2.3, amp=0.2) + np.float32(1e-3) * \
+            np.random.default_rng(4).standard_normal(n).astype(np.float32)
+        out = sim.run(mic, ref=np.stack([L, R], 1))
+        self.assertEqual(sim.eng.status()["slots"], [])
+        self.assertEqual(sim.eng.stats["pair_slotted"], 0)
+        want = to16(mic)
+        np.testing.assert_array_equal(out[F:F + want.size - F], want[:want.size - F])
+
     def test_a_second_speaker_does_not_disturb_the_first(self):
         sim = Sim()
         n = 26 * FS
