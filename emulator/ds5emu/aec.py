@@ -133,6 +133,31 @@ PROBE_SURE_PEAK = 20.0
 #: A slotted endpoint's echo counts as still there with a peak this high
 #: inside its filter's window (see `_probe`).
 PROBE_CONFIRM_PEAK = 8.0
+#: A stereo reference is probed in three views (`_probe_views`: the mix, left,
+#: right). Every peak threshold here -- MIN, SURE, CONFIRM, PAIR -- applies to
+#: the best of the three: they ask whether, and where, the endpoint's echo is
+#: in the mic, whichever channel carries it. That costs a little against
+#: unrelated audio (synthetic null, 1 s windows: median peak 3.73 -> 3.98 over
+#: the whole range, 2.89 -> 3.31 inside a filter's window; the live null
+#: maximum, 10.4, was measured on the mix alone, against PROBE_MIN_PEAK 12;
+#: live with the three views, round 8: stereo music on an endpoint with no
+#: acoustic path, 6 takes, never slotted).
+#: WHICH view an endpoint is aligned on (`Ref.view`, its arrival pattern) is a
+#: separate choice: the mix, unless one channel's peak beats it by
+#: PROBE_VIEW_MARGIN -- over the windows that voted for the delay when the
+#: endpoint is slotted, and while slotted from each probe that hears the echo
+#: (a channel must then beat the CURRENT view by the margin). With mono content
+#: on a stereo endpoint the three views are the same signal and only rounding
+#: tells them apart (review of round 8: the plain best peak picked mix, left,
+#: right 158 / 42 / 0 times in 200), so the margin keeps the mix, and a slot
+#: taken on mono content moves to the right channel by itself once the
+#: content turns stereo. MEASURED: a speaker playing one channel of L != R
+#: content, live (round 8, wired DualSense, right channel only): peak 0.12 /
+#: 0.20 / 0.23 against that channel, 0.05-0.10 against the mix, i.e. ~2x;
+#: synthetic (240 windows per case, room noise 0.5-2x the echo): channel / mix
+#: median 1.62-1.66, 5th percentile 1.26-1.34; mono content exactly 1.000;
+#: unrelated audio 95th percentile 1.25 (it never votes anyway).
+PROBE_VIEW_MARGIN = 1.25
 PROBE_VOTES = 2
 #: Two arrivals of similar strength (see `_pair_vote`): both peaks at least
 #: this high, at most PROBE_PAIR_SPAN_MS apart, at the same places in this
@@ -674,18 +699,34 @@ VIEW_NAMES = ("mix", "left", "right")
 
 def _probe_views(ref: np.ndarray) -> list:
     """(n, nch) -> the signals the delay probe tries: the mix and, for two
-    channels, each channel on its own. The best peak wins; a slotted endpoint
-    keeps the view it was found with for its arrival pattern (`Ref.view`).
+    channels, each channel on its own. The best peak says whether and where
+    the echo is; the view an endpoint's arrival pattern is taken on
+    (`Ref.view`) is the mix unless a channel beats it clearly (see
+    PROBE_VIEW_MARGIN).
 
     MEASURED round 8 (2026-10-23): a DualSense on a USB cable plays only the
     RIGHT channel of its stereo endpoint. With different content left and
-    right the mix halved the correlation peak (0.09-0.10 against 0.20-0.23 for
-    the right channel alone, three takes) and two 18 s takes of stereo speech
-    were never cancelled from a cold start. One speaker of a pair that the pad
-    hears and the other it does not is the same case."""
-    if ref.shape[1] == 1:
-        return [ref[:, 0]]
-    return [_probe_mix(ref)] + [np.ascontiguousarray(ref[:, c]) for c in range(ref.shape[1])]
+    right the mix halved the correlation peak (0.05-0.10 against 0.12, 0.20
+    and 0.23 for the right channel alone, three takes) and two 18 s takes of
+    stereo speech were never cancelled from a cold start. One speaker of a
+    pair that the pad hears and the other it does not is the same case."""
+    return [_probe_view(ref, v) for v in range(1 if ref.shape[1] == 1 else 1 + ref.shape[1])]
+
+
+def _probe_view(ref: np.ndarray, view: int) -> np.ndarray:
+    """One of `_probe_views`, built alone (0: the mix, 1 + c: channel c)."""
+    if view == 0 or ref.shape[1] == 1:
+        return _probe_mix(ref)
+    return np.ascontiguousarray(ref[:, view - 1])
+
+
+def _choose_view(scores, current: int = 0) -> int:
+    """The view to align on, from each view's peak (summed over the windows
+    that agree): `current` unless another beats it by PROBE_VIEW_MARGIN."""
+    best = max(range(len(scores)), key=lambda i: scores[i])
+    if best != current and scores[best] >= PROBE_VIEW_MARGIN * scores[current]:
+        return best
+    return current
 
 
 class Ref:
@@ -723,9 +764,11 @@ class Ref:
         self.rate = 0.0
         self.stored_ms: float | None = None
         self.stored_at = -math.inf
+        self.stored_view = 0
         self.probe_ok_at = -math.inf
-        #: Which `_probe_views` view found the echo (0: the mix); the arrival
-        #: pattern is taken on it. Set when slotted by a probe.
+        #: Which `_probe_views` view the arrival pattern is taken on (0: the
+        #: mix; see PROBE_VIEW_MARGIN). Chosen when slotted, kept in the delay
+        #: store, and re-chosen by the probes while slotted.
         self.view = 0
         self._clear_fine()
         self._clear_windows()
@@ -788,8 +831,16 @@ class DelayStore:
         v = self._d.get(key)
         return None if v is None else float(v["delay_ms"])
 
-    def put(self, key: str, delay_ms: float) -> None:
-        self._d[key] = {"delay_ms": round(float(delay_ms), 3), "t": round(time.time())}
+    def view(self, key: str) -> int:
+        """The probe view stored with the delay (`VIEW_NAMES`); 0, the mix,
+        for an entry written before views were stored, or an unknown name."""
+        v = self._d.get(key) or {}
+        name = v.get("view")
+        return VIEW_NAMES.index(name) if name in VIEW_NAMES else 0
+
+    def put(self, key: str, delay_ms: float, view: int = 0) -> None:
+        self._d[key] = {"delay_ms": round(float(delay_ms), 3), "view": VIEW_NAMES[view],
+                        "t": round(time.time())}
         self._save()
 
     def forget(self, key: str) -> None:
@@ -884,7 +935,8 @@ class EchoCanceller:
         self.stats = {"frames": 0, "frames_active": 0, "lost_packets": 0,
                       "refused": 0, "overruns": 0, "native_errors": 0, "slotted": 0,
                       "slotted_from_store": 0, "store_rejected": 0, "evicted": 0, "pair_slotted": 0,
-                      "unslotted": 0, "delay_moves": 0, "fine_moves": 0, "drift_fits": 0, "fine_repatterns": 0, "probes": 0, "sessions": 0,
+                      "unslotted": 0, "delay_moves": 0, "fine_moves": 0, "drift_fits": 0, "fine_repatterns": 0,
+                      "view_changes": 0, "probes": 0, "sessions": 0,
                       "native_us": 0.0}
 
     def _reset_session(self) -> None:
@@ -1240,23 +1292,24 @@ class EchoCanceller:
         return None if not pad else f"{pad}|{ref.id}"
 
     def _remember(self, ref: Ref, force: bool = True) -> None:
-        """Write this endpoint's delay to the store: always when `force`,
-        otherwise only if it moved by more than STORE_MIN_CHANGE samples, or
-        at all once STORE_DEBOUNCE_S has passed since the last write."""
+        """Write this endpoint's delay and view to the store: always when
+        `force` or the view changed, otherwise only if the delay moved by more
+        than STORE_MIN_CHANGE samples, or at all once STORE_DEBOUNCE_S has
+        passed since the last write."""
         key = self._store_key(ref)
         if not key or ref.delay is None or ref.provisional:
             return                              # only a confirmed delay is kept
         ms = (ref.delay + ref.adj) * 1000 / FS
         now = self._clock()
-        if not force and ref.stored_ms is not None:
+        if not force and ref.stored_ms is not None and ref.stored_view == ref.view:
             # what a followed drift explains is not news: only the part of
             # the change beyond it counts as a move
             elapsed = (now - ref.stored_at) * FS
             moved = abs((ms - ref.stored_ms) * FS / 1000 - ref.rate * elapsed)
             if moved <= STORE_MIN_CHANGE and now - ref.stored_at < STORE_DEBOUNCE_S:
                 return
-        self._store.put(key, ms)
-        ref.stored_ms, ref.stored_at = ms, now
+        self._store.put(key, ms, ref.view)
+        ref.stored_ms, ref.stored_at, ref.stored_view = ms, now, ref.view
 
     def _forget(self, ref: Ref) -> None:
         key = self._store_key(ref)
@@ -1358,8 +1411,10 @@ class EchoCanceller:
                 continue
             ref.delay = d * FS / 1000
             if self._slot(ref, provisional=True):
+                ref.view = self._store.view(key) if ref.nch == 2 else 0
                 self.stats["slotted_from_store"] += 1
-                log.info("echo of %s: using its remembered delay %.1f ms", ref.name, d)
+                log.info("echo of %s: using its remembered delay %.1f ms%s", ref.name, d,
+                         f" ({VIEW_NAMES[ref.view]} channel)" if ref.view else "")
             else:
                 ref.delay = None
 
@@ -1381,7 +1436,9 @@ class EchoCanceller:
             return
         ref.last_probe_pos = P
         self.stats["probes"] += 1
-        view = 0
+        agree = PROBE_AGREE_MS * FS // 1000
+        # Whether and where the echo is: the best peak of the views. Which view
+        # the endpoint is aligned on: by margin (see PROBE_VIEW_MARGIN).
         if ref.slotted:
             # is the echo still where the filter has it? A peak inside the
             # filter's window is far less likely by chance than the highest
@@ -1390,33 +1447,35 @@ class EchoCanceller:
             near = (exp - TRACK_EARLY_MS * FS // 1000, exp + TRACK_LATE_MS * FS // 1000)
             res = [estimate_lag(mic, v, M, A, near=near) for v in views]
             lag, conf, _ = max(res, key=lambda r: r[1])
-            if max(r[2] for r in res) >= PROBE_CONFIRM_PEAK:
+            local = [r[2] for r in res]
+            if max(local) >= PROBE_CONFIRM_PEAK:
                 ref.heard = True
                 ref.probe_ok_at = now
+                self._rechoose_view(ref, local)
         else:
             res = [estimate_lag(mic, v, M, A, second=True) for v in views]
-            view = max(range(len(res)), key=lambda i: res[i][1])
-            lag, conf, lag2, conf2 = res[view]
+            lag, conf = max(res, key=lambda r: r[1])[:2]
+            # each view's peak where it agrees with the best one: a view
+            # whose highest peak is elsewhere did not find this echo
+            scores = [r[1] if abs(r[0] - lag) <= agree else 0.0 for r in res]
         ref.lag_conf = conf
-        agree = PROBE_AGREE_MS * FS // 1000
         if conf < PROBE_MIN_PEAK:
             if not ref.slotted:
                 ref.votes = []
-                if self._pair_vote(ref, lag, conf, lag2, conf2, agree):
-                    ref.view = view
-                    return
+                self._pair_vote(ref, res, agree)
             ref.track_votes = []
             return
         delay = lag - EARLY_MS * FS // 1000
         if not ref.slotted:
-            ref.votes = [v for v in ref.votes[-(PROBE_VOTES - 1):] if abs(v - delay) <= agree] + [delay]
+            ref.votes = [v for v in ref.votes[-(PROBE_VOTES - 1):]
+                         if abs(v[0] - delay) <= agree] + [(delay, scores)]
             if len(ref.votes) >= PROBE_VOTES or conf >= PROBE_SURE_PEAK:
-                ref.delay = float(np.median(ref.votes))
+                ref.delay = float(np.median([v[0] for v in ref.votes]))
                 if self._slot(ref):
-                    ref.view = view
+                    ref.view = _choose_view(np.sum([v[1] for v in ref.votes], axis=0))
                     log.info("echo of %s found %.1f ms behind its reference (peak %.1f%s) "
                              "-- cancelling it", ref.name, lag * 1000 / FS, conf,
-                             f", {VIEW_NAMES[view]} channel" if view else "")
+                             f", {VIEW_NAMES[ref.view]} channel" if ref.view else "")
                     self._remember(ref)
                 else:
                     ref.delay = None
@@ -1448,6 +1507,28 @@ class EchoCanceller:
                      shift * 1000 / FS)
             self._remember(ref)
 
+    def _rechoose_view(self, ref: Ref, local: list) -> None:
+        """A slotted endpoint's view, re-chosen from a probe that heard its
+        echo (`local`: each view's peak inside the filter's window): a slot
+        taken on mono content (the mix) moves to the one channel a speaker
+        plays once the content is stereo, and a wrong or stale view -- from
+        the store, or from content that has changed -- corrects itself. The
+        arrival pattern is kept: it is the room's, and while the views agreed
+        (mono) it was taken on the same signal. One taken on a wrong view
+        while they differed does not match and is re-learned
+        (`FINE_STALE_WINDOWS`); that session is then left to the adaptive
+        filter, and the next one is re-aligned (synthetic: 0.5-3 s after the
+        start -11.9 dB, against -3.3 with the view left wrong)."""
+        view = _choose_view(local, ref.view)
+        if view == ref.view:
+            return
+        log.info("echo of %s: aligning on its %s now (peaks %s)", ref.name,
+                 VIEW_NAMES[view] + (" channel" if view else ""),
+                 " / ".join(f"{VIEW_NAMES[i]} {c:.1f}" for i, c in enumerate(local)))
+        ref.view = view
+        self.stats["view_changes"] += 1
+        self._remember(ref)
+
     def _fine(self, ref: Ref) -> None:
         """Re-locate a slotted endpoint's echo to a fraction of a sample and
         keep it where its filter learned it (see FINE_*)."""
@@ -1467,7 +1548,7 @@ class EchoCanceller:
         # the reference at the exact (fractional) mapping, so must this
         phi = self.mic.off_f - round(self.mic.off_f)
         q = (P - W) + phi - base - ref.delay - ref.adj
-        x = _probe_views(ref.timeline.read(q - E - S, W + 2 * S))[ref.view]
+        x = _probe_view(ref.timeline.read(q - E - S, W + 2 * S), ref.view)
         if (float(np.sqrt(np.mean(x[S:S + W] ** 2))) < LOUD_RMS
                 or float(np.sqrt(np.mean(mic ** 2))) < LOUD_RMS):
             return
@@ -1578,29 +1659,36 @@ class EchoCanceller:
         log.debug("echo of %s re-aligned by %+.2f samples (corr %.2f)", ref.name, d, corr)
         self._remember(ref, force=False)
 
-    def _pair_vote(self, ref: Ref, lag, conf, lag2, conf2, agree) -> bool:
+    def _pair_vote(self, ref: Ref, res: list, agree) -> bool:
         """A room with two near-equal arrivals splits the GCC peak between
         them, and neither reaches PROBE_MIN_PEAK (synthetic, round 6 review:
         9-11). Two peaks that are both above PROBE_PAIR_PEAK and stay at the
         same two places over PROBE_PAIR_VOTES windows in a row are as good as
         one strong peak (unrelated audio puts its peaks somewhere new every
         window); the EARLIER one is the delay, so both arrivals are inside
-        the filter. True if the endpoint was slotted."""
+        the filter. `res`: each view's `estimate_lag(..., second=True)`; the
+        pair is the best view's, the view aligned on is chosen as for a
+        single peak (each view scored where its highest peak is one of the
+        pair). True if the endpoint was slotted."""
+        lag, conf, lag2, conf2 = max(res, key=lambda r: r[1])
         if (conf < PROBE_PAIR_PEAK or conf2 < PROBE_PAIR_PEAK
                 or abs(lag - lag2) > PROBE_PAIR_SPAN_MS * FS // 1000):
             ref.pair_votes = []
             return False
         pair = (min(lag, lag2), max(lag, lag2))
+        scores = [r[1] if min(abs(r[0] - lag), abs(r[0] - lag2)) <= agree else 0.0 for r in res]
         keep = [v for v in ref.pair_votes[-(PROBE_PAIR_VOTES - 1):]
-                if abs(v[0] - pair[0]) <= agree and abs(v[1] - pair[1]) <= agree]
-        ref.pair_votes = keep + [pair]
+                if abs(v[0][0] - pair[0]) <= agree and abs(v[0][1] - pair[1]) <= agree]
+        ref.pair_votes = keep + [(pair, scores)]
         if len(ref.pair_votes) < PROBE_PAIR_VOTES:
             return False
-        ref.delay = float(np.median([v[0] for v in ref.pair_votes])) - EARLY_MS * FS // 1000
+        ref.delay = float(np.median([v[0][0] for v in ref.pair_votes])) - EARLY_MS * FS // 1000
+        view = _choose_view(np.sum([v[1] for v in ref.pair_votes], axis=0))
         ref.pair_votes = []
         if not self._slot(ref):
             ref.delay = None
             return False
+        ref.view = view
         self.stats["pair_slotted"] += 1
         log.info("echo of %s found as two arrivals %.1f and %.1f ms behind its reference "
                  "(peaks %.1f, %.1f) -- cancelling it", ref.name, pair[0] * 1000 / FS,

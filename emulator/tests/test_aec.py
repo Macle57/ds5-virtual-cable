@@ -338,8 +338,104 @@ class CancellerTests(unittest.TestCase):
         self.assertEqual(sim.eng.status()["slots"], ["Speakers (Test)"])
         self.assertEqual(AEC.VIEW_NAMES[sim.eng._refs["Speakers (Test)"].view], "right")
         steady = slice(10 * FS, 17 * FS)
-        # what is left is the room noise (-6 dB under the echo), not the echo
+        # the room noise is 6 dB under the echo, i.e. 7 dB under the mic: at
+        # least 5 of those 7 dB must go (what is left is the noise, not the echo)
         self.assertLess(db(out[steady], mic[steady]), -5.0)
+
+    @staticmethod
+    def _one_channel_take(sim, seed, mono, noise, n=14 * FS, shift_ms=None):
+        """A speaker that plays only the RIGHT channel of its stereo endpoint,
+        with mono content (L == R) or stereo (L != R), room noise 10 dB under
+        its echo. With `shift_ms`, in a new capture session whose mic anchor
+        is that far off the last one's. Returns (mic, output)."""
+        if shift_ms is not None:
+            sim.eng.pause(); sim.eng._new_session(); sim.eng.resume()
+            sim.lat += shift_ms / 1000
+        L = speechlike(n, seed, rate=5.1)
+        R = L if mono else speechlike(n, seed + 1, rate=4.3)
+        e = echo_of(R, room(8, 0.5), 40)
+        mic = e + noise.standard_normal(n).astype(np.float32) * np.float32(0.3 * np.sqrt(np.mean(e ** 2)))
+        return mic, aligned(sim.run(mic, ref=np.stack([L, R], 1)), n)
+
+    def test_mono_content_on_a_one_channel_speaker_does_not_pick_a_channel_by_noise(self):
+        # Review of round 8: with L == R the three probe views are one signal,
+        # and the plain best peak picked mix / left / right by rounding noise.
+        # A wired pad (right channel only) slotted on mono content with the
+        # LEFT view kept it: once the content turned stereo its arrival
+        # pattern was taken on a channel the speaker does not play, every
+        # session-start re-alignment failed, and only an unslot reset it.
+        sim = Sim()
+        sim.rng = np.random.default_rng(4)      # a jitter on which the old probe took "left"
+        noise = np.random.default_rng(104)
+        self._one_channel_take(sim, 2, True, noise, n=8 * FS)
+        r = sim.eng._refs["Speakers (Test)"]
+        self.assertTrue(r.slotted)
+        self.assertEqual(AEC.VIEW_NAMES[r.view], "mix")
+        moves = sim.eng.stats["fine_moves"]
+        mic, out = self._one_channel_take(sim, 12, False, noise, shift_ms=4)
+        # the slotted probe moved it to the channel the speaker plays ...
+        self.assertEqual(AEC.VIEW_NAMES[r.view], "right")
+        self.assertEqual(sim.eng.stats["unslotted"], 0)
+        # ... and the new session was re-aligned (on the mix: before the fix,
+        # on the left channel, it was not: -1.4 and -5.4 dB)
+        self.assertGreaterEqual(sim.eng.stats["fine_moves"], moves + 1)
+        first, steady = slice(FS // 2, 3 * FS), slice(3 * FS, 13 * FS)
+        self.assertLess(db(out[first], mic[first]), -5.0)
+        self.assertLess(db(out[steady], mic[steady]), -9.0)    # the room noise: -10.8
+
+    def test_a_stale_view_corrects_itself_while_slotted(self):
+        # However a slotted endpoint came to align on a channel its speaker
+        # does not play (an old store entry, a channel that went quiet), the
+        # probes move it to the right one without an unslot; from the next
+        # session on the session-start re-alignment works again.
+        sim = Sim()
+        noise = np.random.default_rng(101)
+        self._one_channel_take(sim, 2, True, noise, n=8 * FS)
+        r = sim.eng._refs["Speakers (Test)"]
+        self.assertTrue(r.slotted)
+        r.view = AEC.VIEW_NAMES.index("left")
+        self._one_channel_take(sim, 12, False, noise, shift_ms=4)
+        self.assertEqual(AEC.VIEW_NAMES[r.view], "right")
+        self.assertGreaterEqual(sim.eng.stats["view_changes"], 1)
+        self.assertEqual(sim.eng.stats["unslotted"], 0)
+        moves = sim.eng.stats["fine_moves"]
+        mic, out = self._one_channel_take(sim, 22, False, noise, shift_ms=-3)
+        self.assertGreaterEqual(sim.eng.stats["fine_moves"], moves + 1)
+        first = slice(FS // 2, 3 * FS)
+        self.assertLess(db(out[first], mic[first]), -8.0)      # left kept: -3.3 dB
+
+    def test_the_view_is_remembered_with_the_delay(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "echo-delays.json")
+            store = AEC.DelayStore(path)
+            store.put("pad1|A", 50.0, AEC.VIEW_NAMES.index("right"))
+            store.put("pad1|B", 60.0)
+            again = AEC.DelayStore(path)
+            self.assertEqual(again.get("pad1|A"), 50.0)
+            self.assertEqual(AEC.VIEW_NAMES[again.view("pad1|A")], "right")
+            self.assertEqual(again.view("pad1|B"), 0)
+            # an entry written before views were stored, and one with a view
+            # this build does not know, still load: on the mix
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"pad1|A": {"delay_ms": 40.0, "t": 1}, '
+                        '"pad1|B": {"delay_ms": 41.0, "view": "centre", "t": 1}}')
+            old = AEC.DelayStore(path)
+            self.assertEqual(old.get("pad1|A"), 40.0)
+            self.assertEqual(old.view("pad1|A"), 0)
+            self.assertEqual(old.get("pad1|B"), 41.0)
+            self.assertEqual(old.view("pad1|B"), 0)
+            self.assertEqual(old.view("pad1|C"), 0)
+            # a one-channel speaker found on its channel is slotted on it again
+            # after a restart, from its first sound
+            first = Sim(delay_store=AEC.DelayStore(path), pad_id="pad1")
+            self._one_channel_take(first, 2, False, np.random.default_rng(5), n=8 * FS)
+            self.assertEqual(AEC.VIEW_NAMES[AEC.DelayStore(path).view("pad1|Speakers (Test)")], "right")
+            second = Sim(delay_store=AEC.DelayStore(path), pad_id="pad1")
+            n = FS // 2
+            L, R = speechlike(n, 2, rate=5.1), speechlike(n, 3, rate=4.3)
+            second.run(echo_of(R, room(8, 0.5), 40), ref=np.stack([L, R], 1))
+            self.assertEqual(second.eng.stats["slotted_from_store"], 1)
+            self.assertEqual(AEC.VIEW_NAMES[second.eng._refs["Speakers (Test)"].view], "right")
 
     def test_a_stereo_reference_the_mic_cannot_hear_is_not_slotted(self):
         # the probe takes the best of three views (mix, left, right): unrelated
@@ -566,7 +662,7 @@ class CancellerTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as d:
                     store = AEC.DelayStore(os.path.join(d, "s.json"))
                     put = store.put
-                    store.put = lambda k, v: (writes.append(v), put(k, v))
+                    store.put = lambda k, v, *a: (writes.append(v), put(k, v, *a))
                     sim = Sim(delay_store=store, pad_id="pad1")
                     out = aligned(sim.run(mic, ref=ref), n)
                 r = sim.eng._refs["Speakers (Test)"]
