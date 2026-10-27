@@ -544,23 +544,87 @@ class TestInstallerHandOff(unittest.TestCase):
             sys.argv = argv
 
 
+def _yes(info):
+    return True
+
+
 class TestAutoInstall(unittest.TestCase):
-    """`update_auto_install`: the decision, the act, and once per version."""
+    """`update_auto_install`: the decision, the question, the act, and once
+    per version."""
 
     def info(self):
         return U.evaluate_release(release("v0.5.0"), "0.4.0")
 
     def test_off_by_config(self):
         up = U.Updater(current_version="0.4.0", auto_install=False,
-                       install_fn=lambda: None)
+                       install_fn=lambda: None, ask=_yes)
         self.assertFalse(up.should_auto_install(self.info()))
 
     def test_nothing_to_install_or_nothing_to_call(self):
         up = U.Updater(current_version="0.4.0", auto_install=True,
-                       install_fn=lambda: None)
+                       install_fn=lambda: None, ask=_yes)
         self.assertFalse(up.should_auto_install(None))
-        self.assertFalse(U.Updater(current_version="0.4.0", auto_install=True)
+        self.assertFalse(U.Updater(current_version="0.4.0", auto_install=True,
+                                   ask=_yes)
                          .should_auto_install(self.info()))
+
+    def test_no_one_to_ask_means_nothing_automatic(self):
+        # The whole point: an install never starts without a yes, so an
+        # Updater with no way to get one has no automatic path, on or not.
+        up = U.Updater(current_version="0.4.0", auto_install=True,
+                       install_fn=lambda: None)
+        self.assertFalse(up.should_auto_install(self.info()))
+
+    def test_no_keeps_the_version_until_the_next_start(self):
+        asked, calls = [], []
+        up = U.Updater(current_version="0.4.0", auto_install=True,
+                       install_fn=lambda: calls.append(1),
+                       ask=lambda i: asked.append(i.version) or False)
+        info = self.info()
+        self.assertTrue(up.should_auto_install(info))
+        self.assertFalse(up.ask_user(info))
+        self.assertEqual(asked, ["0.5.0"])
+        self.assertEqual(calls, [])
+        # Declined: this process does not ask about 0.5.0 again ...
+        self.assertFalse(up.should_auto_install(info))
+        # ... but a newer release is a new question, and a new process (a
+        # new Updater) asks about 0.5.0 afresh.
+        newer = U.evaluate_release(release("v0.6.0"), "0.4.0")
+        self.assertTrue(up.should_auto_install(newer))
+        self.assertTrue(U.Updater(current_version="0.4.0", auto_install=True,
+                                  install_fn=lambda: None, ask=_yes)
+                        .should_auto_install(info))
+
+    def test_a_prompt_that_raises_is_a_no(self):
+        def broken(info):
+            raise RuntimeError("no desktop")
+        up = U.Updater(current_version="0.4.0", auto_install=True,
+                       install_fn=lambda: None, ask=broken)
+        self.assertFalse(up.ask_user(self.info()))
+        self.assertFalse(up.should_auto_install(self.info()))
+
+    def test_the_loop_asks_once_and_installs_nothing_on_no(self):
+        import threading
+        import time
+        asked, calls = [], []
+        up = U.Updater(current_version="0.4.0", auto_install=True,
+                       install_fn=lambda: calls.append(1),
+                       ask=lambda i: asked.append(1) or False,
+                       auto_delay_s=0.0)
+        info = self.info()
+        up.check_once = lambda: info
+        saved = (U.STARTUP_DELAY_S, U.CHECK_INTERVAL_S)
+        U.STARTUP_DELAY_S, U.CHECK_INTERVAL_S = 0.0, 0.01   # many checks
+        try:
+            t = threading.Thread(target=up._loop, daemon=True)
+            t.start()
+            time.sleep(0.3)
+        finally:
+            up.stop()
+            U.STARTUP_DELAY_S, U.CHECK_INTERVAL_S = saved
+            t.join(2)
+        self.assertEqual(asked, [1])
+        self.assertEqual(calls, [])
 
     def test_installs_a_bounded_number_of_times_per_version(self):
         # Each attempt here "fails" (the install thread would clear
@@ -568,7 +632,7 @@ class TestAutoInstall(unittest.TestCase):
         # limits the retries: AUTO_INSTALL_ATTEMPTS, then no more.
         calls = []
         up = U.Updater(current_version="0.4.0", auto_install=True,
-                       install_fn=lambda: calls.append(1))
+                       install_fn=lambda: calls.append(1), ask=_yes)
         info = self.info()
         for _ in range(U.AUTO_INSTALL_ATTEMPTS):
             self.assertTrue(up.should_auto_install(info))
@@ -581,11 +645,13 @@ class TestAutoInstall(unittest.TestCase):
     def test_the_loop_retries_a_failed_install_then_falls_back_to_daily(self):
         # A stalled download: `install()` clears `installing` on failure.
         # The loop must try again after `auto_retry_s`, up to the limit, and
-        # keep waiting (not retry) while an attempt is still running.
+        # keep waiting (not retry) while an attempt is still running -- and
+        # ask once: the yes stands for the retries.
         import threading
-        calls = []
+        asked, calls = [], []
         up = U.Updater(current_version="0.4.0", auto_install=True,
                        install_fn=lambda: calls.append(1),
+                       ask=lambda i: asked.append(1) or True,
                        auto_delay_s=0.01)
         up.auto_retry_s = 0.01
         up.auto_attempts = 3
@@ -605,10 +671,11 @@ class TestAutoInstall(unittest.TestCase):
             U.STARTUP_DELAY_S, U.CHECK_INTERVAL_S = saved
             t.join(2)
         self.assertEqual(calls, [1, 1, 1])
+        self.assertEqual(asked, [1])
 
     def test_an_install_already_under_way_is_not_started_twice(self):
         up = U.Updater(current_version="0.4.0", auto_install=True,
-                       install_fn=lambda: None)
+                       install_fn=lambda: None, ask=_yes)
         up.installing = True
         self.assertFalse(up.should_auto_install(self.info()))
 
@@ -618,25 +685,33 @@ class TestAutoInstall(unittest.TestCase):
         def boom():
             raise RuntimeError("no disk")
         up = U.Updater(current_version="0.4.0", auto_install=True, install_fn=boom,
-                       notify=lambda t, b: seen.append((t, b)))
+                       notify=lambda t, b: seen.append((t, b)), ask=_yes)
         up.auto_attempts = 1
         self.assertFalse(up.run_auto_install(self.info()))
         self.assertEqual(seen[0][0], "Update failed")
         self.assertFalse(up.should_auto_install(self.info()))
 
     def test_start_if_enabled_wires_the_config_and_the_callable(self):
-        up = U.start_if_enabled(_Cfg(True, True), install_fn=lambda: None)
+        up = U.start_if_enabled(_Cfg(True, True), install_fn=lambda: None,
+                                ask=_yes)
         try:
             self.assertTrue(up.auto_install)
         finally:
             up.stop()
-        up = U.start_if_enabled(_Cfg(True, False), install_fn=lambda: None)
+        up = U.start_if_enabled(_Cfg(True, False), install_fn=lambda: None,
+                                ask=_yes)
         try:
             self.assertFalse(up.auto_install)
         finally:
             up.stop()
-        # No callable: nothing automatic, whatever the config says.
-        up = U.start_if_enabled(_Cfg(True, True))
+        # No callable, or no one to ask: nothing automatic, whatever the
+        # config says.
+        up = U.start_if_enabled(_Cfg(True, True), ask=_yes)
+        try:
+            self.assertFalse(up.auto_install)
+        finally:
+            up.stop()
+        up = U.start_if_enabled(_Cfg(True, True), install_fn=lambda: None)
         try:
             self.assertFalse(up.auto_install)
         finally:

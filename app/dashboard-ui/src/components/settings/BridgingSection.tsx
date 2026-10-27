@@ -59,7 +59,7 @@ export default function BridgingSection() {
       <Row label="Check for updates" keyName="update_check" root="" help={HELP.update_check}>
         <Toggle path={["update_check"]} dflt />
       </Row>
-      <Row label="Install updates automatically" keyName="update_auto_install" root="" help={HELP.update_auto_install}>
+      <Row label="Ask to install updates" keyName="update_auto_install" root="" help={HELP.update_auto_install}>
         <Toggle path={["update_auto_install"]} dflt />
       </Row>
       <UpdateRow />

@@ -731,9 +731,12 @@ class TrayApp:
             notify=lambda t, x: self._notify_if("update", t, x),
             # The automatic install (config.update_auto_install) runs the
             # same code as the "Install update" row, from the updater's
-            # own thread; without an install_fn there is no automatic path.
+            # own thread, and only after the person has said yes to the
+            # box below; without an install_fn and an ask there is no
+            # automatic path.
             auto_install=bool(getattr(self.cfg, "update_auto_install", True)),
-            install_fn=lambda: self._act_update_install())
+            install_fn=lambda: self._act_update_install(),
+            ask=self._ask_install_update)
         inner = upd.check_once
 
         def check_once():
@@ -1255,6 +1258,26 @@ class TrayApp:
                              if want else
                              "ds5bridge will no longer start at login.")
         self._work("autostart", act)
+
+    def _ask_install_update(self, info) -> bool:
+        """The question behind `update_auto_install`: a Yes/No box, on the
+        updater's thread (it blocks there, which is fine: that thread has
+        nothing else to do until it is answered). Plain on purpose -- not
+        topmost, not forced to the foreground: a box that jumped in front
+        of a full-screen game would be its own kind of interruption, so it
+        waits behind, with the taskbar flashing, and the toast has already
+        said what it is about. No is the default button: a stray Enter must
+        never pull the controller out from under someone."""
+        text = (f"ds5bridge {info.version} is ready to install (you have "
+                f"{VERSION}).\n\n"
+                f"Installing restarts the bridge: every connected controller "
+                f"drops out for about a minute, so not in the middle of a "
+                f"game.\n\n"
+                f"Install it now?\n\n"
+                f"No keeps {VERSION}. Install it any time from the tray menu "
+                f"(Install update {info.version}) or the dashboard; you will "
+                f"be asked again the next time ds5bridge starts.")
+        return _yes_no_box(text, "ds5bridge update")
 
     def _install_update(self, *_):
         """The "Install update" row. All of it happens in update.py; the tray
@@ -1951,6 +1974,20 @@ def _message_box(text: str, title: str) -> None:
         ctypes.windll.user32.MessageBoxW(None, text, title, 0x40)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _yes_no_box(text: str, title: str) -> bool:
+    """A modal Yes/No question with No as the default button -- module-level
+    so tests can replace it. Anything but a plain Yes (No, the close box,
+    no desktop to show it on) is False."""
+    try:
+        import ctypes
+
+        # MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2; IDYES is 6.
+        return ctypes.windll.user32.MessageBoxW(
+            None, text, title, 0x4 | 0x40 | 0x100) == 6
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def run_tray(args) -> int:
