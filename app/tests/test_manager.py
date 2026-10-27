@@ -1818,6 +1818,244 @@ class TestReconnect(_Base):
 
 
 # ---------------------------------------------------------------------------
+# keep the virtual controller connected after a disconnect (rule 8)
+# ---------------------------------------------------------------------------
+
+
+class TestDisconnectLinger(_Base):
+    """`linger_s`: hold a disconnected pad's virtual device for its return.
+
+    The user-facing promise: switch the pad off and on again within the
+    window and the game never sees a controller leave -- the SAME child and
+    the SAME virtual device carry on. Off (0, the default), every grace is
+    exactly what it was; when the window runs out the teardown is the
+    ordinary disconnect teardown.
+    """
+
+    def make(self, **kw):
+        #: Every bridge object the factory built, in order: "no second child"
+        #: is a statement about A's entries in this list (B, still switched
+        #: on, is bridged by the passes as usual).
+        self.built = []
+
+        def factory(*a, **k):
+            b = FakeBridge(*a, **k)
+            self.built.append(b)
+            return b
+        kw.setdefault("bridge_factory", factory)
+        return super().make(**kw)
+
+    def children_of_a(self) -> int:
+        return sum(1 for b in self.built if b.serial == A)
+
+    def lingering(self, m, at_ago=10.0, enumerated=False):
+        """Start A, switch it off `at_ago` seconds ago, and run one pass."""
+        m.start(A)
+        b = m._bridges[A]
+        if not enumerated:
+            self.present = [B]
+        b.go_offline(at=time.monotonic() - at_ago)
+        m.poll_once()
+        return b
+
+    # -- off -----------------------------------------------------------------
+
+    def test_off_by_default(self):
+        m = self.make()
+        self.assertEqual(m.linger_s, 0.0)
+        snap = m.snapshot()
+        self.assertEqual(snap["aggregate"]["lingering"], 0)
+
+    def test_off_keeps_the_two_witness_grace(self):
+        m = self.make()                              # stock graces, no linger
+        b = self.lingering(m, at_ago=3.5)
+        self.assertNotIn(A, m._bridges)
+        self.assertTrue(b.stopped_hard)
+        self.assertEqual(self.children_of_a(), 1)
+
+    def test_off_keeps_the_one_witness_grace(self):
+        m = self.make()
+        self.lingering(m, at_ago=11.0, enumerated=True)
+        self.assertIn(A, m._bridges, "torn down before offline_grace")
+        m._bridges[A]._offline_since = time.monotonic() - 12.5
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+
+    def test_off_reports_no_countdown(self):
+        m = self.make(gone_grace=999.0, offline_grace=999.0)
+        self.lingering(m, at_ago=1.0)
+        c = m.snapshot()["controllers"][A]
+        self.assertEqual(c["state"], M.DEGRADED)
+        self.assertIsNone(c["linger_left_s"])
+
+    # -- on --------------------------------------------------------------------
+
+    def test_a_switched_off_pad_keeps_its_virtual_controller(self):
+        m = self.make(linger_s=120.0)
+        b = self.lingering(m, at_ago=60.0)          # both witnesses agree
+        self.assertIs(m._bridges.get(A), b)
+        self.assertFalse(b.stopped)
+        self.assertEqual(FakeBridge.cleaned, [])
+        snap = m.snapshot()
+        c = snap["controllers"][A]
+        self.assertTrue(c["present"])
+        self.assertTrue(c["attached"])
+        self.assertTrue(55 <= c["linger_left_s"] <= 60, c["linger_left_s"])
+        self.assertEqual(snap["aggregate"]["lingering"], 1)
+        self.assertEqual(snap["aggregate"]["degraded"], 1)
+        self.assertTrue(any(s == A and k == "info" and "keeping" in t
+                            for s, k, t in self.events), self.events)
+
+    def test_the_vanish_clock_cannot_cut_a_linger_short(self):
+        """Off is not enumerated: rule 2 would end every linger at 30 s."""
+        m = self.make(linger_s=120.0, vanish_grace=1.0)
+        self.lingering(m, at_ago=50.0)
+        with m._lock:
+            m._missing_since[A] = time.monotonic() - 100.0
+        m.poll_once()
+        self.assertIn(A, m._bridges)
+        self.assertNotIn(A, m._missing_since)
+
+    def test_a_running_child_whose_pad_vanished_still_uses_the_vanish_grace(self):
+        """Rule 2 is untouched: the link is up, so nothing is lingering."""
+        m = self.make(linger_s=120.0, vanish_grace=0.0)
+        m.start(A)
+        self.present = [B]
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+
+    def test_the_pad_coming_back_rejoins_the_same_bridge(self):
+        m = self.make(linger_s=120.0, retry_after=0.0)
+        b = self.lingering(m, at_ago=30.0)
+        # It re-enumerates before the child has reopened it: the absent ->
+        # present edge (rule 6) must not spawn a second child.
+        self.present = [A, B]
+        m.poll_once()
+        self.assertIs(m._bridges.get(A), b)
+        self.assertEqual(self.children_of_a(), 1, "a second child for one pad")
+        # The child's reconnect loop reopens it.
+        b.come_back()
+        m.poll_once()
+        m.poll_once()
+        self.assertIs(m._bridges.get(A), b)
+        self.assertEqual(self.children_of_a(), 1)
+        self.assertFalse(b.stopped)
+        self.assertEqual(FakeBridge.cleaned, [])
+        self.assertEqual(self.adopted, [])
+        self.assertEqual(self.unhidden, [])
+        c = m.snapshot()["controllers"][A]
+        self.assertEqual(c["state"], M.RUNNING)
+        self.assertIsNone(c["linger_left_s"])
+        self.assertTrue(any(s == A and k == "info" and "back" in t
+                            for s, k, t in self.events), self.events)
+
+    def test_a_cloaked_pad_coming_back_rejoins_the_same_bridge(self):
+        """Hidden: enumeration never sees it, the journal still lists it."""
+        m = self.make(linger_s=120.0, hidden_serials=lambda: [A])
+        m.start(A)
+        b = m._bridges[A]
+        self.present = [B]
+        b.go_offline(at=time.monotonic() - 40.0)
+        m.poll_once()
+        self.assertIs(m._bridges.get(A), b)
+        b.come_back()
+        m.poll_once()
+        self.assertIs(m._bridges.get(A), b)
+        self.assertEqual(self.children_of_a(), 1)
+        self.assertTrue(m.snapshot()["controllers"][A]["present"])
+
+    def test_the_window_running_out_tears_down_as_before(self):
+        m = self.make(linger_s=120.0, retry_after=999.0)
+        b = self.lingering(m, at_ago=121.0)
+        self.assertNotIn(A, m._bridges)
+        self.assertTrue(b.stopped_hard, "a disconnect teardown is hard")
+        self.assertEqual(self.adopted, [A], "the cloak is kept for its return")
+        self.assertEqual(FakeBridge.cleaned, [3241])
+        self.assertGreater(m._retry_at[A], time.monotonic())
+        self.assertNotIn(A, m._linger_until)
+        self.assertTrue(any(s == A and k == "warn" and "120s" in t
+                            for s, k, t in self.events), self.events)
+        # ... and a pad switched on afterwards is bridged afresh (rule 6).
+        self.present = [A, B]
+        m.poll_once()
+        self.assertIn(A, m._bridges)
+        self.assertIsNot(m._bridges[A], b)
+
+    def test_the_window_is_judged_on_a_later_pass_too(self):
+        m = self.make(linger_s=120.0)
+        b = self.lingering(m, at_ago=100.0)
+        self.assertIn(A, m._bridges)
+        b._offline_since = time.monotonic() - 125.0
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+
+    def test_a_short_linger_never_shortens_the_ordinary_grace(self):
+        m = self.make(linger_s=5.0, offline_grace=12.0)
+        b = self.lingering(m, at_ago=6.0, enumerated=True)   # one witness
+        self.assertIn(A, m._bridges, "the linger made the wait SHORTER")
+        b._offline_since = time.monotonic() - 12.5
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+
+    def test_a_short_linger_lengthens_the_two_witness_grace(self):
+        m = self.make(linger_s=8.0, gone_grace=3.0, offline_grace=12.0)
+        b = self.lingering(m, at_ago=4.0)
+        self.assertIn(A, m._bridges)
+        b._offline_since = time.monotonic() - 8.5
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+
+    def test_switching_it_off_mid_wait_applies_at_once(self):
+        m = self.make(linger_s=120.0)
+        self.lingering(m, at_ago=30.0)
+        self.assertIn(A, m._bridges)
+        m._wake.clear()
+        m.set_linger(0)
+        self.assertTrue(m._wake.is_set(), "the change waits for a tick")
+        m.poll_once()
+        self.assertNotIn(A, m._bridges)
+
+    def test_switching_it_on_mid_grace_holds_the_bridge(self):
+        m = self.make(gone_grace=999.0, offline_grace=999.0)
+        b = self.lingering(m, at_ago=10.0)
+        m.gone_grace = 3.0
+        m.set_linger(120)
+        m.poll_once()
+        self.assertIs(m._bridges.get(A), b)
+        self.assertIsNotNone(m.snapshot()["controllers"][A]["linger_left_s"])
+
+    def test_a_second_disconnect_gets_a_fresh_window(self):
+        m = self.make(linger_s=120.0)
+        b = self.lingering(m, at_ago=100.0)
+        b.come_back()
+        m.poll_once()
+        b.go_offline(at=time.monotonic() - 1.0)
+        m.poll_once()
+        self.assertIs(m._bridges.get(A), b)
+        left = m.snapshot()["controllers"][A]["linger_left_s"]
+        self.assertGreaterEqual(left, 115)
+        keeping = [t for s, k, t in self.events if k == "info" and "keeping" in t]
+        self.assertEqual(len(keeping), 2)
+
+    def test_the_watcher_does_not_spin_through_a_linger(self):
+        """`gone_grace` as the deadline would mean ten passes a second."""
+        m = self.make(hotplug_interval=5.0, linger_s=120.0, gone_grace=3.0)
+        self.lingering(m, at_ago=10.0)
+        self.assertAlmostEqual(m._next_interval(), 5.0, places=2)
+        m._bridges[A]._offline_since = time.monotonic() - 118.0
+        m.poll_once()
+        self.assertLessEqual(m._next_interval(), 2.0)
+        self.assertGreaterEqual(m._next_interval(), 0.1)
+
+    def test_a_stop_clears_the_countdown(self):
+        m = self.make(linger_s=120.0)
+        self.lingering(m, at_ago=10.0)
+        m.stop(A)
+        self.assertNotIn(A, m._linger_until)
+        self.assertIsNone(m.snapshot()["controllers"][A]["linger_left_s"])
+
+
+# ---------------------------------------------------------------------------
 # the way out
 # ---------------------------------------------------------------------------
 

@@ -51,6 +51,9 @@ export default function StatusCard() {
         <div className="min-w-0 flex-1 leading-tight">
           <div className="display text-[24px] leading-none">{st}</div>
           <div className="mt-1 flex flex-wrap gap-x-3 text-[12.5px] text-ink-2">
+            {c.linger_left_s != null && (
+              <span className="font-semibold text-ink">waiting for the controller to reconnect, {c.linger_left_s} s left</span>
+            )}
             {c.port && <span>usbip port {c.port}</span>}
             {up > 0 && <span>up {Math.floor(up / 60)} min {Math.floor(up % 60)} s</span>}
             {c.error && <span className="font-semibold text-bad">{c.error}</span>}

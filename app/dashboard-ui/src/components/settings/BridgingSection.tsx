@@ -1,8 +1,9 @@
+import { AnimatePresence } from "framer-motion";
 import { AlertTriangle, Download, Eye, EyeOff, FolderOpen, Loader2, RefreshCw, Search, ShieldCheck, ShieldOff } from "lucide-react";
 import { ACTION_LABEL, getPath, isConnected, short, useStore } from "../../lib/store";
 import type { ActionOp, ConfigDoc, Controller, Json } from "../../lib/types";
 import { HELP } from "./help";
-import { Card, Row, Toggle } from "./controls";
+import { Card, NumberField, Reveal, Row, Toggle } from "./controls";
 
 const asObj = (v: unknown): Record<string, Json> =>
   v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, Json>) : {};
@@ -20,6 +21,7 @@ export default function BridgingSection() {
   const live = useStore((s) => s.state.controllers);
   const master = useStore((s) => s.cfg?.enabled !== false);
   const autostart = useStore((s) => s.state.autostart);
+  const linger = useStore((s) => getPath(s.cfg, ["disconnect_linger", "enabled"]) === true);
   const serials = [...new Set([...Object.keys(live), ...Object.keys(asObj(cfg.controllers))])].sort();
   const mode = autostart?.mode;
   const modeNote = mode === "service" ? "as a service, before sign-in"
@@ -50,6 +52,19 @@ export default function BridgingSection() {
       <Row label="Hide a new controller's Bluetooth pad by default" keyName="hide_bluetooth_default" root="" help={HELP.hide_bluetooth_default}>
         <Toggle path={["hide_bluetooth_default"]} />
       </Row>
+      <Row label="Keep the controller connected after it disconnects" keyName="disconnect_linger.enabled" root="" help={HELP.disconnect_linger}>
+        <Toggle path={["disconnect_linger", "enabled"]} />
+      </Row>
+      {/* Reveal is the .st-rows child that wears the rule: give it the rows' column width */}
+      <AnimatePresence initial={false}>
+        {linger && (
+          <Reveal className="max-w-[780px]">
+            <Row label="Wait for it to come back for" keyName="disconnect_linger.seconds" root="" unit="s" help={HELP.disconnect_linger_seconds}>
+              <NumberField path={["disconnect_linger", "seconds"]} dflt={120} min={5} max={3600} step={5} />
+            </Row>
+          </Reveal>
+        )}
+      </AnimatePresence>
       <Row label={"Start with Windows" + (modeNote ? ` (${modeNote})` : "")} keyName="autostart_on_login" root="" help={HELP.autostart_on_login}>
         {mode && mode !== "none" && (
           <span className="st-sticker" style={{ "--tone": "var(--color-cross)" } as React.CSSProperties}>{mode}</span>
@@ -82,7 +97,8 @@ function PadRow({ index, serial, c }: { index: number; serial: string; c: Contro
   const on = isConnected(c);
   const tone = !c || c.present === false ? "var(--color-idle)" : on ? "var(--color-ok)"
     : c.state === "controller offline" ? "var(--color-warn)" : c.error ? "var(--color-bad)" : "var(--color-idle)";
-  const status = !c ? "not connected" : c.present === false ? "disconnected" : c.state ?? "telemetry";
+  const status = !c ? "not connected" : c.present === false ? "disconnected"
+    : c.linger_left_s != null ? `waiting to reconnect, ${c.linger_left_s} s left` : c.state ?? "telemetry";
   return (
     <div className="st-padrow">
       <span className="st-pnum" style={{ background: PAD_TONES[(index - 1) % PAD_TONES.length], color: "var(--color-ink-on)" }}>P{index}</span>

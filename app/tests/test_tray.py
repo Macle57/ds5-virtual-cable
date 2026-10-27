@@ -31,12 +31,13 @@ B = "d42f4ba1485d"
 
 
 def controller(serial=A, state=S.RUNNING, enabled=True, present=True,
-               rate=250.0, battery=50, error=None, label="", hide=False):
+               rate=250.0, battery=50, error=None, label="", hide=False,
+               linger=None):
     return {"serial": serial, "state": state, "enabled": enabled,
             "present": present, "reports_per_s": rate, "battery_percent": battery,
             "error": error, "label": label, "attached": state == S.RUNNING,
             "port": 3241, "uptime_s": 10, "pid": 1234, "last_event": "",
-            "hide_bluetooth": hide}
+            "hide_bluetooth": hide, "linger_left_s": linger}
 
 
 def snap(controllers, master=True):
@@ -48,6 +49,8 @@ def snap(controllers, master=True):
                       "bridges": len(controllers), "running": running,
                       "degraded": sum(1 for c in controllers
                                       if c["state"] == S.DEGRADED),
+                      "lingering": sum(1 for c in controllers
+                                       if c.get("linger_left_s") is not None),
                       "attached": running,
                       "reports_per_s": sum(c["reports_per_s"] for c in controllers),
                       "errors": sum(1 for c in controllers if c["error"])},
@@ -94,6 +97,17 @@ class DescribeTests(unittest.TestCase):
     def test_an_unknown_battery_is_omitted_rather_than_guessed(self):
         self.assertNotIn("%", T.describe(controller(battery=None)))
 
+    def test_a_lingering_controller_shows_its_countdown(self):
+        # config.disconnect_linger: offline, but its virtual controller is
+        # held for its return -- a different promise from plain "offline".
+        text = T.describe(controller(state=S.DEGRADED, rate=0.0, linger=95))
+        self.assertIn("waiting to reconnect, 95s left", text)
+        self.assertNotIn(S.DEGRADED, text)
+
+    def test_an_offline_controller_without_a_linger_is_unchanged(self):
+        text = T.describe(controller(state=S.DEGRADED, rate=0.0))
+        self.assertEqual(text, f"a0fa..d8bb  {S.DEGRADED}  50%")
+
     def test_a_label_is_used_and_keeps_the_serial(self):
         # A label has to stay attributable: two pads called "mine" would be
         # worse than no label at all.
@@ -124,6 +138,9 @@ class _FakeManager:
 
     def set_master_enabled(self, value):
         self.calls.append(("set_master_enabled", value))
+
+    def set_linger(self, seconds):
+        self.calls.append(("set_linger", seconds))
 
     def is_hiding(self, serial):
         return self._snap["controllers"][serial].get("hide_bluetooth", False)
@@ -922,6 +939,21 @@ class TitleTests(unittest.TestCase):
         self.assertIn("1 of 2 bridged", head)
         self.assertIn("1 offline", head)
 
+    def test_a_lingering_controller_is_said_apart_from_offline(self):
+        app = app_with([controller(A),
+                        controller(B, state=S.DEGRADED, linger=60)])
+        head = app._title().splitlines()[0]
+        self.assertEqual(head,
+                         "ds5bridge -- 1 of 2 bridged, 1 waiting to reconnect")
+        self.assertIn("waiting to reconnect, 60s left", app._title())
+
+    def test_lingering_and_offline_are_both_counted(self):
+        app = app_with([controller(A, state=S.DEGRADED),
+                        controller(B, state=S.DEGRADED, linger=60)])
+        self.assertEqual(
+            app._title().splitlines()[0],
+            "ds5bridge -- 0 of 2 bridged, 1 offline, 1 waiting to reconnect")
+
     def test_nothing_offline_says_nothing_about_it(self):
         app = app_with([controller(A), controller(B)])
         self.assertEqual(app._title().splitlines()[0],
@@ -1031,6 +1063,13 @@ class MenuRefreshTests(unittest.TestCase):
         up = self.app([controller(A)])
         down = self.app([controller(A, state=S.DEGRADED)])
         self.assertNotEqual(up._menu_key(), down._menu_key())
+
+    def test_a_linger_countdown_does_in_five_second_steps(self):
+        a = self.app([controller(A, state=S.DEGRADED, linger=101)])
+        b = self.app([controller(A, state=S.DEGRADED, linger=103)])
+        c = self.app([controller(A, state=S.DEGRADED, linger=97)])
+        self.assertEqual(a._menu_key(), b._menu_key())
+        self.assertNotEqual(a._menu_key(), c._menu_key())
 
     def test_a_toggled_checkbox_does(self):
         on = self.app([controller(A, hide=False)])
@@ -1373,6 +1412,19 @@ class DashboardControlTests(unittest.TestCase):
         settle()
         self.assertTrue(app._update_loop_on)
         self.assertEqual(len(_FakeUpdater.made), 2)
+
+    def test_the_dashboard_saving_disconnect_linger_applies_it(self):
+        app = self.app()
+        T.A.available = lambda: False
+        linger = types.SimpleNamespace(linger_s=lambda: 300.0)
+        cfg = types.SimpleNamespace(enabled=True, controllers={},
+                                    hide_bluetooth_default=False,
+                                    autostart_on_login=False,
+                                    update_check=False,
+                                    disconnect_linger=linger)
+        app._on_dashboard_config(cfg)
+        settle()
+        self.assertIn(("set_linger", 300.0), app.mgr.calls)
 
     def test_the_dashboard_saving_autostart_refreshes_the_cache(self):
         app = self.app()

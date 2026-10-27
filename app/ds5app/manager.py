@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import math
 import os
 import re
 import subprocess
@@ -944,6 +945,7 @@ class BridgeManager:
                  vanish_grace: float = 30.0,
                  offline_grace: float = 12.0,
                  gone_grace: float = 3.0,
+                 linger_s: float = 0.0,
                  retry_after: float = 60.0,
                  usbip_exe: str | None = None,
                  audio_target: str = "speaker",
@@ -1012,6 +1014,26 @@ class BridgeManager:
         #: that switching a controller off during a game does what the user
         #: expects it to do -- the controller disconnects.
         self.gone_grace = gone_grace
+        #: "Keep the virtual controller connected after a disconnect"
+        #: (`config.disconnect_linger`): how long a bridge whose child says the
+        #: link is dead keeps its virtual device attached, in seconds. 0 is off
+        #: and is exactly the behaviour above, grace for grace.
+        #:
+        #: The two graces answer "how soon may we believe the pad is gone";
+        #: this answers a different question the user asked themselves: "even
+        #: once it IS gone, hold its place for a while". A game that loses its
+        #: controller often wants it picked again from a menu, or hands the
+        #: returning pad a new player slot; a virtual device that never left
+        #: means the pad that is switched back on inside the window comes back
+        #: on the SAME device, through the same child -- the backend's own
+        #: reconnect loop (`BridgeBackend._reconnect_loop`, every 2 s, no
+        #: limit) reopens it, and the game never sees a thing.
+        #:
+        #: It LENGTHENS the wait and never shortens it: the effective grace is
+        #: `max(linger_s, <the grace the witnesses chose>)`, so a short linger
+        #: under `offline_grace` changes nothing a user could notice. Read on
+        #: every pass, so `set_linger()` applies to a bridge already waiting.
+        self.linger_s = max(0.0, float(linger_s or 0.0))
         self.retry_after = retry_after
         self.usbip_exe = usbip_exe
         self.audio_target = audio_target
@@ -1097,6 +1119,11 @@ class BridgeManager:
         #: Normally a copy of the child's own `offline_since`, which is stamped
         #: when the child says it rather than when a poll notices.
         self._offline_since: dict[str, float] = {}
+        #: Monotonic deadline of each bridge that is LINGERING: offline, with
+        #: `linger_s` on, its virtual device held for the pad's return. Written
+        #: by `poll_once` (which knows which grace the witnesses chose) so that
+        #: `snapshot()` can say "Ns left" without asking anything itself.
+        self._linger_until: dict[str, float] = {}
         #: What the last pass ENUMERATED (not the vouched-for union). Its only
         #: job is to spot the absent -> present edge, which is the moment a
         #: retry backoff stops being justified: see `poll_once`.
@@ -1416,6 +1443,7 @@ class BridgeManager:
             b = self._bridges.pop(serial, None)
             self._missing_since.pop(serial, None)
             self._offline_since.pop(serial, None)
+            self._linger_until.pop(serial, None)
             # Under the SAME lock as the pop. A hotplug pass that saw the bridge
             # gone but not the hold would spawn a replacement while this one was
             # still tearing down, and the replacement dies on the port's named
@@ -1703,6 +1731,27 @@ class BridgeManager:
            BTHENUM nodes stay present and started -- so the pad stayed at
            "1 of 2" through the very fix meant to end that. The HID child
            is what leaves.
+        8. **A lingering bridge waits for its pad (`linger_s`).** With
+           "keep the virtual controller connected" on, a DEGRADED child keeps
+           its bridge for `max(linger_s, grace)` instead of the grace rules
+           4 and 5 chose -- whatever the witnesses say, because the point is
+           to keep the device attached while the pad is KNOWN to be off. Three
+           things follow, and each is load-bearing:
+
+           * the `vanish_grace` clock (rule 2) does not run for a lingering
+             bridge. A pad that is off is not enumerated, so without this the
+             30 s vanish teardown would cut every linger longer than that
+             short. A RUNNING child whose pad merely left enumeration is NOT
+             lingering -- the link is up, so it is not the disconnect this
+             option is about -- and keeps rule 2 exactly as before;
+           * the pad's return needs nothing from this pass. The child's own
+             reconnect loop reopens it (it is whitelisted, so a kept cloak is
+             no obstacle), the child says RUNNING, and the linger ends. The
+             start loop below already skips a serial with a bridge, so the
+             absent -> present edge of rule 6 cannot spawn a second child;
+           * when the window closes the teardown is `_stop_offline`, the same
+             disconnect-shaped stop as without the option: hard, cloak kept,
+             retry window recorded.
         """
         now = time.monotonic()
         with self._lock:
@@ -1753,9 +1802,11 @@ class BridgeManager:
             # in every time the journal spoke up for it.
             self._present = present_list
 
+        linger = self.linger_s
         for serial, b in running:
             if serial in inflight:
                 continue
+            lingering = False
             if snaps[serial].get("state") == DEGRADED:
                 # The child's own timestamp when it has one: it was stamped when
                 # the link died, not when this pass happened to look.
@@ -1777,21 +1828,49 @@ class BridgeManager:
                 # caller has set the two graces to.
                 grace = (min(self.gone_grace, self.offline_grace) if gone
                          else self.offline_grace)
-                if now - first >= grace:
-                    self._emit(serial, "warn",
-                               ("the controller is offline and no longer "
-                                "connected -- switched off, or out of range"
-                                if gone else
-                                f"the controller has been offline for "
+                # Rule 8: the linger only ever lengthens the wait.
+                waited = max(linger, grace) if linger > 0 else grace
+                if now - first >= waited:
+                    if linger > 0:
+                        text = (f"the controller did not come back within "
+                                f"{waited:.0f}s")
+                    elif gone:
+                        text = ("the controller is offline and no longer "
+                                "connected -- switched off, or out of range")
+                    else:
+                        text = (f"the controller has been offline for "
                                 f"{grace:.0f}s")
-                               + " -- stopping its bridge")
+                    self._emit(serial, "warn", text + " -- stopping its bridge")
                     self._stop_offline(serial, now)
                     continue
+                if linger > 0:
+                    lingering = True
+                    with self._lock:
+                        fresh = serial not in self._linger_until
+                        self._linger_until[serial] = first + waited
+                    if fresh:
+                        self._emit(serial, "info",
+                                   f"controller offline -- keeping its virtual "
+                                   f"controller connected for up to "
+                                   f"{waited:.0f}s in case it comes back")
             else:
                 with self._lock:
                     self._offline_since.pop(serial, None)
+                    was_lingering = self._linger_until.pop(serial, None)
+                if was_lingering is not None and snaps[serial].get(
+                        "state") == RUNNING:
+                    self._emit(serial, "info",
+                               "controller back -- reconnected to the same "
+                               "virtual controller")
+            if not lingering:
+                with self._lock:
+                    self._linger_until.pop(serial, None)
 
-            if serial in present:
+            # Rule 2's vanish clock, which a lingering bridge (rule 8) does
+            # not run: its pad is known to be off and the linger owns the
+            # deadline. Popping it also means the clock cannot resume from a
+            # stale start once the child says RUNNING again.
+            if lingering or serial in present:
                 with self._lock:
                     self._missing_since.pop(serial, None)
             else:
@@ -1916,15 +1995,40 @@ class BridgeManager:
         a full interval later. `gone_grace` is used as the deadline even for a
         controller that is still enumerated: waking early costs one enumeration
         and the pass simply decides not to act yet.
+
+        With `linger_s` on, the deadline is the earliest of the two a
+        lingering bridge can have (rule 8 in `poll_once`) that is still ahead
+        -- never `gone_grace`, which would turn a two-minute linger into two
+        minutes of passes ten times a second.
         """
         now = time.monotonic()
         with self._lock:
             starts = list(self._offline_since.values())
+        linger = self.linger_s
         soonest = self.hotplug_interval
         for first in starts:
-            soonest = min(soonest, first + self.gone_grace - now)
+            if linger > 0:
+                ahead = [d for d in (
+                    first + max(linger, min(self.gone_grace,
+                                            self.offline_grace)),
+                    first + max(linger, self.offline_grace)) if d > now]
+                deadline = min(ahead) if ahead else now
+            else:
+                deadline = first + self.gone_grace
+            soonest = min(soonest, deadline - now)
         # Never a hot loop, and never longer than asked for.
         return max(0.1, min(self.hotplug_interval, soonest))
+
+    def set_linger(self, seconds: float) -> None:
+        """Change `linger_s` on a running manager. 0 switches it off.
+
+        Takes effect on the next pass, which this triggers: a bridge already
+        lingering is judged against the new value at once -- turning the
+        option off mid-wait tears it down if the ordinary grace has passed,
+        which is what "off" means.
+        """
+        self.linger_s = max(0.0, float(seconds or 0.0))
+        self._wake.set()
 
     def stop_hotplug(self) -> None:
         self._watch_stop.set()
@@ -1964,14 +2068,16 @@ class BridgeManager:
             enabled = dict(self._enabled)
             hide = dict(self._hide)
             ports = dict(self._ports)
+            linger_until = dict(self._linger_until)
             master = self.master_enabled
             default_enabled = self.default_enabled
             hide_default = self.hide_default
 
         controllers = {}
-        running = degraded = attached = 0
+        running = degraded = attached = lingering = 0
         total_rate = 0.0
         present_set = set(present)
+        now = time.monotonic()
         for serial, b in bridges:
             snap = b.snapshot()
             snap["enabled"] = enabled.get(serial, default_enabled)
@@ -1983,11 +2089,20 @@ class BridgeManager:
                         else {"hide_effective": None, "hide_note": ""})
             snap["present"] = (serial in present_set
                                or snap["state"] in _HOLDING)
+            # Rule 8 of `poll_once`: whole seconds until a lingering bridge
+            # gives up on its pad, else None. Only a DEGRADED child can be
+            # lingering; a deadline left over from a moment ago is not news.
+            until = linger_until.get(serial)
+            snap["linger_left_s"] = (
+                max(0, math.ceil(until - now))
+                if until is not None and snap["state"] == DEGRADED else None)
             controllers[serial] = snap
             if snap["state"] in (RUNNING, DEGRADED):
                 running += 1
             if snap["state"] == DEGRADED:
                 degraded += 1
+            if snap["linger_left_s"] is not None:
+                lingering += 1
             if snap.get("attached"):
                 attached += 1
             total_rate += snap.get("reports_per_s") or 0.0
@@ -2005,6 +2120,7 @@ class BridgeManager:
                     "uptime_s": 0, "attached": False, "last_event": "",
                     "remote_mode": None, "keyboard_open": None,
                     "echo": None, "echo_note": "",
+                    "linger_left_s": None,
                     "enabled": enabled.get(serial, default_enabled),
                     "hide_bluetooth": hide.get(serial, hide_default),
                     **(_hide_status(serial) if hide.get(serial, hide_default)
@@ -2026,6 +2142,9 @@ class BridgeManager:
                 # controller sits switched off on the desk is how a user learns
                 # not to believe the tray.
                 "degraded": degraded,
+                # A subset of `degraded`: the offline bridges that are holding
+                # their virtual device for the pad's return (`linger_s`).
+                "lingering": lingering,
                 "attached": attached,
                 "reports_per_s": round(total_rate, 1),
                 "errors": sum(1 for c in controllers.values() if c.get("error")),

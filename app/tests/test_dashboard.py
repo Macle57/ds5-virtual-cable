@@ -219,6 +219,37 @@ class DashboardCase(unittest.TestCase):
         self.assertNotIn("input", cfg.extra)
         self.assertEqual(cfg.input.off_timer_minutes, 30)
 
+    def test_disconnect_linger_is_served_off_by_default(self):
+        doc = self.get_json("/api/config")["config"]
+        self.assertEqual(doc["disconnect_linger"],
+                         {"enabled": False, "seconds": 120})
+
+    def test_disconnect_linger_round_trips_through_the_api(self):
+        status, body, _ = self.post_config(
+            {"disconnect_linger": {"enabled": True, "seconds": 300}})
+        self.assertEqual(status, 200, body)
+        cfg = K.load()
+        self.assertNotIn("disconnect_linger", cfg.extra)
+        self.assertTrue(cfg.disconnect_linger.enabled)
+        self.assertEqual(cfg.disconnect_linger.seconds, 300)
+        # The host is handed the parsed section, which is what the tray
+        # pushes into the running manager.
+        self.assertEqual(self.saved[-1].disconnect_linger.linger_s(), 300.0)
+        doc = self.get_json("/api/config")["config"]
+        self.assertEqual(doc["disconnect_linger"],
+                         {"enabled": True, "seconds": 300})
+        # A partial update merges: switching it off keeps the chosen time.
+        self.post_config({"disconnect_linger": {"enabled": False}})
+        self.assertEqual(K.load().disconnect_linger.to_dict(),
+                         {"enabled": False, "seconds": 300})
+
+    def test_disconnect_linger_seconds_are_clamped_on_save(self):
+        self.post_config({"disconnect_linger": {"enabled": True,
+                                                "seconds": 999999}})
+        self.assertEqual(K.load().disconnect_linger.seconds, 3600)
+        self.post_config({"disconnect_linger": {"seconds": 1}})
+        self.assertEqual(K.load().disconnect_linger.seconds, 5)
+
     def test_config_post_coerces_garbage_instead_of_saving_it(self):
         # `Config.from_dict` is the gate: nonsense degrades to defaults, so a
         # buggy page cannot poison the startup path.

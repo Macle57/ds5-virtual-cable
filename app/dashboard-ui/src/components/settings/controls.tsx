@@ -25,11 +25,11 @@ export function Toggle({ path, dflt = false, onChange }: { path: string[]; dflt?
   );
 }
 
-export function NumberField({ path, dflt, step, width = 110, nullable = false }:
-  { path: string[]; dflt: number | null; step?: number; width?: number; nullable?: boolean }) {
+export function NumberField({ path, dflt, step, min, max, width = 110, nullable = false }:
+  { path: string[]; dflt: number | null; step?: number; min?: number; max?: number; width?: number; nullable?: boolean }) {
   const [v, set] = useBind<number | null>(path, dflt);
   return (
-    <input type="number" className="field num" step={step} style={{ width }}
+    <input type="number" className="field num" step={step} min={min} max={max} style={{ width }}
            value={v ?? ""}
            onChange={(e) => set(e.target.value === "" ? (nullable ? null : dflt) : Number(e.target.value))} />
   );

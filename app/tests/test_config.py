@@ -640,5 +640,77 @@ class UpdateAutoInstallTests(unittest.TestCase):
         self.assertTrue(CFG.Config.from_dict({"update_auto_install": "maybe"}).update_auto_install)
 
 
+
+class DisconnectLingerTests(_Temp):
+    """`disconnect_linger`: keep the virtual controller connected for a while
+    after the pad disconnects. Off by default (the manager then behaves exactly
+    as it always did), a bounded timer when on, global, and surviving the
+    hand-edited values the rest of this file is about."""
+
+    def test_off_by_default_with_a_sensible_first_value(self):
+        dl = CFG.Config().disconnect_linger
+        self.assertFalse(dl.enabled)
+        self.assertEqual(dl.seconds, 120)
+        self.assertEqual(dl.linger_s(), 0.0,
+                         "off must hand the manager 0 -- the old graces")
+        self.assertEqual(CFG.Config().to_dict()["disconnect_linger"],
+                         {"enabled": False, "seconds": 120})
+
+    def test_an_old_file_without_the_section_loads_as_off(self):
+        self.write(json.dumps({"enabled": True, "controllers": {}}))
+        self.assertEqual(CFG.load().disconnect_linger.linger_s(), 0.0)
+
+    def test_round_trip_through_the_file(self):
+        cfg = CFG.load()
+        cfg.disconnect_linger.enabled = True
+        cfg.disconnect_linger.seconds = 300
+        CFG.save(cfg)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["disconnect_linger"],
+                             {"enabled": True, "seconds": 300})
+        back = CFG.load().disconnect_linger
+        self.assertTrue(back.enabled)
+        self.assertEqual(back.seconds, 300)
+        self.assertEqual(back.linger_s(), 300.0)
+
+    def test_the_seconds_are_kept_while_the_option_is_off(self):
+        dl = CFG.Config.from_dict(
+            {"disconnect_linger": {"enabled": False, "seconds": 45}}
+        ).disconnect_linger
+        self.assertEqual(dl.seconds, 45)
+        self.assertEqual(dl.linger_s(), 0.0)
+
+    def test_out_of_range_seconds_are_clamped_not_discarded(self):
+        def secs(v):
+            return CFG.Config.from_dict(
+                {"disconnect_linger": {"enabled": True, "seconds": v}}
+            ).disconnect_linger.seconds
+        self.assertEqual(secs(1), 5)
+        self.assertEqual(secs(0), 5)
+        self.assertEqual(secs(-30), 5)
+        self.assertEqual(secs(99999), 3600)
+        self.assertEqual(secs(float("inf")), 3600)
+        self.assertEqual(secs(90.4), 90)
+        self.assertEqual(secs("600"), 600)
+
+    def test_garbage_degrades_to_the_defaults(self):
+        def dl(raw):
+            return CFG.Config.from_dict({"disconnect_linger": raw}).disconnect_linger
+        self.assertEqual(dl("yes").to_dict(), {"enabled": False, "seconds": 120})
+        self.assertEqual(dl(None).to_dict(), {"enabled": False, "seconds": 120})
+        got = dl({"enabled": "on", "seconds": "soon"})
+        self.assertTrue(got.enabled)
+        self.assertEqual(got.seconds, 120)
+        self.assertEqual(dl({"seconds": True}).seconds, 120)
+        self.assertEqual(dl({"seconds": float("nan")}).seconds, 120)
+
+    def test_unknown_keys_in_the_section_ride_through(self):
+        cfg = CFG.Config.from_dict(
+            {"disconnect_linger": {"enabled": True, "seconds": 60, "later": 1}})
+        self.assertEqual(cfg.to_dict()["disconnect_linger"],
+                         {"enabled": True, "seconds": 60, "later": 1})
+        self.assertNotIn("disconnect_linger", cfg.extra)
+
+
 if __name__ == "__main__":
     unittest.main()

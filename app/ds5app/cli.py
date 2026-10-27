@@ -583,6 +583,7 @@ def cmd_run_all(args) -> int:
                                          or cfg.hide_bluetooth_default),
                            hidhide_cli=(getattr(args, "hidhide_cli", None)
                                         or cfg.hidhide_cli),
+                           linger_s=cfg.disconnect_linger.linger_s(),
                            telemetry_port=(hub.port if hub else None),
                            on_event=ev)
     if hub is not None:

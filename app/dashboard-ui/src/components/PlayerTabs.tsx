@@ -44,7 +44,8 @@ function PlayerTab({ index, serial, c, active, onSelect }:
   const pct = off ? null : c.telemetry?.decoded?.battery_percent ?? c.battery_percent;
   const remote = !off && remoteMode(c) === true;
   const rc = useRemoteColor();
-  const sub = off ? "switched off" : c.label ? short(serial) : c.state ?? "telemetry";
+  const sub = off ? "switched off" : c.linger_left_s != null ? `waiting to reconnect, ${c.linger_left_s} s`
+    : c.label ? short(serial) : c.state ?? "telemetry";
   const lean = index % 2 ? -1.2 : 1;
   return (
     <motion.button role="tab" aria-selected={active} onClick={onSelect} data-present={off ? "false" : "true"}
