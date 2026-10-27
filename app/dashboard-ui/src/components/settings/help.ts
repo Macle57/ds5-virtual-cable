@@ -6,6 +6,8 @@ export const HELP: Record<string, string> = {
   master_enabled: "The tray's master switch. Off, every bridge stops and the pads go back to being plain Bluetooth controllers; on, enabled pads are bridged again as they are found.",
   auto_bridge_new: "A DualSense this app has never seen is bridged the moment it pairs. Off, a new pad waits until you enable it here or in the tray.",
   hide_bluetooth_default: "What a NEW controller's 'hide' switch starts as: hide its Bluetooth pad from games and Steam while it is bridged, so only the virtual wired pad is seen (no doubled controller). Existing pads keep their own switch below.",
+  disconnect_linger: "When a pad is switched off or loses its Bluetooth link, keep its virtual wired pad plugged in for a while, holding still, instead of unplugging it a few seconds later. Switch the pad back on in time and it carries on as the same controller: the game never sees it leave, so no 'reconnect your controller' screen and no new player slot. When the time runs out it is unplugged as usual. Applies to every controller.",
+  disconnect_linger_seconds: "How long to wait for the pad to come back, from 5 seconds to an hour. While it waits, the tray and this page say 'waiting to reconnect' with the time left.",
   ctrl_enabled: "Bridge this controller: run a virtual wired pad for it whenever it is connected. Off, the pad stays a plain Bluetooth controller.",
   echo_cancel: "Removes what this PC plays from the pad's microphone, so a voice chat does not hear your game back: the pad's own speaker (by the controller itself) and any other speaker the PC drives that the pad can hear, such as a TV or desktop speakers (by the bridge, once it has heard that speaker in the mic). People and other devices in the room are kept. Headphones are never touched.",
   ctrl_hide: "Hide this controller's Bluetooth pad (HidHide) while it is bridged, so games and Steam see only the virtual wired one. The pill beside it says whether the hide is actually in effect right now.",
@@ -152,7 +154,7 @@ export const CTRL_FIELDS: [string, string, "bool" | "number" | "string" | "choic
   ["echo_cancel", "Pad echo cancellation (mic)", "bool"],
   ["port", "usbip TCP port (leave blank for automatic)", "number"],
 ];
-export const KNOWN_GLOBAL = new Set([...GLOBAL_FIELDS.map((f) => f[0]), "controllers", "input", "notifications"]);
+export const KNOWN_GLOBAL = new Set([...GLOBAL_FIELDS.map((f) => f[0]), "controllers", "input", "notifications", "disconnect_linger"]);
 export const KNOWN_CTRL = new Set(CTRL_FIELDS.map((f) => f[0]));
 export const KNOWN_INPUT = new Set(["enabled", "chord_button", "chords", "actions", "macros",
   "double_press_ms", "tap_replay_ms", "repeat_ms", "haptic_ack", "haptic_strength",

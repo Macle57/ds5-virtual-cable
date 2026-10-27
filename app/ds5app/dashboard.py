@@ -53,14 +53,20 @@ Every response is JSON unless stated. Every request must carry a loopback
                                             per-controller snapshot (state,
                                             enabled, present, port, battery,
                                             hide_bluetooth, hide_effective,
-                                            hide_note, error, label, ...) plus
+                                            hide_note, error, label,
+                                            linger_left_s, ...) plus
                                             `telemetry` (the decoded live
                                             input) when the pad is publishing.
                                             A pad the tray has known and lost
                                             stays listed with `present: false`.
+                                            `linger_left_s` is whole seconds
+                                            an offline pad's virtual device
+                                            is still held for its return
+                                            (`disconnect_linger`), else null.
                               aggregate     {present, bridges, running,
-                                            degraded, attached, reports_per_s,
-                                            errors, master_enabled} -- counts
+                                            degraded, lingering, attached,
+                                            reports_per_s, errors,
+                                            master_enabled} -- counts
                                             over PRESENT pads only, so the
                                             header's "N/M bridged" is
                                             running/present.
@@ -82,8 +88,9 @@ Every response is JSON unless stated. Every request must carry a loopback
                             The tray applies the keys it owns LIVE on every
                             save (`enabled`, `controllers.<serial>.enabled`
                             / `.hide_bluetooth`, `hide_bluetooth_default`,
-                            `autostart_on_login`, `update_check`) and its
-                            menu follows immediately.
+                            `autostart_on_login`, `update_check`,
+                            `disconnect_linger`) and its menu follows
+                            immediately.
     GET  /api/actions       the vocabulary the settings page builds its
                             pickers from (see `actions_meta`)
     POST /api/action        {"op": <name>, ...} -> {"ok": bool, "text": str}

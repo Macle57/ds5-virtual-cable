@@ -55,12 +55,14 @@ export interface Controller {
   keyboard_open?: boolean | null;            // the on-screen keyboard is up
   echo?: "off" | "idle" | "on" | "degraded" | null;  // mic echo cancellation (null = not reported)
   echo_note?: string;                        // why it is degraded, when it is
+  linger_left_s?: number | null;             // offline, virtual pad held for its return: seconds left (disconnect_linger)
   last_event?: string;
   telemetry?: Telemetry;
 }
 
 export interface Aggregate {
   present?: number; bridges?: number; running?: number; degraded?: number;
+  lingering?: number;                        // the subset of `degraded` waiting to reconnect
   attached?: number; reports_per_s?: number; errors?: number;
   master_enabled?: boolean;
 }

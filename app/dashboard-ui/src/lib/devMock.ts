@@ -11,6 +11,9 @@
      ?mock=offline  the FIRST pad is switched off (present:false, "controller
                     offline") -- the auto-select must land on the other one
      ?mock=update   an update is available (the Install button lights up)
+     ?mock=linger   the LAST pad is switched off but its virtual pad is held
+                    for its return (disconnect_linger): "waiting to
+                    reconnect", counting down from 120 s and starting over
 
    Compiled out of the production build (import.meta.env.DEV is false there). */
 import type { ActionsMeta, LiveState } from "./types";
@@ -55,6 +58,16 @@ export function mockState(state: LiveState): LiveState {
     void _t;
     controllers[off] = { ...rest, present: false, state: "controller offline", attached: false, reports_per_s: 0, battery_percent: null };
     aggregate = { ...aggregate, present: serials.length - 1, running: serials.length - 1, attached: serials.length - 1 };
+  }
+  if (mode === "linger" && serials.length) {
+    // the manager keeps a lingering pad present and attached, state "controller
+    // offline", with the seconds left on its window (rule 8 of manager.poll_once)
+    const waiting = serials[serials.length - 1];
+    const { telemetry: _t, ...rest } = controllers[waiting];
+    void _t;
+    controllers[waiting] = { ...rest, state: "controller offline", reports_per_s: 0, battery_percent: null,
+                             linger_left_s: 120 - (Math.floor(Date.now() / 1000) % 120) };
+    aggregate = { ...aggregate, degraded: 1, lingering: 1 };
   }
   return {
     ...state, controllers, aggregate,

@@ -907,10 +907,63 @@ class Notifications:
         return True
 
 
+_LINGER_KNOWN = ("enabled", "seconds")
+
+#: The bounds and the first-time value of `disconnect_linger.seconds`.
+LINGER_MIN_S = 5
+LINGER_MAX_S = 3600
+LINGER_DEFAULT_S = 120
+
+
+@dataclass
+class DisconnectLinger:
+    """Keep the virtual controller connected after the pad disconnects.
+
+    Off (the default), a pad that is switched off or drops its Bluetooth link
+    takes its virtual wired DualSense with it a few seconds later, and the
+    game sees the controller unplugged. On, the virtual device stays attached
+    -- reporting a neutral controller -- for up to `seconds`, so a pad that is
+    switched back on inside that window comes back on the SAME device and the
+    game never has to find it again. When the window runs out the bridge is
+    torn down exactly as it would have been without the option.
+
+    Global, not per controller, and always a timer: an "indefinitely" would be
+    a virtual pad a game cannot tell from a real one sitting attached to
+    nothing for as long as the tray runs. `BridgeManager.linger_s` is where
+    it lands; `linger_s()` below is the one number it needs.
+    """
+
+    enabled: bool = False
+    #: How long to hold the virtual device, in seconds. Kept while `enabled`
+    #: is off so the value a user chose survives switching the option off and
+    #: on again. Clamped to LINGER_MIN_S..LINGER_MAX_S.
+    seconds: int = LINGER_DEFAULT_S
+    extra: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "DisconnectLinger":
+        if not isinstance(data, dict):
+            return cls()
+        dl = cls(enabled=_as_bool(data.get("enabled"), False),
+                 seconds=_as_clamped_int(data.get("seconds"), LINGER_DEFAULT_S,
+                                         LINGER_MIN_S, LINGER_MAX_S))
+        dl.extra = {k: v for k, v in data.items() if k not in _LINGER_KNOWN}
+        return dl
+
+    def to_dict(self) -> dict:
+        out = dict(self.extra)
+        out.update(enabled=bool(self.enabled), seconds=int(self.seconds))
+        return out
+
+    def linger_s(self) -> float:
+        """What the manager is given: the seconds when on, 0 when off."""
+        return float(self.seconds) if self.enabled else 0.0
+
+
 _CFG_KNOWN = ("enabled", "autostart_on_login", "auto_bridge_new", "port_base",
               "controllers", "hide_bluetooth_default", "hidhide_cli",
               "dashboard_port", "update_check", "update_auto_install", "input",
-              "notifications")
+              "notifications", "disconnect_linger")
 
 
 @dataclass
@@ -963,6 +1016,8 @@ class Config:
     input: InputConfig = field(default_factory=InputConfig)
     #: Which tray balloons are shown (`Notifications`).
     notifications: Notifications = field(default_factory=Notifications)
+    #: Hold a disconnected pad's virtual device for a while (`DisconnectLinger`).
+    disconnect_linger: DisconnectLinger = field(default_factory=DisconnectLinger)
     extra: dict = field(default_factory=dict)
     #: Where this was loaded from, so `save()` round-trips to the same file even
     #: if the environment changes underneath a long-running tray process.
@@ -1093,6 +1148,8 @@ class Config:
             update_auto_install=_as_bool(data.get("update_auto_install"), True),
             input=InputConfig.from_dict(data.get("input")),
             notifications=Notifications.from_dict(data.get("notifications")),
+            disconnect_linger=DisconnectLinger.from_dict(
+                data.get("disconnect_linger")),
         )
         raw = data.get("controllers")
         if raw is not None and not isinstance(raw, dict):
@@ -1126,6 +1183,7 @@ class Config:
                    update_auto_install=bool(self.update_auto_install),
                    input=self.input.to_dict(),
                    notifications=self.notifications.to_dict(),
+                   disconnect_linger=self.disconnect_linger.to_dict(),
                    controllers={s: cc.to_dict()
                                 for s, cc in sorted(self.controllers.items())})
         return out
@@ -1170,6 +1228,21 @@ def _as_int(value: object, default: int, lo: int, hi: int) -> int:
     except (TypeError, ValueError):
         return default
     return v if lo <= v <= hi else default
+
+
+def _as_clamped_int(value: object, default: int, lo: int, hi: int) -> int:
+    """Like `_as_int`, but an out-of-range number is pulled to the nearest
+    bound instead of discarded: 99999 seconds means "as long as you allow",
+    not "the default". Non-numbers (and bools) still become the default."""
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v != v:                      # NaN
+        return default
+    return int(round(max(lo, min(hi, v))))
 
 
 def _as_float(value: object, default: float, lo: float) -> float:

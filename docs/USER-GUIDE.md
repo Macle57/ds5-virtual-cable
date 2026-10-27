@@ -226,6 +226,27 @@ That is the right thing to do when a game already supports a DualSense properly
 over Bluetooth, or when a launcher gets confused by seeing two pads. Tick it
 again when you want the wired features back.
 
+#### Optional: keeping the controller connected while it is switched off
+
+Normally, a few seconds after you switch a controller off (or it loses its
+Bluetooth link), its virtual wired controller is unplugged too, and the game
+sees the controller go. Some games then stop at a "reconnect your controller"
+screen, or hand the controller a new player slot when it comes back.
+
+If you would rather the game never noticed, open the dashboard's **Settings →
+Bridging & tray** and turn on **Keep the controller connected after it
+disconnects**, then pick how long to wait in **Wait for it to come back for**
+(2 minutes to start with; anything from 5 seconds to an hour). While a
+controller is away its virtual one stays plugged in, holding still, and the
+tray and the dashboard say **waiting to reconnect** with the time left. Switch
+the controller back on in time and it carries on as the same controller. If
+the time runs out, it is unplugged exactly as it would have been without the
+setting.
+
+It is off by default, applies to every controller, and takes effect as soon as
+you save. In `config.json` it is `"disconnect_linger": {"enabled": true,
+"seconds": 120}`.
+
 #### Optional: hiding the Bluetooth pad, so games see ONE controller
 
 While a controller is bridged, Windows has **two** DualSenses -- the real
@@ -403,6 +424,11 @@ again by itself, typically well under a second later. Nothing to click.
 (That is deliberate. Making the virtual device disappear instead would drop most
 games straight to a "please reconnect your controller" screen, and some of them
 do not recover cleanly when it comes back.)
+
+How long it waits is the catch: on its own, ds5bridge decides after a few
+seconds that a controller which is not answering has been switched off, and
+unplugs the virtual one. To have it wait longer, turn on **Keep the controller
+connected after it disconnects** (see "Using it").
 
 ---
 

@@ -280,6 +280,10 @@ def describe(c: dict) -> str:
         bits.append("not connected")
     elif c["state"] == S.RUNNING:
         bits.append(f"{c.get('reports_per_s') or 0:.0f}/s")
+    elif c.get("linger_left_s") is not None:
+        # Offline, but its virtual controller is being held for its return
+        # (config.disconnect_linger): a different promise from "offline".
+        bits.append(f"waiting to reconnect, {int(c['linger_left_s'])}s left")
     elif c["state"] == S.STOPPED and c.get("error"):
         bits.append("failed")
     else:
@@ -398,6 +402,7 @@ class TrayApp:
             usbip_exe=getattr(args, "usbip", None),
             audio_target=getattr(args, "audio_target", "speaker"),
             hotplug_interval=float(getattr(args, "hotplug_interval", 5.0)),
+            linger_s=self.cfg.disconnect_linger.linger_s(),
             telemetry_port=(self.hub.port if self.hub is not None else None),
             on_event=self._on_event,
             on_enabled_changed=self._persist_enabled,
@@ -585,6 +590,11 @@ class TrayApp:
                 if self.mgr.is_hiding(serial) != bool(cc.hide_bluetooth):
                     self.mgr.set_hide_bluetooth(serial, bool(cc.hide_bluetooth))
             self.mgr.hide_default = bool(cfg.hide_bluetooth_default)
+            # Keep-connected-after-disconnect: read on every hotplug pass, so
+            # a bridge that is already waiting is judged by the new value.
+            linger = getattr(cfg, "disconnect_linger", None)
+            if linger is not None:
+                self.mgr.set_linger(linger.linger_s())
             # Autostart: the registry normally wins (`_reconcile_autostart`),
             # but a saved checkbox is the user speaking, same as the menu row.
             try:
@@ -1567,11 +1577,17 @@ class TrayApp:
             return "ds5bridge -- off"
         running, present = agg.get("running", 0), agg.get("present", 0)
         offline = agg.get("degraded", 0)
+        # A subset of `offline`: bridges holding their virtual controller for
+        # the pad's return (config.disconnect_linger). Said apart, because
+        # "offline" reads as "about to disconnect" and these are not.
+        waiting = agg.get("lingering", 0) or 0
         if not present:
             return "ds5bridge -- no controller connected"
         head = f"ds5bridge -- {running - offline} of {present} bridged"
-        if offline:
-            head += f", {offline} offline"
+        if offline - waiting:
+            head += f", {offline - waiting} offline"
+        if waiting:
+            head += f", {waiting} waiting to reconnect"
         bits = [head]
         for c in self._controllers():
             bits.append("  " + describe(c))
@@ -1641,7 +1657,11 @@ class TrayApp:
                        bool(c.get("present")),
                        self._desired_hide(c["serial"]), bool(c.get("error")),
                        c.get("battery_percent"),
-                       round((c.get("reports_per_s") or 0.0) / 10.0))
+                       round((c.get("reports_per_s") or 0.0) / 10.0),
+                       # A lingering pad's countdown, in 5 s steps: enough
+                       # to watch it move without a rebuild every tick.
+                       (None if c.get("linger_left_s") is None
+                        else int(c["linger_left_s"]) // 5))
                       for c in self._controllers()))
 
     def _sync_menu(self) -> None:
