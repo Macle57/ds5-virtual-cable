@@ -640,5 +640,21 @@ class UpdateAutoInstallTests(unittest.TestCase):
         self.assertTrue(CFG.Config.from_dict({"update_auto_install": "maybe"}).update_auto_install)
 
 
+
+class AudioAutoPrimeTests(unittest.TestCase):
+    """`audio_auto_prime` (audio_prime.py): on by default, round-trips,
+    tolerates a hand-edited value."""
+
+    def test_default_and_round_trip(self):
+        self.assertTrue(CFG.Config().audio_auto_prime)
+        cfg = CFG.Config.from_dict({"audio_auto_prime": False})
+        self.assertFalse(cfg.audio_auto_prime)
+        self.assertFalse(CFG.Config.from_dict(cfg.to_dict()).audio_auto_prime)
+        self.assertIn("audio_auto_prime", CFG.Config().to_dict())
+        self.assertNotIn("audio_auto_prime", cfg.extra)
+
+    def test_garbage_is_the_default(self):
+        self.assertTrue(CFG.Config.from_dict({"audio_auto_prime": "maybe"}).audio_auto_prime)
+
 if __name__ == "__main__":
     unittest.main()

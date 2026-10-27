@@ -910,7 +910,7 @@ class Notifications:
 _CFG_KNOWN = ("enabled", "autostart_on_login", "auto_bridge_new", "port_base",
               "controllers", "hide_bluetooth_default", "hidhide_cli",
               "dashboard_port", "update_check", "update_auto_install", "input",
-              "notifications")
+              "notifications", "audio_auto_prime")
 
 
 @dataclass
@@ -955,6 +955,13 @@ class Config:
     #: its name so saved configs stay valid.)
     update_auto_install: bool = True
     # -- end SERVICE region ---------------------------------------------------
+    #: Open each newly bridged pad's speaker endpoint once, silently, as soon
+    #: as Windows has built it (`audio_prime.py`). Games on Sony's pad library
+    #: (Genshin Impact) open that endpoint once at start-up for HD haptics and
+    #: give up if the first open of a cold endpoint is slow; after any program
+    #: has opened it once, theirs succeeds. The Sound control panel's Test
+    #: button, clicked for you. Read at every bridge-up, so it applies live.
+    audio_auto_prime: bool = True
     #: Keyed by LOWERCASED bdaddr, e.g. "d42f4ba1485d".
     controllers: dict = field(default_factory=dict)
     #: The chord/shortcut engine (PS-button chords, touch gestures, remote
@@ -1091,6 +1098,7 @@ class Config:
             dashboard_port=_as_dashboard_port(data.get("dashboard_port")),
             update_check=_as_bool(data.get("update_check"), True),
             update_auto_install=_as_bool(data.get("update_auto_install"), True),
+            audio_auto_prime=_as_bool(data.get("audio_auto_prime"), True),
             input=InputConfig.from_dict(data.get("input")),
             notifications=Notifications.from_dict(data.get("notifications")),
         )
@@ -1124,6 +1132,7 @@ class Config:
                    dashboard_port=int(self.dashboard_port),
                    update_check=bool(self.update_check),
                    update_auto_install=bool(self.update_auto_install),
+                   audio_auto_prime=bool(self.audio_auto_prime),
                    input=self.input.to_dict(),
                    notifications=self.notifications.to_dict(),
                    controllers={s: cc.to_dict()

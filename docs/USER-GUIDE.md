@@ -388,6 +388,7 @@ drain faster than a cable ever would. Charge between sessions.
 | **I ticked "Hide Bluetooth pad" and nothing happened** | either HidHide is not installed, or the game was already running | `ds5bridge doctor` says which. HidHide cannot hide a device from a program that already has it open — close the game, then start it again. |
 | **"NOT hiding: this program is not on HidHide's whitelist"** | ds5bridge refused to hide, because it could not confirm it would still be able to read the controller itself | Deliberate, and the safe outcome: hiding a pad it cannot open would leave you with no working controller at all. Run `ds5bridge doctor` and read the `granting` row; `python app\tools\hidhide_verify.py` gives the full diagnosis. |
 | **Controller works, but no haptics or triggers** | the game is using the Bluetooth device, not the virtual wired one | See the row above. |
+| **No haptics in Genshin Impact (or another game on Sony's pad library), but they work after you click Test on the controller in the Sound control panel** | the game opens the controller's speaker once at start-up, and the very first open after the pad connects is too slow for it | Leave **Wake the pad's speaker after bridging** on (the default). See "Haptics need the speaker opened once" below. |
 | **Sound comes out of the controller speaker when you did not want it** | Windows picked the virtual DualSense as the default playback device | **Settings → System → Sound → Output**, choose your usual speakers. |
 | **"Windows protected your PC"** | SmartScreen; the build is not code-signed | More info → Run anyway, if you trust the source. |
 | **Everything looks stuck after a crash** | leftovers | `ds5bridge cleanup`. It is safe to run any time, twice, or when nothing is up. |
@@ -403,6 +404,32 @@ again by itself, typically well under a second later. Nothing to click.
 (That is deliberate. Making the virtual device disappear instead would drop most
 games straight to a "please reconnect your controller" screen, and some of them
 do not recover cleanly when it comes back.)
+
+### Haptics need the speaker opened once
+
+On a wired DualSense, HD haptics are audio: the game plays them into the
+controller's four-channel speaker device ("Speakers (DualSense Wireless
+Controller)" in the Sound control panel). Games built on Sony's own pad
+library — Genshin Impact is the one that was reported — open that device
+**once**, while they set the controller up, and do not try again. The first
+time anything opens it after the pad connects, Windows has to wake the
+virtual USB device and start its audio stream, and that takes long enough
+that the game gives up and runs with no haptics at all. The second open is
+quick. You could see this by hand: click **Test** on the controller's
+speaker in the Sound control panel (even cancelling it straight away), then
+start the game, and the haptics worked.
+
+ds5bridge now does that click for you. A second or two after a controller is
+bridged — and again every time it reconnects, because Windows builds a fresh
+speaker device each time — it opens the speaker, plays under half a second of
+silence and closes it. You hear and feel nothing. The tray log says
+`primed the speaker endpoint 'Speakers (2- DualSense Wireless Controller)'`
+when it happens.
+
+It is on by default. To turn it off, untick **Wake the pad's speaker after
+bridging** in the dashboard, or put `"audio_auto_prime": false` in your
+`config.json`. A game started in the first couple of seconds after the pad
+connects can still beat it; give it a moment.
 
 ---
 

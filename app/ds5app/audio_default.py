@@ -78,7 +78,7 @@ PKEY_Device_FriendlyName_PID = 14
 
 @dataclass(frozen=True)
 class Endpoint:
-    """One audio capture endpoint as Windows lists it."""
+    """One audio endpoint (capture or render) as Windows lists it."""
 
     id: str
     name: str
@@ -343,6 +343,15 @@ if sys.platform == "win32":
         """The real `IMMDeviceEnumerator` / `IPolicyConfig` calls. Fail soft."""
 
         def capture_endpoints(self) -> list:
+            return self._endpoints(E_CAPTURE)
+
+        def render_endpoints(self) -> list:
+            """Playback endpoints, every state. `audio_prime` finds the pad's
+            speaker here, as `capture_endpoints` finds its microphone."""
+            return self._endpoints(E_RENDER)
+
+        def _endpoints(self, flow: int) -> list:
+            kind = "capture" if flow == E_CAPTURE else "render"
             out: list = []
             try:
                 with _Com():
@@ -352,7 +361,7 @@ if sys.platform == "win32":
                         coll = ctypes.c_void_p()
                         _method(enum, 3, ctypes.c_int, wintypes.DWORD,
                                 ctypes.POINTER(ctypes.c_void_p))(
-                            enum, E_CAPTURE, DEVICE_STATE_ALL,
+                            enum, flow, DEVICE_STATE_ALL,
                             ctypes.byref(coll))
                         try:
                             n = wintypes.UINT()
@@ -368,8 +377,8 @@ if sys.platform == "win32":
                                                         _friendly_name(dev),
                                                         _device_state(dev)))
                                 except OSError:
-                                    log.debug("capture endpoint %d unreadable",
-                                              i, exc_info=True)
+                                    log.debug("%s endpoint %d unreadable",
+                                              kind, i, exc_info=True)
                                 finally:
                                     _release(dev)
                         finally:
@@ -377,7 +386,8 @@ if sys.platform == "win32":
                     finally:
                         _release(enum)
             except Exception:  # noqa: BLE001
-                log.warning("enumerating capture devices failed", exc_info=True)
+                log.warning("enumerating %s devices failed", kind,
+                            exc_info=True)
             return out
 
         def default_capture_id(self, role: int = E_CONSOLE):
@@ -424,6 +434,9 @@ else:  # pragma: no cover - the app targets Windows; keep imports safe elsewhere
         """No audio endpoints anywhere but Windows."""
 
         def capture_endpoints(self) -> list:
+            return []
+
+        def render_endpoints(self) -> list:
             return []
 
         def default_capture_id(self, role: int = E_CONSOLE):

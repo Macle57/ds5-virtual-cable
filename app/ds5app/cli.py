@@ -545,6 +545,24 @@ def _doctor_visibility(HH, cfg) -> int:
     return len(stuck)
 
 
+def _auto_primer(cfg):
+    """The speaker auto-prime hook for a manager, or None (audio_prime.py).
+
+    Only where a MANAGER runs: `cmd_run` is also what every tray child runs,
+    and priming there as well would open the endpoint twice per bridge-up.
+    """
+    if not getattr(cfg, "audio_auto_prime", True):
+        return None
+    try:
+        from . import audio_prime as AP
+
+        return AP.AutoPrimer().schedule
+    except Exception:  # noqa: BLE001
+        logging.getLogger("ds5app.cli").exception(
+            "the speaker auto-prime is unavailable")
+        return None
+
+
 def cmd_run_all(args) -> int:
     """Every connected controller, one child process and one port each.
 
@@ -584,7 +602,8 @@ def cmd_run_all(args) -> int:
                            hidhide_cli=(getattr(args, "hidhide_cli", None)
                                         or cfg.hidhide_cli),
                            telemetry_port=(hub.port if hub else None),
-                           on_event=ev)
+                           on_event=ev,
+                           on_bridged=_auto_primer(cfg))
     if hub is not None:
         try:
             dash = DB.DashboardServer(hub=hub, snapshot_fn=mgr.snapshot,
