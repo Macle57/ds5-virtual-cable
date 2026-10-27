@@ -50,6 +50,9 @@ export default function BridgingSection() {
       <Row label="Hide a new controller's Bluetooth pad by default" keyName="hide_bluetooth_default" root="" help={HELP.hide_bluetooth_default}>
         <Toggle path={["hide_bluetooth_default"]} />
       </Row>
+      <Row label="Wake the pad's speaker after bridging (for HD haptics)" keyName="audio_auto_prime" root="" help={HELP.audio_auto_prime}>
+        <Toggle path={["audio_auto_prime"]} dflt />
+      </Row>
       <Row label={"Start with Windows" + (modeNote ? ` (${modeNote})` : "")} keyName="autostart_on_login" root="" help={HELP.autostart_on_login}>
         {mode && mode !== "none" && (
           <span className="st-sticker" style={{ "--tone": "var(--color-cross)" } as React.CSSProperties}>{mode}</span>

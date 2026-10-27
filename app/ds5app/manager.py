@@ -967,6 +967,7 @@ class BridgeManager:
                  on_master_changed=None,
                  on_port_assigned=None,
                  on_hide_changed=None,
+                 on_bridged=None,
                  use_job: bool = True):
         # 3240 is usbipd-win's. Refuse it as a base rather than silently
         # sliding off it, so a caller that passes it hears about it.
@@ -1026,6 +1027,13 @@ class BridgeManager:
         self.on_master_changed = on_master_changed or (lambda v: None)
         self.on_port_assigned = on_port_assigned or (lambda s, p: None)
         self.on_hide_changed = on_hide_changed or (lambda s, v: None)
+        #: Called with the serial each time a bridge has come up and is being
+        #: kept: a NEW virtual pad that Windows is now building devices for,
+        #: on first start and on every re-bridge after a reconnect. The tray
+        #: hangs the speaker auto-prime (`audio_prime.AutoPrimer.schedule`)
+        #: on it. Runs on whichever thread called `start()`, so it must return
+        #: at once; anything slow belongs on its own thread.
+        self.on_bridged = on_bridged or (lambda s: None)
 
         self._child_command = child_command or (
             lambda serial, port: default_child_command(
@@ -1368,6 +1376,10 @@ class BridgeManager:
             except Exception:  # noqa: BLE001
                 log.exception("unhiding %s after an abandoned start", serial)
             return False
+        try:
+            self.on_bridged(serial)
+        except Exception:  # noqa: BLE001
+            log.exception("the bridged-pad hook failed for %s", serial)
         return True
 
     def _record_failure(self, serial: str, text: str) -> None:

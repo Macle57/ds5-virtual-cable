@@ -1817,6 +1817,62 @@ class TestReconnect(_Base):
         self.assertEqual(len(FakeBridge.cleaned), 10)
 
 
+class TestOnBridged(_Base):
+    """`on_bridged` is where the speaker auto-prime hangs (audio_prime.py):
+    once per bridge that came up and is being kept -- first start and every
+    re-bridge, never a failed or abandoned one -- and never able to fail it."""
+
+    def test_called_once_per_bridge_up_including_reconnects(self):
+        seen = []
+        m = self.make(offline_grace=0.0, gone_grace=0.0, retry_after=999.0,
+                      on_bridged=seen.append)
+        self.assertTrue(m.start(A))
+        self.assertTrue(m.start(A))              # already up: not a new pad
+        self.assertEqual(seen, [A])
+        for _ in range(3):                       # off, on: Windows rebuilt it
+            m._bridges[A].go_offline()
+            self.present = [B]
+            m.poll_once()
+            self.present = [A, B]
+            m.poll_once()
+        # B is bridged by the first pass too, once; A once per reconnect.
+        self.assertEqual(seen.count(A), 4)
+        self.assertEqual(seen.count(B), 1)
+
+    def test_not_called_for_a_start_that_failed(self):
+        seen = []
+        FakeBridge.never_ready = {A}
+        FakeBridge.fail_on_start = {B}
+        m = self.make(on_bridged=seen.append)
+        self.assertFalse(m.start(A))
+        self.assertFalse(m.start(B))
+        self.assertEqual(seen, [])
+
+    def test_not_called_for_an_abandoned_start(self):
+        seen = []
+        m = self.make(on_bridged=seen.append)
+        orig = FakeBridge.wait_ready
+
+        def stopped_meanwhile(bridge, timeout=60.0):
+            m._held.add(bridge.serial)           # a Stop landed mid-start
+            return orig(bridge, timeout)
+
+        FakeBridge.wait_ready = stopped_meanwhile
+        try:
+            self.assertFalse(m.start(A))
+        finally:
+            FakeBridge.wait_ready = orig
+        self.assertEqual(seen, [])
+
+    def test_a_raising_hook_does_not_fail_the_start(self):
+        def boom(serial):
+            raise RuntimeError("audio stack on fire")
+
+        m = self.make(on_bridged=boom)
+        self.assertTrue(m.start(A))
+        self.assertEqual(m.snapshot()["controllers"][A]["state"], M.RUNNING)
+
+
 # ---------------------------------------------------------------------------
 # the way out
 # ---------------------------------------------------------------------------

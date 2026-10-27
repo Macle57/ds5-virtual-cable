@@ -385,6 +385,19 @@ class TrayApp:
             log.exception("the telemetry hub could not start; the dashboard "
                           "will have no live input")
 
+        #: Opens each newly bridged pad's speaker once so a game's first open
+        #: of it is not the slow cold one (audio_prime.py). `enabled` reads
+        #: the LIVE config, so the dashboard switch applies at the next
+        #: bridge-up with nothing to rebuild.
+        self.primer = None
+        try:
+            from . import audio_prime as AP
+
+            self.primer = AP.AutoPrimer(enabled=lambda: bool(
+                getattr(self.cfg, "audio_auto_prime", True)))
+        except Exception:  # noqa: BLE001
+            log.exception("the speaker auto-prime is unavailable")
+
         self.mgr = M.BridgeManager(
             base_port=self.cfg.port_base,
             ports=self._ports(),
@@ -403,7 +416,9 @@ class TrayApp:
             on_enabled_changed=self._persist_enabled,
             on_master_changed=self._persist_master,
             on_port_assigned=self._persist_port,
-            on_hide_changed=self._persist_hide)
+            on_hide_changed=self._persist_hide,
+            on_bridged=(self.primer.schedule if self.primer is not None
+                        else None))
         self._snap = self.mgr.snapshot()
 
         try:
