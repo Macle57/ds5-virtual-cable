@@ -436,20 +436,26 @@ after that**. The check is one small request for public release information —
 nothing about you or your machine is sent, and nothing is downloaded or
 installed by the check itself.
 
-When a newer version exists you get a balloon notification, and — by default
-— **it installs itself a minute later**: the new installer is downloaded,
-verified against the release's published SHA-256 checksums and run silently
+When a newer version exists you get a balloon notification and, a moment
+later — by default — **a question**: a Yes/No box names the version and
+reminds you that installing restarts the bridge, so every connected
+controller drops out for about a minute. It is not pinned on top of whatever
+you are doing: in a full-screen game it waits behind, with the taskbar
+flashing, until you are ready. **Yes** downloads the new installer, verifies
+it against the release's published SHA-256 checksums and runs it silently
 (app only, no driver, no reboot); the tray, or the service, restarts on the
-new version. Bridging stops for the few seconds that takes and comes back on
-its own. A download that stalls on a slow connection is resumed where it
-stopped (a few attempts, minutes apart) rather than started over, and a
-failed automatic install is tried again later that day. If a download
-ever fails its checksum it is deleted and nothing changes. The tray's right-click menu also grows a row, **Install update
-x.y.z**, for doing it right now.
+new version. **No** keeps what you have: the tray's right-click menu has a
+row, **Install update x.y.z**, and the dashboard an **Install update**
+button, for whenever suits you, and the question comes back the next time
+ds5bridge starts (not at every check — a long session is not nagged). A
+download that stalls on a slow connection is resumed where it stopped (a few
+attempts, minutes apart) rather than started over, and a failed install is
+tried again later without asking twice. If a download ever fails its
+checksum it is deleted and nothing changes.
 
-Prefer to decide yourself? Put `"update_auto_install": false` in your
-`config.json` (or untick it in the dashboard): the balloon and the menu row
-stay, nothing installs without a click. Not interested at all? `"update_check":
+Prefer no question at all? Put `"update_auto_install": false` in your
+`config.json` (or untick **Ask to install updates** in the dashboard): the
+balloon, the menu row and the button stay, nothing installs without a click. Not interested at all? `"update_check":
 false` and the tray never asks GitHub anything.
 You can always update by re-running the install line — it is the same
 download, and it leaves your settings alone.
