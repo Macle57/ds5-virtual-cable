@@ -66,7 +66,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install runtime dependencies
-        run: python -m pip install --upgrade pip hidapi numpy av pystray pillow
+        run: python -m pip install --upgrade pip setuptools hidapi numpy av pystray pillow
+
+      # The echo canceller's native core, from the vendored source (speexdsp
+      # MDF + ds5aec.c). MSVC is found the way setuptools finds it for C
+      # extensions; the runner image has Visual Studio. Without it the
+      # canceller tests would skip, and this job promises nothing skips.
+      - name: Build the echo canceller DLL
+        working-directory: emulator
+        run: python native/build.py
 
       - name: Unit tests (nothing should skip)
         working-directory: emulator

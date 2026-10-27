@@ -79,6 +79,7 @@ class Player(threading.Thread):
                             self.dev.send_report_36(
                                 at(i), silent_h, fc,
                                 self.target, self.volume, mic_active=self.mic_active,
+                                echo_cancel=False,
                             )
                         else:
                             self.dev.send_report_39(
@@ -150,7 +151,7 @@ def main() -> int:
     d = D.DualSense(info).open()
 
     print("[mic] arming (0x31 mic-state + 0x32 control)")
-    d.send_mic_state(True)
+    d.send_mic_state(True, echo_cancel=False)  # this test listens for the speaker
     time.sleep(0.05)
     d.send_mic_control(True)
     time.sleep(0.4)  # let the stream spin up
@@ -183,7 +184,7 @@ def main() -> int:
     # silence + disarm
     for _ in range(3):
         d.send_report_36(A.silent_opus_frame(), A.silent_haptic_frame(), 0,
-                         args.target, args.volume)
+                         args.target, args.volume, echo_cancel=False)
         time.sleep(A.FRAME_MS / 1000)
     d.send_mic_control(False)
     time.sleep(0.02)

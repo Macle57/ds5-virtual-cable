@@ -7,6 +7,7 @@ export const HELP: Record<string, string> = {
   auto_bridge_new: "A DualSense this app has never seen is bridged the moment it pairs. Off, a new pad waits until you enable it here or in the tray.",
   hide_bluetooth_default: "What a NEW controller's 'hide' switch starts as: hide its Bluetooth pad from games and Steam while it is bridged, so only the virtual wired pad is seen (no doubled controller). Existing pads keep their own switch below.",
   ctrl_enabled: "Bridge this controller: run a virtual wired pad for it whenever it is connected. Off, the pad stays a plain Bluetooth controller.",
+  echo_cancel: "Removes what this PC plays from the pad's microphone, so a voice chat does not hear your game back: the pad's own speaker (by the controller itself) and any other speaker the PC drives that the pad can hear, such as a TV or desktop speakers (by the bridge, once it has heard that speaker in the mic). People and other devices in the room are kept. Headphones are never touched.",
   ctrl_hide: "Hide this controller's Bluetooth pad (HidHide) while it is bridged, so games and Steam see only the virtual wired one. The pill beside it says whether the hide is actually in effect right now.",
   autostart_on_login: "Start the tray with Windows. Installed as a service it starts before anyone signs in (the pads work on the lock screen too); installed as a scheduled task it starts at sign-in. The installer chooses which; this switch turns whichever is installed on or off.",
   update_check: "Look for a newer release on GitHub every 6 hours and when the tray starts. Off, nothing is ever fetched.",
@@ -148,6 +149,7 @@ export const CTRL_FIELDS: [string, string, "bool" | "number" | "string" | "choic
   ["label", "Label", "string"],
   ["audio_target", "Audio target", "choice", ["speaker", "headphone"]],
   ["hide_bluetooth", "Hide Bluetooth pad while bridged", "bool"],
+  ["echo_cancel", "Pad echo cancellation (mic)", "bool"],
   ["port", "usbip TCP port (leave blank for automatic)", "number"],
 ];
 export const KNOWN_GLOBAL = new Set([...GLOBAL_FIELDS.map((f) => f[0]), "controllers", "input", "notifications"]);

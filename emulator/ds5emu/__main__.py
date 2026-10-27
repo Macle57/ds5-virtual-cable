@@ -151,6 +151,8 @@ def _snapshot(server, backend) -> dict:
         snap["backend"] = dict(bstats)
         if hasattr(backend, "clock_seam"):
             snap["clock_seam"] = backend.clock_seam()
+        if hasattr(backend, "echo_status"):
+            snap["echo_cancel"] = backend.echo_status()
     for ep in dev.meter.endpoints():
         s = dev.meter.summary(ep)
         s["gap_histogram_ms"] = [
@@ -233,7 +235,8 @@ def cmd_serve(args) -> int:
 
         backend = BridgeBackend(target=args.audio_target,
                                 mic_always_on=args.mic_always_on,
-                                serial=args.bt_serial)
+                                serial=args.bt_serial,
+                                echo_cancel=not args.no_echo_cancel)
         if args.capture:
             from .capture import BlackBox
 
@@ -341,6 +344,10 @@ def main(argv=None) -> int:
     s.add_argument("--mic-always-on", action="store_true",
                    help="bridge backend: arm the microphone at start() instead of "
                         "waiting for the host to SET_INTERFACE alt 1")
+    s.add_argument("--no-echo-cancel", action="store_true",
+                   help="bridge backend: no echo cancellation -- neither the "
+                        "pad's own canceller nor the bridge's for the PC's other "
+                        "speakers")
     s.add_argument("--tone", type=float, default=1000.0,
                    help="synthetic microphone tone in Hz")
     s.add_argument("--capture", default=None, metavar="PREFIX",

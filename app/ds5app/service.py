@@ -425,6 +425,38 @@ def _read_input_section(path: str):
         return None
 
 
+class EchoSetting:
+    """One controller's `echo_cancel`, shaped for `InputConfigWatcher` (which
+    only needs `to_dict()` to compare a saved value with the running one)."""
+
+    def __init__(self, on: bool):
+        self.on = bool(on)
+
+    def to_dict(self) -> dict:
+        return {"echo_cancel": self.on}
+
+
+def _read_echo_setting(path: str, serial: str):
+    """`controllers[serial].echo_cancel` from the config at `path` as an
+    `EchoSetting`, or None. Never raises; the same "degrade, don't poison"
+    reading as `_read_input_section`. A controller with no entry yet gets the
+    shipped default, ON."""
+    from . import config as K
+
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.loads(f.read())
+        if not isinstance(data, dict):
+            return None
+        ctrls = data.get("controllers")
+        entry = ctrls.get(K.norm_serial(serial)) if isinstance(ctrls, dict) else None
+        if entry is None:
+            return EchoSetting(True)
+        return EchoSetting(K.ControllerConfig.from_dict(entry).echo_cancel)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
 class InputConfigWatcher:
     """Applies saved `input` settings to a running bridge, within seconds.
 
@@ -450,7 +482,8 @@ class InputConfigWatcher:
     """
 
     def __init__(self, apply_fn, current_fn, *, path: str | None = None,
-                 interval: float = 2.0, load_fn=None, on_applied=None):
+                 interval: float = 2.0, load_fn=None, on_applied=None,
+                 label: str = "input settings"):
         #: `apply_fn(input_cfg)` hands a changed section to the owner;
         #: `current_fn()` returns the `InputConfig` the engine runs now.
         self._apply = apply_fn
@@ -466,6 +499,9 @@ class InputConfigWatcher:
         #: bridge can route it through its event stream (tray notification
         #: channel, child stdout). Without it, the module log speaks.
         self._on_applied = on_applied
+        #: What the applied-live line calls the section. The same watcher
+        #: also follows one controller's `echo_cancel` (`EchoSetting`).
+        self.label = label
         self._mtime: int | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -520,7 +556,7 @@ class InputConfigWatcher:
                           if new_d.get(k) != cur_d.get(k))
                    if cur_d is not None else ["all"])
         self._apply(new)
-        msg = f"input settings applied live: {', '.join(changed)} changed"
+        msg = f"{self.label} applied live: {', '.join(changed)} changed"
         if self._on_applied is not None:
             self._on_applied(msg)
         else:
@@ -544,6 +580,38 @@ def mode_line(remote: bool, keyboard: bool) -> str:
             f"keyboard {'open' if keyboard else 'closed'}")
 
 
+def echo_summary(status: dict | None) -> tuple[str, str]:
+    """`BridgeBackend.echo_status()` as (state, note) for the status channel:
+
+        off        echo cancellation switched off
+        idle       on, but the mic is not in use (nothing to cancel yet)
+        on         on and working (the pad's canceller + the software one)
+        degraded   on, but the software canceller is not working -- the
+                   pad still cancels its own speaker, the PC's other
+                   speakers are NOT cancelled; `note` says why
+    """
+    if not status:
+        return "idle", ""
+    if not status.get("enabled"):
+        return "off", ""
+    mode = status.get("mode")
+    if mode in (None, "idle", "starting"):
+        return "idle", ""
+    if status.get("health") == "degraded" or mode == "passthrough":
+        reason = status.get("reason") or "the canceller stopped"
+        if not status.get("worker_alive", True) and "died" not in reason:
+            reason = "the canceller stopped"
+        return "degraded", " ".join(str(reason).split())
+    return "on", ""
+
+
+def echo_line(state: str, note: str = "") -> str:
+    """The echo canceller's state as one status line: `echo on`, or
+    `echo degraded  <why>`. Printed under `cli._log`'s "mode" prefix and
+    parsed back by `manager._ECHO_RE`."""
+    return f"echo {state}" + (f"  {note}" if note else "")
+
+
 def toast_line(category: str, title: str, body: str) -> str:
     """A tray notification as one child status line: `category|title|body`
     (printed under `cli._log`'s "toast" prefix, parsed back by
@@ -561,7 +629,8 @@ class BridgeService:
                  auto_cleanup: bool = True, on_event=None,
                  hide_bluetooth: bool = False, hidhide_cli: str | None = None,
                  telemetry_port: int | None = None,
-                 input_config=None):
+                 input_config=None, echo_cancel: bool = True,
+                 follow_echo_config: bool = False):
         self.serial = serial
         self.port = port
         self.host = host
@@ -570,6 +639,7 @@ class BridgeService:
         self.audio_target = audio_target
         self.auto_cleanup = auto_cleanup
         self.on_event = on_event or (lambda kind, text: None)
+        self._echo_reported: tuple | None = None
         #: Hide the real Bluetooth pad from everything else while bridged.
         #: Owned HERE rather than in the manager or the tray so that ONE code
         #: path serves the tray, `ds5bridge --all` and a bare `ds5bridge run` --
@@ -596,6 +666,14 @@ class BridgeService:
         #: engine (`InputConfigWatcher`) -- the dashboard's Save must reach a
         #: bridge that is already up, without a restart.
         self._input_watcher = None
+        #: Echo cancellation (`BridgeBackend.echo_cancel`: the pad's own
+        #: canceller plus the software one for the PC's other speakers). With
+        #: `follow_echo_config`, a second watcher keeps it in step with this
+        #: controller's `echo_cancel` in config.json, so the dashboard switch
+        #: applies to a running bridge; a `--echo-cancel` flag pins it instead.
+        self.echo_cancel = bool(echo_cancel)
+        self.follow_echo_config = bool(follow_echo_config)
+        self._echo_watcher = None
 
         self.state = STOPPED
         self.error: str | None = None
@@ -761,6 +839,19 @@ class BridgeService:
                 self.usbip.detach(p)
             ports = sorted(ports)[:1]
         self._our_ports = list(ports)
+        # The software echo canceller leaves this pad's own speaker endpoint
+        # to the pad; this is how it recognises it (aec.py).
+        try:
+            self._backend.own_usb_ports = set(ports)
+        except Exception:  # noqa: BLE001
+            pass
+        # ...and where it remembers each speaker's echo delay for this pad,
+        # so a known speaker is cancelled from its first sound next run.
+        try:
+            from . import config as K
+            self._backend.aec_store_path = os.path.join(K.config_dir(), "echo-delays.json")
+        except Exception:  # noqa: BLE001
+            pass
         self._attached = True
         self.started_at = time.time()
         # Prime the rate differencer so the first snapshot reports a real number
@@ -808,12 +899,33 @@ class BridgeService:
                 log.exception("could not start the input-config watcher")
                 self._input_watcher = None
 
+        if self.follow_echo_config and self.serial:
+            serial = self.serial
+            try:
+                self._echo_watcher = InputConfigWatcher(
+                    apply_fn=self._apply_echo_setting,
+                    current_fn=lambda: EchoSetting(self.echo_cancel),
+                    load_fn=lambda path: _read_echo_setting(path, serial),
+                    label="pad echo cancellation",
+                    on_applied=lambda text: self._emit("info", text))
+                self._echo_watcher.start()
+            except Exception:  # noqa: BLE001
+                log.exception("could not start the echo-setting watcher")
+                self._echo_watcher = None
+
+    def _apply_echo_setting(self, setting) -> None:
+        self.echo_cancel = setting.on
+        be = self._backend
+        if be is not None:
+            be.set_echo_cancel(setting.on)
+
     def _start_server(self) -> None:
         from ds5emu.bridge import BridgeBackend
         from ds5emu.server import UsbIpServer
         from ds5emu.timing import TimerResolution
 
-        self._backend = BridgeBackend(target=self.audio_target, serial=self.serial)
+        self._backend = BridgeBackend(target=self.audio_target, serial=self.serial,
+                                      echo_cancel=self.echo_cancel)
         self._attach_interceptor()
         self._server = UsbIpServer(self._backend, host=self.host, port=self.port,
                                    busid=self.busid)
@@ -941,6 +1053,12 @@ class BridgeService:
             except Exception:  # noqa: BLE001
                 log.exception("stopping the input-config watcher failed")
             self._input_watcher = None
+        if self._echo_watcher is not None:
+            try:
+                self._echo_watcher.stop()
+            except Exception:  # noqa: BLE001
+                log.exception("stopping the echo-setting watcher failed")
+            self._echo_watcher = None
 
         # The chord engine first: it may be holding a synthetic key down (an
         # Alt-Tab mid-gesture), and a stuck Alt key outlives everything else
@@ -1118,6 +1236,15 @@ class BridgeService:
                 snap["state"] = DEGRADED
         except Exception:  # noqa: BLE001
             log.exception("snapshot failed")
+        try:
+            echo, note = echo_summary(be.echo_status())
+        except Exception:  # noqa: BLE001
+            echo, note = "idle", ""
+        snap.update(echo=echo, echo_note=note)
+        # the status channel hears about a change the moment it is seen
+        if (echo, note) != self._echo_reported:
+            self._echo_reported = (echo, note)
+            self._emit("mode", echo_line(echo, note))
         return snap
 
     def status_line(self, snap: dict | None = None) -> str:

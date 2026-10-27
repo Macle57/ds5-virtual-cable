@@ -72,6 +72,38 @@ LED_R = 44
 LED_G = 45
 LED_B = 46
 
+# audioControl (body byte 7). High nibble: output path (3 = internal speaker,
+# 0 = headphone jack). Low nibble, as the public research names it and as
+# MEASURED on one pad (cameo) over Bluetooth (2026-10-05, scratchpad/aec
+# rounds 3-4):
+#   bits 0-1  mic select (1 = the pad's internal capsule, 0 = automatic)
+#   bit 2     EchoCancelEnable: the pad's own canceller for ITS speaker -- the
+#             own-speaker echo in the mic fell 44 dB, to the noise floor
+#   bit 3     NoiseCancelEnable: the pad's noise suppressor. It expands the mic's
+#             dynamics and suppresses steady sounds -- including the music from
+#             another device that a voice chat should carry -- and it made every
+#             echo path nonlinear. Never set by this module.
+AC_MIC_INTERNAL = 0x01
+AC_ECHO_CANCEL = 0x04
+AC_NOISE_CANCEL = 0x08
+AC_DSP_MASK = AC_ECHO_CANCEL | AC_NOISE_CANCEL
+
+
+def audio_control(output_path: int, *, echo_cancel: bool = True,
+                  headset_plugged: bool = False) -> int:
+    """The audioControl byte: `output_path` (high nibble, e.g. 3 << 4) with the
+    internal mic selected (automatic when a headset is plugged), the pad's echo
+    canceller per `echo_cancel`, and its noise suppressor off.
+
+    The headset case used to be 0x08: mic select 0 (automatic) PLUS bit 3, the
+    noise suppressor. Mic select stays automatic; bit 3 goes for the same
+    reason it goes everywhere -- nothing here sets the noise suppressor."""
+    low = 0 if headset_plugged else AC_MIC_INTERNAL
+    if echo_cancel:
+        low |= AC_ECHO_CANCEL
+    return (output_path & 0xF0) | low
+
+
 # validFlag0 bits
 F0_COMPATIBLE_VIBRATION = 1 << 0
 F0_HAPTICS_SELECT = 1 << 1
@@ -203,14 +235,16 @@ class SetState:
         self.body[AT_RIGHT_MODE + 1 : AT_RIGHT_MODE + 11] = p
         return self.flag0(F0_RIGHT_TRIGGER_FFB)
 
-    def speaker_volume(self, vol: int) -> "SetState":
+    def speaker_volume(self, vol: int, echo_cancel: bool = True) -> "SetState":
         self.body[SPEAKER_VOLUME] = vol & 0xFF
-        self.body[AUDIO_CONTROL] = 3 << 4  # output path = internal speaker
+        # output path = internal speaker
+        self.body[AUDIO_CONTROL] = audio_control(3 << 4, echo_cancel=echo_cancel)
         return self.flag0(F0_SPEAKER_VOLUME | F0_AUDIO_CONTROL)
 
-    def headphone_volume(self, vol: int) -> "SetState":
+    def headphone_volume(self, vol: int, echo_cancel: bool = True) -> "SetState":
         self.body[HEADPHONE_VOLUME] = vol & 0xFF
-        self.body[AUDIO_CONTROL] = 0 << 4  # output path = headphone jack
+        # output path = headphone jack
+        self.body[AUDIO_CONTROL] = audio_control(0 << 4, echo_cancel=echo_cancel)
         return self.flag0(F0_HEADPHONE_VOLUME | F0_AUDIO_CONTROL)
 
     def mic_volume(self, vol: int) -> "SetState":
@@ -263,8 +297,13 @@ def build_report_36(
     target: str = "speaker",
     volume: int = 0x4B,
     mic_active: bool = False,
+    echo_cancel: bool = True,
 ) -> bytes:
     """398-byte BT audio+haptics report (report id included).
+
+    `echo_cancel` sets the pad's echo canceller in the audioControl byte the
+    report carries; a caller that armed the mic with it off must pass False,
+    or every report switches it back on.
 
     Port of btAudioStream.ts:buildReportSix. Payload index = report offset - 1.
 
@@ -289,7 +328,7 @@ def build_report_36(
         p[3] = F0_SPEAKER_VOLUME | F0_AUDIO_CONTROL  # 0xA0
         p[8] = volume & 0xFF
     p[4] = 0x00
-    p[10] = 0x09  # audioControl
+    p[10] = audio_control(0x00, echo_cancel=echo_cancel)  # audioControl
 
     # audio subpacket
     p[66] = 0x91
@@ -366,7 +405,7 @@ BT_MIC_OPUS_OFFSET = 2  # within the 0x31 payload (after report id)
 
 
 def build_bt_mic_state(seq: int, active: bool, muted: bool = False,
-                       headset_plugged: bool = False) -> bytes:
+                       headset_plugged: bool = False, echo_cancel: bool = True) -> bytes:
     """78-byte 0x31 output that arms/disarms the mic stream.
 
     Port of microphoneProtocol.ts:buildBtMicStateReport.
@@ -378,7 +417,8 @@ def build_bt_mic_state(seq: int, active: bool, muted: bool = False,
     p[off + VALID_FLAG0] = F0_MIC_VOLUME | F0_AUDIO_CONTROL          # 0xC0
     p[off + VALID_FLAG1] = F1_MIC_MUTE_LED | F1_POWER_SAVE_MUTE | F1_AUDIO_CONTROL2  # 0x83
     p[off + MIC_VOLUME] = 0x08 if (active and not muted) else 0x00
-    p[off + AUDIO_CONTROL] = 0x08 if headset_plugged else 0x09
+    p[off + AUDIO_CONTROL] = audio_control(0x00, echo_cancel=echo_cancel,
+                                           headset_plugged=headset_plugged)
     p[off + MUTE_LED_CONTROL] = 0x01 if muted else 0x00
     p[off + POWER_SAVE_MUTE_CONTROL] = 0x0F if (active and not muted) else 0x1F
     p[off + AUDIO_CONTROL2] = 0x01

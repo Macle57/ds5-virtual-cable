@@ -53,6 +53,8 @@ export interface Controller {
   hide_note?: string;                        // why hide_effective disagrees, when it does
   remote_mode?: boolean | null;              // the pad is driving the OS, not the game
   keyboard_open?: boolean | null;            // the on-screen keyboard is up
+  echo?: "off" | "idle" | "on" | "degraded" | null;  // mic echo cancellation (null = not reported)
+  echo_note?: string;                        // why it is degraded, when it is
   last_event?: string;
   telemetry?: Telemetry;
 }

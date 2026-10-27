@@ -129,7 +129,8 @@ def norm_serial(serial: str | None) -> str:
 # the data
 # ---------------------------------------------------------------------------
 
-_CC_KNOWN = ("enabled", "audio_target", "port", "label", "hide_bluetooth")
+_CC_KNOWN = ("enabled", "audio_target", "port", "label", "hide_bluetooth",
+             "echo_cancel")
 
 
 @dataclass
@@ -146,6 +147,10 @@ class ControllerConfig:
     #: must change nothing for anybody who does not go looking for it. Needs
     #: HidHide installed separately; see `hidhide.py` and docs/USER-GUIDE.md.
     hide_bluetooth: bool = False
+    #: Echo cancellation for this pad's microphone: the pad's own canceller
+    #: for its speaker (audioControl bit 2) plus the bridge's canceller for
+    #: the PC's other speakers (ds5emu/aec.py). Ships ON.
+    echo_cancel: bool = True
     #: Keys this version does not know about, carried through untouched so that
     #: a config written by a newer build and opened by an older one does not
     #: quietly lose the newer build's settings.
@@ -167,6 +172,7 @@ class ControllerConfig:
             port=_as_port(data.get("port")),
             label=_as_str(data.get("label"), ""),
             hide_bluetooth=_as_bool(data.get("hide_bluetooth"), False),
+            echo_cancel=_as_bool(data.get("echo_cancel"), True),
         )
         cc.extra = {k: v for k, v in data.items() if k not in _CC_KNOWN}
         return cc
@@ -175,7 +181,8 @@ class ControllerConfig:
         out = dict(self.extra)
         out.update(enabled=bool(self.enabled), audio_target=self.audio_target,
                    port=self.port, label=self.label,
-                   hide_bluetooth=bool(self.hide_bluetooth))
+                   hide_bluetooth=bool(self.hide_bluetooth),
+                   echo_cancel=bool(self.echo_cancel))
         return out
 
 
@@ -995,6 +1002,12 @@ class Config:
         happens inside a bridge's lifetime.
         """
         return bool(self.get(serial).hide_bluetooth)
+
+    def should_echo_cancel(self, serial: str) -> bool:
+        """Should this controller's microphone be echo-cancelled? Read by the
+        bridge child at spawn and by its config watcher afterwards, the same
+        way `should_hide` is read."""
+        return bool(self.get(serial).echo_cancel)
 
     def set_hide_bluetooth_default(self, hide: bool) -> None:
         """The seed `get()` stamps on a controller this machine has never seen.

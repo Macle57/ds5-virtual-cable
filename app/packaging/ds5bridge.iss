@@ -184,12 +184,12 @@ Source: "{#BundleUsbip}"; DestDir: "{tmp}"; DestName: "{#UsbipFile}"; Flags: don
 #ifdef BundleHidHide
 Source: "{#BundleHidHide}"; DestDir: "{tmp}"; DestName: "{#HidHideFile}"; Flags: dontcopy
 #endif
-#if Defined(BundleUsbip) || Defined(BundleHidHide)
-; A bundled build redistributes a vendor installer, and BSD-2 asks for the
-; notice "in the materials provided with the distribution". Next to the
-; uninstaller, not under app\ (the updater swaps that directory whole).
+; Every build carries SpeexDSP (compiled into the echo canceller's DLL), and
+; a bundled build also redistributes the vendor installers; their BSD
+; licences ask for the notices "in the materials provided with the
+; distribution". Next to the uninstaller, not under app\ (the updater swaps
+; that directory whole; the app bundle carries its own copy, see the spec).
 Source: "bundle\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
-#endif
 
 [Icons]
 Name: "{userprograms}\ds5bridge"; Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Comment: "ds5bridge -- a Bluetooth DualSense, presented to Windows as a wired one"; Components: app

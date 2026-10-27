@@ -431,7 +431,7 @@ export function ControllersSection() {
           <Card key={serial} title={(typeof asObj(controllers[serial]).label === "string" && String(asObj(controllers[serial]).label).trim()) || "Controller"}
                 tag={serial} className="st-boxed">
             {CTRL_FIELDS.map(([key, label, kind, choices]) => (
-              <Row key={key} label={label}>
+              <Row key={key} label={label} help={HELP[key]}>
                 {kind === "bool" ? <Toggle path={["controllers", serial, key]} />
                   : kind === "number" ? <NumberField path={["controllers", serial, key]} dflt={null} nullable width={130} />
                   : kind === "choice" ? <SelectField path={["controllers", serial, key]} dflt={choices![0]} width={150}
