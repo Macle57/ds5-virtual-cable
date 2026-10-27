@@ -942,13 +942,17 @@ class Config:
     #: without a click. See `update.py` for what a check actually sends
     #: (nothing about you; a conditional GET of public release metadata).
     update_check: bool = True
-    # -- SERVICE region (update.py's auto-install; see its docstring) --------
-    #: When a check finds a newer release, install it without a click: the
-    #: updater downloads the installer, verifies it against the release's
-    #: SHA256SUMS and runs it silently a minute later; the tray (or the
-    #: service) restarts itself on the new version. False keeps the old
-    #: "Install update" menu row / dashboard button as the only way. Nothing
-    #: without `update_check`.
+    # -- SERVICE region (update.py's ask-then-install; see its docstring) ----
+    #: When a check finds a newer release, ASK whether to install it: a
+    #: Yes/No box names the version and warns that the bridge restarts. Yes
+    #: downloads the installer, verifies it against the release's SHA256SUMS
+    #: and runs it silently; the tray (or the service) restarts itself on the
+    #: new version. No keeps this one until the "Install update" menu row /
+    #: dashboard button, and the box returns at the next start. False: a new
+    #: release is only announced (balloon, menu row, dashboard button).
+    #: Nothing without `update_check`. (The key predates the question -- it
+    #: used to install a minute after the toast, mid-game or not -- and kept
+    #: its name so saved configs stay valid.)
     update_auto_install: bool = True
     # -- end SERVICE region ---------------------------------------------------
     #: Keyed by LOWERCASED bdaddr, e.g. "d42f4ba1485d".

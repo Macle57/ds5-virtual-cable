@@ -1,14 +1,27 @@
-# Release pipeline: push a tag `vX.Y.Z`, get a GitHub release carrying ONE
-# installer -- ds5bridge-setup-<version>-bundled.exe -- and its SHA256SUMS.
+# Release pipeline: every push to `main` becomes a GitHub release carrying
+# ONE installer -- ds5bridge-setup-<version>-bundled.exe -- and its
+# SHA256SUMS. Installed copies pick it up on their next update check
+# (app/ds5app/update.py) and install it on their own.
+#
+# Branch flow: feature branches merge into `dev`; `dev` merges into `main`
+# when it is ready to ship. Nothing lands on main that should not reach
+# users, because landing on main IS shipping.
+#
+# Docs-only pushes (docs/, *.md) are skipped: no installer ships them, and
+# a release would make every installed copy download 75 MB for nothing.
 #
 # The contract with the rest of the system, spelled out because three
 # consumers depend on it exactly:
 #
-#   * The tag MUST equal `v` + ds5app.__version__ (app/ds5app/__init__.py --
-#     the single source of truth; cli.py, the updater and build-installer.ps1
-#     all read it). The first job fails the release on a mismatch, because a
-#     v0.5.0 release containing an exe that says 0.4.0 would make every
-#     installed copy offer itself its own "update" forever.
+#   * The version is minted here, not typed by hand. app/ds5app/__init__.py
+#     holds the BASE version (bump MAJOR.MINOR there for a feature release).
+#     The release is that base if it is newer than every vX.Y.Z tag, else the
+#     newest tag's patch + 1. The job writes the minted version into
+#     __init__.py in its checkout before building (never committed back), so
+#     the exe, the installer name and the tag all agree -- a release whose
+#     exe reported an older version would make every installed copy offer
+#     itself its own "update" forever. The tag `v<version>` is created on the
+#     pushed commit by `gh release create`.
 #   * The installer is named  ds5bridge-setup-<version>-bundled.exe  and
 #     carries usbip-win2 0.9.7.7 and HidHide 1.5.230 inside it, unmodified
 #     (app/packaging/build-installer.ps1 -Bundle; the name is ds5bridge.iss's
@@ -37,10 +50,20 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:   # re-ship main by hand (e.g. after a failed run)
+
+# One release at a time, in push order: two pushes racing would both read
+# the same newest tag and mint the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
-  contents: write   # gh release create
+  contents: write   # gh release create (and the tag it makes)
 
 defaults:
   run:
@@ -51,24 +74,39 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # every tag, to find the newest release
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Tag must match ds5app.__version__
+      # Mint the version and stamp it into ds5app.__version__ for this build.
+      - name: Pick this release's version
+        id: version
         run: |
-          $tag = '${{ github.ref_name }}'
-          $init = Get-Content app/ds5app/__init__.py -Raw
-          if ($init -notmatch '__version__\s*=\s*"([^"]+)"') {
-            throw 'no __version__ in app/ds5app/__init__.py'
+          $released = git tag --points-at HEAD --list 'v*'
+          if ($released) { throw "this commit is already released as $released -- nothing new to ship" }
+          $path = 'app/ds5app/__init__.py'
+          $init = [IO.File]::ReadAllText($path)
+          if ($init -notmatch '__version__\s*=\s*"(\d+\.\d+\.\d+)"') {
+            throw "no X.Y.Z __version__ in $path"
           }
-          $ver = $Matches[1]
-          if ($tag -ne "v$ver") {
-            throw "tag '$tag' does not match ds5app.__version__ '$ver' -- bump app/ds5app/__init__.py (the single source of truth) and re-tag."
+          $base = [version]$Matches[1]
+          $latest = git tag --list 'v*' |
+            Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } |
+            ForEach-Object { [version]$_.Substring(1) } |
+            Sort-Object -Descending | Select-Object -First 1
+          if (-not $latest -or $base -gt $latest) { $v = $base }
+          else { $v = [version]::new($latest.Major, $latest.Minor, $latest.Build + 1) }
+          $ver = $v.ToString(3)
+          "base $base, newest tag $latest -> releasing $ver"
+          $new = [regex]::Replace($init, '__version__\s*=\s*"[^"]+"', "__version__ = `"$ver`"")
+          [IO.File]::WriteAllText($path, $new)
+          if ([IO.File]::ReadAllText($path) -notmatch [regex]::Escape("__version__ = `"$ver`"")) {
+            throw "failed to stamp $ver into $path"
           }
           "version=$ver" | Out-File $env:GITHUB_OUTPUT -Append
-        id: version
 
       # build.ps1 insists on this exact venv path, and that is a feature: the
       # release build runs the same script a developer runs, not a parallel
@@ -189,7 +227,7 @@ jobs:
           | `ds5bridge-setup-VERSION-bundled.exe` | The installer. Also what the app's in-place updater downloads. |
           | `SHA256SUMS` | Its SHA-256. Nothing here is code-signed, so this is how to check the download. |
 
-          Nothing is code-signed yet: Windows SmartScreen shows "Windows protected your PC" on first run (*More info* > *Run anyway*). By default ds5bridge installs as a **Windows service** that bridges your pads at boot, before anyone signs in (or pick "at sign-in" in the installer); the tray icon appears once you are signed in. The app updates itself from these releases automatically (switch it off in the dashboard). Uninstalling removes the drivers in two halves around **one reboot**; reboot **twice** before reinstalling usbip-win2 (docs/installer.md).
+          Nothing is code-signed yet: Windows SmartScreen shows "Windows protected your PC" on first run (*More info* > *Run anyway*). By default ds5bridge installs as a **Windows service** that bridges your pads at boot, before anyone signs in (or pick "at sign-in" in the installer); the tray icon appears once you are signed in. The app spots these releases on its own and asks before installing one, so nothing restarts mid-game without a yes (switch the question off in the dashboard). Uninstalling removes the drivers in two halves around **one reboot**; reboot **twice** before reinstalling usbip-win2 (docs/installer.md).
 
           '@
           $notes.Replace('VERSION', $ver) | Out-File dist\notes.md -Encoding utf8
@@ -199,10 +237,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ver = '${{ steps.version.outputs.version }}'
-          gh release create '${{ github.ref_name }}' `
+          gh release create "v$ver" `
             "dist/ds5bridge-setup-$ver-bundled.exe" `
             "dist/SHA256SUMS" `
+            --target '${{ github.sha }}' `
             --title "ds5bridge $ver" `
             --notes-file dist/notes.md `
-            --generate-notes `
-            --verify-tag
+            --generate-notes
