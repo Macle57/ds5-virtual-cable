@@ -82,7 +82,8 @@ class SettingTests(_Temp):
         self.write({"controllers": {SERIAL: {"echo_cancel": False},
                                     OTHER: {"echo_cancel": True}}})
         cfg = K.load()
-        self.assertEqual(cfg.controllers[SERIAL].mic_mode, "pad")
+        # false switched both cancellers off: what "studio" is now
+        self.assertEqual(cfg.controllers[SERIAL].mic_mode, "studio")
         self.assertEqual(cfg.controllers[OTHER].mic_mode, "voice")
 
     def test_save_drops_the_old_key(self):
@@ -90,19 +91,19 @@ class SettingTests(_Temp):
         K.save(K.load())
         with open(self.path, encoding="utf-8") as f:
             entry = json.load(f)["controllers"][SERIAL]
-        self.assertEqual(entry["mic_mode"], "pad")
+        self.assertEqual(entry["mic_mode"], "studio")
         self.assertNotIn("echo_cancel", entry)
         self.assertEqual(entry["label"], "x")
 
     def test_the_new_key_wins_over_the_old_one(self):
         # A dashboard save merged over an old file can carry both.
         self.write({"controllers": {SERIAL: {"echo_cancel": False,
-                                             "mic_mode": "studio"}}})
-        self.assertEqual(K.load().controllers[SERIAL].mic_mode, "studio")
+                                             "mic_mode": "pad"}}})
+        self.assertEqual(K.load().controllers[SERIAL].mic_mode, "pad")
 
     def test_a_hand_edited_value_is_coerced_not_fatal(self):
         self.write({"controllers": {SERIAL: {"echo_cancel": "off"}}})
-        self.assertEqual(K.load().controllers[SERIAL].mic_mode, "pad")
+        self.assertEqual(K.load().controllers[SERIAL].mic_mode, "studio")
         self.write({"controllers": {SERIAL: {"echo_cancel": [1, 2]}}})
         self.assertEqual(K.load().controllers[SERIAL].mic_mode, "voice")
         self.write({"controllers": {SERIAL: {"mic_mode": " Studio "}}})
@@ -111,7 +112,7 @@ class SettingTests(_Temp):
         self.assertEqual(K.load().controllers[SERIAL].mic_mode, "voice")
         # an unknown new value falls back to the old key, if there is one
         self.write({"controllers": {SERIAL: {"mic_mode": 3, "echo_cancel": False}}})
-        self.assertEqual(K.load().controllers[SERIAL].mic_mode, "pad")
+        self.assertEqual(K.load().controllers[SERIAL].mic_mode, "studio")
 
     def test_both_keys_are_known_not_extras(self):
         self.write({"controllers": {SERIAL: {"echo_cancel": False, "mic_mode": "pad"}}})
@@ -162,7 +163,7 @@ class RunResolutionTests(_Temp):
 
     def test_an_old_setting_is_read_through_the_migration(self):
         self.write({"controllers": {SERIAL: {"echo_cancel": False}}})
-        self.assertEqual(self._run(["run", "--serial", SERIAL])["mic_mode"], "pad")
+        self.assertEqual(self._run(["run", "--serial", SERIAL])["mic_mode"], "studio")
 
     def test_a_new_controller_defaults_to_voice(self):
         kw = self._run(["run", "--serial", SERIAL])
@@ -176,9 +177,9 @@ class RunResolutionTests(_Temp):
             self.assertFalse(kw["follow_mic_config"])
 
     def test_the_old_flag_is_an_alias(self):
-        self.write({"controllers": {SERIAL: {"mic_mode": "studio"}}})
+        self.write({"controllers": {SERIAL: {"mic_mode": "pad"}}})
         kw = self._run(["run", "--serial", SERIAL, "--echo-cancel", "off"])
-        self.assertEqual(kw["mic_mode"], "pad")
+        self.assertEqual(kw["mic_mode"], "studio")
         self.assertFalse(kw["follow_mic_config"])
         kw = self._run(["run", "--serial", SERIAL, "--echo-cancel", "on"])
         self.assertEqual(kw["mic_mode"], "voice")
@@ -227,7 +228,7 @@ class LiveApplyTests(_Temp):
         w, applied = self._watcher(current)
         self.write({"controllers": {SERIAL: {"echo_cancel": False}}}, 1)
         self.assertTrue(w.poll_once())
-        self.assertEqual(applied, ["pad"])
+        self.assertEqual(applied, ["studio"])
 
     def test_an_unrelated_save_does_not_touch_it(self):
         current = ["voice"]

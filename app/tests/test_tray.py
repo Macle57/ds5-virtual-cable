@@ -568,6 +568,15 @@ class MicrophoneMenuTests(unittest.TestCase):
         self.assertEqual(app._pending, {})
         self.assertEqual(app.timers, [])
 
+    def test_a_one_run_serial_override_writes_nothing(self):
+        # Same rule as `_persist_enabled`: `tray --serial` must not edit the
+        # settings every other run uses.
+        app = self._app([controller(A)], mic_modes={A: "voice"})
+        app.only = A
+        app._mic_rows()[2][2]()
+        self.assertEqual(app.cfg.controllers, {A: "voice"})
+        self.assertEqual(app.cfg.saves, 0)
+
     def test_choosing_with_no_controller_says_so(self):
         app = self._app([])
         app._mic_rows()[2][2]()

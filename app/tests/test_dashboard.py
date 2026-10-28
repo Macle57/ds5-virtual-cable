@@ -179,15 +179,15 @@ class DashboardCase(unittest.TestCase):
         with open(K.config_path(), "w", encoding="utf-8") as f:
             json.dump({"controllers": {"aabbccddeeff": {"echo_cancel": False}}}, f)
         doc = self.get_json("/api/config")["config"]
-        self.assertEqual(doc["controllers"]["aabbccddeeff"]["mic_mode"], "pad")
+        self.assertEqual(doc["controllers"]["aabbccddeeff"]["mic_mode"], "studio")
         self.assertNotIn("echo_cancel", doc["controllers"]["aabbccddeeff"])
         status, body, _ = self.post_config(
-            {"controllers": {"aabbccddeeff": {"mic_mode": "studio"}}})
+            {"controllers": {"aabbccddeeff": {"mic_mode": "pad"}}})
         self.assertEqual(status, 200, body)
-        self.assertEqual(K.load().mic_mode_for("aabbccddeeff"), "studio")
+        self.assertEqual(K.load().mic_mode_for("aabbccddeeff"), "pad")
         with open(K.config_path(), encoding="utf-8") as f:
             entry = json.load(f)["controllers"]["aabbccddeeff"]
-        self.assertEqual(entry["mic_mode"], "studio")
+        self.assertEqual(entry["mic_mode"], "pad")
         self.assertNotIn("echo_cancel", entry)
 
     def test_macros_round_trip_and_delete_through_the_api(self):

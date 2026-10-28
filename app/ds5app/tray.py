@@ -1173,6 +1173,8 @@ class TrayApp:
         canceller and the pad's audioControl byte live, without a re-bridge.
         """
         def act(*_):
+            if self.only:
+                return                  # a one-run override must not be written
             serials = self._mic_serials()
             if not serials:
                 self._notify("Microphone",

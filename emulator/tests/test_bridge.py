@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest import mock
 
 try:
     from ds5emu import bridge as B
@@ -1526,9 +1527,62 @@ class PadAudioControlTests(unittest.TestCase):
         self.assertTrue((out == 32767).all())
 
     def test_the_arm_sends_the_documented_mic_byte(self):
+        # Through the bridge's own arm path and the real device methods: the
+        # 0x31 mic-state report it writes carries MIC_VOLUME = 0x08, and the
+        # windows capture level does not change that.
+        from ds5bridge import device as DEV
+        from ds5emu import descriptors as D
+        from ds5emu.uac import FU_VOLUME_CONTROL
+
         P = self.P
-        rep = P.build_bt_mic_state(0, True)
-        self.assertEqual(rep[1 + 2 + P.MIC_VOLUME], B.MIC_ARM_VOLUME_BYTE)
+
+        class RealArm(_FakeDev):
+            send_mic_state = DEV.DualSense.send_mic_state
+            send_mic_control = DEV.DualSense.send_mic_control
+
+        be = B.BridgeBackend()
+        be._dev = dev = RealArm()
+        be.on_uac_control(D.UNIT_FU_MIC, FU_VOLUME_CONTROL, 40 * 256)
+        be._arm_mic_now(True)
+        states = [w for w in dev.writes if w[0] == P.BT_OUT_31]
+        self.assertEqual(len(states), 1)
+        body = states[0][3:]                        # [0x31][seq/tag][0x10][body]
+        self.assertTrue(body[P.VALID_FLAG0] & P.F0_MIC_VOLUME)
+        self.assertEqual(body[P.MIC_VOLUME], B.MIC_ARM_VOLUME_BYTE)
+        self.assertEqual(B.MIC_ARM_VOLUME_BYTE, 0x08)
+
+    def test_a_live_switch_pauses_and_resumes_the_same_canceller(self):
+        # voice -> pad -> voice must keep the software canceller (each
+        # speaker's delay and filter), not tear it down and build a new one.
+        class Engine:
+            def __init__(self):
+                self.active = True
+                self.calls = []
+
+            def pause(self):
+                self.active = False
+                self.calls.append("pause")
+
+            def resume(self):
+                self.active = True
+                self.calls.append("resume")
+
+        be = B.BridgeBackend(mic_mode="voice")
+        be._threads = ["pretend the backend is started"]
+        be._mic_armed.set()
+        be._write_setstate_body = lambda body: None
+        be._aec = eng = Engine()
+        with mock.patch.object(B.AEC, "EchoCanceller",
+                               side_effect=AssertionError("rebuilt")):
+            be.set_mic_mode("pad")
+            be._drain_control_q()
+            self.assertIs(be._aec, eng)
+            self.assertFalse(eng.active)
+            be.set_mic_mode("voice")
+            be._drain_control_q()
+        self.assertIs(be._aec, eng)
+        self.assertTrue(eng.active)
+        self.assertEqual(eng.calls, ["pause", "resume"])
 
     def test_the_mic_level_is_the_same_with_the_canceller_on(self):
         # The pad lowers its mic 1.9 dB when its canceller is on; the bridge

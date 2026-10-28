@@ -255,7 +255,7 @@ quiet before this version, set the slider once: Windows may have kept the old
 level, which now means no boost at all.
 
 (Settings written by an older version had a switch, `echo_cancel`, instead:
-on reads as Voice chat, off as Pad only, and the file is rewritten with
+on reads as Voice chat, off as Studio, and the file is rewritten with
 `mic_mode` the next time anything is saved.)
 
 #### Optional: hiding the Bluetooth pad, so games see ONE controller

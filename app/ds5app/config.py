@@ -88,16 +88,15 @@ def mic_mode_from_dict(data: dict) -> str:
     """A controller entry's microphone mode, reading the old key too.
 
     `mic_mode` wins when it is one of `MIC_MODES`. Otherwise the bool it
-    replaced, `echo_cancel`, decides: false reads as `pad` (the bridge's
-    canceller for the PC's other speakers off; the pad still cancels its
-    own speaker, which the bool used to switch off along with it), true,
-    absent or unreadable as the default, `voice`. Save writes `mic_mode`
-    only."""
+    replaced, `echo_cancel`, decides, meaning what it meant: false switched
+    BOTH cancellers off (the pad's bit and the bridge's), which is `studio`;
+    true, absent or unreadable is the default, `voice`. Save writes
+    `mic_mode` only."""
     mode = _as_choice(data.get("mic_mode"), MIC_MODES, "")
     if mode:
         return mode
     if "echo_cancel" in data:
-        return MIC_VOICE if _as_bool(data.get("echo_cancel"), True) else MIC_PAD
+        return MIC_VOICE if _as_bool(data.get("echo_cancel"), True) else MIC_STUDIO
     return DEFAULT_MIC_MODE
 
 

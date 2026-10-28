@@ -647,14 +647,15 @@ def _close_quietly(*closers) -> None:
 def mic_mode_flag(args) -> str | None:
     """The microphone mode the command line pins, or None to follow the
     config. `--mic-mode` wins; the deprecated `--echo-cancel on|off` means
-    voice|pad (what the bool `echo_cancel` setting now loads as)."""
+    voice|studio -- what it always did (off cleared the pad's canceller bit
+    and the bridge's), and what the bool `echo_cancel` setting loads as."""
     mode = getattr(args, "mic_mode", None)
     if mode:
         return mode
     echo = getattr(args, "echo_cancel", None)
     if echo is None:
         return None
-    return "voice" if echo == "on" else "pad"
+    return "voice" if echo == "on" else "studio"
 
 
 def cmd_run(args) -> int:
@@ -888,7 +889,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "without it, a change in the tray or the dashboard "
                         "applies live")
     r.add_argument("--echo-cancel", choices=("on", "off"), default=None,
-                   help="deprecated: --mic-mode voice (on) or pad (off)")
+                   help="deprecated: --mic-mode voice (on) or studio (off)")
     r.add_argument("--telemetry-port", type=int, default=None, metavar="PORT",
                    help="publish live input state (buttons, sticks, touch) as "
                         "UDP datagrams to 127.0.0.1:PORT at up to 60 Hz, for "
