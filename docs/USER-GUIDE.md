@@ -202,6 +202,7 @@ Right-click for the menu:
 | **Open dashboard** | opens the status dashboard in your browser |
 | **Bridging enabled** | the master switch. Unticking it stops every bridge |
 | **Controllers >** | one row per controller — tick to bridge it, untick to leave it alone |
+| **Microphone >** | what the pads' microphones remove, for every controller at once: **Voice chat**, **Pad only** or **Studio** — see below |
 | **Hide Bluetooth pads while bridged** | optional, off by default — sets *every* controller at once; see below |
 | **Hide per controller >** | the same choice, one pad at a time |
 | **Rescan for controllers** | look again now instead of waiting for the next sweep |
@@ -225,6 +226,37 @@ ordinary Bluetooth controller.
 That is the right thing to do when a game already supports a DualSense properly
 over Bluetooth, or when a launcher gets confused by seeing two pads. Tick it
 again when you want the wired features back.
+
+#### The microphone: what it removes, and how loud it is
+
+The pad's microphone works like a wired pad's: in Windows it is
+**Headset Microphone (DualSense Wireless Controller)**. What is removed from
+it before Windows hears it is your choice, per controller in the dashboard
+(**Settings → Controllers → Microphone**) or for all of them at once in the
+tray's **Microphone** menu:
+
+| mode | what is removed | use it for |
+|---|---|---|
+| **Voice chat** (the default) | everything this PC plays: the pad's own speaker (the controller does that itself) and any other speaker the PC drives that the pad can hear, such as a TV or desktop speakers (the bridge does that, once it has heard that speaker in the mic) | talking to friends while the game plays out loud |
+| **Pad only** | only the pad's own speaker; the PC's other speakers stay in | when people should hear the music or the TV |
+| **Studio** | nothing: the mic is sent exactly as the pad hears it, its own speaker included | recording, or software that does its own echo cancellation |
+
+In every mode people and other sounds in the room are kept, and headphones
+are never touched. A change applies to a running bridge within a couple of
+seconds; nothing restarts. The status line (and the dashboard's sticker)
+says `echo on` / `idle` in Voice chat, `echo pad` in Pad only and `echo off`
+in Studio.
+
+**Too quiet?** The mic level is the Windows one: **Settings → System → Sound →
+Input → Headset Microphone (DualSense Wireless Controller) → Input volume**.
+As on a wired pad it is a boost, from none at 0 % to +48 dB at 100 %; around
+65 % (+15 dB) is a normal level for a pad held in your hands. If the mic was
+quiet before this version, set the slider once: Windows may have kept the old
+level, which now means no boost at all.
+
+(Settings written by an older version had a switch, `echo_cancel`, instead:
+on reads as Voice chat, off as Pad only, and the file is rewritten with
+`mic_mode` the next time anything is saved.)
 
 #### Optional: hiding the Bluetooth pad, so games see ONE controller
 
@@ -388,6 +420,8 @@ drain faster than a cable ever would. Charge between sessions.
 | **I ticked "Hide Bluetooth pad" and nothing happened** | either HidHide is not installed, or the game was already running | `ds5bridge doctor` says which. HidHide cannot hide a device from a program that already has it open — close the game, then start it again. |
 | **"NOT hiding: this program is not on HidHide's whitelist"** | ds5bridge refused to hide, because it could not confirm it would still be able to read the controller itself | Deliberate, and the safe outcome: hiding a pad it cannot open would leave you with no working controller at all. Run `ds5bridge doctor` and read the `granting` row; `python app\tools\hidhide_verify.py` gives the full diagnosis. |
 | **Controller works, but no haptics or triggers** | the game is using the Bluetooth device, not the virtual wired one | See the row above. |
+| **Your voice chat hears the game** | the microphone is in Pad only or Studio, or the bridge has not heard that speaker yet | Tray → **Microphone → Voice chat**. The bridge needs a few seconds of sound from a new speaker before it can remove it; the dashboard's status card says if its canceller is not working. |
+| **Friends can barely hear you** | the Windows input level for the pad's mic is low | **Settings → System → Sound → Input**, pick **Headset Microphone (DualSense Wireless Controller)** and raise **Input volume** (about 65 % is normal, 100 % is +48 dB). |
 | **Sound comes out of the controller speaker when you did not want it** | Windows picked the virtual DualSense as the default playback device | **Settings → System → Sound → Output**, choose your usual speakers. |
 | **"Windows protected your PC"** | SmartScreen; the build is not code-signed | More info → Run anyway, if you trust the source. |
 | **Everything looks stuck after a crash** | leftovers | `ds5bridge cleanup`. It is safe to run any time, twice, or when nothing is up. |
@@ -424,8 +458,10 @@ ds5bridge --version
 Useful extras: `--status-every 5` (more frequent status lines), `--port 3242`
 (if something else wants 3241), `--audio-target headphone` (route audio to the
 controller's 3.5 mm jack instead of its speaker — untested),
-`--hide-bluetooth` (hide the Bluetooth pad for this run; needs HidHide), `-v`
-(verbose logs when reporting a problem).
+`--hide-bluetooth` (hide the Bluetooth pad for this run; needs HidHide),
+`--mic-mode voice|pad|studio` (what the mic removes, for this run; without
+it the controller's setting is used and followed live), `-v` (verbose logs
+when reporting a problem).
 
 ---
 

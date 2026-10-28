@@ -36,7 +36,15 @@ back to the game. It ships off; switch it on from the dashboard.
 The full keymap, every gesture and how the engine hooks in are in
 [`docs/input-shortcuts.md`](docs/input-shortcuts.md).
 
-Ps: next feature acoustic echo cancellation, so u can talk to your friends while playing games on your tv's speaker via controller's mic without echo 
+### Voice chat through the pad's mic
+
+Talk to your friends through the controller's mic while the game plays on
+your TV or speakers: the bridge removes what the PC plays from the mic, and
+the pad removes its own speaker, so nobody hears the game echo back. The
+tray's **Microphone** menu picks **Voice chat** (remove everything the PC
+plays, the default), **Pad only** (just the pad's own speaker) or **Studio**
+(send everything). Details in the
+[user guide](docs/USER-GUIDE.md#the-microphone-what-it-removes-and-how-loud-it-is).
 
 ## How it works
 
