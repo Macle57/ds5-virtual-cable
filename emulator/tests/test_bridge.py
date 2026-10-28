@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest import mock
 
 try:
     from ds5emu import bridge as B
@@ -208,7 +209,7 @@ class BackendWithoutHardwareTests(unittest.TestCase):
         self.assertEqual(len(self.be.get_feature_report(0x05, 8)), 8)
 
     def test_uac_volume_maps_monotonically_onto_the_dualsense_knob(self):
-        quiet = B._uac_db_to_byte(-96 * 256)
+        quiet = B._uac_db_to_byte(-100 * 256)
         mid = B._uac_db_to_byte(-20 * 256)
         loud = B._uac_db_to_byte(0)
         self.assertLess(quiet, mid)
@@ -1014,6 +1015,25 @@ class ClockSeamTests(unittest.TestCase):
         self.be.on_uac_control(D.UNIT_FU_SPEAKER, FU_VOLUME_CONTROL, -20 * 256)
         self.assertEqual(len(self.be._control_q), 1)
 
+    def test_the_mic_level_is_a_gain_not_a_pad_byte(self):
+        # Windows' capture level becomes the bridge's own gain; nothing is
+        # written to the pad (the next arm would overwrite it with 0x08).
+        from ds5emu import descriptors as D
+        from ds5emu.uac import FU_VOLUME_CONTROL
+
+        self.be._threads = ["pretend the backend is started"]
+        self.be.on_uac_control(D.UNIT_FU_MIC, FU_VOLUME_CONTROL, 24 * 256)
+        self.assertEqual(len(self.be._control_q), 0)
+        self.assertEqual(self.be.mic_gain_db, 24.0)
+        self.be.on_uac_control(D.UNIT_FU_MIC, FU_VOLUME_CONTROL, 0)
+        self.assertEqual(self.be.mic_gain_db, 0.0)
+
+    def test_the_mic_gain_starts_at_the_feature_units_default(self):
+        from ds5emu import uac as UAC
+
+        self.assertAlmostEqual(B.BridgeBackend().mic_gain_db,
+                               UAC.MIC_VOLUME_DEFAULT / 256.0)
+
     def test_the_control_queue_is_bounded(self):
         self.be._threads = ["pretend the backend is started"]
         for _ in range(500):
@@ -1355,10 +1375,24 @@ class PadAudioControlTests(unittest.TestCase):
         self.assertEqual(rep[1 + 2 + P.AUDIO_CONTROL], 0x01)
 
     def test_the_bridge_arms_the_mic_with_its_setting(self):
-        be = B.BridgeBackend(echo_cancel=False)
-        be._dev = dev = self.MicDev()
-        be._arm_mic_now(True)
-        self.assertEqual(dev.mic_states, [(True, False)])
+        for mode, pad_ec in (("voice", True), ("pad", True), ("studio", False)):
+            be = B.BridgeBackend(mic_mode=mode)
+            be._dev = dev = self.MicDev()
+            be._arm_mic_now(True)
+            self.assertEqual(dev.mic_states, [(True, pad_ec)], mode)
+
+    def test_the_modes_split_the_two_cancellers(self):
+        for mode, pad_ec, pc_ec in (("voice", True, True), ("pad", True, False),
+                                    ("studio", False, False)):
+            be = B.BridgeBackend(mic_mode=mode)
+            self.assertEqual((be.pad_echo_cancel, be.pc_echo_cancel), (pad_ec, pc_ec), mode)
+            st = be.echo_status()
+            self.assertEqual((st["enabled"], st["pad"], st["mic_mode"]), (pc_ec, pad_ec, mode))
+        self.assertEqual(B.BridgeBackend().mic_mode, "voice")
+        with self.assertRaises(ValueError):
+            B.BridgeBackend(mic_mode="loud")
+        with self.assertRaises(ValueError):
+            B.BridgeBackend().set_mic_mode("loud")
 
     def test_a_host_setstate_cannot_switch_the_dsp(self):
         P = self.P
@@ -1367,7 +1401,9 @@ class PadAudioControlTests(unittest.TestCase):
         body[P.VALID_FLAG0] = P.F0_AUDIO_CONTROL
         body[P.AUDIO_CONTROL] = 0x39                  # NC on, EC off, internal mic
         self.assertEqual(be._audio_policy(bytes(body))[P.AUDIO_CONTROL], 0x35)
-        be.echo_cancel = False
+        be.mic_mode = "pad"
+        self.assertEqual(be._audio_policy(bytes(body))[P.AUDIO_CONTROL], 0x35)
+        be.mic_mode = "studio"
         self.assertEqual(be._audio_policy(bytes(body))[P.AUDIO_CONTROL], 0x31)
         body[P.VALID_FLAG0] = 0                       # not asking: untouched
         self.assertEqual(be._audio_policy(bytes(body)), bytes(body))
@@ -1377,12 +1413,17 @@ class PadAudioControlTests(unittest.TestCase):
         be = B.BridgeBackend()
         sent: list = []
         be._write_setstate_body = sent.append
-        be.set_echo_cancel(False)
-        self.assertFalse(be.echo_cancel)
-        self.assertEqual(sent[-1][P.AUDIO_CONTROL], 0x31)
+        be.set_mic_mode("studio")
+        self.assertEqual(be.mic_mode, "studio")
+        self.assertFalse(be.pad_echo_cancel)
+        self.assertEqual(sent[-1][P.AUDIO_CONTROL], 0x31)        # no AC_ECHO_CANCEL
         self.assertTrue(sent[-1][P.VALID_FLAG0] & P.F0_AUDIO_CONTROL)
-        be.set_echo_cancel(True)
+        be.set_mic_mode("pad")
         self.assertEqual(sent[-1][P.AUDIO_CONTROL], 0x35)
+        self.assertFalse(be.pc_echo_cancel)
+        be.set_mic_mode("voice")
+        self.assertEqual(sent[-1][P.AUDIO_CONTROL], 0x35)
+        self.assertTrue(be.pc_echo_cancel)
 
     def test_switching_live_changes_only_the_dsp_bits(self):
         # The host routed audio to the headphone jack with the automatic mic
@@ -1396,11 +1437,11 @@ class PadAudioControlTests(unittest.TestCase):
         be.write_output_report(bytes([0x02]) + bytes(body))
         sent: list = []
         be._write_setstate_body = sent.append
-        be.set_echo_cancel(True)
+        be.set_mic_mode("voice")
         out = sent[-1]
         self.assertEqual(out[P.AUDIO_CONTROL], 0x04)          # path/mic kept, EC on
         self.assertEqual(out[P.VALID_FLAG0], P.F0_AUDIO_CONTROL)   # no volume write
-        be.set_echo_cancel(False)
+        be.set_mic_mode("studio")
         self.assertEqual(sent[-1][P.AUDIO_CONTROL], 0x00)
 
     def test_the_reconnect_replay_goes_through_the_policy(self):
@@ -1428,37 +1469,128 @@ class PadAudioControlTests(unittest.TestCase):
         self.assertEqual(off[1 + 10], 0x01)
 
     def test_disarming_carries_the_setting(self):
-        be = B.BridgeBackend(echo_cancel=False)
+        be = B.BridgeBackend(mic_mode="studio")
         be._dev = dev = self.MicDev()
         be._arm_mic_now(False)
         self.assertEqual(dev.mic_states, [(False, False)])
 
     def test_the_connect_prime_carries_the_policy(self):
         P = self.P
-        be = B.BridgeBackend()
-        be._dev = dev = _FakeDev()
-        be._prime_setstate()
-        # BT 0x31 SetState: [0x31][seq/tag][0x10][body...]
-        self.assertEqual(dev.writes[-1][3 + P.AUDIO_CONTROL], 0x35)
+        for mode, byte in (("voice", 0x35), ("pad", 0x35), ("studio", 0x31)):
+            be = B.BridgeBackend(mic_mode=mode)
+            be._dev = dev = _FakeDev()
+            be._prime_setstate()
+            # BT 0x31 SetState: [0x31][seq/tag][0x10][body...]
+            self.assertEqual(dev.writes[-1][3 + P.AUDIO_CONTROL], byte, mode)
 
     class _Dec:
         def decode(self, opus):
             import numpy as np
             return np.full(480, 0.25, np.float32)
 
-    def _mic_level(self, echo_cancel):
+    def _mic_level(self, mode):
         import numpy as np
-        be = B.BridgeBackend(echo_cancel=echo_cancel)
+        be = B.BridgeBackend(mic_mode=mode)
+        be.mic_gain_db = 0.0
         be._on_mic_payload(self._Dec(), bytes(200))
         pcm = np.frombuffer(be._mic_ring.read_exact(480 * B.USB_IN_FRAME_BYTES), "<i2")
         return float(np.abs(pcm[0::2]).mean())
+
+    def test_windows_capture_gain_is_applied_in_db(self):
+        # The direct path and the software canceller's output both carry it.
+        import math
+        import numpy as np
+        for db in (0.0, 6.0, 11.5):          # 0.25 * 10^(11.5/20) < 1: no clipping
+            be = B.BridgeBackend(mic_mode="studio")
+            be.mic_gain_db = 0.0
+            be._on_mic_payload(self._Dec(), bytes(200))
+            ref = np.frombuffer(be._mic_ring.read_exact(480 * B.USB_IN_FRAME_BYTES), "<i2")
+            be.mic_gain_db = db
+            be._on_mic_payload(self._Dec(), bytes(200))
+            out = np.frombuffer(be._mic_ring.read_exact(480 * B.USB_IN_FRAME_BYTES), "<i2")
+            got = 20 * math.log10(np.abs(out).mean() / np.abs(ref).mean())
+            self.assertAlmostEqual(got, db, delta=0.05)
+            be._write_mic(ref.tobytes())
+            via_aec = np.frombuffer(be._mic_ring.read_exact(480 * B.USB_IN_FRAME_BYTES), "<i2")
+            got = 20 * math.log10(np.abs(via_aec).mean() / np.abs(ref).mean())
+            self.assertAlmostEqual(got, db, delta=0.05)
+
+    def test_a_loud_gain_clips_rather_than_wraps(self):
+        import numpy as np
+        be = B.BridgeBackend()
+        be.mic_gain_db = 48.0
+        be._write_mic(np.full(960, 20000, "<i2").tobytes())
+        out = np.frombuffer(be._mic_ring.read_exact(960 * 2), "<i2")
+        self.assertTrue((out == 32767).all())
+        be._on_mic_payload(self._Dec(), bytes(200))
+        out = np.frombuffer(be._mic_ring.read_exact(480 * B.USB_IN_FRAME_BYTES), "<i2")
+        self.assertTrue((out == 32767).all())
+
+    def test_the_arm_sends_the_documented_mic_byte(self):
+        # Through the bridge's own arm path and the real device methods: the
+        # 0x31 mic-state report it writes carries MIC_VOLUME = 0x08, and the
+        # windows capture level does not change that.
+        from ds5bridge import device as DEV
+        from ds5emu import descriptors as D
+        from ds5emu.uac import FU_VOLUME_CONTROL
+
+        P = self.P
+
+        class RealArm(_FakeDev):
+            send_mic_state = DEV.DualSense.send_mic_state
+            send_mic_control = DEV.DualSense.send_mic_control
+
+        be = B.BridgeBackend()
+        be._dev = dev = RealArm()
+        be.on_uac_control(D.UNIT_FU_MIC, FU_VOLUME_CONTROL, 40 * 256)
+        be._arm_mic_now(True)
+        states = [w for w in dev.writes if w[0] == P.BT_OUT_31]
+        self.assertEqual(len(states), 1)
+        body = states[0][3:]                        # [0x31][seq/tag][0x10][body]
+        self.assertTrue(body[P.VALID_FLAG0] & P.F0_MIC_VOLUME)
+        self.assertEqual(body[P.MIC_VOLUME], B.MIC_ARM_VOLUME_BYTE)
+        self.assertEqual(B.MIC_ARM_VOLUME_BYTE, 0x08)
+
+    def test_a_live_switch_pauses_and_resumes_the_same_canceller(self):
+        # voice -> pad -> voice must keep the software canceller (each
+        # speaker's delay and filter), not tear it down and build a new one.
+        class Engine:
+            def __init__(self):
+                self.active = True
+                self.calls = []
+
+            def pause(self):
+                self.active = False
+                self.calls.append("pause")
+
+            def resume(self):
+                self.active = True
+                self.calls.append("resume")
+
+        be = B.BridgeBackend(mic_mode="voice")
+        be._threads = ["pretend the backend is started"]
+        be._mic_armed.set()
+        be._write_setstate_body = lambda body: None
+        be._aec = eng = Engine()
+        with mock.patch.object(B.AEC, "EchoCanceller",
+                               side_effect=AssertionError("rebuilt")):
+            be.set_mic_mode("pad")
+            be._drain_control_q()
+            self.assertIs(be._aec, eng)
+            self.assertFalse(eng.active)
+            be.set_mic_mode("voice")
+            be._drain_control_q()
+        self.assertIs(be._aec, eng)
+        self.assertTrue(eng.active)
+        self.assertEqual(eng.calls, ["pause", "resume"])
 
     def test_the_mic_level_is_the_same_with_the_canceller_on(self):
         # The pad lowers its mic 1.9 dB when its canceller is on; the bridge
         # puts it back, so the switch never changes how loud a voice is.
         import math
-        on, off = self._mic_level(True), self._mic_level(False)
+        on, off = self._mic_level("pad"), self._mic_level("studio")
         self.assertAlmostEqual(20 * math.log10(on / off), B.PAD_EC_MAKEUP_DB, delta=0.05)
+        self.assertEqual(self._mic_level("voice"), on)
 
 
 if __name__ == "__main__":

@@ -80,6 +80,7 @@ OutputBaseFilename=ds5bridge-bundle-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\ds5bridge.ico
 UninstallDisplayIcon={app}\ds5bridge-tray.exe
 UninstallDisplayName=ds5bridge (includes usbip-win2 and HidHide drivers)
 SetupLogging=yes

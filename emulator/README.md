@@ -235,9 +235,10 @@ capped at 1 s and it now takes 2.1 s.
   frequency against a silent baseline -- it proves the path carries the signal
   and the channel mapping is right, not that it is undistorted.
 - **Anything longer than four minutes.** Longest continuous run: 120 s.
-- UAC1 volume MIN/MAX/RES are **assumed** values, not captured from the
-  physical controller (risk R7). Windows accepted them and built a working
-  mixer, which is weaker evidence than sniffing the real answers.
+- UAC1 volume MIN/MAX/RES (risk R7) are now the real pad's, read through
+  Windows' endpoint volume on two wired DualSenses (speaker -100..0 dB in 1 dB
+  steps, microphone a 0..+48 dB gain in 0.4765625 dB steps; `uac.py`). What
+  the pad's Bluetooth speaker byte does to loudness is still a heuristic.
 - `SyntheticBackend`'s feature reports `0x05`/`0x20` are correctly *sized* but
   zero-filled, so anything parsing calibration or firmware strings sees garbage.
 - No game or Sony PC SDK title has been run against the attached device.

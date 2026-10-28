@@ -8,7 +8,7 @@ import {
   ADVANCED_FIELDS, CTRL_FIELDS, GESTURE_FALLBACK, GESTURE_GROUPS, HELP, KNOWN_BATTERY, KNOWN_CTRL, KNOWN_GESTURES, KNOWN_GLOBAL,
   KNOWN_INPUT, KNOWN_LIGHTBAR, KNOWN_REMOTE, isGestureKey, keyLabel,
 } from "./help";
-import { Card, ColorField, JsonField, NumberField, RangeField, Reveal, Row, SelectField, TextField, Toggle } from "./controls";
+import { Card, ColorField, JsonField, MicModeField, NumberField, RangeField, Reveal, Row, SelectField, TextField, Toggle } from "./controls";
 import GenericRows from "./GenericRows";
 import ButtonGlyph from "./ButtonGlyph";
 import ActionPickerUI from "./ActionPicker";
@@ -431,8 +431,9 @@ export function ControllersSection() {
           <Card key={serial} title={(typeof asObj(controllers[serial]).label === "string" && String(asObj(controllers[serial]).label).trim()) || "Controller"}
                 tag={serial} className="st-boxed">
             {CTRL_FIELDS.map(([key, label, kind, choices]) => (
-              <Row key={key} label={label} help={HELP[key]}>
-                {kind === "bool" ? <Toggle path={["controllers", serial, key]} />
+              <Row key={key} label={label} help={HELP[key]} stack={kind === "mic"}>
+                {kind === "mic" ? <MicModeField path={["controllers", serial, key]} />
+                  : kind === "bool" ? <Toggle path={["controllers", serial, key]} />
                   : kind === "number" ? <NumberField path={["controllers", serial, key]} dflt={null} nullable width={130} />
                   : kind === "choice" ? <SelectField path={["controllers", serial, key]} dflt={choices![0]} width={150}
                                                      options={choices!.map((c) => ({ value: c, label: c }))} />

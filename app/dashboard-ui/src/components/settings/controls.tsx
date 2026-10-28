@@ -1,7 +1,7 @@
 import { useId, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { getPath, setPath, useStore } from "../../lib/store";
-import { hexToRgb, rgbToHex } from "./help";
+import { MIC_MODES, hexToRgb, rgbToHex } from "./help";
 
 /* ------------------------------------------------------------------------
    Controls bound to CFG paths. Each renders the engine default when the
@@ -52,6 +52,26 @@ export function SelectField({ path, dflt, options, onChange, width }:
             onChange={(e) => { set(e.target.value); onChange?.(e.target.value); }}>
       {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
     </select>
+  );
+}
+
+/* The per-controller microphone mode: the three modes as one segmented row
+   (the macro editor's .st-seg), and a line saying what the chosen one does. */
+export function MicModeField({ path }: { path: string[] }) {
+  const [v, set] = useBind<string>(path, "voice");
+  const current = MIC_MODES.find((m) => m.value === v) ?? MIC_MODES[0];
+  const id = useId();
+  return (
+    <div className="grid w-full gap-1.5">
+      <div className="st-seg" role="group" aria-label="Microphone mode" aria-describedby={id}>
+        {MIC_MODES.map((m) => (
+          <button key={m.value} type="button" aria-pressed={current.value === m.value} onClick={() => set(m.value)}>
+            {m.label}
+          </button>
+        ))}
+      </div>
+      <p id={id} className="text-[12.5px] leading-snug text-ink-2" aria-live="polite">{current.note}</p>
+    </div>
   );
 }
 

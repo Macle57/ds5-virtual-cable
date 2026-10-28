@@ -189,18 +189,34 @@ class ControlTests(unittest.TestCase):
         _, data = split(self.submit(control(0xA1, 0x81, 0x0100, idx, 1)))
         self.assertEqual(data, b"\x01")
 
-    def test_uac_volume_min_max_res(self):
-        idx = self._uac_index(D.UNIT_FU_SPEAKER)
-        _, mn = split(self.submit(control(0xA1, 0x82, 0x0200, idx, 2)))
-        _, mx = split(self.submit(control(0xA1, 0x83, 0x0200, idx, 2)))
-        _, rs = split(self.submit(control(0xA1, 0x84, 0x0200, idx, 2)))
-        self.assertEqual(struct.unpack("<h", mn)[0], -96 * 256)
-        self.assertEqual(struct.unpack("<h", mx)[0], 0)
-        self.assertEqual(struct.unpack("<h", rs)[0], 256)
+    def _range(self, unit):
+        idx = self._uac_index(unit)
+        out = []
+        for req in (0x82, 0x83, 0x84, 0x81):          # MIN, MAX, RES, CUR
+            _, b = split(self.submit(control(0xA1, req, 0x0200, idx, 2)))
+            out.append(struct.unpack("<h", b)[0])
+        return out
+
+    def test_uac_speaker_volume_range_is_the_real_pads(self):
+        # MEASURED on two wired DualSenses through Windows' endpoint volume
+        # (uac.py docstring): -100..0 dB in 1 dB steps.
+        self.assertEqual(self._range(D.UNIT_FU_SPEAKER), [-100 * 256, 0, 256, 0])
+
+    def test_uac_mic_volume_range_is_the_real_pads(self):
+        # A gain, 0..+48 dB in 0.4765625 dB (0x7A/256) steps -- not the
+        # attenuator the assumed values made it.
+        mn, mx, res, cur = self._range(D.UNIT_FU_MIC)
+        self.assertEqual((mn, mx, res), (0, 48 * 256, 0x7A))
+        self.assertAlmostEqual(res / 256.0, 0.4765625)
+        self.assertTrue(mn <= cur <= mx)
+        self.assertEqual((cur - mn) % res, 0)
 
     def test_uac_volume_set_cur_is_clamped(self):
         idx = self._uac_index(D.UNIT_FU_MIC)
         self.submit(control(0x21, 0x01, 0x0200, idx, 2), struct.pack("<h", 30000))
+        _, cur = split(self.submit(control(0xA1, 0x81, 0x0200, idx, 2)))
+        self.assertEqual(struct.unpack("<h", cur)[0], 48 * 256)
+        self.submit(control(0x21, 0x01, 0x0200, idx, 2), struct.pack("<h", -2560))
         _, cur = split(self.submit(control(0xA1, 0x81, 0x0200, idx, 2)))
         self.assertEqual(struct.unpack("<h", cur)[0], 0)
 

@@ -173,6 +173,23 @@ class DashboardCase(unittest.TestCase):
         self.assertEqual(cc.label, "sofa")
         self.assertFalse(cc.enabled)
 
+    def test_the_microphone_mode_posts_and_replaces_the_old_bool(self):
+        # The page's segmented control posts `mic_mode`; a file that still
+        # has the old `echo_cancel` must come out with only the new key.
+        with open(K.config_path(), "w", encoding="utf-8") as f:
+            json.dump({"controllers": {"aabbccddeeff": {"echo_cancel": False}}}, f)
+        doc = self.get_json("/api/config")["config"]
+        self.assertEqual(doc["controllers"]["aabbccddeeff"]["mic_mode"], "studio")
+        self.assertNotIn("echo_cancel", doc["controllers"]["aabbccddeeff"])
+        status, body, _ = self.post_config(
+            {"controllers": {"aabbccddeeff": {"mic_mode": "pad"}}})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(K.load().mic_mode_for("aabbccddeeff"), "pad")
+        with open(K.config_path(), encoding="utf-8") as f:
+            entry = json.load(f)["controllers"]["aabbccddeeff"]
+        self.assertEqual(entry["mic_mode"], "pad")
+        self.assertNotIn("echo_cancel", entry)
+
     def test_macros_round_trip_and_delete_through_the_api(self):
         self.post_config({"input": {"macros": {
             "tm": {"keys": ["ctrl", "shift", "esc"], "label": "Task Manager"},
