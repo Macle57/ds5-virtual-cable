@@ -971,6 +971,13 @@ class ArtTests(unittest.TestCase):
             img = T._icon_image((60, 170, 90), 50, count, size=16)
             self.assertEqual(img.size, (16, 16))
 
+    def test_the_file_icon_is_the_running_colour(self):
+        # app/packaging/ds5bridge.ico is drawn in APP_ICON_RGB; it is meant to
+        # look like the tray when all is well.
+        from ds5app import icon_art as IA
+
+        self.assertEqual(IA.APP_ICON_RGB, T.COLORS[S.RUNNING])
+
 
 #: What pystray's win32 backend actually registers its tray callback under --
 #: `WM_USER + 11`, not `WM_NOTIFY`. The value is here only so the fake is
