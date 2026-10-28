@@ -129,7 +129,7 @@ def main() -> int:
     hap_hz = args.haptic_freq if args.mode in ("both", "haptics") else 0.0
 
     # This listens for the speaker in the mic: the pad's echo canceller off.
-    be = BridgeBackend(speaker_volume=args.volume, echo_cancel=False)
+    be = BridgeBackend(speaker_volume=args.volume, mic_mode="studio")
     be.start()
 
     # The host opening the capture endpoint is what arms the microphone.

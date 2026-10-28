@@ -644,6 +644,19 @@ def _close_quietly(*closers) -> None:
                 pass
 
 
+def mic_mode_flag(args) -> str | None:
+    """The microphone mode the command line pins, or None to follow the
+    config. `--mic-mode` wins; the deprecated `--echo-cancel on|off` means
+    voice|pad (what the bool `echo_cancel` setting now loads as)."""
+    mode = getattr(args, "mic_mode", None)
+    if mode:
+        return mode
+    echo = getattr(args, "echo_cancel", None)
+    if echo is None:
+        return None
+    return "voice" if echo == "on" else "pad"
+
+
 def cmd_run(args) -> int:
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
@@ -665,15 +678,13 @@ def cmd_run(args) -> int:
     hide = bool(getattr(args, "hide_bluetooth", False))
     if not hide and args.serial:
         hide = cfg.should_hide(args.serial)
-    # The pad's echo canceller: the flag, else this controller's setting, else ON.
-    # No flag from the manager on purpose -- the child reads the setting here
-    # and keeps following it live through the config watcher, so the
-    # dashboard switch applies to a running bridge.
-    echo = getattr(args, "echo_cancel", None)
-    if echo is None:
-        echo = cfg.should_echo_cancel(args.serial) if args.serial else True
-    else:
-        echo = echo == "on"
+    # The microphone mode: the flag, else this controller's setting, else
+    # "voice". No flag from the manager on purpose -- the child reads the
+    # setting here and keeps following it live through the config watcher, so
+    # the tray's Microphone rows and the dashboard apply to a running bridge.
+    mic_flag = mic_mode_flag(args)
+    mic_mode = mic_flag or (cfg.mic_mode_for(args.serial) if args.serial
+                            else K.DEFAULT_MIC_MODE)
 
     svc = S.BridgeService(serial=args.serial, port=args.port, usbip_exe=args.usbip,
                           audio_target=args.audio_target,
@@ -683,8 +694,8 @@ def cmd_run(args) -> int:
                                        or cfg.hidhide_cli),
                           telemetry_port=getattr(args, "telemetry_port", None),
                           input_config=cfg.input,
-                          echo_cancel=echo,
-                          follow_echo_config=getattr(args, "echo_cancel", None) is None,
+                          mic_mode=mic_mode,
+                          follow_mic_config=mic_flag is None,
                           on_event=_log)
     try:
         svc.start()
@@ -866,13 +877,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "leaves it hidden, `ds5bridge unhide` gets it back")
     r.add_argument("--hidhide-cli", default=None, metavar="PATH",
                    help="path to HidHideCLI.exe, if it is somewhere unusual")
+    r.add_argument("--mic-mode", choices=("voice", "pad", "studio"), default=None,
+                   help="what is removed from the pad's microphone. voice: "
+                        "everything this PC plays -- the pad's own speaker (the "
+                        "pad's canceller) and other speakers the pad can hear "
+                        "(the bridge's); pad: only the pad's own speaker; "
+                        "studio: nothing, the mic exactly as the pad hears it. "
+                        "Default: the controller's `mic_mode` setting, which "
+                        "ships voice. Giving the flag pins it for this run; "
+                        "without it, a change in the tray or the dashboard "
+                        "applies live")
     r.add_argument("--echo-cancel", choices=("on", "off"), default=None,
-                   help="remove what this PC plays from the pad's microphone: "
-                        "the pad's own speaker (the pad's canceller) and other "
-                        "speakers the pad can hear (the bridge's). Default: the "
-                        "controller's `echo_cancel` setting, which ships on. "
-                        "Giving the flag pins it for this run; without it, a "
-                        "change in the dashboard applies live")
+                   help="deprecated: --mic-mode voice (on) or pad (off)")
     r.add_argument("--telemetry-port", type=int, default=None, metavar="PORT",
                    help="publish live input state (buttons, sticks, touch) as "
                         "UDP datagrams to 127.0.0.1:PORT at up to 60 Hz, for "

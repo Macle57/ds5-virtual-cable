@@ -71,6 +71,35 @@ TMP_SUFFIX = ".tmp"
 
 AUDIO_TARGETS = ("speaker", "headphone")
 
+#: What the bridge removes from a pad's microphone (`ControllerConfig.mic_mode`):
+#:   voice   the pad cancels its own speaker AND the bridge cancels every other
+#:           speaker the PC drives that the pad can hear (aec.py). The default.
+#:   pad     only the pad's own canceller, for its own speaker.
+#:   studio  nothing: the pad's canceller is off too, and the mic is sent
+#:           exactly as the pad hears it.
+MIC_VOICE = "voice"
+MIC_PAD = "pad"
+MIC_STUDIO = "studio"
+MIC_MODES = (MIC_VOICE, MIC_PAD, MIC_STUDIO)
+DEFAULT_MIC_MODE = MIC_VOICE
+
+
+def mic_mode_from_dict(data: dict) -> str:
+    """A controller entry's microphone mode, reading the old key too.
+
+    `mic_mode` wins when it is one of `MIC_MODES`. Otherwise the bool it
+    replaced, `echo_cancel`, decides: false reads as `pad` (the bridge's
+    canceller for the PC's other speakers off; the pad still cancels its
+    own speaker, which the bool used to switch off along with it), true,
+    absent or unreadable as the default, `voice`. Save writes `mic_mode`
+    only."""
+    mode = _as_choice(data.get("mic_mode"), MIC_MODES, "")
+    if mode:
+        return mode
+    if "echo_cancel" in data:
+        return MIC_VOICE if _as_bool(data.get("echo_cancel"), True) else MIC_PAD
+    return DEFAULT_MIC_MODE
+
 
 class ConfigWriteError(RuntimeError):
     """Saving failed. The message is user-facing text, not a stack trace."""
@@ -129,8 +158,10 @@ def norm_serial(serial: str | None) -> str:
 # the data
 # ---------------------------------------------------------------------------
 
+#: `echo_cancel` is the key `mic_mode` replaced: known so that it is read
+#: (`mic_mode_from_dict`) and then dropped, never carried along as an extra.
 _CC_KNOWN = ("enabled", "audio_target", "port", "label", "hide_bluetooth",
-             "echo_cancel")
+             "mic_mode", "echo_cancel")
 
 
 @dataclass
@@ -147,10 +178,12 @@ class ControllerConfig:
     #: must change nothing for anybody who does not go looking for it. Needs
     #: HidHide installed separately; see `hidhide.py` and docs/USER-GUIDE.md.
     hide_bluetooth: bool = False
-    #: Echo cancellation for this pad's microphone: the pad's own canceller
-    #: for its speaker (audioControl bit 2) plus the bridge's canceller for
-    #: the PC's other speakers (ds5emu/aec.py). Ships ON.
-    echo_cancel: bool = True
+    #: What is removed from this pad's microphone, one of `MIC_MODES`:
+    #: "voice" (the pad's own canceller for its speaker, audioControl bit 2,
+    #: plus the bridge's canceller for the PC's other speakers,
+    #: ds5emu/aec.py), "pad" (the pad's canceller only) or "studio" (nothing).
+    #: Ships "voice". Replaces the bool `echo_cancel` (see `mic_mode_from_dict`).
+    mic_mode: str = DEFAULT_MIC_MODE
     #: Keys this version does not know about, carried through untouched so that
     #: a config written by a newer build and opened by an older one does not
     #: quietly lose the newer build's settings.
@@ -172,7 +205,7 @@ class ControllerConfig:
             port=_as_port(data.get("port")),
             label=_as_str(data.get("label"), ""),
             hide_bluetooth=_as_bool(data.get("hide_bluetooth"), False),
-            echo_cancel=_as_bool(data.get("echo_cancel"), True),
+            mic_mode=mic_mode_from_dict(data),
         )
         cc.extra = {k: v for k, v in data.items() if k not in _CC_KNOWN}
         return cc
@@ -182,7 +215,8 @@ class ControllerConfig:
         out.update(enabled=bool(self.enabled), audio_target=self.audio_target,
                    port=self.port, label=self.label,
                    hide_bluetooth=bool(self.hide_bluetooth),
-                   echo_cancel=bool(self.echo_cancel))
+                   mic_mode=(self.mic_mode if self.mic_mode in MIC_MODES
+                             else DEFAULT_MIC_MODE))
         return out
 
 
@@ -1003,11 +1037,33 @@ class Config:
         """
         return bool(self.get(serial).hide_bluetooth)
 
-    def should_echo_cancel(self, serial: str) -> bool:
-        """Should this controller's microphone be echo-cancelled? Read by the
-        bridge child at spawn and by its config watcher afterwards, the same
-        way `should_hide` is read."""
-        return bool(self.get(serial).echo_cancel)
+    def mic_mode_for(self, serial: str) -> str:
+        """This controller's microphone mode (`MIC_MODES`). Read by the bridge
+        child at spawn and by its config watcher afterwards, the same way
+        `should_hide` is read."""
+        mode = self.get(serial).mic_mode
+        return mode if mode in MIC_MODES else DEFAULT_MIC_MODE
+
+    def set_mic_mode(self, serial: str, mode: str) -> ControllerConfig:
+        """Set one controller's microphone mode. An unknown mode is a
+        programming error, not a hand edit, so it raises."""
+        if mode not in MIC_MODES:
+            raise ValueError(f"unknown microphone mode {mode!r}")
+        cc = self.get(serial)
+        cc.mic_mode = mode
+        return cc
+
+    def shared_mic_mode(self, serials=None) -> str | None:
+        """The microphone mode EVERY controller in `serials` (default: every
+        configured one) has, or None when they disagree. With no controller
+        at all, the mode a new one gets (the default) -- what the tray's
+        Microphone rows show."""
+        if serials is None:
+            serials = list(self.controllers)
+        modes = {self.mic_mode_for(s) for s in serials}
+        if not modes:
+            return DEFAULT_MIC_MODE
+        return modes.pop() if len(modes) == 1 else None
 
     def set_hide_bluetooth_default(self, hide: bool) -> None:
         """The seed `get()` stamps on a controller this machine has never seen.
