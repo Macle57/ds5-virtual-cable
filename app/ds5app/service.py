@@ -585,7 +585,13 @@ def echo_summary(status: dict | None) -> tuple[str, str]:
 
         off        echo cancellation switched off
         idle       on, but the mic is not in use (nothing to cancel yet)
-        on         on and working (the pad's canceller + the software one)
+        on         on and working (the pad's canceller + the software one);
+                   `note` names the PC speakers whose echo it has found
+                   and is cancelling right now ("cancelling Speakers
+                   (...)"), empty while it has found none -- so the log
+                   tells "on and cancelling the laptop speakers" from "on,
+                   but no speaker's echo found" (round 9: the user heard
+                   their laptop speakers while the line said "echo on")
         degraded   on, but the software canceller is not working -- the
                    pad still cancels its own speaker, the PC's other
                    speakers are NOT cancelled; `note` says why
@@ -602,7 +608,8 @@ def echo_summary(status: dict | None) -> tuple[str, str]:
         if not status.get("worker_alive", True) and "died" not in reason:
             reason = "the canceller stopped"
         return "degraded", " ".join(str(reason).split())
-    return "on", ""
+    slots = [" ".join(str(s).split()) for s in status.get("slots") or []]
+    return "on", ("cancelling " + ", ".join(slots)) if slots else ""
 
 
 def echo_line(state: str, note: str = "") -> str:

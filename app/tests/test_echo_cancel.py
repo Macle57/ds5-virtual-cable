@@ -194,6 +194,13 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(SVC.echo_summary({"enabled": True, "mode": "idle"}), ("idle", ""))
         self.assertEqual(SVC.echo_summary({"enabled": True, "mode": "aec", "health": "ok",
                                            "worker_alive": True}), ("on", ""))
+        # on, and which speakers' echo it is cancelling (none found: no note)
+        self.assertEqual(SVC.echo_summary({"enabled": True, "mode": "aec", "health": "ok",
+                                           "worker_alive": True, "slots": []}), ("on", ""))
+        self.assertEqual(
+            SVC.echo_summary({"enabled": True, "mode": "aec", "health": "ok", "worker_alive": True,
+                              "slots": ["Speakers (Realtek(R) Audio)", "HDMI\n(TV)"]}),
+            ("on", "cancelling Speakers (Realtek(R) Audio), HDMI (TV)"))
         self.assertEqual(
             SVC.echo_summary({"enabled": True, "mode": "passthrough", "health": "degraded",
                               "reason": "no native canceller: ds5aec.dll\n not found",
@@ -234,6 +241,9 @@ class StatusTests(unittest.TestCase):
                          ("degraded", "no native canceller: gone"))
         child._note_mode(SVC.echo_line("on"))
         self.assertEqual((child._snap["echo"], child._snap["echo_note"]), ("on", ""))
+        child._note_mode(SVC.echo_line("on", "cancelling Speakers (Realtek(R) Audio)"))
+        self.assertEqual((child._snap["echo"], child._snap["echo_note"]),
+                         ("on", "cancelling Speakers (Realtek(R) Audio)"))
         # the remote/keyboard line still parses
         child._note_mode(SVC.mode_line(True, False))
         self.assertTrue(child._snap["remote_mode"])

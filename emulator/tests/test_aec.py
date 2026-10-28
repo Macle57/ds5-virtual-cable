@@ -159,6 +159,36 @@ class CancellerTests(unittest.TestCase):
         reduction = db(out[steady], mic[steady])
         self.assertLess(reduction, -20.0, f"echo only reduced {reduction:.1f} dB")
 
+    def test_a_quiet_echo_of_a_loud_reference_is_found_and_cancelled(self):
+        # Round 9 (user report: laptop speakers still heard in the pad mic).
+        # The loopback reference is taken before the endpoint volume, so a
+        # speaker turned down, or a pad mic with little gain, gives an echo
+        # 50 dB under its reference: here ~-77 dBFS in the mic with room noise
+        # 10 dB under it. The probe skipped every mic window under -60 dBFS,
+        # so this was never probed, never slotted, never cancelled -- while
+        # the status said "echo on".
+        sim = Sim()
+        n = 16 * FS
+        ref = speechlike(n, 2, rate=5.1)
+        echo = echo_of(ref, room(6, 0.003), 40)
+        noise = np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        mic = echo + noise * np.float32(0.3 * np.sqrt(np.mean(echo ** 2)))
+        self.assertLess(db(mic), -70.0)
+        out = aligned(sim.run(mic, ref=ref), n)
+        self.assertEqual(sim.eng.status()["slots"], ["Speakers (Test)"])
+        steady = slice(8 * FS, n - FS)
+        # the noise is 10.5 dB under the mic: most of that must go
+        reduction = db(out[steady], mic[steady])
+        self.assertLess(reduction, -7.0, f"quiet echo only reduced {reduction:.1f} dB")
+
+    def test_a_silent_mic_is_never_probed(self):
+        # A muted pad sends digital silence: nothing to look for an echo in.
+        sim = Sim()
+        n = 6 * FS
+        sim.run(np.zeros(n, np.float32), ref=speechlike(n, 2, rate=5.1))
+        self.assertEqual(sim.eng.stats["probes"], 0)
+        self.assertEqual(sim.eng.status()["slots"], [])
+
     def test_the_near_end_survives_double_talk(self):
         sim = Sim()
         n = 16 * FS
