@@ -40,6 +40,7 @@ export default function StatusCard() {
   // but the PC's other speakers (TV, desktop speakers) reach the voice chat.
   const echoBroken = c.echo === "degraded";
   const echoOn = c.echo === "on" || c.echo === "idle";
+  const echoPad = c.echo === "pad";      // "Pad only": just the pad's own speaker
 
   return (
     <section className="panel w2 pop p-4" style={{ "--i": 2 } as React.CSSProperties}>
@@ -111,8 +112,9 @@ export default function StatusCard() {
         <Flag on={!!c.hide_bluetooth || hideBroken} icon={hideBroken ? <Eye size={13} strokeWidth={2.5} /> : <EyeOff size={13} strokeWidth={2.5} />}
               label={hideBroken ? "BT pad not hidden" : "BT pad hidden"} tone={hideBroken ? "var(--color-warn)" : "var(--color-square)"} />
         {c.echo != null && (
-          <Flag on={echoOn || echoBroken} icon={echoBroken || c.echo === "off" ? <EarOff size={13} strokeWidth={2.5} /> : <Ear size={13} strokeWidth={2.5} />}
-                label={echoBroken ? "echo cancel degraded" : "echo cancel"} tone={echoBroken ? "var(--color-warn)" : "var(--color-ok)"} />
+          <Flag on={echoOn || echoBroken || echoPad} icon={echoBroken || c.echo === "off" ? <EarOff size={13} strokeWidth={2.5} /> : <Ear size={13} strokeWidth={2.5} />}
+                label={echoBroken ? "echo cancel degraded" : echoPad ? "pad echo cancel" : c.echo === "off" ? "studio mic" : "echo cancel"}
+                tone={echoBroken ? "var(--color-warn)" : "var(--color-ok)"} />
         )}
       </div>
 
