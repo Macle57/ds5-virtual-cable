@@ -139,6 +139,14 @@ APPLY_DELAY_S = 2.0
 #: most games -- and an invisible slot costs nothing.
 MAX_SLOTS = 8
 
+#: The Microphone submenu, in `config.MIC_MODES` order: (mode, row text).
+#: Radio rows; the dashboard's help text carries the longer explanation.
+MIC_ROWS = (
+    (K.MIC_VOICE, "Voice chat (cancel everything the PC plays)"),
+    (K.MIC_PAD, "Pad only (cancel the pad's own speaker)"),
+    (K.MIC_STUDIO, "Studio (send everything)"),
+)
+
 #: Grey stopped, blue starting, green running, amber degraded, red error.
 COLORS = {
     S.STOPPED:  (110, 110, 118),
@@ -1135,6 +1143,64 @@ class TrayApp:
                          "from now on will stay visible.")
         self._poke_apply()
 
+    def _mic_serials(self) -> list[str]:
+        """Every controller the Microphone rows answer for: each one in the
+        config, plus any listed right now (`_controllers()` creates their
+        entries anyway)."""
+        serials = set(self.cfg.controllers)
+        serials.update(c["serial"] for c in self._controllers())
+        return sorted(serials)
+
+    def _mic_checked_mode(self) -> str | None:
+        """The mode the Microphone rows show as chosen: the one EVERY
+        controller has, or None (no row checked) when they disagree -- a
+        radio group with no third state, so a mixed selection shows nothing
+        rather than claiming one pad's mode for all of them. With no
+        controller at all, the mode a new one gets."""
+        return self.cfg.shared_mic_mode(self._mic_serials())
+
+    def _set_mic_mode_all(self, mode: str):
+        """The action of one Microphone row: `mode` for every controller.
+
+        A pure settings write, so not debounced (like the hide seed in
+        `_toggle_hide_all`): there is no hardware behind it in this process.
+        Each running bridge child follows its controller's `mic_mode` in
+        config.json (`service.MicSetting`, polled every ~2 s) and switches its
+        canceller and the pad's audioControl byte live, without a re-bridge.
+        """
+        def act(*_):
+            if self.only:
+                return                  # a one-run override must not be written
+            serials = self._mic_serials()
+            if not serials:
+                self._notify("Microphone",
+                             "No controller is set up yet. A new controller "
+                             "starts in Voice chat.")
+                return
+            for serial in serials:
+                self.cfg.set_mic_mode(serial, mode)
+            self._save()
+        return act
+
+    def _mic_rows(self):
+        """[(text, checked, action)] for the Microphone submenu -- callables
+        over the latest config, so the menu stays built-exactly-once. The mode
+        is bound as a default argument: a bare closure over the loop variable
+        would make every row answer for the last mode."""
+        return [(text,
+                 lambda _i=None, m=mode: self._mic_checked_mode() == m,
+                 self._set_mic_mode_all(mode))
+                for mode, text in MIC_ROWS]
+
+    def _mic_menu(self):
+        """The `Microphone >` submenu: three radio rows, one per mode. Built
+        once, like every other submenu here."""
+        import pystray
+
+        return pystray.Menu(*[pystray.MenuItem(text, action, checked=checked,
+                                               radio=True)
+                              for text, checked, action in self._mic_rows()])
+
     def _open_dashboard(self, *_):
         """Open the local status dashboard in whatever browser is the default.
 
@@ -1628,6 +1694,9 @@ class TrayApp:
                 # current one rather than rebuilt again two seconds later.
                 self._desired_master(),
                 self._hide_all_checked(),
+                # A mode chosen on the dashboard (or by a sibling row) has to
+                # move the radio dot without waiting for a click.
+                self._mic_checked_mode(),
                 self._autostart_enabled(),
                 # In-memory read; this is how the "Install update" row appears
                 # when the daily background check lands mid-session.
@@ -1774,6 +1843,10 @@ class TrayApp:
                      "Bridging enabled", self._toggle_master,
                      checked=lambda _i: self._desired_master()),
                  pystray.MenuItem("Controllers", self._controllers_menu()),
+                 # What the pads' microphones remove, for every controller at
+                 # once (per pad: the dashboard). Radio rows; none is checked
+                 # when the pads disagree.
+                 pystray.MenuItem("Microphone", self._mic_menu()),
                  pystray.Menu.SEPARATOR,
                  # The pair for hiding: the checkbox is the all-switch (checked
                  # only when EVERY pad is set to hide -- `_hide_all_checked`),

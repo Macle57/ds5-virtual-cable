@@ -11,12 +11,26 @@ master channel and nothing on the per-channel entries, and `bControlSize = 1`.
 Both CS_ENDPOINT descriptors have `bmAttributes = 0x00`, i.e. **no sampling
 frequency control** — so endpoint-recipient class requests must STALL.
 
-!! ASSUMED VALUES !!
-The volume MIN/MAX/RES words below were NOT captured from the physical
-controller. Hub IOCTLs return descriptors, not class-request responses, so
-Phase 0 could not read them. They are plausible UAC1 defaults (1/256 dB units).
-This is risk R7 in `docs/virtualization-options.md`; Phase 3 should sniff the
-real wired controller with USBPcap and replace them.
+Volume ranges (risk R7, closed 2026-10-28)
+------------------------------------------
+Hub IOCTLs return descriptors, not class-request responses, so Phase 0 could
+not read the feature units' GET_MIN/GET_MAX/GET_RES and this module shipped
+assumed values (-96..0 dB in 1 dB steps on both units). They are now MEASURED,
+read-only, from two real DualSenses on USB cables: Windows' usbaudio driver
+asks the device for exactly these three values when the endpoint starts and
+hands them to `IAudioEndpointVolume::GetVolumeRange` unchanged (pycaw, both
+pads identical):
+
+    Speakers (DualSense Wireless Controller)            -100.0 .. 0.0 dB, step 1.0 dB
+    Headset Microphone (DualSense Wireless Controller)     0.0 .. +48.0 dB, step 0.4765625 dB
+
+0.4765625 dB is 122/256, i.e. RES = 0x007A in the UAC1 1/256 dB unit; +48 dB
+is MAX = 0x3000. The microphone's feature unit is a GAIN (0 dB at the bottom,
+not an attenuator with 0 dB at the top), which matters: Windows' capture slider
+on a real wired pad goes from no gain at 0 % to +48 dB at 100 % -- the same
+pad on this PC sat at +14.9 dB for a slider at 65 %. With the old assumed
+range the same slider was an attenuator, which is half of why a bridged pad's
+mic was quiet (bridge.py `on_uac_control` has the other half).
 """
 
 from __future__ import annotations
@@ -38,13 +52,28 @@ FU_VOLUME_CONTROL = 0x02
 
 CH_MASTER = 0
 
-# 1/256 dB, signed 16-bit. ASSUMED — see the module docstring.
-VOLUME_MIN = -96 * 256   # -96.0 dB
-VOLUME_MAX = 0           #   0.0 dB
-VOLUME_RES = 256         #   1.0 dB
-VOLUME_DEFAULT = 0
+# 1/256 dB, signed 16-bit. MEASURED from a real wired pad -- module docstring.
+SPEAKER_VOLUME_MIN = -100 * 256   # -100.0 dB
+SPEAKER_VOLUME_MAX = 0            #    0.0 dB
+SPEAKER_VOLUME_RES = 256          #    1.0 dB
+SPEAKER_VOLUME_DEFAULT = 0
+
+MIC_VOLUME_MIN = 0                #    0.0 dB  (no gain; not muted)
+MIC_VOLUME_MAX = 48 * 256         #  +48.0 dB
+MIC_VOLUME_RES = 0x7A             #   0.4765625 dB
+#: What GET_CUR answers before Windows has set a level: 31 steps, +14.8 dB --
+#: where a real pad's slider sat on this PC (65 %, +14.9 dB).
+MIC_VOLUME_DEFAULT = 31 * MIC_VOLUME_RES
 
 FEATURE_UNITS = (D.UNIT_FU_SPEAKER, D.UNIT_FU_MIC)
+
+#: unit -> (MIN, MAX, RES, default CUR)
+VOLUME_RANGES = {
+    D.UNIT_FU_SPEAKER: (SPEAKER_VOLUME_MIN, SPEAKER_VOLUME_MAX,
+                        SPEAKER_VOLUME_RES, SPEAKER_VOLUME_DEFAULT),
+    D.UNIT_FU_MIC: (MIC_VOLUME_MIN, MIC_VOLUME_MAX,
+                    MIC_VOLUME_RES, MIC_VOLUME_DEFAULT),
+}
 
 
 class UacState:
@@ -52,7 +81,7 @@ class UacState:
 
     def __init__(self) -> None:
         self.mute = {u: False for u in FEATURE_UNITS}
-        self.volume = {u: VOLUME_DEFAULT for u in FEATURE_UNITS}
+        self.volume = {u: VOLUME_RANGES[u][3] for u in FEATURE_UNITS}
 
     # -- request handling -------------------------------------------------
 
@@ -109,13 +138,15 @@ class UacState:
             if len(data) < 2:
                 return None
             (value,) = struct.unpack_from("<h", data, 0)
-            self.volume[unit] = max(VOLUME_MIN, min(VOLUME_MAX, value))
+            lo, hi, _res, _cur = VOLUME_RANGES[unit]
+            self.volume[unit] = max(lo, min(hi, value))
             return b""
+        lo, hi, res, _cur = VOLUME_RANGES[unit]
         table = {
             GET_CUR: self.volume[unit],
-            GET_MIN: VOLUME_MIN,
-            GET_MAX: VOLUME_MAX,
-            GET_RES: VOLUME_RES,
+            GET_MIN: lo,
+            GET_MAX: hi,
+            GET_RES: res,
         }
         if bRequest in table:
             return struct.pack("<h", table[bRequest])[:wLength]

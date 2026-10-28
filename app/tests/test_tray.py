@@ -153,11 +153,28 @@ class _FakeConfig:
     written, and when, is exactly what several tests assert.
     """
 
-    def __init__(self, hide_default=False):
+    def __init__(self, hide_default=False, mic_modes=None):
         self.hide_bluetooth_default = hide_default
         self.dashboard_port = 8765
         self.saves = 0
         self.calls = []
+        #: serial -> mic_mode, standing in for `controllers` (the keys are
+        #: all the tray reads of it).
+        self.controllers = dict(mic_modes or {})
+
+    def mic_mode_for(self, serial):
+        return self.controllers.get(serial, "voice")
+
+    def set_mic_mode(self, serial, mode):
+        self.calls.append(("set_mic_mode", serial, mode))
+        self.controllers[serial] = mode
+
+    def shared_mic_mode(self, serials=None):
+        from ds5app import config as K
+        cfg = K.Config()
+        for serial in (self.controllers if serials is None else serials):
+            cfg.set_mic_mode(serial, self.mic_mode_for(serial))
+        return cfg.shared_mic_mode()
 
     def get(self, serial):
         return types.SimpleNamespace(label="", port=None, enabled=True)
@@ -495,6 +512,91 @@ class HideAllSwitchTests(unittest.TestCase):
         self.assertFalse(checked())
         app._snap = snap([controller(A, hide=True)])
         self.assertTrue(checked(), "the row must read the newest snapshot")
+
+
+class MicrophoneMenuTests(unittest.TestCase):
+    """The Microphone submenu: three radio rows over every controller's
+    `mic_mode`. A pure settings write -- the bridge children follow the file
+    live (service.MicSetting) -- so nothing here touches the manager."""
+
+    TEXTS = ["Voice chat (cancel everything the PC plays)",
+             "Pad only (cancel the pad's own speaker)",
+             "Studio (send everything)"]
+
+    def _app(self, controllers, mic_modes=None):
+        app = app_with(controllers)
+        app.cfg = _FakeConfig(mic_modes=mic_modes)
+        return app
+
+    def checked(self, app):
+        return [c() for _t, c, _a in app._mic_rows()]
+
+    def test_the_rows_say_the_three_modes_in_order(self):
+        app = self._app([controller(A)])
+        self.assertEqual([t for t, _c, _a in app._mic_rows()], self.TEXTS)
+        self.assertEqual([m for m, _t in T.MIC_ROWS], ["voice", "pad", "studio"])
+
+    def test_the_shared_mode_is_checked(self):
+        app = self._app([controller(A), controller(B)],
+                        mic_modes={A: "studio", B: "studio"})
+        self.assertEqual(self.checked(app), [False, False, True])
+
+    def test_disagreeing_controllers_check_nothing(self):
+        app = self._app([controller(A), controller(B)],
+                        mic_modes={A: "studio", B: "pad"})
+        self.assertEqual(self.checked(app), [False, False, False])
+
+    def test_a_configured_but_absent_controller_counts(self):
+        # "every controller in the config", not only the ones connected now
+        app = self._app([controller(A)], mic_modes={A: "pad", B: "studio"})
+        self.assertEqual(self.checked(app), [False, False, False])
+
+    def test_with_no_controller_the_default_is_checked(self):
+        self.assertEqual(self.checked(self._app([])), [True, False, False])
+
+    def test_choosing_sets_every_controller_and_saves(self):
+        app = self._app([controller(A)], mic_modes={A: "voice", B: "pad"})
+        rows = app._mic_rows()
+        rows[2][2]()                                       # Studio
+        self.assertEqual(app.cfg.controllers, {A: "studio", B: "studio"})
+        self.assertEqual(app.cfg.saves, 1)
+        self.assertEqual(self.checked(app), [False, False, True])
+        rows[1][2](None, None)                             # pystray's (icon, item)
+        self.assertEqual(app.cfg.controllers, {A: "pad", B: "pad"})
+        self.assertEqual(self.checked(app), [False, True, False])
+        # config only: no pending intent, no apply timer, no manager call
+        self.assertEqual(app._pending, {})
+        self.assertEqual(app.timers, [])
+
+    def test_a_one_run_serial_override_writes_nothing(self):
+        # Same rule as `_persist_enabled`: `tray --serial` must not edit the
+        # settings every other run uses.
+        app = self._app([controller(A)], mic_modes={A: "voice"})
+        app.only = A
+        app._mic_rows()[2][2]()
+        self.assertEqual(app.cfg.controllers, {A: "voice"})
+        self.assertEqual(app.cfg.saves, 0)
+
+    def test_choosing_with_no_controller_says_so(self):
+        app = self._app([])
+        app._mic_rows()[2][2]()
+        self.assertEqual(app.cfg.saves, 0)
+        self.assertEqual(len(app.notes), 1)
+        self.assertIn("No controller", app.notes[0][1])
+
+    def test_the_rows_read_the_newest_config(self):
+        # built once: the same callables answer after the config moved
+        app = self._app([controller(A)], mic_modes={A: "voice"})
+        rows = app._mic_rows()
+        app.cfg.controllers[A] = "studio"
+        self.assertEqual([c() for _t, c, _a in rows], [False, False, True])
+
+    def test_a_changed_mode_changes_the_menu_key(self):
+        # a dashboard save must move the radio dot without waiting for a click
+        app = self._app([controller(A)], mic_modes={A: "voice"})
+        before = app._menu_key()
+        app.cfg.controllers[A] = "pad"
+        self.assertNotEqual(app._menu_key(), before)
 
 
 class DebounceTests(unittest.TestCase):

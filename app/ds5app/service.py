@@ -425,22 +425,23 @@ def _read_input_section(path: str):
         return None
 
 
-class EchoSetting:
-    """One controller's `echo_cancel`, shaped for `InputConfigWatcher` (which
+class MicSetting:
+    """One controller's `mic_mode`, shaped for `InputConfigWatcher` (which
     only needs `to_dict()` to compare a saved value with the running one)."""
 
-    def __init__(self, on: bool):
-        self.on = bool(on)
+    def __init__(self, mode: str):
+        self.mode = mode
 
     def to_dict(self) -> dict:
-        return {"echo_cancel": self.on}
+        return {"mic_mode": self.mode}
 
 
-def _read_echo_setting(path: str, serial: str):
-    """`controllers[serial].echo_cancel` from the config at `path` as an
-    `EchoSetting`, or None. Never raises; the same "degrade, don't poison"
+def _read_mic_setting(path: str, serial: str):
+    """`controllers[serial].mic_mode` from the config at `path` as a
+    `MicSetting`, or None. Never raises; the same "degrade, don't poison"
     reading as `_read_input_section`. A controller with no entry yet gets the
-    shipped default, ON."""
+    shipped default, "voice"; an old entry with only `echo_cancel` is read
+    the way `config.load()` reads it (`config.mic_mode_from_dict`)."""
     from . import config as K
 
     try:
@@ -451,8 +452,8 @@ def _read_echo_setting(path: str, serial: str):
         ctrls = data.get("controllers")
         entry = ctrls.get(K.norm_serial(serial)) if isinstance(ctrls, dict) else None
         if entry is None:
-            return EchoSetting(True)
-        return EchoSetting(K.ControllerConfig.from_dict(entry).echo_cancel)
+            return MicSetting(K.DEFAULT_MIC_MODE)
+        return MicSetting(K.ControllerConfig.from_dict(entry).mic_mode)
     except (OSError, ValueError, UnicodeDecodeError):
         return None
 
@@ -500,7 +501,7 @@ class InputConfigWatcher:
         #: channel, child stdout). Without it, the module log speaks.
         self._on_applied = on_applied
         #: What the applied-live line calls the section. The same watcher
-        #: also follows one controller's `echo_cancel` (`EchoSetting`).
+        #: also follows one controller's `mic_mode` (`MicSetting`).
         self.label = label
         self._mtime: int | None = None
         self._stop = threading.Event()
@@ -581,19 +582,24 @@ def mode_line(remote: bool, keyboard: bool) -> str:
 
 
 def echo_summary(status: dict | None) -> tuple[str, str]:
-    """`BridgeBackend.echo_status()` as (state, note) for the status channel:
+    """`BridgeBackend.echo_status()` as (state, note) for the status channel.
+    The state says what is being removed from the mic:
 
-        off        echo cancellation switched off
-        idle       on, but the mic is not in use (nothing to cancel yet)
-        on         on and working (the pad's canceller + the software one)
-        degraded   on, but the software canceller is not working -- the
+        off        nothing ("studio" mode): the mic is sent as the pad hears it
+        pad        only the pad's own speaker, by the pad ("pad" mode)
+        idle       "voice", but the mic is not in use (nothing to cancel yet)
+        on         "voice" and working (the pad's canceller + the software one)
+        degraded   "voice", but the software canceller is not working -- the
                    pad still cancels its own speaker, the PC's other
                    speakers are NOT cancelled; `note` says why
     """
     if not status:
         return "idle", ""
     if not status.get("enabled"):
-        return "off", ""
+        # The software canceller is off; whether the pad's own still runs is
+        # what tells "pad" from "studio". A status without the key predates
+        # the modes, when off meant both.
+        return ("pad" if status.get("pad") else "off"), ""
     mode = status.get("mode")
     if mode in (None, "idle", "starting"):
         return "idle", ""
@@ -629,8 +635,8 @@ class BridgeService:
                  auto_cleanup: bool = True, on_event=None,
                  hide_bluetooth: bool = False, hidhide_cli: str | None = None,
                  telemetry_port: int | None = None,
-                 input_config=None, echo_cancel: bool = True,
-                 follow_echo_config: bool = False):
+                 input_config=None, mic_mode: str = "voice",
+                 follow_mic_config: bool = False):
         self.serial = serial
         self.port = port
         self.host = host
@@ -666,14 +672,16 @@ class BridgeService:
         #: engine (`InputConfigWatcher`) -- the dashboard's Save must reach a
         #: bridge that is already up, without a restart.
         self._input_watcher = None
-        #: Echo cancellation (`BridgeBackend.echo_cancel`: the pad's own
-        #: canceller plus the software one for the PC's other speakers). With
-        #: `follow_echo_config`, a second watcher keeps it in step with this
-        #: controller's `echo_cancel` in config.json, so the dashboard switch
-        #: applies to a running bridge; a `--echo-cancel` flag pins it instead.
-        self.echo_cancel = bool(echo_cancel)
-        self.follow_echo_config = bool(follow_echo_config)
-        self._echo_watcher = None
+        #: The microphone mode (`BridgeBackend.mic_mode`: "voice" = the pad's
+        #: own canceller plus the software one for the PC's other speakers,
+        #: "pad" = the pad's only, "studio" = nothing). With
+        #: `follow_mic_config`, a second watcher keeps it in step with this
+        #: controller's `mic_mode` in config.json, so the tray's Microphone
+        #: rows and the dashboard apply to a running bridge; a `--mic-mode`
+        #: (or `--echo-cancel`) flag pins it instead.
+        self.mic_mode = mic_mode
+        self.follow_mic_config = bool(follow_mic_config)
+        self._mic_watcher = None
 
         self.state = STOPPED
         self.error: str | None = None
@@ -899,25 +907,25 @@ class BridgeService:
                 log.exception("could not start the input-config watcher")
                 self._input_watcher = None
 
-        if self.follow_echo_config and self.serial:
+        if self.follow_mic_config and self.serial:
             serial = self.serial
             try:
-                self._echo_watcher = InputConfigWatcher(
-                    apply_fn=self._apply_echo_setting,
-                    current_fn=lambda: EchoSetting(self.echo_cancel),
-                    load_fn=lambda path: _read_echo_setting(path, serial),
-                    label="pad echo cancellation",
+                self._mic_watcher = InputConfigWatcher(
+                    apply_fn=self._apply_mic_setting,
+                    current_fn=lambda: MicSetting(self.mic_mode),
+                    load_fn=lambda path: _read_mic_setting(path, serial),
+                    label="microphone mode",
                     on_applied=lambda text: self._emit("info", text))
-                self._echo_watcher.start()
+                self._mic_watcher.start()
             except Exception:  # noqa: BLE001
-                log.exception("could not start the echo-setting watcher")
-                self._echo_watcher = None
+                log.exception("could not start the microphone-mode watcher")
+                self._mic_watcher = None
 
-    def _apply_echo_setting(self, setting) -> None:
-        self.echo_cancel = setting.on
+    def _apply_mic_setting(self, setting) -> None:
+        self.mic_mode = setting.mode
         be = self._backend
         if be is not None:
-            be.set_echo_cancel(setting.on)
+            be.set_mic_mode(setting.mode)
 
     def _start_server(self) -> None:
         from ds5emu.bridge import BridgeBackend
@@ -925,7 +933,7 @@ class BridgeService:
         from ds5emu.timing import TimerResolution
 
         self._backend = BridgeBackend(target=self.audio_target, serial=self.serial,
-                                      echo_cancel=self.echo_cancel)
+                                      mic_mode=self.mic_mode)
         self._attach_interceptor()
         self._server = UsbIpServer(self._backend, host=self.host, port=self.port,
                                    busid=self.busid)
@@ -1053,12 +1061,12 @@ class BridgeService:
             except Exception:  # noqa: BLE001
                 log.exception("stopping the input-config watcher failed")
             self._input_watcher = None
-        if self._echo_watcher is not None:
+        if self._mic_watcher is not None:
             try:
-                self._echo_watcher.stop()
+                self._mic_watcher.stop()
             except Exception:  # noqa: BLE001
-                log.exception("stopping the echo-setting watcher failed")
-            self._echo_watcher = None
+                log.exception("stopping the microphone-mode watcher failed")
+            self._mic_watcher = None
 
         # The chord engine first: it may be holding a synthetic key down (an
         # Alt-Tab mid-gesture), and a stuck Alt key outlives everything else

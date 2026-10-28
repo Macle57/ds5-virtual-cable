@@ -7,7 +7,7 @@ export const HELP: Record<string, string> = {
   auto_bridge_new: "A DualSense this app has never seen is bridged the moment it pairs. Off, a new pad waits until you enable it here or in the tray.",
   hide_bluetooth_default: "What a NEW controller's 'hide' switch starts as: hide its Bluetooth pad from games and Steam while it is bridged, so only the virtual wired pad is seen (no doubled controller). Existing pads keep their own switch below.",
   ctrl_enabled: "Bridge this controller: run a virtual wired pad for it whenever it is connected. Off, the pad stays a plain Bluetooth controller.",
-  echo_cancel: "Removes what this PC plays from the pad's microphone, so a voice chat does not hear your game back: the pad's own speaker (by the controller itself) and any other speaker the PC drives that the pad can hear, such as a TV or desktop speakers (by the bridge, once it has heard that speaker in the mic). People and other devices in the room are kept. Headphones are never touched.",
+  mic_mode: "What is removed from this pad's microphone. Voice chat (the default) removes everything this PC plays, so a voice chat does not hear your game back: the pad's own speaker (by the controller itself) and any other speaker the PC drives that the pad can hear, such as a TV or desktop speakers (by the bridge, once it has heard that speaker in the mic). Pad only removes just the pad's own speaker and leaves the PC's other speakers in, for when you want people to hear the music or the TV. Studio removes nothing: the mic is sent exactly as the pad hears it, its own speaker included, for recording or for software that does its own echo cancellation. In every mode people and other devices in the room are kept, and headphones are never touched. Applies to a running bridge within a couple of seconds; the tray's Microphone menu sets it for every controller at once.",
   ctrl_hide: "Hide this controller's Bluetooth pad (HidHide) while it is bridged, so games and Steam see only the virtual wired one. The pill beside it says whether the hide is actually in effect right now.",
   autostart_on_login: "Start the tray with Windows. Installed as a service it starts before anyone signs in (the pads work on the lock screen too); installed as a scheduled task it starts at sign-in. The installer chooses which; this switch turns whichever is installed on or off.",
   update_check: "Look for a newer release on GitHub every 6 hours and when the tray starts. Off, nothing is ever fetched.",
@@ -144,16 +144,23 @@ export const NOTIFICATION_FIELDS: [string, string, boolean, string][] = [
   ["update", "Update available", true, "n_update"],
 ];
 export const KNOWN_NOTIFICATIONS = new Set(NOTIFICATION_FIELDS.map((f) => f[0]));
-export const CTRL_FIELDS: [string, string, "bool" | "number" | "string" | "choice", string[]?][] = [
+/* The microphone modes (config.MIC_MODES), with the tray's row texts. */
+export const MIC_MODES: { value: string; label: string; note: string }[] = [
+  { value: "voice", label: "Voice chat", note: "Cancel everything the PC plays: the pad's own speaker and your TV or desktop speakers." },
+  { value: "pad", label: "Pad only", note: "Cancel the pad's own speaker. Sound from the PC's other speakers stays in the mic." },
+  { value: "studio", label: "Studio", note: "Send everything: the mic exactly as the pad hears it, its own speaker included." },
+];
+export const CTRL_FIELDS: [string, string, "bool" | "number" | "string" | "choice" | "mic", string[]?][] = [
   ["enabled", "Bridge this controller", "bool"],
   ["label", "Label", "string"],
   ["audio_target", "Audio target", "choice", ["speaker", "headphone"]],
   ["hide_bluetooth", "Hide Bluetooth pad while bridged", "bool"],
-  ["echo_cancel", "Pad echo cancellation (mic)", "bool"],
+  ["mic_mode", "Microphone", "mic"],
   ["port", "usbip TCP port (leave blank for automatic)", "number"],
 ];
 export const KNOWN_GLOBAL = new Set([...GLOBAL_FIELDS.map((f) => f[0]), "controllers", "input", "notifications"]);
-export const KNOWN_CTRL = new Set(CTRL_FIELDS.map((f) => f[0]));
+/* echo_cancel: the bool mic_mode replaced; the backend drops it on load. */
+export const KNOWN_CTRL = new Set([...CTRL_FIELDS.map((f) => f[0]), "echo_cancel"]);
 export const KNOWN_INPUT = new Set(["enabled", "chord_button", "chords", "actions", "macros",
   "double_press_ms", "tap_replay_ms", "repeat_ms", "haptic_ack", "haptic_strength",
   "stick_mouse_in_chord", "off_timer_minutes", "battery", "lightbar", "remote", "gestures"]);

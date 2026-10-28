@@ -137,7 +137,7 @@ def main() -> int:
     args = ap.parse_args()
 
     # This listens for the speaker in the mic: the pad's echo canceller off.
-    be = BridgeBackend(speaker_volume=args.volume, echo_cancel=False)
+    be = BridgeBackend(speaker_volume=args.volume, mic_mode="studio")
     be.start()
     dev = DualSenseDevice(be)
     fail = 0
