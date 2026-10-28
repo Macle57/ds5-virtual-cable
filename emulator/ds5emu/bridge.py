@@ -130,6 +130,7 @@ from . import _bootstrap  # noqa: F401  (sys.path side effect)
 from . import aec as AEC
 from . import descriptors as D
 from . import translate as T
+from . import uac as UAC
 from .backend import Backend
 
 import numpy as np  # noqa: E402
@@ -239,6 +240,15 @@ MIC_VOICE = "voice"
 MIC_PAD = "pad"
 MIC_STUDIO = "studio"
 MIC_MODES = (MIC_VOICE, MIC_PAD, MIC_STUDIO)
+
+#: The microphone byte (SetState MIC_VOLUME) every arm sends,
+#: `ds5bridge.protocol.build_bt_mic_state`: 0x08. Every mic measurement in
+#: this project (the echo-canceller rounds, PAD_EC_MAKEUP below) was taken at
+#: it. Windows' capture level does NOT move it -- it is applied by the bridge
+#: as `mic_gain_db`, exactly in dB -- because what the byte does to the
+#: level has never been measured, while the dB range of the wired pad's
+#: own gain stage has (uac.py).
+MIC_ARM_VOLUME_BYTE = 0x08
 
 #: Gain put back on the microphone while the pad's echo canceller is on.
 #: MEASURED 2026-10-05 (four takes on cameo, external speech
@@ -685,11 +695,12 @@ class _StreamOpusEncoder:
 
 
 def _uac_db_to_byte(millidb: int) -> int:
-    """UAC1 volume (1/256 dB, signed) -> the DualSense's 0..255 linear knob.
+    """UAC1 SPEAKER volume (1/256 dB, signed) -> the DualSense's 0..255 knob.
 
     Heuristic, not captured from hardware: amplitude = 10^(dB/20) scaled to the
-    Phase-1 working range. `uac.py`'s MIN/MAX are themselves assumed values
-    (risk R7), so this cannot be better than they are.
+    Phase-1 working range. The range itself is measured now (uac.py: -100..0
+    dB); how the pad's speaker byte maps to loudness is not. The microphone
+    does not go through this at all: see `BridgeBackend.mic_gain_db`.
     """
     db = millidb / 256.0
     amp = 10.0 ** (db / 20.0)
@@ -774,6 +785,14 @@ class BridgeBackend(Backend):
         #: service after attach): how the software canceller recognises this
         #: pad's own speaker endpoint and leaves it to the pad.
         self.own_usb_ports: set | None = None
+        #: Windows' capture level for this pad, in dB: the virtual pad's mic
+        #: feature unit, which is a GAIN of 0..+48 dB like a real wired pad's
+        #: (uac.py). Applied to the mic by the bridge, after the software
+        #: canceller (`_write_mic`), so a wired pad's slider and a bridged
+        #: pad's slider mean the same thing: 0 % = the pad as it is, 100 % =
+        #: +48 dB. Set by `on_uac_control`; until Windows sets it, uac.py's
+        #: GET_CUR default.
+        self.mic_gain_db = UAC.MIC_VOLUME_DEFAULT / 256.0
         #: Where the software canceller remembers each speaker's delay for
         #: this pad (None: it re-finds them every run). Set by the service.
         self.aec_store_path: str | None = None
@@ -1548,10 +1567,26 @@ class BridgeBackend(Backend):
         # mono -> the 2-channel USB IN stream: the real wired controller
         # duplicates the single capsule to L and R (FINDINGS: "USB mic IN: 2ch
         # descriptor, mono duplicated to L/R").
-        i16 = np.clip(mono, -1.0, 1.0)
+        g = self._mic_gain()
+        i16 = np.clip(mono * g if g != 1.0 else mono, -1.0, 1.0)
         i16 = (i16 * 32767.0).astype("<i2")
         stereo = np.repeat(i16, 2)
         self._mic_ring.write(stereo.tobytes())
+
+    def _mic_gain(self) -> float:
+        """`mic_gain_db` as a linear factor (1.0 at 0 dB)."""
+        db = self.mic_gain_db
+        return 1.0 if not db else 10.0 ** (db / 20.0)
+
+    def _write_mic(self, pcm: bytes) -> None:
+        """The software canceller's output (s16le stereo) into the mic ring,
+        with Windows' capture gain applied. The direct path applies the same
+        gain in `_on_mic_payload`, before its own int16 conversion."""
+        g = self._mic_gain()
+        if g != 1.0:
+            x = np.frombuffer(pcm, "<i2").astype(np.float32) * g
+            pcm = np.clip(x, -32768.0, 32767.0).astype("<i2").tobytes()
+        self._mic_ring.write(pcm)
 
     # =====================================================================
     # thread 2: audio pump  (USB iso OUT -> BT 0x39)
@@ -2151,9 +2186,17 @@ class BridgeBackend(Backend):
     def on_uac_control(self, unit: int, selector: int, value: int) -> None:
         """A UAC1 SET_CUR landed on a feature unit; mirror it onto the DualSense.
 
-        The mapping is a heuristic (see `_uac_db_to_byte`): the emulator's UAC
-        volume range is itself an assumed value, so this cannot be exact until
-        the real wired controller is sniffed (risk R7).
+        Speaker volume goes to the pad's speaker byte (a heuristic, see
+        `_uac_db_to_byte`). Microphone volume does NOT go to the pad: it is
+        Windows' capture gain, 0..+48 dB as on a real wired pad (uac.py), and
+        becomes `mic_gain_db`, which the bridge applies itself. It used to be
+        sent as the pad's MIC_VOLUME byte through the speaker heuristic, which
+        was wrong three ways: the next mic arm overwrote it with 0x08 anyway
+        (Windows sets the level once, an app opens the mic later), the byte it
+        made for 0 dB was 200 against a knob that public reverse-engineering
+        notes (not measured here) describe as topping out at 0x40, and with
+        the old assumed -96..0 dB range every slider position below 100 %
+        was an attenuation.
 
         Runs on the asyncio server thread, so the Bluetooth write is posted to
         the writer thread rather than performed here (module docstring, last
@@ -2178,8 +2221,11 @@ class BridgeBackend(Backend):
         elif unit == D.UNIT_FU_MIC:
             if selector == FU_MUTE_CONTROL:
                 self._defer(self._arm_mic_now, self._mic_armed.is_set(), bool(value))
-                return
-            st.mic_volume(_uac_db_to_byte(value) if selector == FU_VOLUME_CONTROL else 0x08)
+            elif selector == FU_VOLUME_CONTROL:
+                self.mic_gain_db = value / 256.0
+                log.info("microphone gain %+.1f dB (Windows capture level)",
+                         self.mic_gain_db)
+            return
         else:
             return
         self._defer(self._write_setstate_body, bytes(st.body))
@@ -2294,7 +2340,7 @@ class BridgeBackend(Backend):
         with self._aec_lock:
             if want and self._aec is None:
                 store = AEC.DelayStore(self.aec_store_path) if self.aec_store_path else None
-                eng = AEC.EchoCanceller(self._mic_ring.write,
+                eng = AEC.EchoCanceller(self._write_mic,
                                         own_usb_ports=lambda: self.own_usb_ports,
                                         delay_store=store, pad_id=lambda: self.serial)
                 eng.start()
