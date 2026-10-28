@@ -113,6 +113,9 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName=ds5bridge {#AppVersion}
+; The setup exe wears the app icon (icon\make_icon.py makes it); Add/Remove
+; Programs shows the tray exe's, which carries the same icon (ds5bridge.spec).
+SetupIconFile=ds5bridge.ico
 UninstallDisplayIcon={app}\app\ds5bridge-tray.exe
 ; Always keep a log in %TEMP% (Setup Log *.txt); /LOG="file" names it.
 SetupLogging=yes
@@ -195,7 +198,9 @@ Source: "bundle\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{userprograms}\ds5bridge"; Filename: "{app}\app\ds5bridge-tray.exe"; WorkingDir: "{app}\app"; Comment: "ds5bridge -- a Bluetooth DualSense, presented to Windows as a wired one"; Components: app
 ; Internet shortcuts (.url): Windows opens them with the default browser, so
 ; no elevated process is involved (the tray hands URLs to explorer for the
-; same reason). The tray's own icon, so they are recognisable.
+; same reason). The tray's own icon, so they are recognisable: Inno writes it
+; as the .url's IconFile/IconIndex, and the shell reads an exe's icon group
+; there just as it does for a .lnk.
 Name: "{userprograms}\ds5bridge dashboard"; Filename: "{code:DashboardUrl}"; IconFilename: "{app}\app\ds5bridge-tray.exe"; Comment: "The ds5bridge dashboard, in your browser"; Components: app; Tasks: dashstartmenu
 Name: "{userdesktop}\ds5bridge dashboard"; Filename: "{code:DashboardUrl}"; IconFilename: "{app}\app\ds5bridge-tray.exe"; Comment: "The ds5bridge dashboard, in your browser"; Components: app; Tasks: dashdesktop
 

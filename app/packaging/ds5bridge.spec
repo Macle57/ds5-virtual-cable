@@ -16,15 +16,50 @@
 # the packages are already top-level inside the bundle.
 
 import os
+import re
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_dynamic_libs
+from PyInstaller.utils.win32 import versioninfo as VI
 
 SPEC_DIR = Path(SPECPATH).resolve()
 APP_DIR = SPEC_DIR.parent
 REPO = APP_DIR.parent
 
 ONEFILE = os.environ.get("DS5_ONEFILE") == "1"
+
+# The file icon: the tray's pad drawing, made by app/packaging/icon/make_icon.py
+# (rerun it after changing ds5app/icon_art.py). Both exes carry it, so the
+# Start menu, launchers, Task Manager and the uninstall entry all show it.
+ICON = str(SPEC_DIR / "ds5bridge.ico")
+
+# Version resource (Properties > Details), from ds5app.__version__.
+_ver = re.search(r'^__version__ = "([^"]+)"',
+                 (APP_DIR / "ds5app" / "__init__.py").read_text(encoding="utf-8"),
+                 re.M).group(1)
+_vt = tuple((list(map(int, re.findall(r"\d+", _ver)[:4])) + [0, 0, 0, 0])[:4])
+
+
+def _version_info(exe_name, description):
+    return VI.VSVersionInfo(
+        ffi=VI.FixedFileInfo(filevers=_vt, prodvers=_vt),
+        kids=[
+            VI.StringFileInfo([VI.StringTable("040904B0", [
+                VI.StringStruct("CompanyName", "ds5bridge contributors"),
+                VI.StringStruct("FileDescription", description),
+                VI.StringStruct("FileVersion", _ver),
+                VI.StringStruct("InternalName", exe_name),
+                VI.StringStruct("OriginalFilename", exe_name + ".exe"),
+                VI.StringStruct("ProductName", "ds5bridge"),
+                VI.StringStruct("ProductVersion", _ver),
+            ])]),
+            VI.VarFileInfo([VI.VarStruct("Translation", [0x0409, 0x04B0])]),
+        ],
+    )
+
+
+VERSION_CLI = _version_info("ds5bridge", "ds5bridge (command line)")
+VERSION_TRAY = _version_info("ds5bridge-tray", "ds5bridge")
 
 hidden = [
     # Imported by name inside functions, so the analysis cannot see them:
@@ -36,7 +71,7 @@ hidden = [
     "ds5bridge.protocol", "ds5bridge.device", "ds5bridge.audio",
     "ds5bridge.pacing", "ds5bridge.crc",
     "ds5app.tray", "ds5app.cli", "ds5app.service", "ds5app.controller",
-    "ds5app.usbip",
+    "ds5app.usbip", "ds5app.icon_art",
     #   cli.cmd_run_all -> ds5app.manager, and cli.cmd_doctor -> config/autostart,
     # both imported inside the function bodies for the same reason.
     "ds5app.manager", "ds5app.config", "ds5app.autostart",
@@ -130,16 +165,18 @@ pyz_tray = PYZ(a_tray.pure)
 # console tool people cannot paste into an issue.
 if ONEFILE:
     exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="ds5bridge",
-              console=True, upx=False, strip=False)
+              console=True, upx=False, strip=False,
+              icon=ICON, version=VERSION_CLI)
     exe_tray = EXE(pyz_tray, a_tray.scripts, a_tray.binaries, a_tray.datas, [],
                    name="ds5bridge-tray", console=False, upx=False, strip=False,
-                   uac_admin=True)
+                   uac_admin=True, icon=ICON, version=VERSION_TRAY)
 else:
     exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="ds5bridge",
-              console=True, upx=False, strip=False)
+              console=True, upx=False, strip=False,
+              icon=ICON, version=VERSION_CLI)
     exe_tray = EXE(pyz_tray, a_tray.scripts, [], exclude_binaries=True,
                    name="ds5bridge-tray", console=False, upx=False, strip=False,
-                   uac_admin=True)
+                   uac_admin=True, icon=ICON, version=VERSION_TRAY)
     COLLECT(exe, a.binaries, a.datas,
             exe_tray, a_tray.binaries, a_tray.datas,
             strip=False, upx=False, name="ds5bridge")
