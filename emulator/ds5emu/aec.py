@@ -102,6 +102,27 @@ QUEUE_MAX_MS = 150
 SEQ_MAX_FILL = 25
 #: A reference frame quieter than this (-60 dBFS RMS) is silence.
 LOUD_RMS = 1e-3
+#: A microphone window quieter than this (-90 dBFS RMS, about one LSB of the
+#: pad's 16-bit mic) carries nothing to look for an echo in: the probe and
+#: the fine alignment skip it. It is NOT the reference's -60 dBFS: the echo of
+#: a PC speaker in the pad's mic is routinely far quieter than the audio
+#: Windows sends that speaker. The loopback reference is taken BEFORE the
+#: endpoint volume (MEASURED round 9, laptop Realtek speakers: a -20 dBFS tone
+#: loops back at -20.0 dBFS at volume 1.00 and at 0.30), so turning the PC's
+#: volume down weakens the echo and leaves the reference as it was. MEASURED
+#: (round 9, the round-8 laptop-speaker dumps replayed with the mic 10 dB
+#: quieter, i.e. a lower volume or mic gain): with the old -60 dBFS gate on
+#: the mic the echo (-67..-73 dBFS, 5-10 dB above the room) was never probed
+#: -- 0 probes, never cancelled -- while the status said "echo on"; with this
+#: gate it was found and cancelled exactly as at full level. The probe's
+#: thresholds are on GCC-PHAT peak-to-RMS, which does not depend on level,
+#: so a quiet mic does not make a false find likelier (null replay, round 9:
+#: 96 probes, never slotted, at the mic's level and 20 dB under it). LIVE
+#: (round 9, BT pad mic, real music on the laptop speakers at volume 0.15,
+#: echo -68 dBFS before the mic gain): the old gate dropped the slot ("no
+#: longer found") and cancelled 1.4 dB; this one kept it, 8 dB, the
+#: residual at the room's noise floor.
+MIC_MIN_RMS = 3e-5
 #: The canceller stays active this long after its last loud reference frame
 #: (the filter tail plus margin), then drops to the bit-exact idle path.
 ACTIVE_HOLD_FRAMES = TAIL_MS // 10 + 10
@@ -1442,7 +1463,7 @@ class EchoCanceller:
         mic = self.mic_hist.read(P - W, W)
         views = _probe_views(ref.timeline.read(P - W - base - M, W + M + A))
         if (float(np.sqrt(np.mean(views[0][M:M + W] ** 2))) < LOUD_RMS
-                or float(np.sqrt(np.mean(mic ** 2))) < LOUD_RMS):
+                or float(np.sqrt(np.mean(mic ** 2))) < MIC_MIN_RMS):
             return
         ref.last_probe_pos = P
         self.stats["probes"] += 1
@@ -1560,7 +1581,7 @@ class EchoCanceller:
         q = (P - W) + phi - base - ref.delay - ref.adj
         x = _probe_view(ref.timeline.read(q - E - S, W + 2 * S), ref.view)
         if (float(np.sqrt(np.mean(x[S:S + W] ** 2))) < LOUD_RMS
-                or float(np.sqrt(np.mean(mic ** 2))) < LOUD_RMS):
+                or float(np.sqrt(np.mean(mic ** 2))) < MIC_MIN_RMS):
             return
         ref.fine_last = P
         pat = fine_pattern(mic, x, S)

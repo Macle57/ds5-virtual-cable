@@ -56,7 +56,7 @@ export interface Controller {
   // what the mic's cancellers are doing (null = not reported): off = nothing is
   // removed (studio), pad = only the pad's own speaker, idle/on/degraded = voice chat
   echo?: "off" | "pad" | "idle" | "on" | "degraded" | null;
-  echo_note?: string;                        // why it is degraded, when it is
+  echo_note?: string;                        // degraded: why; on: "cancelling <speakers>"
   last_event?: string;
   telemetry?: Telemetry;
 }
