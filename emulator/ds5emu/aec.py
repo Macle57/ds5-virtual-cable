@@ -117,7 +117,11 @@ LOUD_RMS = 1e-3
 #: gate it was found and cancelled exactly as at full level. The probe's
 #: thresholds are on GCC-PHAT peak-to-RMS, which does not depend on level,
 #: so a quiet mic does not make a false find likelier (null replay, round 9:
-#: 96 probes, never slotted, at the mic's level and 20 dB under it).
+#: 96 probes, never slotted, at the mic's level and 20 dB under it). LIVE
+#: (round 9, BT pad mic, real music on the laptop speakers at volume 0.15,
+#: echo -68 dBFS before the mic gain): the old gate dropped the slot ("no
+#: longer found") and cancelled 1.4 dB; this one kept it, 8 dB, the
+#: residual at the room's noise floor.
 MIC_MIN_RMS = 3e-5
 #: The canceller stays active this long after its last loud reference frame
 #: (the filter tail plus margin), then drops to the bit-exact idle path.
