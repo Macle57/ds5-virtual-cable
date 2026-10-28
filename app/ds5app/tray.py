@@ -101,6 +101,7 @@ from . import __version__ as VERSION
 from . import autostart as A
 from . import config as K
 from . import controller as C
+from . import icon_art as IA
 from . import manager as M
 from . import service as S
 from . import update as U
@@ -173,13 +174,8 @@ def _icon_image(rgb, battery: int | None, count: int = 0, size: int = 64):
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     s = size / 64.0
-    # body: two grips joined by a bar
-    d.rounded_rectangle([6 * s, 20 * s, 58 * s, 46 * s], radius=12 * s, fill=rgb + (255,))
-    d.ellipse([2 * s, 22 * s, 26 * s, 50 * s], fill=rgb + (255,))
-    d.ellipse([38 * s, 22 * s, 62 * s, 50 * s], fill=rgb + (255,))
-    # sticks
-    for cx in (24, 40):
-        d.ellipse([(cx - 5) * s, 30 * s, (cx + 5) * s, 40 * s], fill=(20, 20, 24, 255))
+    # body and sticks: the same drawing the packaged .ico is made from
+    IA.draw_pad(d, rgb, s)
     if count > 1:
         # A filled pip, outlined so it stays visible against the body colour.
         d.ellipse([44 * s, 2 * s, 62 * s, 20 * s], fill=(30, 30, 34, 255))
