@@ -1965,6 +1965,16 @@ class TrayApp:
             self.mgr.reconcile_stale(log_fn=lambda t: print("  " + t, flush=True))
         except Exception:  # noqa: BLE001  (housekeeping must not stop the tray)
             log.exception("the startup reconciliation failed")
+        # Same idea for the Windows Audio service: a bridge killed between
+        # the stop and the start of its one restart this boot would leave it
+        # stopped (audio_range.py). Off the UI path; a no-op when it runs.
+        try:
+            from . import audio_range as AR
+
+            threading.Thread(target=AR.ensure_running_now, name="audiosrv-check",
+                             daemon=True).start()
+        except Exception:  # noqa: BLE001
+            log.exception("the audio service check failed to start")
 
     # -- entry point -------------------------------------------------------
 

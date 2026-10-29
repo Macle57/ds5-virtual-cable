@@ -38,12 +38,30 @@ reports the old -96..0 dB / 1 dB range -- which no real DualSense and no
 current build ever declares -- the Windows Audio service is restarted (one
 second without sound, once) when we are elevated, as the tray always is, and
 otherwise the user is told how to do it.
+
+Two guard rails:
+
+  * At most ONE restart per boot, across every bridge process. A marker in the
+    config directory (`audiosrv-refresh.json`, next to echo-delays.json) holds
+    the boot time it was written in, and is written BEFORE the restart. If a
+    stale range survives the restart -- an old build bridging a second pad,
+    say -- later attaches (tray launches, reconnects, power-cycle respawns)
+    only log the advice instead of cutting the PC's sound every time.
+  * The restart cannot be left half-done by a child process. It drives the
+    Service Control Manager in-process (ControlService STOP, wait,
+    StartService): a powershell child would have joined the tray's
+    kill-on-close job (manager.py, no breakaway) and could die between the
+    stop and the start. The bridge process itself can still be killed in that
+    gap, so every bridge, and the tray at startup, first starts Audiosrv again
+    if it is stopped AND this boot's marker says we were the ones touching it
+    (a service the user stopped on purpose is left alone).
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import subprocess
+import os
 import sys
 import threading
 import time
@@ -65,10 +83,19 @@ AUDIO_SERVICE = "Audiosrv"
 #: attaching together must not restart the audio service twice.
 MUTEX_NAME = "Global\\ds5bridge-audiosrv-refresh"
 
+#: The once-per-boot marker, in the config directory.
+MARKER_NAME = "audiosrv-refresh.json"
+#: Two boot-time readings (wall clock minus uptime) of one boot agree to
+#: within a second on legion; this absorbs clock corrections.
+BOOT_TOLERANCE_S = 120.0
+#: How long to wait for the service to reach STOPPED / RUNNING.
+SERVICE_WAIT_S = 30.0
+
 OK = "ok"                     # nothing stale seen
 REFRESHED = "refreshed"       # stale, Audiosrv restarted, now correct
 NEED_ADMIN = "need-admin"     # stale, not elevated: told the user
 FAILED = "failed"             # stale, restart failed or did not help
+ALREADY = "already"           # stale, but this boot already had its restart
 
 ADVICE = ("Windows is still using the volume range an older ds5bridge "
           "reported for the controller, so the microphone slider cannot add "
@@ -101,13 +128,15 @@ class RangeRefresher:
     endpoints' ranges, `restart()` restarts the audio service and returns
     success, `is_admin()` says whether we may. Pure enough to unit test."""
 
-    def __init__(self, audio, restart, is_admin, lock=None,
+    def __init__(self, audio, restart, is_admin, lock=None, marker=None,
                  sleep=time.sleep, clock=time.monotonic,
                  watch_s: float = WATCH_S, poll_s: float = POLL_S):
         self.audio = audio
         self.restart = restart
         self.is_admin = is_admin
         self.lock = lock
+        #: `BootMarker`-shaped: `used()` / `mark()`. None = no limit (tests).
+        self.marker = marker
         self.sleep = sleep
         self.clock = clock
         self.watch_s = watch_s
@@ -137,6 +166,15 @@ class RangeRefresher:
             # Another bridge may have restarted the service while we waited.
             if not self._stale():
                 return REFRESHED
+            if self.marker is not None:
+                if self.marker.used():
+                    log.warning("the Windows Audio service was already "
+                                "restarted once this boot; not again")
+                    return ALREADY
+                # Before the restart: a process killed half-way must still
+                # count as this boot's one restart (and lets the next start
+                # put a stopped service back, `ensure_running_now`).
+                self.marker.mark()
             log.warning("restarting the Windows Audio service to drop it")
             if not self.restart():
                 return FAILED
@@ -156,6 +194,53 @@ class RangeRefresher:
             return None
 
 
+def boot_time() -> float:
+    """This boot's start as a wall-clock timestamp (time.time() minus the
+    uptime, sleep included). 0.0 when unknown."""
+    if sys.platform != "win32":
+        return 0.0
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetTickCount64.restype = ctypes.c_ulonglong
+        return time.time() - k32.GetTickCount64() / 1000.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+class BootMarker:
+    """"Did we restart the audio service during THIS boot?" as a tiny JSON
+    file holding the boot time it was written in. Shared by every bridge
+    process through the config directory. Unreadable = not used; a write that
+    fails is logged and the restart goes ahead (the mutex still stops two
+    restarts at once)."""
+
+    def __init__(self, path: str, boot=boot_time,
+                 tolerance: float = BOOT_TOLERANCE_S):
+        self.path = path
+        self.boot = boot
+        self.tolerance = tolerance
+
+    def used(self) -> bool:
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                stamp = float(json.load(f)["boot"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        now = self.boot()
+        return bool(now) and abs(stamp - now) <= self.tolerance
+
+    def mark(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"boot": self.boot(), "written": time.time()}, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            log.warning("could not write %s", self.path, exc_info=True)
+
+
 class _NullLock:
     def __enter__(self):
         return self
@@ -168,26 +253,95 @@ class _NullLock:
 # the real thing
 # ---------------------------------------------------------------------------
 
-_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+# Service states (winsvc.h) and the Win32 errors the logic cares about.
+SERVICE_STOPPED, SERVICE_START_PENDING, SERVICE_STOP_PENDING, SERVICE_RUNNING = 1, 2, 3, 4
+ERROR_DEPENDENT_SERVICES_RUNNING = 1051
+ERROR_SERVICE_ALREADY_RUNNING = 1056
+ERROR_SERVICE_NOT_ACTIVE = 1062
 
 
-def restart_audio_service(timeout: float = 60.0) -> bool:
-    """`Restart-Service -Force` (Audiosrv's dependents are demand-start
-    helpers such as AarSvc; -Force stops them too and they restart on use)."""
+def _wait_state(sc, want: int, sleep, clock, timeout: float) -> bool:
+    deadline = clock() + timeout
+    while True:
+        if sc.state() == want:
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(0.2)
+
+
+def ensure_service_running(sc, sleep=time.sleep, clock=time.monotonic,
+                           timeout: float = SERVICE_WAIT_S) -> bool:
+    """Make sure the service ends up RUNNING. `sc` is `ServiceControl`-shaped:
+    `state()`, `stop()`, `start()` (Win32 error codes, 0 = ok),
+    `active_dependents()`, `stop_named(name)`."""
+    st = sc.state()
+    if st in (SERVICE_RUNNING, SERVICE_START_PENDING):
+        return _wait_state(sc, SERVICE_RUNNING, sleep, clock, timeout)
+    if st == SERVICE_STOP_PENDING:
+        _wait_state(sc, SERVICE_STOPPED, sleep, clock, timeout)
+    err = sc.start()
+    if err not in (0, ERROR_SERVICE_ALREADY_RUNNING):
+        log.warning("starting %s failed (error %d)", AUDIO_SERVICE, err)
+        return False
+    return _wait_state(sc, SERVICE_RUNNING, sleep, clock, timeout)
+
+
+def restart_service(sc, sleep=time.sleep, clock=time.monotonic,
+                    timeout: float = SERVICE_WAIT_S) -> bool:
+    """Stop, wait for STOPPED, start, wait for RUNNING -- in this process.
+
+    Once a stop was accepted this always ends by starting the service again:
+    it never returns with the service left stopped by us. A stop that is
+    refused changes nothing and returns False.
+    """
+    err = sc.stop()
+    if err == ERROR_DEPENDENT_SERVICES_RUNNING:
+        # Audiosrv's dependents are demand-start helpers (AarSvc on legion);
+        # stopping them is what `Restart-Service -Force` does, and they start
+        # again on use.
+        for name in sc.active_dependents():
+            sc.stop_named(name)
+        err = sc.stop()
+    if err not in (0, ERROR_SERVICE_NOT_ACTIVE):
+        log.warning("stopping %s failed (error %d)", AUDIO_SERVICE, err)
+        return False
+    if not _wait_state(sc, SERVICE_STOPPED, sleep, clock, timeout):
+        log.warning("%s did not stop within %.0f s", AUDIO_SERVICE, timeout)
+    return ensure_service_running(sc, sleep, clock, timeout)
+
+
+def ensure_running_now(marker=None, sc=None, is_admin=None) -> bool:
+    """Start Audiosrv again if it is stopped and this boot's marker says we
+    were restarting it (a bridge or tray killed between stop and start).
+    Called by every bridge before its range check and by the tray at startup.
+    Returns True when it had to start the service. Never raises."""
+    if sys.platform != "win32" and sc is None:
+        return False
     try:
-        r = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-             f"Restart-Service -Name {AUDIO_SERVICE} -Force -ErrorAction Stop"],
-            capture_output=True, text=True, timeout=timeout,
-            creationflags=_CREATE_NO_WINDOW)
+        marker = marker if marker is not None else default_marker()
+        sc = sc if sc is not None else ServiceControl(AUDIO_SERVICE)
+        admin = is_admin if is_admin is not None else _is_admin
+        if sc.state() == SERVICE_RUNNING or not marker.used() or not admin():
+            return False
+        with (_NamedMutex(MUTEX_NAME) if sys.platform == "win32" else _NullLock()):
+            if sc.state() == SERVICE_RUNNING:
+                return False
+            log.warning("%s is stopped after our restart this boot; "
+                        "starting it again", AUDIO_SERVICE)
+            return ensure_service_running(sc)
     except Exception:  # noqa: BLE001
-        log.warning("restarting %s failed", AUDIO_SERVICE, exc_info=True)
+        log.warning("checking %s failed", AUDIO_SERVICE, exc_info=True)
         return False
-    if r.returncode != 0:
-        log.warning("restarting %s failed: %s", AUDIO_SERVICE,
-                    (r.stderr or r.stdout).strip()[:300])
-        return False
-    return True
+
+
+def default_marker() -> BootMarker:
+    try:
+        from . import config as K
+        d = K.config_dir()
+    except Exception:  # noqa: BLE001
+        d = os.path.join(os.environ.get("APPDATA") or ".", "ds5bridge")
+    return BootMarker(os.path.join(d, MARKER_NAME))
 
 
 def _is_admin() -> bool:
@@ -238,6 +392,114 @@ if sys.platform == "win32":
     from ctypes import wintypes
 
     from . import audio_default as AD
+
+    _adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    _SC_MANAGER_CONNECT = 0x0001
+    _SERVICE_QUERY_STATUS = 0x0004
+    _SERVICE_ENUMERATE_DEPENDENTS = 0x0008
+    _SERVICE_START = 0x0010
+    _SERVICE_STOP = 0x0020
+    _SERVICE_CONTROL_STOP = 0x00000001
+    _SERVICE_ACTIVE = 0x00000001
+
+    class _SERVICE_STATUS(ctypes.Structure):
+        _fields_ = [(n, wintypes.DWORD) for n in (
+            "dwServiceType", "dwCurrentState", "dwControlsAccepted",
+            "dwWin32ExitCode", "dwServiceSpecificExitCode", "dwCheckPoint",
+            "dwWaitHint")]
+
+    class _ENUM_SERVICE_STATUSW(ctypes.Structure):
+        _fields_ = (("lpServiceName", wintypes.LPWSTR),
+                    ("lpDisplayName", wintypes.LPWSTR),
+                    ("ServiceStatus", _SERVICE_STATUS))
+
+    _adv.OpenSCManagerW.restype = wintypes.HANDLE
+    _adv.OpenSCManagerW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+    _adv.OpenServiceW.restype = wintypes.HANDLE
+    _adv.OpenServiceW.argtypes = (wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD)
+    _adv.CloseServiceHandle.argtypes = (wintypes.HANDLE,)
+    _adv.QueryServiceStatus.argtypes = (wintypes.HANDLE, ctypes.POINTER(_SERVICE_STATUS))
+    _adv.ControlService.argtypes = (wintypes.HANDLE, wintypes.DWORD,
+                                    ctypes.POINTER(_SERVICE_STATUS))
+    _adv.StartServiceW.argtypes = (wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p)
+    _adv.EnumDependentServicesW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD))
+
+    class ServiceControl:
+        """The SCM calls `restart_service` needs, each opening and closing its
+        own handles. Returns Win32 error codes (0 = ok); raises nothing."""
+
+        def __init__(self, name: str):
+            self.name = name
+
+        @staticmethod
+        def _call(name: str, access: int, fn) -> int:
+            scm = _adv.OpenSCManagerW(None, None, _SC_MANAGER_CONNECT)
+            if not scm:
+                return ctypes.get_last_error() or 5
+            try:
+                h = _adv.OpenServiceW(scm, name, access)
+                if not h:
+                    return ctypes.get_last_error() or 5
+                try:
+                    return fn(h)
+                finally:
+                    _adv.CloseServiceHandle(h)
+            finally:
+                _adv.CloseServiceHandle(scm)
+
+        def state(self) -> int:
+            out = []
+
+            def q(h):
+                st = _SERVICE_STATUS()
+                if not _adv.QueryServiceStatus(h, ctypes.byref(st)):
+                    return ctypes.get_last_error()
+                out.append(int(st.dwCurrentState))
+                return 0
+            self._call(self.name, _SERVICE_QUERY_STATUS, q)
+            return out[0] if out else 0
+
+        def _stop(self, name: str) -> int:
+            def c(h):
+                st = _SERVICE_STATUS()
+                ok = _adv.ControlService(h, _SERVICE_CONTROL_STOP, ctypes.byref(st))
+                return 0 if ok else ctypes.get_last_error()
+            return self._call(name, _SERVICE_STOP | _SERVICE_QUERY_STATUS, c)
+
+        def stop(self) -> int:
+            return self._stop(self.name)
+
+        def stop_named(self, name: str) -> int:
+            return self._stop(name)
+
+        def start(self) -> int:
+            def go(h):
+                return 0 if _adv.StartServiceW(h, 0, None) else ctypes.get_last_error()
+            return self._call(self.name, _SERVICE_START | _SERVICE_QUERY_STATUS, go)
+
+        def active_dependents(self) -> list:
+            names: list = []
+
+            def e(h):
+                need, count = wintypes.DWORD(), wintypes.DWORD()
+                _adv.EnumDependentServicesW(h, _SERVICE_ACTIVE, None, 0,
+                                            ctypes.byref(need), ctypes.byref(count))
+                if not need.value:
+                    return 0
+                buf = ctypes.create_string_buffer(need.value)
+                if not _adv.EnumDependentServicesW(h, _SERVICE_ACTIVE, buf, need.value,
+                                                   ctypes.byref(need), ctypes.byref(count)):
+                    return ctypes.get_last_error()
+                arr = ctypes.cast(buf, ctypes.POINTER(_ENUM_SERVICE_STATUSW))
+                names.extend(arr[i].lpServiceName for i in range(count.value))
+                return 0
+            self._call(self.name, _SERVICE_ENUMERATE_DEPENDENTS, e)
+            return names
+
+    def restart_audio_service() -> bool:
+        return restart_service(ServiceControl(AUDIO_SERVICE))
 
     IID_IAudioEndpointVolume = "{5CDF2C82-841E-4546-9722-0CF74078229A}"
     _E_ALL = 2
@@ -310,8 +572,11 @@ def check_after_attach(on_event=None) -> str:
     if sys.platform != "win32":
         return OK
     try:
+        marker = default_marker()
+        ensure_running_now(marker)
         result = RangeRefresher(EndpointVolumes(), restart_audio_service,
-                                _is_admin, lock=_NamedMutex(MUTEX_NAME)).run()
+                                _is_admin, lock=_NamedMutex(MUTEX_NAME),
+                                marker=marker).run()
     except Exception:  # noqa: BLE001
         log.warning("volume range check failed", exc_info=True)
         return FAILED
@@ -319,6 +584,7 @@ def check_after_attach(on_event=None) -> str:
         REFRESHED: ("info", "Windows Audio restarted once to load the "
                             "controller's real volume ranges"),
         NEED_ADMIN: ("warn", ADVICE),
+        ALREADY: ("warn", ADVICE),
         FAILED: ("warn", ADVICE),
     }.get(result)
     if msg and on_event is not None:
