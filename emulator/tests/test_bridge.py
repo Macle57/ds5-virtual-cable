@@ -1500,7 +1500,7 @@ class PadAudioControlTests(unittest.TestCase):
         # The direct path and the software canceller's output both carry it.
         import math
         import numpy as np
-        for db in (0.0, 6.0, 11.5):          # 0.25 * 10^(11.5/20) < 1: no clipping
+        for db in (0.0, 3.0, 5.5):           # 0.25 * 10^(5.5/20) < the limiter's knee
             be = B.BridgeBackend(mic_mode="studio")
             be.mic_gain_db = 0.0
             be._on_mic_payload(self._Dec(), bytes(200))
@@ -1515,16 +1515,47 @@ class PadAudioControlTests(unittest.TestCase):
             got = 20 * math.log10(np.abs(via_aec).mean() / np.abs(ref).mean())
             self.assertAlmostEqual(got, db, delta=0.05)
 
-    def test_a_loud_gain_clips_rather_than_wraps(self):
+    def test_a_loud_gain_saturates_under_full_scale_rather_than_wraps(self):
         import numpy as np
+        lo, hi = int(0.99 * B.MIC_LIMIT_CEIL * 32767), 32767   # just under full scale
+
+        def saturated(out, sign=1):
+            v = set((sign * out).tolist())
+            return len(v) == 1 and lo < v.pop() < hi
+
         be = B.BridgeBackend()
         be.mic_gain_db = 48.0
         be._write_mic(np.full(960, 20000, "<i2").tobytes())
         out = np.frombuffer(be._mic_ring.read_exact(960 * 2), "<i2")
-        self.assertTrue((out == 32767).all())
+        self.assertTrue(saturated(out), out[:4])
+        be._write_mic(np.full(960, -20000, "<i2").tobytes())
+        out = np.frombuffer(be._mic_ring.read_exact(960 * 2), "<i2")
+        self.assertTrue(saturated(out, -1), out[:4])
         be._on_mic_payload(self._Dec(), bytes(200))
         out = np.frombuffer(be._mic_ring.read_exact(480 * B.USB_IN_FRAME_BYTES), "<i2")
-        self.assertTrue((out == 32767).all())
+        self.assertTrue(saturated(out), out[:4])
+
+    def test_the_limiter_is_the_identity_below_its_knee_and_smooth_above(self):
+        import numpy as np
+        x = np.linspace(-1.5, 1.5, 3001, dtype=np.float32)
+        y = B._soft_limit(x)
+        quiet = np.abs(x) <= B.MIC_LIMIT_KNEE
+        self.assertTrue(np.array_equal(y[quiet], x[quiet]))
+        self.assertLess(float(np.abs(y).max()), B.MIC_LIMIT_CEIL + 1e-6)
+        self.assertTrue((np.diff(y) >= 0).all())          # monotonic: no fold-over
+        step = float(x[1] - x[0])
+        self.assertLess(float(np.abs(np.diff(y)).max()), step * 1.001)  # slope <= 1
+        small = np.full(4, 0.1, np.float32)
+        self.assertIs(B._soft_limit(small), small)        # untouched, not copied
+
+    def test_no_limiter_at_0_db(self):
+        # The measured 0 dB path is bit-identical: a full-scale sample stays one.
+        import numpy as np
+        be = B.BridgeBackend()
+        be.mic_gain_db = 0.0
+        pcm = np.array([32767, -32768, 30000, 100] * 240, "<i2").tobytes()
+        be._write_mic(pcm)
+        self.assertEqual(be._mic_ring.read_exact(len(pcm)), pcm)
 
     def test_the_arm_sends_the_documented_mic_byte(self):
         # Through the bridge's own arm path and the real device methods: the

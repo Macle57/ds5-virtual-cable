@@ -86,6 +86,9 @@ hidden = [
     # bodies (service._start_inner, cli.cmd_run_all, tray) for the same
     # reason: both are optional passengers a broken machine can live without.
     "ds5app.dashboard", "ds5app.telemetry",
+    #   service._start_inner reaches the volume range check from inside a
+    # function body as well (another passenger); it imports audio_default.
+    "ds5app.audio_range", "ds5app.audio_default",
     # PyAV loads its codecs through the extension modules; numpy is pulled in
     # by ds5bridge.audio.
     "av", "numpy", "hid",
