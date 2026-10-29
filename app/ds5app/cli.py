@@ -697,6 +697,7 @@ def cmd_run(args) -> int:
                           input_config=cfg.input,
                           mic_mode=mic_mode,
                           follow_mic_config=mic_flag is None,
+                          check_volume_ranges=True,
                           on_event=_log)
     try:
         svc.start()

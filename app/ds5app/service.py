@@ -643,7 +643,8 @@ class BridgeService:
                  hide_bluetooth: bool = False, hidhide_cli: str | None = None,
                  telemetry_port: int | None = None,
                  input_config=None, mic_mode: str = "voice",
-                 follow_mic_config: bool = False):
+                 follow_mic_config: bool = False,
+                 check_volume_ranges: bool = False):
         self.serial = serial
         self.port = port
         self.host = host
@@ -689,6 +690,11 @@ class BridgeService:
         self.mic_mode = mic_mode
         self.follow_mic_config = bool(follow_mic_config)
         self._mic_watcher = None
+        #: After attach, look for volume ranges Windows' audio service still
+        #: holds from an older build and drop them (`audio_range.py`). Off by
+        #: default so a test that drives `_start_inner` never touches the
+        #: real audio service; `ds5bridge run` (every tray child) turns it on.
+        self.check_volume_ranges = bool(check_volume_ranges)
 
         self.state = STOPPED
         self.error: str | None = None
@@ -877,6 +883,16 @@ class BridgeService:
         self.state = RUNNING
         self._emit("ready",
                    f"virtual wired DualSense attached (controller {self.serial})")
+
+        if self.check_volume_ranges:
+            # A passenger too: a background thread that only ever logs, and at
+            # most restarts the Windows Audio service once (audio_range.py).
+            try:
+                from . import audio_range as AR
+
+                AR.check_in_background(self._emit)
+            except Exception:  # noqa: BLE001
+                log.exception("could not start the volume range check")
 
         self._battery = C.BatteryWatcher(
             self._backend,

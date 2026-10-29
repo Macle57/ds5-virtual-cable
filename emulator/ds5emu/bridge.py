@@ -259,6 +259,31 @@ MIC_ARM_VOLUME_BYTE = 0x08
 PAD_EC_MAKEUP_DB = 1.9
 PAD_EC_MAKEUP = 10.0 ** (PAD_EC_MAKEUP_DB / 20.0)
 
+#: Soft limiter on Windows' capture gain. MEASURED 2026-10-29 (blue over
+#: Bluetooth, a Mac saying a sentence at normal volume about a metre away):
+#: at 0 dB the voice is -62 dBFS RMS with -46 dBFS peaks, so the top of the
+#: slider (+48 dB) puts its peaks about 2 dB over full scale -- a hard clip
+#: on every loud syllable. Above 0 dB of gain, samples past the knee are bent
+#: smoothly (tanh, unit slope at the knee) towards a ceiling just under full
+#: scale instead. Below the knee it is the identity, and at 0 dB it is not
+#: applied at all, so the measured 0 dB path is bit-identical.
+MIC_LIMIT_KNEE = 0.5      # -6.0 dBFS
+MIC_LIMIT_CEIL = 0.97     # -0.3 dBFS
+
+
+def _soft_limit(x: "np.ndarray") -> "np.ndarray":
+    """Identity up to MIC_LIMIT_KNEE, then a tanh curve that never passes
+    MIC_LIMIT_CEIL (float samples, full scale = 1.0)."""
+    a = np.abs(x)
+    over = a > MIC_LIMIT_KNEE
+    if not over.any():
+        return x
+    span = MIC_LIMIT_CEIL - MIC_LIMIT_KNEE
+    y = np.array(x, dtype=np.float32, copy=True)
+    y[over] = np.sign(x[over]) * (MIC_LIMIT_KNEE + span * np.tanh(
+        (a[over] - MIC_LIMIT_KNEE) / span))
+    return y
+
 # --- factory-test feature reports 0x80 / 0x81 (Phase 4c) --------------------
 # The DualSense's whole factory-diagnostics channel is one request/response
 # pair: SET feature 0x80 carries [deviceId, actionId, params...], GET feature
@@ -1568,7 +1593,11 @@ class BridgeBackend(Backend):
         # duplicates the single capsule to L and R (FINDINGS: "USB mic IN: 2ch
         # descriptor, mono duplicated to L/R").
         g = self._mic_gain()
-        i16 = np.clip(mono * g if g != 1.0 else mono, -1.0, 1.0)
+        if g > 1.0:
+            mono = _soft_limit(mono * g)
+        elif g != 1.0:
+            mono = mono * g
+        i16 = np.clip(mono, -1.0, 1.0)
         i16 = (i16 * 32767.0).astype("<i2")
         stereo = np.repeat(i16, 2)
         self._mic_ring.write(stereo.tobytes())
@@ -1583,7 +1612,10 @@ class BridgeBackend(Backend):
         with Windows' capture gain applied. The direct path applies the same
         gain in `_on_mic_payload`, before its own int16 conversion."""
         g = self._mic_gain()
-        if g != 1.0:
+        if g > 1.0:
+            x = np.frombuffer(pcm, "<i2").astype(np.float32) * (g / 32768.0)
+            pcm = (_soft_limit(x) * 32767.0).astype("<i2").tobytes()
+        elif g != 1.0:
             x = np.frombuffer(pcm, "<i2").astype(np.float32) * g
             pcm = np.clip(x, -32768.0, 32767.0).astype("<i2").tobytes()
         self._mic_ring.write(pcm)

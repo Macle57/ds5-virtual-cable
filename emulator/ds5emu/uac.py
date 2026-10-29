@@ -31,6 +31,14 @@ on a real wired pad goes from no gain at 0 % to +48 dB at 100 % -- the same
 pad on this PC sat at +14.9 dB for a slider at 65 %. With the old assumed
 range the same slider was an attenuator, which is half of why a bridged pad's
 mic was quiet (bridge.py `on_uac_control` has the other half).
+
+"Unchanged" holds for a device the Windows Audio service has not seen before.
+For one it HAS seen -- a machine that ran a bridge with the old assumed ranges
+since its last boot -- the service keeps the old range in memory per endpoint,
+while usbaudio.sys does re-ask the device on every attach (measured
+2026-10-29: the device answered the values above, `GetVolumeRange` still said
+-96..0 dB). app/ds5app/audio_range.py detects that after attach and restarts
+the audio service once; its docstring has the measurements.
 """
 
 from __future__ import annotations
