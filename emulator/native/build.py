@@ -11,7 +11,11 @@ in `speexdsp/` (BSD-3-Clause, see speexdsp/COPYING) from the upstream release
 tag SpeexDSP-1.2.1 -- https://github.com/xiph/speexdsp/archive/refs/tags/
 SpeexDSP-1.2.1.tar.gz, sha256 d17ca363654556a4ff1d02cc13d9eb1fc5a8642c90b40bd54ce266c3807b91a7.
 The files are byte-identical to the release except speexdsp_config_types.h,
-which upstream generates at configure time and is written out here.
+which upstream generates at configure time and is written out here, and one
+patch to mdf.c / include/speex/speex_echo.h (every changed line is marked
+"ds5-virtual-usb patch"): a SPEEX_ECHO_SET_ADAPT_SCALE ctl that scales the
+filter's adaptation step (0 = frozen; 1, the default, is upstream behaviour),
+so ds5aec.c can slow the linear stages during double talk.
 
 The compiler is found the way setuptools finds it for C extensions (vswhere ->
 MSVC), so neither a developer prompt nor any download is needed: a Visual

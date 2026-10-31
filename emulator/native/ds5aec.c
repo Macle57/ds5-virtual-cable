@@ -67,7 +67,7 @@
 #define API __attribute__((visibility("default")))
 #endif
 
-#define DS5AEC_VERSION 3
+#define DS5AEC_VERSION 4
 #define MAX_STAGES 8
 #define MAX_CH 2
 
@@ -108,6 +108,13 @@ API ds5mdf *ds5mdf_new(int frame, int tail, int nch, int rate)
     if (!m->mdf || !m->out || !m->zeros) { ds5mdf_free(m); return NULL; }
     speex_echo_ctl(m->mdf, SPEEX_ECHO_SET_SAMPLING_RATE, &rate);
     return m;
+}
+
+/* Scale the stage's adaptation step (vendored speexdsp patch, SPEEX_ECHO_SET_ADAPT_SCALE): 1 = upstream,
+ * 0 = frozen. The chain runner sets it per frame from the double-talk detector. */
+API void ds5mdf_set_adapt(ds5mdf *m, float scale)
+{
+    if (m && m->mdf) speex_echo_ctl(m->mdf, SPEEX_ECHO_SET_ADAPT_SCALE, &scale);
 }
 
 API void ds5mdf_reset(ds5mdf *m)
@@ -161,6 +168,12 @@ enum {
     P_UP_SLOW_DB,    /* the reference leakage's creep per frame where it is far exceeded */
     P_GATE_L_DB,     /* the learning gate's floor, relative to the linear estimate */
     P_FRESH,         /* frames after the PC starts playing in which every bin learns */
+    P_DT_K,          /* double talk: a bin is "near end" when its error exceeds dt_k x the reference-based estimate */
+    P_DT_SHARE,      /* ... and the frame is when more than this share of 300 Hz-4 kHz is */
+    P_DT_HOLD,       /* frames the linear stages stay slowed after the last double-talk frame */
+    P_DT_ADAPT,      /* the linear stages' adaptation scale during double talk (1 = never slowed) */
+    P_DT_BETA,       /* over-subtraction factor during double talk (x beta) */
+    P_DT_FLOOR_DB,   /* the deepest gain during double talk */
     P_COUNT
 };
 
@@ -177,7 +190,8 @@ typedef struct {
     float *lL, *lG;               /* leakages, 10 log10: residual / linear estimate, residual / reference */
     float *hist;                  /* (MAX_HOLD + 1) x nbins reference power, newest at row `hpos` */
     float *refw;                  /* per-bin weight of the reference-based estimate */
-    int hpos, ns_init, fresh;
+    int hpos, ns_init, fresh, dt_hold, dt_lo, dt_hi;
+    float dt_flag;
     kiss_fft_scalar *tb;
     kiss_fft_cpx *E, *X, *R;
     float *m_prev;                /* previous mic frame, float */
@@ -285,6 +299,14 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->p[P_UP_SLOW_DB] = 0.02f;
     s->p[P_GATE_L_DB] = -100.0f;
     s->p[P_FRESH] = 150.0f;
+    s->p[P_DT_K] = 4.0f;
+    s->p[P_DT_SHARE] = 0.3f;
+    s->p[P_DT_HOLD] = 20.0f;
+    s->p[P_DT_ADAPT] = 1.0f;
+    s->p[P_DT_BETA] = 1.0f;
+    s->p[P_DT_FLOOR_DB] = -100.0f;
+    s->dt_lo = (int)(300.0 * s->nfft / rate);
+    s->dt_hi = (int)(4000.0 * s->nfft / rate);
     for (i = 0; i < nb; i++) { s->lL[i] = s->p[P_L_INIT_DB]; s->lG[i] = s->p[P_G_INIT_DB]; }
     derive(s);
     return s;
@@ -328,6 +350,8 @@ API void ds5aec_reset(ds5aec *s)
     memset(s->ola, 0, sizeof(float) * s->frame);
     memset(s->mic_prev, 0, sizeof(int16_t) * s->frame);
     s->was_active = 0;
+    s->dt_hold = 0;
+    s->dt_flag = 0.0f;
 }
 
 static void stft(ds5aec *s, const float *prev, const float *cur, kiss_fft_cpx *X)
@@ -387,8 +411,9 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
     int k, d, nb = s->nbins, hold = (int)s->p[P_HOLD];
     float q = s->p[P_Q], step = s->p[P_STEP_DB];
     float up = step * q, dn = step * (1.0f - q);
-    float beta = s->p[P_BETA], frz = s->p[P_FRZ], nfac = s->p[P_NFAC];
-    float floor2 = UNDB10(s->p[P_FLOOR_DB]);
+    float beta = s->p[P_BETA] * (s->dt_hold > 0 ? s->p[P_DT_BETA] : 1.0f), frz = s->p[P_FRZ], nfac = s->p[P_NFAC];
+    float floor2 = UNDB10(s->p[P_FLOOR_DB] > (s->dt_hold > 0 ? s->p[P_DT_FLOOR_DB] : -100.0f)
+                          ? s->p[P_FLOOR_DB] : s->p[P_DT_FLOOR_DB]);
     float lmax = s->p[P_LMAX_DB], gcap = -s->p[P_GMAX_DB], decay = s->p[P_DECAY];
     float rel = s->p[P_RELEASE], nbias = s->p[P_NBIAS], nsub = s->p[P_NSUB];
     float upslow = s->p[P_UP_SLOW_DB], gate_l = UNDB10(s->p[P_GATE_L_DB]);
@@ -429,6 +454,21 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
          * very first second is the exception, and is unlearned in the echo-only seconds after) */
         s->fresh--;
         learn = 2;
+    }
+    /* double talk for the LINEAR stages, from the reference-based estimate only (the linear stages' own
+     * estimate is what double talk corrupts): the share of the voice band whose error is far above what
+     * the reference explains */
+    {
+        int nn = 0, nf = 0;
+        for (k = s->dt_lo; k < s->dt_hi; k++) {
+            float pe = E[k].r * E[k].r + E[k].i * E[k].i;
+            float est = s->refw[k] * UNDB10(s->lG[k]) * pr[k];
+            if (pe <= s->p[P_LEARN_SNR] * nbias * s->ns[k]) continue;     /* at the room's level: no evidence */
+            nn++;
+            if (pe > s->p[P_DT_K] * est) nf++;
+        }
+        s->dt_flag = (nn > 0 && (float)nf / (float)(s->dt_hi - s->dt_lo) > s->p[P_DT_SHARE]) ? 1.0f : 0.0f;
+        if (s->fresh > 0) s->dt_flag = 0.0f;
     }
     if (near_out) *near_out = learn ? 0.0f : 1.0f;
     for (k = 0; k < nb; k++) {
@@ -540,6 +580,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
         for (j = 0; j < nstage; j++) {
             ds5mdf *m = stages[j];
             double pe = 0, pin = 0, pou = 0;
+            ds5mdf_set_adapt(m, s->dt_hold > 0 ? s->p[P_DT_ADAPT] : 1.0f);
             speex_echo_cancellation(m->mdf, cur, refs[j], m->out);
             for (i = 0; i < n; i++) {
                 float d = (float)cur[i] - (float)m->out[i];
@@ -573,11 +614,11 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
             s->pe[k] = 0.5f * s->pe[k] + 0.5f * pe;
         }
         track_noise(s);
-        if (s->p[P_BYPASS] > 0) {
+        residual_gains(s, s->E, s->X, s->R, &near);
+        if (s->p[P_BYPASS] > 0)
             for (k = 0; k < s->nbins; k++) s->g[k] = 1.0f;
-        } else {
-            residual_gains(s, s->E, s->X, s->R, &near);
-        }
+        if (s->dt_flag > 0) s->dt_hold = (int)s->p[P_DT_HOLD];
+        else if (s->dt_hold > 0) s->dt_hold--;
         for (k = 0; k < s->nbins; k++) {
             float g = s->g[k];
             s->E[k].r *= g; s->E[k].i *= g;
@@ -617,6 +658,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
         memset(s->hist, 0, sizeof(float) * s->nbins * (MAX_HOLD + 1));
         gsum = s->nbins;
         near = 0;
+        s->dt_hold = 0;
     }
 
     if (active && s->was_active) {
@@ -640,7 +682,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
         stats[0] = (float)(pmic / n); stats[1] = (float)(plin / n);
         stats[2] = (float)(pest / n); stats[3] = (float)(pout / n);
         stats[4] = near; stats[5] = (float)(gsum / s->nbins);
-        stats[6] = (float)active; stats[7] = 0.0f;
+        stats[6] = (float)active; stats[7] = s->dt_hold > 0 ? 1.0f : 0.0f;   /* linear stages slowed (double talk) */
     }
     FTZ_OFF(csr);
     return 0;

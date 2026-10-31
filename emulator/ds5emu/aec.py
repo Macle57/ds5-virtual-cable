@@ -303,7 +303,7 @@ def _dll_path() -> str:
 _DLL = None
 
 
-NATIVE_VERSION = 3
+NATIVE_VERSION = 4
 
 #: The residual stage's tunables (ds5aec.c, `ds5aec_param` ids). The defaults
 #: live in the DLL; `DS5_AEC_RESIDUAL="beta=2,floor_db=-20"` overrides some for
@@ -311,7 +311,7 @@ NATIVE_VERSION = 3
 #: ignored).
 RESIDUAL_PARAMS = ("beta", "q", "step_db", "floor_db", "nfac", "hold", "decay", "release",
                    "nrise_db", "fsm", "ref_lo_hz", "ref_lo_db", "frz", "dtd", "lmax_db",
-                   "gmax_db", "bypass", "nbias", "learn_snr", "nsub", "l_init_db", "g_init_db", "up_slow_db", "gate_l_db", "fresh")
+                   "gmax_db", "bypass", "nbias", "learn_snr", "nsub", "l_init_db", "g_init_db", "up_slow_db", "gate_l_db", "fresh", "dt_k", "dt_share", "dt_hold", "dt_adapt", "dt_beta", "dt_floor_db")
 
 
 def load_native():

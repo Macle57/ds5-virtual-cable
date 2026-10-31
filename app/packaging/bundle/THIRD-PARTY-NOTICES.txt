@@ -97,8 +97,10 @@ Compiled into: ds5emu\_native\ds5aec.dll (the microphone echo canceller)
 Source: release tag SpeexDSP-1.2.1, archive SHA-256
 D17CA363654556A4FF1D02CC13D9EB1FC5A8642C90B40BD54CE266C3807B91A7; the files
 used (mdf.c, resample.c, fftwrap.c, kiss_fft.c, kiss_fftr.c and their
-headers) are vendored unmodified in emulator/native/speexdsp/ of the
-ds5bridge source.
+headers) are vendored in emulator/native/speexdsp/ of the ds5bridge
+source, unmodified except one small patch to mdf.c and speex_echo.h (an
+adaptation-step control, SPEEX_ECHO_SET_ADAPT_SCALE; every changed line is
+marked "ds5-virtual-usb patch").
 --------------------------------------------------------------------------------
 
 Copyright 2002-2008 	Xiph.org Foundation

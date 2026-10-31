@@ -113,6 +113,11 @@ The people who built [Opus](https://opus-codec.org/),
 [PortAudio](https://www.portaudio.com/) — every one of which this project uses
 without ceremony and would be far harder without.
 
+[SpeexDSP](https://github.com/xiph/speexdsp) (Jean-Marc Valin and the Xiph.org
+contributors, BSD-3-Clause) is the microphone echo canceller's linear stage and
+resampler. It is vendored with one small patch, an adaptation-step control
+(`SPEEX_ECHO_SET_ADAPT_SCALE` in `mdf.c`); `NOTICE` has the details.
+
 ---
 
 *This project is not affiliated with, endorsed by, or sponsored by Sony

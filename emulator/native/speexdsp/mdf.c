@@ -172,6 +172,7 @@ struct SpeexEchoState_ {
    spx_float_t   Pyy;
    spx_word16_t *window;
    spx_word16_t *prop;
+   float adapt_scale;   /* ds5-virtual-usb patch: SPEEX_ECHO_SET_ADAPT_SCALE (1 = upstream behaviour) */
    void *fft_table;
    spx_word16_t *memX, *memD, *memE;
    spx_word16_t preemph;
@@ -421,6 +422,7 @@ EXPORT SpeexEchoState *speex_echo_state_init_mc(int frame_size, int filter_lengt
    M = st->M = (filter_length+st->frame_size-1)/frame_size;
    st->cancel_count=0;
    st->sum_adapt = 0;
+   st->adapt_scale = 1.0f;
    st->saturated = 0;
    st->screwed_up = 0;
    /* This is the default sampling rate */
@@ -1145,6 +1147,7 @@ EXPORT void speex_echo_cancellation(SpeexEchoState *st, const spx_int16_t *in, c
          r = MULT16_32_Q15(QCONST16(.7,15),r) + MULT16_32_Q15(QCONST16(.3,15),(spx_word32_t)(MULT16_32_Q15(RER,e)));
          /*st->power_1[i] = adapt_rate*r/(e*(1+st->power[i]));*/
          st->power_1[i] = FLOAT_SHL(FLOAT_DIV32_FLOAT(r,FLOAT_MUL32U(e,st->power[i]+10)),WEIGHT_SHIFT+16);
+         st->power_1[i] *= st->adapt_scale;   /* ds5-virtual-usb patch */
       }
    } else {
       /* Temporary adaption rate if filter is not yet adapted enough */
@@ -1163,7 +1166,7 @@ EXPORT void speex_echo_cancellation(SpeexEchoState *st, const spx_int16_t *in, c
          adapt_rate = FLOAT_EXTRACT16(FLOAT_SHL(FLOAT_DIV32(tmp32, See),15));
       }
       for (i=0;i<=st->frame_size;i++)
-         st->power_1[i] = FLOAT_SHL(FLOAT_DIV32(EXTEND32(adapt_rate),ADD32(st->power[i],10)),WEIGHT_SHIFT+1);
+         st->power_1[i] = FLOAT_SHL(FLOAT_DIV32(EXTEND32(adapt_rate),ADD32(st->power[i],10)),WEIGHT_SHIFT+1) * st->adapt_scale;   /* ds5-virtual-usb patch */
 
 
       /* How much have we adapted so far? */
@@ -1270,6 +1273,9 @@ EXPORT int speex_echo_ctl(SpeexEchoState *st, int request, void *ptr)
                filt[j*n+i] = PSHR32(MULT16_16(32767,st->wtmp[i]), WEIGHT_SHIFT-NORMALIZE_SCALEDOWN);
          }
       }
+         break;
+      case SPEEX_ECHO_SET_ADAPT_SCALE:   /* ds5-virtual-usb patch: scale the adaptation step (0 = frozen) */
+         st->adapt_scale = *(float*)ptr;
          break;
       default:
          speex_warning_int("Unknown speex_echo_ctl request: ", request);
