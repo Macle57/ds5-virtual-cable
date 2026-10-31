@@ -153,6 +153,9 @@ enum {
     P_LMAX_DB,       /* cap of the residual / linear-estimate leakage */
     P_GMAX_DB,       /* the residual / reference leakage stays under -gmax dB */
     P_BYPASS,        /* 1: gains forced to 1 (the linear chain's output, for analysis) */
+    P_NBIAS,         /* the noise floor's mean over its tracked minimum */
+    P_LEARN_SNR,     /* a bin learns only while its error is this far above the noise */
+    P_NSUB,          /* the share of the room's noise taken off the residual estimate */
     P_COUNT
 };
 
@@ -269,6 +272,9 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->p[P_LMAX_DB] = 0.0f;
     s->p[P_GMAX_DB] = 20.0f;
     s->p[P_BYPASS] = 0.0f;
+    s->p[P_NBIAS] = 3.0f;
+    s->p[P_LEARN_SNR] = 2.0f;
+    s->p[P_NSUB] = 1.0f;
     derive(s);
     return s;
 }
@@ -367,7 +373,7 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
     float beta = s->p[P_BETA], frz = s->p[P_FRZ], nfac = s->p[P_NFAC];
     float floor2 = UNDB10(s->p[P_FLOOR_DB]);
     float lmax = s->p[P_LMAX_DB], gcap = -s->p[P_GMAX_DB], decay = s->p[P_DECAY];
-    float rel = s->p[P_RELEASE];
+    float rel = s->p[P_RELEASE], nbias = s->p[P_NBIAS], nsub = s->p[P_NSUB];
     float *h0;
     int nfar = 0, nband = 0, learn = 1, fsm = (int)s->p[P_FSM];
     float *pr = s->gt;                      /* scratch: S per bin, then the raw gains */
@@ -406,16 +412,23 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
         float pe = E[k].r * E[k].r + E[k].i * E[k].i;
         float S = pr[k], L = UNDB10(s->lL[k]), G = s->refw[k] * UNDB10(s->lG[k]);
         float res, g2, gn2;
-        if (learn && pe > 2.0f * s->ns[k]) {
+        float N = nbias * s->ns[k];
+        if (learn) {
             float r0 = L * py, r1 = G * S;
             if (frz <= 0 || pe < frz * (r0 > r1 ? r0 : r1)) {
-                float lpe = DB10(pe + 1e-9f);
-                if (py > s->ns[k]) {
+                /* the echo part of the error, not the room's; an error AT the
+                 * room's level is evidence too -- that the leakage is small --
+                 * wherever the current estimate predicts more than the room */
+                float ee = pe - N, lpe;
+                int above = pe > s->p[P_LEARN_SNR] * N;
+                if (ee < 0.01f * N) ee = 0.01f * N;
+                lpe = DB10(ee + 1e-9f);
+                if (py > N && (above || r0 > N)) {
                     float r = lpe - DB10(py + 1e-9f);
                     s->lL[k] += r > s->lL[k] ? up : -dn;
                     if (s->lL[k] > lmax) s->lL[k] = lmax;
                 }
-                if (S > 100.0f) {
+                if (S > 100.0f && (above || r1 > N)) {
                     float r = lpe - DB10(S + 1e-9f);
                     s->lG[k] += r > s->lG[k] ? up : -dn;
                     if (s->lG[k] > gcap) s->lG[k] = gcap;
@@ -426,8 +439,12 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
         }
         res = L * py;
         if (G * S > res) res = G * S;
+        /* an estimate at the room's level cannot be told from the room: only
+         * what it predicts ABOVE the room is taken out */
+        res -= nsub * N;
+        if (res < 0) res = 0;
         g2 = 1.0f - beta * res / (s->pe[k] + 1e-9f);
-        gn2 = nfac * s->ns[k] / (s->pe[k] + 1e-9f);
+        gn2 = nfac * N / (s->pe[k] + 1e-9f);
         if (gn2 > 1.0f) gn2 = 1.0f;
         if (gn2 < floor2) gn2 = floor2;
         if (g2 < gn2) g2 = gn2;

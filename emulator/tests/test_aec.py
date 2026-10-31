@@ -159,6 +159,51 @@ class CancellerTests(unittest.TestCase):
         reduction = db(out[steady], mic[steady])
         self.assertLess(reduction, -20.0, f"echo only reduced {reduction:.1f} dB")
 
+    def test_an_echo_the_linear_filter_cannot_model_is_suppressed_to_the_room(self):
+        # Round 10: a laptop speaker at full volume. Part of its echo is not a
+        # linear function of the reference (driver excursion, processing the
+        # loopback never sees), so the linear stage leaves it; the residual
+        # stage must take it down to the room's noise -- and not below it
+        # (the room keeps its sound; a canceller that gates the room pumps).
+        n = 16 * FS
+        ref = speechlike(n, 2, rate=5.1)
+        lin = echo_of(ref, room(6, 0.6), 40)
+        # the nonlinear part: a soft-clipped copy, the clipping varying in time
+        drive = 3.0 + 2.0 * np.sin(2 * np.pi * 0.3 * np.arange(n) / FS)
+        nl = (np.tanh(drive * lin * 4) / 4 - lin * drive / 4 * 0.9).astype(np.float32)
+        noise = np.random.default_rng(1).standard_normal(n).astype(np.float32) * np.float32(1e-3)
+        mic = lin + nl + noise
+
+        def bypassed():
+            nat = AEC.NativeCanceller()
+            nat.set(bypass=1)
+            return nat
+        outs = {}
+        for name, fac in (("full", None), ("linear", bypassed)):
+            sim = Sim(native_factory=fac)
+            outs[name] = aligned(sim.run(mic, ref=ref), n)
+            self.assertEqual(sim.eng.status()["slots"], ["Speakers (Test)"])
+        steady = slice(8 * FS, n - FS)
+        left_lin = db(outs["linear"][steady], mic[steady])
+        left = db(outs["full"][steady], mic[steady])
+        self.assertGreater(left_lin, -25.0, f"the test's echo is too linear ({left_lin:.1f} dB)")
+        self.assertLess(left, left_lin - 10.0,
+                        f"residual stage took {left_lin:.1f} -> {left:.1f} dB only")
+
+    def test_the_room_keeps_its_noise_while_an_echo_is_cancelled(self):
+        # The residual stage suppresses down to the room's own noise level in
+        # each bin, never below it: a room that goes quieter whenever the PC
+        # plays, and comes back when it stops, pumps.
+        n = 16 * FS
+        ref = speechlike(n, 2, rate=5.1)
+        noise = np.random.default_rng(1).standard_normal(n).astype(np.float32) * np.float32(3e-3)
+        out = aligned(Sim().run(echo_of(ref, room(6, 0.6), 40) + noise, ref=ref), n)
+        lost = [db(out[k:k + 4800], noise[k:k + 4800]) for k in range(8 * FS, n - FS, 4800)]
+        # MEASURED (round 10): median -2.2 dB, worst -4.0 (the min-statistics
+        # floor sits a little under the noise's mean)
+        self.assertGreater(float(np.median(lost)), -3.5, f"room noise median {np.median(lost):.1f} dB")
+        self.assertGreater(min(lost), -6.0, f"room noise worst 100 ms {min(lost):.1f} dB")
+
     def test_a_quiet_echo_of_a_loud_reference_is_found_and_cancelled(self):
         # Round 9 (user report: laptop speakers still heard in the pad mic).
         # The loopback reference is taken before the endpoint volume, so a
