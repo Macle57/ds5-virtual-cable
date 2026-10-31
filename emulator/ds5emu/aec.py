@@ -285,7 +285,15 @@ def _dll_path() -> str:
 _DLL = None
 
 
-NATIVE_VERSION = 2
+NATIVE_VERSION = 3
+
+#: The residual stage's tunables (ds5aec.c, `ds5aec_param` ids). The defaults
+#: live in the DLL; `DS5_AEC_RESIDUAL="beta=2,floor_db=-20"` overrides some for
+#: a test run (logged; unknown names are an error at start, not silently
+#: ignored).
+RESIDUAL_PARAMS = ("beta", "q", "step_db", "floor_db", "nfac", "hold", "decay", "release",
+                   "nrise_db", "fsm", "ref_lo_hz", "ref_lo_db", "frz", "dtd", "lmax_db",
+                   "gmax_db", "bypass")
 
 
 def load_native():
@@ -303,7 +311,10 @@ def load_native():
         d.ds5aec_new.argtypes = [ci, ci]
         d.ds5aec_free.argtypes = [vp]
         d.ds5aec_reset.argtypes = [vp]
-        d.ds5aec_set.argtypes = [vp] + [ctypes.c_float] * 5 + [ci]
+        d.ds5aec_param.argtypes = [vp, ci, ctypes.c_float]
+        d.ds5aec_param.restype = ci
+        d.ds5aec_get_param.argtypes = [vp, ci]
+        d.ds5aec_get_param.restype = ctypes.c_float
         d.ds5aec_process.argtypes = [vp, vp, ci, vp, vp, vp, ci, vp, vp, vp]
         d.ds5aec_process.restype = ci
         d.ds5mdf_new.restype = vp
@@ -372,10 +383,24 @@ class NativeCanceller:
         self._hs = (ctypes.c_void_p * 8)()
         self._rs = (ctypes.c_void_p * 8)()
         self.gains = None              # set to a (481,) float32 array to receive the gains
+        env = os.environ.get("DS5_AEC_RESIDUAL", "").strip()
+        if env:
+            kw = {}
+            for item in env.split(","):
+                k, _, v = item.partition("=")
+                kw[k.strip()] = float(v)
+            self.set(**kw)
+            log.warning("echo canceller residual stage overridden: %s", kw)
 
-    def set(self, rho=-1.0, over=-1.0, gmin_near=-1.0, gmin_far=-1.0, near_ratio=-1.0,
-            hold_frames=-1) -> None:
-        self._d.ds5aec_set(self._h, rho, over, gmin_near, gmin_far, near_ratio, hold_frames)
+    def set(self, **params) -> None:
+        """Residual-stage tunables by name (`RESIDUAL_PARAMS`)."""
+        for k, v in params.items():
+            if k not in RESIDUAL_PARAMS:
+                raise ValueError(f"unknown residual parameter {k!r}")
+            self._d.ds5aec_param(self._h, RESIDUAL_PARAMS.index(k), float(v))
+
+    def get(self, name: str) -> float:
+        return float(self._d.ds5aec_get_param(self._h, RESIDUAL_PARAMS.index(name)))
 
     def process(self, mic16: np.ndarray, stages: list, refs: list, active: bool) -> np.ndarray:
         """mic16 (FRAME,) int16; stages[i] a NativeStage, refs[i] its

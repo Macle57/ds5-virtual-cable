@@ -15,13 +15,19 @@
  *      Per frame and frequency bin, wherever the chain left MORE energy than the
  *      microphone had, the microphone's own bin is used: the output can never
  *      be louder than the input in any bin.
- *   2. RESIDUAL stage (`ds5aec`): a spectral suppressor keyed on the chain's
- *      echo ESTIMATE (mic - linear output). The residual echo in each bin is
- *      taken as `rho` of the estimate's power; bins whose error power is not
- *      well above that are attenuated, down to a floor that is gentle while the
- *      near end (anything the references do not explain) is active and deeper
- *      while only PC audio is present.
- *
+ *   2. RESIDUAL stage (`ds5aec`): a spectral suppressor that knows the
+ *      references. Per bin it estimates the echo the linear stages left from
+ *      two things -- their own echo ESTIMATE (mic - linear output) and the
+ *      reference's power itself -- each scaled by a leakage it learns online
+ *      while the bin holds only echo, and attenuates the bin by how much of
+ *      it that estimate explains: deep (to -30 dB) where only echo is left,
+ *      not at all where something the references do not explain (a person in
+ *      the room) dominates, and never below the room's own noise level in
+ *      that bin, so the room keeps its sound instead of pumping to silence.
+ *      The reference-based half is what removes the echo of a speaker the
+ *      linear model cannot follow (a laptop speaker at full volume, sound
+ *      processing the loopback never sees, the top octaves where a fraction
+ *      of a sample of timing error undoes the subtraction); see residual_gains.
  * The residual stage is a 50 %-overlap STFT (sqrt-Hann analysis/synthesis,
  * perfect reconstruction), so the output is delayed by exactly one frame. With
  * `active == 0` the call runs no stage at all: the output is the input delayed
@@ -61,7 +67,7 @@
 #define API __attribute__((visibility("default")))
 #endif
 
-#define DS5AEC_VERSION 2
+#define DS5AEC_VERSION 3
 #define MAX_STAGES 8
 #define MAX_CH 2
 
@@ -128,114 +134,173 @@ API void ds5mdf_flush(ds5mdf *m, int frames)
 /* the chain + residual stage                                                */
 /* ------------------------------------------------------------------------ */
 
+/* Residual-stage tunables (ds5aec_param ids). Defaults in ds5aec_new. */
+enum {
+    P_BETA = 0,      /* over-subtraction of the residual-echo estimate */
+    P_Q,             /* quantile the leakage trackers converge to */
+    P_STEP_DB,       /* leakage tracker step per frame, dB */
+    P_FLOOR_DB,      /* deepest gain */
+    P_NFAC,          /* keep the room's noise: never below nfac * noise floor */
+    P_HOLD,          /* reference max-hold, frames (<= MAX_HOLD) */
+    P_DECAY,         /* reference max-hold decay per frame beyond 2 */
+    P_RELEASE,       /* gain recovery per frame towards a higher target */
+    P_NRISE_DB,      /* noise-floor tracker rise, dB per second */
+    P_FSM,           /* gain smoothing across +-fsm bins */
+    P_REF_LO_HZ,     /* below this the reference-based estimate is weighted down... */
+    P_REF_LO_DB,     /* ...by this much */
+    P_FRZ,           /* a bin learns only while its error is under frz x the estimate */
+    P_DTD,           /* a frame learns nothing while more than this share of bins does not */
+    P_LMAX_DB,       /* cap of the residual / linear-estimate leakage */
+    P_GMAX_DB,       /* the residual / reference leakage stays under -gmax dB */
+    P_BYPASS,        /* 1: gains forced to 1 (the linear chain's output, for analysis) */
+    P_COUNT
+};
+
+#define MAX_HOLD 8
+
 typedef struct {
     int frame, nfft, nbins, rate;
     kiss_fftr_cfg fwd, inv;
     float *win;                   /* sqrt-Hann, nfft */
-    float *e_prev, *y_prev;       /* previous frame of linear output / echo estimate */
+    float *e_prev, *r_prev;       /* previous frame of linear output / summed reference */
     float *ola;                   /* overlap-add tail, frame */
-    float *pe, *py, *g;           /* smoothed powers and gains, nbins */
+    float *pe, *g, *gt;           /* smoothed error power, gains, gain scratch; nbins */
+    float *ns;                    /* noise floor (min-statistics on the smoothed error), nbins */
+    float *lL, *lG;               /* leakages, 10 log10: residual / linear estimate, residual / reference */
+    float *hist;                  /* (MAX_HOLD + 1) x nbins reference power, newest at row `hpos` */
+    float *refw;                  /* per-bin weight of the reference-based estimate */
+    int hpos, ns_init;
     kiss_fft_scalar *tb;
-    kiss_fft_cpx *E, *Y, *X;
+    kiss_fft_cpx *E, *X, *R;
     float *m_prev;                /* previous mic frame, float */
     int16_t *mic_prev;
     float *proc;                  /* processed output of this frame, frame */
-    int was_active, near_hold;
-    int band_lo, band_hi;         /* near-end detection band, in bins */
-    /* tunables (ds5aec_set) */
-    float rho, over, gmin_near, gmin_far, near_ratio, smooth, release;
-    int hold_frames;
+    int was_active;
+    int dtd_lo, dtd_hi;           /* double-talk decision band, in bins */
+    float p[P_COUNT];
+    float nrise;                  /* per-frame factor from P_NRISE_DB */
 } ds5aec;
 
 API void ds5aec_free(ds5aec *s)
 {
     if (!s) return;
     free(s->fwd); free(s->inv);
-    free(s->win); free(s->e_prev); free(s->y_prev); free(s->ola);
-    free(s->pe); free(s->py); free(s->g); free(s->tb); free(s->E); free(s->Y);
-    free(s->X); free(s->m_prev);
+    free(s->win); free(s->e_prev); free(s->r_prev); free(s->ola);
+    free(s->pe); free(s->g); free(s->gt); free(s->ns); free(s->lL); free(s->lG);
+    free(s->hist); free(s->refw);
+    free(s->tb); free(s->E); free(s->X); free(s->R); free(s->m_prev);
     free(s->mic_prev); free(s->proc);
     free(s);
+}
+
+static void derive(ds5aec *s)
+{
+    int k;
+    float lo = s->p[P_REF_LO_HZ], w = powf(10.0f, s->p[P_REF_LO_DB] / 10.0f);
+    for (k = 0; k < s->nbins; k++)
+        s->refw[k] = ((float)k * s->rate / s->nfft >= lo) ? 1.0f : w;
+    s->nrise = powf(10.0f, s->p[P_NRISE_DB] / 10.0f * s->frame / s->rate);
+    if (s->p[P_HOLD] < 0) s->p[P_HOLD] = 0;
+    if (s->p[P_HOLD] > MAX_HOLD) s->p[P_HOLD] = MAX_HOLD;
 }
 
 API ds5aec *ds5aec_new(int frame, int rate)
 {
     ds5aec *s;
-    int i;
+    int i, nb;
     if (frame <= 0 || frame > 4096 || rate <= 0) return NULL;
     s = (ds5aec *)zalloc(sizeof(*s));
     if (!s) return NULL;
     s->frame = frame; s->rate = rate;
-    s->nfft = 2 * frame; s->nbins = frame + 1;
+    s->nfft = 2 * frame; s->nbins = nb = frame + 1;
     s->fwd = kiss_fftr_alloc(s->nfft, 0, NULL, NULL);
     s->inv = kiss_fftr_alloc(s->nfft, 1, NULL, NULL);
     s->win = (float *)zalloc(sizeof(float) * s->nfft);
     s->e_prev = (float *)zalloc(sizeof(float) * frame);
-    s->y_prev = (float *)zalloc(sizeof(float) * frame);
+    s->r_prev = (float *)zalloc(sizeof(float) * frame);
     s->ola = (float *)zalloc(sizeof(float) * frame);
-    s->pe = (float *)zalloc(sizeof(float) * s->nbins);
-    s->py = (float *)zalloc(sizeof(float) * s->nbins);
-    s->g = (float *)zalloc(sizeof(float) * s->nbins);
+    s->pe = (float *)zalloc(sizeof(float) * nb);
+    s->g = (float *)zalloc(sizeof(float) * nb);
+    s->gt = (float *)zalloc(sizeof(float) * nb);
+    s->ns = (float *)zalloc(sizeof(float) * nb);
+    s->lL = (float *)zalloc(sizeof(float) * nb);
+    s->lG = (float *)zalloc(sizeof(float) * nb);
+    s->refw = (float *)zalloc(sizeof(float) * nb);
+    s->hist = (float *)zalloc(sizeof(float) * nb * (MAX_HOLD + 1));
     s->tb = (kiss_fft_scalar *)zalloc(sizeof(kiss_fft_scalar) * s->nfft);
-    s->E = (kiss_fft_cpx *)zalloc(sizeof(kiss_fft_cpx) * s->nbins);
-    s->Y = (kiss_fft_cpx *)zalloc(sizeof(kiss_fft_cpx) * s->nbins);
-    s->X = (kiss_fft_cpx *)zalloc(sizeof(kiss_fft_cpx) * s->nbins);
+    s->E = (kiss_fft_cpx *)zalloc(sizeof(kiss_fft_cpx) * nb);
+    s->X = (kiss_fft_cpx *)zalloc(sizeof(kiss_fft_cpx) * nb);
+    s->R = (kiss_fft_cpx *)zalloc(sizeof(kiss_fft_cpx) * nb);
     s->m_prev = (float *)zalloc(sizeof(float) * frame);
     s->mic_prev = (int16_t *)zalloc(sizeof(int16_t) * frame);
     s->proc = (float *)zalloc(sizeof(float) * frame);
-    if (!s->fwd || !s->inv || !s->win || !s->e_prev || !s->y_prev || !s->ola
-        || !s->pe || !s->py || !s->g || !s->tb || !s->E || !s->Y || !s->X || !s->m_prev
-        || !s->mic_prev || !s->proc) {
+    if (!s->fwd || !s->inv || !s->win || !s->e_prev || !s->r_prev || !s->ola || !s->pe
+        || !s->g || !s->gt || !s->ns || !s->lL || !s->lG || !s->refw || !s->hist || !s->tb
+        || !s->E || !s->X || !s->R || !s->m_prev || !s->mic_prev || !s->proc) {
         ds5aec_free(s);
         return NULL;
     }
     for (i = 0; i < s->nfft; i++)     /* periodic Hann, square-rooted */
         s->win[i] = (float)sqrt(0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / s->nfft));
-    for (i = 0; i < s->nbins; i++) s->g[i] = 1.0f;
-    s->band_lo = (int)(300.0 * s->nfft / rate);
-    s->band_hi = (int)(4000.0 * s->nfft / rate);
-    s->rho = 0.08f;          /* residual echo = -11 dB of the estimate (measured, review-r3) */
-    s->over = 2.0f;
-    s->gmin_near = 0.7f;     /* -3 dB while the near end talks */
-    /* -6 dB at most with only PC audio. MEASURED (round 5, live takes replayed,
-     * a quiet external source 2-15 dB under the echo): a -30 dB floor dipped
-     * the external by up to 23 dB in 100 ms windows the near-end detector
-     * missed; -6 dB caps that at 6 dB and costs the echo reduction 0.2-0.5 dB
-     * -- the linear stages do the work. */
-    s->gmin_far = 0.5f;
-    s->near_ratio = 2.0f;    /* error > 3 dB above the expected residual = near end */
-    s->smooth = 0.5f;
-    s->release = 0.7f;       /* gain recovery per frame towards a higher target */
-    s->hold_frames = 30;     /* 300 ms */
+    for (i = 0; i < nb; i++) {
+        s->g[i] = 1.0f;
+        s->lL[i] = -10.0f;            /* the linear stage leaves -10 dB of its estimate */
+        s->lG[i] = -50.0f;            /* echo + residual 50 dB under the reference: learned up */
+    }
+    s->dtd_lo = (int)(500.0 * s->nfft / rate);
+    s->dtd_hi = (int)(10000.0 * s->nfft / rate);
+    if (s->dtd_hi >= nb) s->dtd_hi = nb - 1;
+    /* MEASURED, scratchpad/aec/r10 (round-9 laptop-speaker dumps replayed, a clean voice mixed
+     * into the mic 6 and 15 dB under the echo): see aec.py's module docstring. */
+    s->p[P_BETA] = 1.5f;
+    s->p[P_Q] = 0.7f;
+    s->p[P_STEP_DB] = 0.3f;
+    s->p[P_FLOOR_DB] = -30.0f;
+    s->p[P_NFAC] = 1.0f;
+    s->p[P_HOLD] = 2.0f;
+    s->p[P_DECAY] = 0.6f;
+    s->p[P_RELEASE] = 0.5f;
+    s->p[P_NRISE_DB] = 0.2f;
+    s->p[P_FSM] = 1.0f;
+    s->p[P_REF_LO_HZ] = 4000.0f;
+    s->p[P_REF_LO_DB] = -6.0f;
+    s->p[P_FRZ] = 6.0f;
+    s->p[P_DTD] = 0.3f;
+    s->p[P_LMAX_DB] = 0.0f;
+    s->p[P_GMAX_DB] = 20.0f;
+    s->p[P_BYPASS] = 0.0f;
+    derive(s);
     return s;
 }
 
-/* Tunables, all optional. Negative = leave as is. */
-API void ds5aec_set(ds5aec *s, float rho, float over, float gmin_near, float gmin_far,
-                    float near_ratio, int hold_frames)
+/* One tunable. Returns 0, or -1 for an unknown id. */
+API int ds5aec_param(ds5aec *s, int id, float v)
 {
-    if (!s) return;
-    if (rho >= 0) s->rho = rho;
-    if (over >= 0) s->over = over;
-    if (gmin_near >= 0) s->gmin_near = gmin_near;
-    if (gmin_far >= 0) s->gmin_far = gmin_far;
-    if (near_ratio >= 0) s->near_ratio = near_ratio;
-    if (hold_frames >= 0) s->hold_frames = hold_frames;
+    if (!s || id < 0 || id >= P_COUNT) return -1;
+    s->p[id] = v;
+    derive(s);
+    return 0;
 }
 
-/* A new capture session: the residual stage's adaptive state and its one
- * frame of delay line start from silence (the linear stages are kept; they are
- * reset individually with ds5mdf_reset). */
+API float ds5aec_get_param(ds5aec *s, int id)
+{
+    if (!s || id < 0 || id >= P_COUNT) return -1.0f;
+    return s->p[id];
+}
+
+/* A new capture session: the residual stage's short-term state and its one
+ * frame of delay line start from silence. What it learned about the room --
+ * the leakages and the noise floor -- is kept (the linear stages are kept
+ * too; they are reset individually with ds5mdf_reset). */
 API void ds5aec_reset(ds5aec *s)
 {
     int i;
     if (!s) return;
     memset(s->pe, 0, sizeof(float) * s->nbins);
-    memset(s->py, 0, sizeof(float) * s->nbins);
+    memset(s->hist, 0, sizeof(float) * s->nbins * (MAX_HOLD + 1));
     for (i = 0; i < s->nbins; i++) s->g[i] = 1.0f;
-    s->near_hold = 0;
     memset(s->e_prev, 0, sizeof(float) * s->frame);
-    memset(s->y_prev, 0, sizeof(float) * s->frame);
+    memset(s->r_prev, 0, sizeof(float) * s->frame);
     memset(s->m_prev, 0, sizeof(float) * s->frame);
     memset(s->ola, 0, sizeof(float) * s->frame);
     memset(s->mic_prev, 0, sizeof(int16_t) * s->frame);
@@ -260,23 +325,146 @@ static int16_t sat16(float v)
     return (int16_t)v;
 }
 
+/* the room's noise floor per bin: follows a falling smoothed power at once and
+ * rises slowly (min-statistics), so speech and echo do not lift it */
+static void track_noise(ds5aec *s)
+{
+    int k;
+    if (!s->ns_init) {
+        for (k = 0; k < s->nbins; k++) s->ns[k] = s->pe[k] + 1.0f;
+        s->ns_init = 1;
+    }
+    for (k = 0; k < s->nbins; k++) {
+        float v = s->pe[k] < s->ns[k] ? s->pe[k] : s->ns[k] * s->nrise;
+        s->ns[k] = v < 1.0f ? 1.0f : v;
+    }
+}
+
+#define DB10(x) (4.3429448f * logf(x))          /* 10 log10 */
+#define UNDB10(x) expf(0.23025851f * (x))        /* 10^(x/10) */
+
+/* The residual suppressor, per bin k, on the chain's output E, its echo
+ * estimate Y = X - E and the summed reference R:
+ *
+ *   residual echo  res = max( L * |Y|^2 , w * G * S ),   S = max-hold of |R|^2
+ *   gain^2         = 1 - beta * res / |E|^2 (smoothed), never below the room's
+ *                    own noise in that bin (nfac x its noise floor) nor `floor`
+ *
+ * L and G are leakages learned online per bin (log-domain quantile trackers,
+ * quantile q): L is what the linear stage leaves of its own estimate (its
+ * errors scale with the echo: misalignment, a slowly changing path), G what
+ * is left relative to the reference itself (the part the linear stage cannot
+ * model at all: a nonlinear speaker, an enhancement the loopback never saw).
+ * A bin learns only while its error is within frz x the estimate (not near
+ * end) and above the room noise, and a frame where most of the band is near
+ * end teaches nothing. */
+static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx *X,
+                           const kiss_fft_cpx *R, float *near_out)
+{
+    int k, d, nb = s->nbins, hold = (int)s->p[P_HOLD];
+    float q = s->p[P_Q], step = s->p[P_STEP_DB];
+    float up = step * q, dn = step * (1.0f - q);
+    float beta = s->p[P_BETA], frz = s->p[P_FRZ], nfac = s->p[P_NFAC];
+    float floor2 = UNDB10(s->p[P_FLOOR_DB]);
+    float lmax = s->p[P_LMAX_DB], gcap = -s->p[P_GMAX_DB], decay = s->p[P_DECAY];
+    float rel = s->p[P_RELEASE];
+    float *h0;
+    int nfar = 0, nband = 0, learn = 1, fsm = (int)s->p[P_FSM];
+    float *pr = s->gt;                      /* scratch: S per bin, then the raw gains */
+    float wd[MAX_HOLD + 1];
+
+    for (d = 0; d <= hold; d++) wd[d] = d <= 2 ? 1.0f : powf(decay, (float)(d - 2));
+    s->hpos = (s->hpos + MAX_HOLD) % (MAX_HOLD + 1);
+    h0 = s->hist + (size_t)s->hpos * nb;
+    for (k = 0; k < nb; k++) h0[k] = R[k].r * R[k].r + R[k].i * R[k].i;
+    for (k = 0; k < nb; k++) {
+        float m = 0;
+        for (d = 0; d <= hold; d++) {
+            float v = s->hist[(size_t)((s->hpos + d) % (MAX_HOLD + 1)) * nb + k] * wd[d];
+            if (v > m) m = v;
+        }
+        pr[k] = m;
+    }
+    /* frame-level double-talk: the share of the band that is far above the estimate */
+    if (frz > 0) {
+        for (k = s->dtd_lo; k < s->dtd_hi; k++) {
+            float ex = X[k].r - E[k].r, ey = X[k].i - E[k].i;
+            float py = ex * ex + ey * ey;
+            float pe = E[k].r * E[k].r + E[k].i * E[k].i;
+            float r0 = UNDB10(s->lL[k]) * py, r1 = s->refw[k] * UNDB10(s->lG[k]) * pr[k];
+            if (r1 > r0) r0 = r1;
+            nband++;
+            if (pe < frz * r0) nfar++;
+        }
+        if (s->p[P_DTD] > 0 && nband > 0 && (float)(nband - nfar) / nband > s->p[P_DTD])
+            learn = 0;
+    }
+    if (near_out) *near_out = learn ? 0.0f : 1.0f;
+    for (k = 0; k < nb; k++) {
+        float ex = X[k].r - E[k].r, ey = X[k].i - E[k].i;
+        float py = ex * ex + ey * ey;
+        float pe = E[k].r * E[k].r + E[k].i * E[k].i;
+        float S = pr[k], L = UNDB10(s->lL[k]), G = s->refw[k] * UNDB10(s->lG[k]);
+        float res, g2, gn2;
+        if (learn && pe > 2.0f * s->ns[k]) {
+            float r0 = L * py, r1 = G * S;
+            if (frz <= 0 || pe < frz * (r0 > r1 ? r0 : r1)) {
+                float lpe = DB10(pe + 1e-9f);
+                if (py > s->ns[k]) {
+                    float r = lpe - DB10(py + 1e-9f);
+                    s->lL[k] += r > s->lL[k] ? up : -dn;
+                    if (s->lL[k] > lmax) s->lL[k] = lmax;
+                }
+                if (S > 100.0f) {
+                    float r = lpe - DB10(S + 1e-9f);
+                    s->lG[k] += r > s->lG[k] ? up : -dn;
+                    if (s->lG[k] > gcap) s->lG[k] = gcap;
+                }
+                L = UNDB10(s->lL[k]);
+                G = s->refw[k] * UNDB10(s->lG[k]);
+            }
+        }
+        res = L * py;
+        if (G * S > res) res = G * S;
+        g2 = 1.0f - beta * res / (s->pe[k] + 1e-9f);
+        gn2 = nfac * s->ns[k] / (s->pe[k] + 1e-9f);
+        if (gn2 > 1.0f) gn2 = 1.0f;
+        if (gn2 < floor2) gn2 = floor2;
+        if (g2 < gn2) g2 = gn2;
+        if (g2 > 1.0f) g2 = 1.0f;
+        pr[k] = sqrtf(g2);                    /* S is no longer needed for this bin */
+    }
+    for (k = 0; k < nb; k++) {
+        float g = pr[k];
+        if (fsm > 0) {
+            int a = k - fsm, b = k + fsm, j;
+            float acc = 0;
+            for (j = a; j <= b; j++) acc += (j >= 0 && j < nb) ? pr[j] : 0.0f;
+            g = acc / (float)(2 * fsm + 1);
+        }
+        if (g > s->g[k]) g = s->g[k] + rel * (g - s->g[k]);
+        s->g[k] = g;
+    }
+}
+
 /* mic: frame int16. stages[i] / refs[i], i < nstage: the linear stages to run
  * this frame, in order, and each one's reference frame (frame * nch int16,
- * interleaved). out: frame int16 (one frame late). gains (optional, nbins
- * floats): the residual gains applied this frame. stats (optional, 8 floats):
- * mic power, linear-output power, echo-estimate power, output power, near-end
- * flag, mean gain, active, reserved. stage_stats (optional, 3 * nstage
- * floats): per stage, the power of its input, of its output and of its own
- * echo estimate (input - output). Returns 0, or -1 on bad arguments (nothing
- * is touched then). */
+ * interleaved; channel 0 -- mono, or the mid of a stereo endpoint -- is also
+ * what the residual stage's reference-based estimate uses). out: frame int16
+ * (one frame late). gains (optional, nbins floats): the residual gains applied
+ * this frame. stats (optional, 8 floats): mic power, linear-output power,
+ * echo-estimate power, output power, near-end (double-talk) flag, mean gain,
+ * active, reserved. stage_stats (optional, 3 * nstage floats): per stage, the
+ * power of its input, of its output and of its own echo estimate (input -
+ * output). Returns 0, or -1 on bad arguments (nothing is touched then). */
 API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const *stages,
                        const int16_t *const *refs, int16_t *out, int active,
                        float *gains, float *stats, float *stage_stats)
 {
     int i, k, j, n;
-    float ecur[4096], ycur[4096], mcur[4096];
+    float ecur[4096], mcur[4096], rcur[4096];
     double pmic = 0, plin = 0, pest = 0, pout = 0, gsum = 0;
-    int near = 0;
+    float near = 0;
     unsigned int csr;
     if (!s || !mic || !out || nstage < 0 || nstage > MAX_STAGES) return -1;
     if (nstage > 0 && (!stages || !refs)) return -1;
@@ -292,9 +480,8 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
     /* the processed path also runs in the frame where it is switched off, so
      * that frame can be cross-faded out of it */
     if (active || s->was_active) {
-        double se = 0, sr = 0;
-        float gmin2;
         const int16_t *cur = mic;
+        for (i = 0; i < n; i++) rcur[i] = 0.0f;
         for (j = 0; j < nstage; j++) {
             ds5mdf *m = stages[j];
             double pe = 0, pin = 0, pou = 0;
@@ -304,6 +491,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
                 pe += (double)d * d;
                 pin += (double)cur[i] * cur[i];
                 pou += (double)m->out[i] * m->out[i];
+                rcur[i] += (float)refs[j][i * m->nch];
             }
             if (stage_stats) {
                 stage_stats[3 * j] = (float)(pin / n);
@@ -313,47 +501,30 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
             cur = m->out;
         }
         for (i = 0; i < n; i++) {
+            float y = (float)mic[i] - (float)cur[i];
             ecur[i] = (float)cur[i];
-            ycur[i] = (float)mic[i] - (float)cur[i];
             plin += (double)ecur[i] * ecur[i];
-            pest += (double)ycur[i] * ycur[i];
+            pest += (double)y * y;
         }
         stft(s, s->e_prev, ecur, s->E);
-        stft(s, s->y_prev, ycur, s->Y);
         stft(s, s->m_prev, mcur, s->X);
+        stft(s, s->r_prev, rcur, s->R);
         for (k = 0; k < s->nbins; k++) {
             float pe = s->E[k].r * s->E[k].r + s->E[k].i * s->E[k].i;
             float px = s->X[k].r * s->X[k].r + s->X[k].i * s->X[k].i;
-            float py;
             /* never worse than no cancellation: where the subtraction ADDED
              * energy (a filter that is wrong right now), keep the mic's bin */
             if (pe > px) { s->E[k] = s->X[k]; pe = px; }
-            py = s->Y[k].r * s->Y[k].r + s->Y[k].i * s->Y[k].i;
-            s->pe[k] = s->smooth * s->pe[k] + (1.0f - s->smooth) * pe;
-            s->py[k] = s->smooth * s->py[k] + (1.0f - s->smooth) * py;
-            if (k >= s->band_lo && k <= s->band_hi) {
-                se += pe;
-                sr += s->over * s->rho * py;
-            }
+            s->pe[k] = 0.5f * s->pe[k] + 0.5f * pe;
         }
-        /* near end: error well above what residual echo explains, in the speech band */
-        if (se > s->near_ratio * sr + 1e-3 * (s->band_hi - s->band_lo + 1) * s->nfft) {
-            near = 1;
-            s->near_hold = s->hold_frames;
-        } else if (s->near_hold > 0) {
-            s->near_hold--;
-            near = 1;
+        track_noise(s);
+        if (s->p[P_BYPASS] > 0) {
+            for (k = 0; k < s->nbins; k++) s->g[k] = 1.0f;
+        } else {
+            residual_gains(s, s->E, s->X, s->R, &near);
         }
-        gmin2 = near ? s->gmin_near * s->gmin_near : s->gmin_far * s->gmin_far;
         for (k = 0; k < s->nbins; k++) {
-            float r = s->over * s->rho * s->py[k];
-            float g2 = 1.0f - r / (s->pe[k] + 1e-9f);
-            float g;
-            if (g2 < gmin2) g2 = gmin2;
-            if (g2 > 1.0f) g2 = 1.0f;
-            g = sqrtf(g2);
-            if (g > s->g[k]) g = s->g[k] + s->release * (g - s->g[k]);   /* smooth recovery */
-            s->g[k] = g;
+            float g = s->g[k];
             s->E[k].r *= g; s->E[k].i *= g;
             gsum += g;
             if (gains) gains[k] = g;
@@ -364,9 +535,18 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
             s->ola[i] = s->tb[n + i] * s->win[n + i] / (float)s->nfft;
         }
         memcpy(s->e_prev, ecur, sizeof(float) * n);
-        memcpy(s->y_prev, ycur, sizeof(float) * n);
-    } else if (stage_stats) {
-        for (j = 0; j < 3 * nstage; j++) stage_stats[j] = 0.0f;
+        memcpy(s->r_prev, rcur, sizeof(float) * n);
+    } else {
+        if (stage_stats)
+            for (j = 0; j < 3 * nstage; j++) stage_stats[j] = 0.0f;
+        /* idle: the noise floor keeps following the room (the output does not
+         * depend on it) */
+        stft(s, s->m_prev, mcur, s->X);
+        for (k = 0; k < s->nbins; k++) {
+            float px = s->X[k].r * s->X[k].r + s->X[k].i * s->X[k].i;
+            s->pe[k] = 0.5f * s->pe[k] + 0.5f * px;
+        }
+        track_noise(s);
     }
     memcpy(s->m_prev, mcur, sizeof(float) * n);
     if (!active) {
@@ -376,11 +556,12 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
             float w2 = s->win[n + i] * s->win[n + i];
             s->ola[i] = (float)mic[i] * w2;
             s->e_prev[i] = (float)mic[i];
-            s->y_prev[i] = 0.0f;
+            s->r_prev[i] = 0.0f;
         }
-        for (k = 0; k < s->nbins; k++) { s->g[k] = 1.0f; s->pe[k] = 0; s->py[k] = 0; if (gains) gains[k] = 1.0f; }
+        for (k = 0; k < s->nbins; k++) { s->g[k] = 1.0f; if (gains) gains[k] = 1.0f; }
+        memset(s->hist, 0, sizeof(float) * s->nbins * (MAX_HOLD + 1));
         gsum = s->nbins;
-        s->near_hold = 0;
+        near = 0;
     }
 
     if (active && s->was_active) {
@@ -403,7 +584,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
     if (stats) {
         stats[0] = (float)(pmic / n); stats[1] = (float)(plin / n);
         stats[2] = (float)(pest / n); stats[3] = (float)(pout / n);
-        stats[4] = (float)near; stats[5] = (float)(gsum / s->nbins);
+        stats[4] = near; stats[5] = (float)(gsum / s->nbins);
         stats[6] = (float)active; stats[7] = 0.0f;
     }
     FTZ_OFF(csr);
