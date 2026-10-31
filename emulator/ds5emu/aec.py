@@ -18,11 +18,29 @@ per 10 ms frame, so the GIL is released for the whole of it):
      endpoint: a silent endpoint costs nothing, keeps what it learned across
      capture sessions, and another endpoint coming or going never touches
      it. It only subtracts.
-  2. RESIDUAL: a spectral suppressor keyed on the chain's echo estimate,
-     never deeper than -3 dB while anything the references do not explain
-     is present and -6 dB while only PC audio is: the linear stages do the
-     cancelling; a deeper floor bought 0.2-0.5 dB and dipped a quiet person
-     in the room by up to 23 dB when the near-end detector missed them.
+  2. RESIDUAL: a spectral suppressor that knows the references (ds5aec.c,
+     `residual_gains`). Per frequency bin it estimates the echo the chain
+     left from the chain's own echo estimate AND from the summed reference's
+     power, each scaled by a leakage it learns while the bin holds only echo,
+     and attenuates the bin by what that estimate explains: down to -30 dB
+     where only echo is left, not at all where something no reference
+     explains (a person in the room) dominates, and never below the room's
+     own noise level in the bin, so the room does not pump to silence when
+     the PC plays. It is per bin, over the whole band (a 10 kHz tone is
+     treated like a voice-band one). MEASURED offline (round 10, scratchpad/
+     aec/r10: the round-9 live dump of real music on the laptop speakers at
+     volume 1.00 replayed, and the pad mic's own recording of a voice in the
+     room mixed into it): the linear chain leaves 13-16 dB above the room
+     floor in every band from 200 Hz up (its ERLE falls from 14 dB under
+     1 kHz to 2 dB above 8 kHz: that echo is not a linear function of the
+     reference); this stage takes it to 2-6 dB above the floor (the round-9
+     stage, capped at -6 dB, to 10-15). The voice in the room, 6 dB under
+     the echo: SDR against its own recording 7.1 dB (round 9: 5.3, linear
+     alone 2.4), level -2.0 dB, 5th-percentile 100 ms window -4.8 dB, worst
+     -12.5; 15 dB under the echo it loses more (p5 -9.7). A pre-trained
+     neural residual suppressor (DTLN-aec 128/256/512, reference input) was
+     measured on the same material and rejected: it gated that voice (p5
+     -24 dB, SDR 3.3) and the room noise.
 
 MEASURED (scratchpad/aec rounds 4-5, cameo, HDMI speaker): a stereo
 speaker playing different content left and right is cancelled by 23 dB with
