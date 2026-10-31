@@ -156,6 +156,9 @@ enum {
     P_NBIAS,         /* the noise floor's mean over its tracked minimum */
     P_LEARN_SNR,     /* a bin learns only while its error is this far above the noise */
     P_NSUB,          /* the share of the room's noise taken off the residual estimate */
+    P_L_INIT_DB,     /* starting leakages (setting one restarts its tracker) */
+    P_G_INIT_DB,
+    P_UP_SLOW_DB,    /* the reference leakage's creep per frame where it is far exceeded */
     P_COUNT
 };
 
@@ -245,11 +248,7 @@ API ds5aec *ds5aec_new(int frame, int rate)
     }
     for (i = 0; i < s->nfft; i++)     /* periodic Hann, square-rooted */
         s->win[i] = (float)sqrt(0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * i / s->nfft));
-    for (i = 0; i < nb; i++) {
-        s->g[i] = 1.0f;
-        s->lL[i] = -10.0f;            /* the linear stage leaves -10 dB of its estimate */
-        s->lG[i] = -50.0f;            /* echo + residual 50 dB under the reference: learned up */
-    }
+    for (i = 0; i < nb; i++) s->g[i] = 1.0f;
     s->dtd_lo = (int)(500.0 * s->nfft / rate);
     s->dtd_hi = (int)(10000.0 * s->nfft / rate);
     if (s->dtd_hi >= nb) s->dtd_hi = nb - 1;
@@ -275,6 +274,14 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->p[P_NBIAS] = 3.0f;
     s->p[P_LEARN_SNR] = 2.0f;
     s->p[P_NSUB] = 1.0f;
+    /* START HIGH and learn down: a bin learns only while its error is
+     * within frz x the estimate, so an estimate that starts far too low
+     * would never learn up (round 10: -50 dB took music at full volume
+     * 6 s to come down) */
+    s->p[P_L_INIT_DB] = -6.0f;
+    s->p[P_G_INIT_DB] = -30.0f;
+    s->p[P_UP_SLOW_DB] = 0.02f;
+    for (i = 0; i < nb; i++) { s->lL[i] = s->p[P_L_INIT_DB]; s->lG[i] = s->p[P_G_INIT_DB]; }
     derive(s);
     return s;
 }
@@ -284,6 +291,12 @@ API int ds5aec_param(ds5aec *s, int id, float v)
 {
     if (!s || id < 0 || id >= P_COUNT) return -1;
     s->p[id] = v;
+    if (id == P_L_INIT_DB || id == P_G_INIT_DB) {
+        int k;
+        for (k = 0; k < s->nbins; k++) {
+            if (id == P_L_INIT_DB) s->lL[k] = v; else s->lG[k] = v;
+        }
+    }
     derive(s);
     return 0;
 }
@@ -374,6 +387,7 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
     float floor2 = UNDB10(s->p[P_FLOOR_DB]);
     float lmax = s->p[P_LMAX_DB], gcap = -s->p[P_GMAX_DB], decay = s->p[P_DECAY];
     float rel = s->p[P_RELEASE], nbias = s->p[P_NBIAS], nsub = s->p[P_NSUB];
+    float upslow = s->p[P_UP_SLOW_DB];
     float *h0;
     int nfar = 0, nband = 0, learn = 1, fsm = (int)s->p[P_FSM];
     float *pr = s->gt;                      /* scratch: S per bin, then the raw gains */
@@ -434,6 +448,14 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
                     if (s->lG[k] > gcap) s->lG[k] = gcap;
                 }
                 L = UNDB10(s->lL[k]);
+                G = s->refw[k] * UNDB10(s->lG[k]);
+            } else if (upslow > 0 && S > 100.0f && pe > s->p[P_LEARN_SNR] * N) {
+                /* far above the estimate: a person in the room -- or an echo the
+                 * estimate has never seen (a tone where the content had nothing,
+                 * the volume turned up). Creep up, slowly: a voice gains a few dB
+                 * over a sentence and loses it in the next echo-only second */
+                s->lG[k] += upslow;
+                if (s->lG[k] > gcap) s->lG[k] = gcap;
                 G = s->refw[k] * UNDB10(s->lG[k]);
             }
         }
