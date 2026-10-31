@@ -159,6 +159,8 @@ enum {
     P_L_INIT_DB,     /* starting leakages (setting one restarts its tracker) */
     P_G_INIT_DB,
     P_UP_SLOW_DB,    /* the reference leakage's creep per frame where it is far exceeded */
+    P_GATE_L_DB,     /* the learning gate's floor, relative to the linear estimate */
+    P_FRESH,         /* frames after the PC starts playing in which every bin learns */
     P_COUNT
 };
 
@@ -175,7 +177,7 @@ typedef struct {
     float *lL, *lG;               /* leakages, 10 log10: residual / linear estimate, residual / reference */
     float *hist;                  /* (MAX_HOLD + 1) x nbins reference power, newest at row `hpos` */
     float *refw;                  /* per-bin weight of the reference-based estimate */
-    int hpos, ns_init;
+    int hpos, ns_init, fresh;
     kiss_fft_scalar *tb;
     kiss_fft_cpx *E, *X, *R;
     float *m_prev;                /* previous mic frame, float */
@@ -281,6 +283,8 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->p[P_L_INIT_DB] = -6.0f;
     s->p[P_G_INIT_DB] = -30.0f;
     s->p[P_UP_SLOW_DB] = 0.02f;
+    s->p[P_GATE_L_DB] = -100.0f;
+    s->p[P_FRESH] = 150.0f;
     for (i = 0; i < nb; i++) { s->lL[i] = s->p[P_L_INIT_DB]; s->lG[i] = s->p[P_G_INIT_DB]; }
     derive(s);
     return s;
@@ -387,7 +391,7 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
     float floor2 = UNDB10(s->p[P_FLOOR_DB]);
     float lmax = s->p[P_LMAX_DB], gcap = -s->p[P_GMAX_DB], decay = s->p[P_DECAY];
     float rel = s->p[P_RELEASE], nbias = s->p[P_NBIAS], nsub = s->p[P_NSUB];
-    float upslow = s->p[P_UP_SLOW_DB];
+    float upslow = s->p[P_UP_SLOW_DB], gate_l = UNDB10(s->p[P_GATE_L_DB]);
     float *h0;
     int nfar = 0, nband = 0, learn = 1, fsm = (int)s->p[P_FSM];
     float *pr = s->gt;                      /* scratch: S per bin, then the raw gains */
@@ -413,11 +417,18 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
             float pe = E[k].r * E[k].r + E[k].i * E[k].i;
             float r0 = UNDB10(s->lL[k]) * py, r1 = s->refw[k] * UNDB10(s->lG[k]) * pr[k];
             if (r1 > r0) r0 = r1;
+            if (gate_l * py > r0) r0 = gate_l * py;
             nband++;
             if (pe < frz * r0) nfar++;
         }
         if (s->p[P_DTD] > 0 && nband > 0 && (float)(nband - nfar) / nband > s->p[P_DTD])
             learn = 0;
+    }
+    if (s->fresh > 0) {
+        /* the PC just started playing: what the mic has is its echo (a person talking over the
+         * very first second is the exception, and is unlearned in the echo-only seconds after) */
+        s->fresh--;
+        learn = 2;
     }
     if (near_out) *near_out = learn ? 0.0f : 1.0f;
     for (k = 0; k < nb; k++) {
@@ -429,7 +440,11 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
         float N = nbias * s->ns[k];
         if (learn) {
             float r0 = L * py, r1 = G * S;
-            if (frz <= 0 || pe < frz * (r0 > r1 ? r0 : r1)) {
+            /* the gate's estimate: never under gate_l x the linear estimate, so a residual that
+             * grew (the volume turned up, the speaker driven into distortion) can still be learned */
+            float rg = r0 > r1 ? r0 : r1, rl = gate_l * py;
+            if (rl > rg) rg = rl;
+            if (frz <= 0 || learn == 2 || pe < frz * rg) {
                 /* the echo part of the error, not the room's; an error AT the
                  * room's level is evidence too -- that the leakage is small --
                  * wherever the current estimate predicts more than the room */
@@ -518,6 +533,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
 
     /* the processed path also runs in the frame where it is switched off, so
      * that frame can be cross-faded out of it */
+    if (active && !s->was_active) s->fresh = (int)s->p[P_FRESH];
     if (active || s->was_active) {
         const int16_t *cur = mic;
         for (i = 0; i < n; i++) rcur[i] = 0.0f;
