@@ -401,21 +401,30 @@ class NativeCanceller:
         self._hs = (ctypes.c_void_p * 8)()
         self._rs = (ctypes.c_void_p * 8)()
         self.gains = None              # set to a (481,) float32 array to receive the gains
+        #: Residual-stage overrides from DS5_AEC_RESIDUAL (a test aid; shown in status()).
+        self.override: dict = {}
         env = os.environ.get("DS5_AEC_RESIDUAL", "").strip()
         if env:
             kw = {}
             for item in env.split(","):
-                k, _, v = item.partition("=")
+                if not item.strip():
+                    continue
+                k, sep, v = item.partition("=")
+                if not sep:
+                    raise ValueError(f"DS5_AEC_RESIDUAL: {item!r} is not name=value")
                 kw[k.strip()] = float(v)
             self.set(**kw)
+            self.override = kw
             log.warning("echo canceller residual stage overridden: %s", kw)
 
     def set(self, **params) -> None:
-        """Residual-stage tunables by name (`RESIDUAL_PARAMS`)."""
+        """Residual-stage tunables by name (`RESIDUAL_PARAMS`). Raises ValueError for an
+        unknown name or a value the native stage refuses (out of range, not finite)."""
         for k, v in params.items():
             if k not in RESIDUAL_PARAMS:
                 raise ValueError(f"unknown residual parameter {k!r}")
-            self._d.ds5aec_param(self._h, RESIDUAL_PARAMS.index(k), float(v))
+            if self._d.ds5aec_param(self._h, RESIDUAL_PARAMS.index(k), float(v)) != 0:
+                raise ValueError(f"residual parameter {k}={v!r} refused (out of range)")
 
     def get(self, name: str) -> float:
         return float(self._d.ds5aec_get_param(self._h, RESIDUAL_PARAMS.index(name)))
@@ -1779,6 +1788,7 @@ class EchoCanceller:
         return {"mode": self.mode, "reason": self.reason, "active": self.active,
                 "health": "degraded" if degraded else "ok", "worker_alive": alive,
                 "slots": [r.name for r in self._slots],
+                "residual_override": dict(getattr(self.native, "override", {}) or {}),
                 "references": [r.describe() for r in list(self._refs.values())],
                 "loopback": None if lb is None else {
                     "endpoints": sorted(v[0] for v in lb.open_endpoints.values()),

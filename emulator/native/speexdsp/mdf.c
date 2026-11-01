@@ -422,7 +422,7 @@ EXPORT SpeexEchoState *speex_echo_state_init_mc(int frame_size, int filter_lengt
    M = st->M = (filter_length+st->frame_size-1)/frame_size;
    st->cancel_count=0;
    st->sum_adapt = 0;
-   st->adapt_scale = 1.0f;
+   st->adapt_scale = 1.0f;   /* ds5-virtual-usb patch */
    st->saturated = 0;
    st->screwed_up = 0;
    /* This is the default sampling rate */
@@ -1170,7 +1170,7 @@ EXPORT void speex_echo_cancellation(SpeexEchoState *st, const spx_int16_t *in, c
 
 
       /* How much have we adapted so far? */
-      st->sum_adapt = ADD32(st->sum_adapt,adapt_rate);
+      st->sum_adapt = ADD32(st->sum_adapt,adapt_rate * st->adapt_scale);   /* ds5-virtual-usb patch: a frozen filter has not adapted */
    }
 
    /* FIXME: MC conversion required */
@@ -1275,8 +1275,8 @@ EXPORT int speex_echo_ctl(SpeexEchoState *st, int request, void *ptr)
       }
          break;
       case SPEEX_ECHO_SET_ADAPT_SCALE:   /* ds5-virtual-usb patch: scale the adaptation step (0 = frozen) */
-         st->adapt_scale = *(float*)ptr;
-         break;
+         st->adapt_scale = *(float*)ptr;   /* ds5-virtual-usb patch */
+         break;   /* ds5-virtual-usb patch */
       default:
          speex_warning_int("Unknown speex_echo_ctl request: ", request);
          return -1;

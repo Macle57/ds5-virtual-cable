@@ -178,6 +178,9 @@ enum {
 };
 
 #define MAX_HOLD 8
+/* the room's noise floor: minimum statistics over NS_SUB sub-windows of NS_LEN frames (8 x 20 = 1.6 s) */
+#define NS_SUB 8
+#define NS_LEN 20
 
 typedef struct {
     int frame, nfft, nbins, rate;
@@ -187,10 +190,12 @@ typedef struct {
     float *ola;                   /* overlap-add tail, frame */
     float *pe, *g, *gt;           /* smoothed error power, gains, gain scratch; nbins */
     float *ns;                    /* noise floor (min-statistics on the smoothed error), nbins */
+    float *ns_sub;                /* NS_SUB x nbins sub-window minima, the current one at ns_pos */
+    int ns_pos, ns_cnt;
     float *lL, *lG;               /* leakages, 10 log10: residual / linear estimate, residual / reference */
     float *hist;                  /* (MAX_HOLD + 1) x nbins reference power, newest at row `hpos` */
     float *refw;                  /* per-bin weight of the reference-based estimate */
-    int hpos, ns_init, fresh, dt_hold, dt_lo, dt_hi;
+    int hpos, ns_init, fresh, dt_hold, dt_lo, dt_hi, learned;
     float dt_flag;
     kiss_fft_scalar *tb;
     kiss_fft_cpx *E, *X, *R;
@@ -208,7 +213,7 @@ API void ds5aec_free(ds5aec *s)
     if (!s) return;
     free(s->fwd); free(s->inv);
     free(s->win); free(s->e_prev); free(s->r_prev); free(s->ola);
-    free(s->pe); free(s->g); free(s->gt); free(s->ns); free(s->lL); free(s->lG);
+    free(s->pe); free(s->g); free(s->gt); free(s->ns); free(s->ns_sub); free(s->lL); free(s->lG);
     free(s->hist); free(s->refw);
     free(s->tb); free(s->E); free(s->X); free(s->R); free(s->m_prev);
     free(s->mic_prev); free(s->proc);
@@ -245,6 +250,7 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->g = (float *)zalloc(sizeof(float) * nb);
     s->gt = (float *)zalloc(sizeof(float) * nb);
     s->ns = (float *)zalloc(sizeof(float) * nb);
+    s->ns_sub = (float *)zalloc(sizeof(float) * nb * NS_SUB);
     s->lL = (float *)zalloc(sizeof(float) * nb);
     s->lG = (float *)zalloc(sizeof(float) * nb);
     s->refw = (float *)zalloc(sizeof(float) * nb);
@@ -257,7 +263,7 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->mic_prev = (int16_t *)zalloc(sizeof(int16_t) * frame);
     s->proc = (float *)zalloc(sizeof(float) * frame);
     if (!s->fwd || !s->inv || !s->win || !s->e_prev || !s->r_prev || !s->ola || !s->pe
-        || !s->g || !s->gt || !s->ns || !s->lL || !s->lG || !s->refw || !s->hist || !s->tb
+        || !s->g || !s->gt || !s->ns || !s->ns_sub || !s->lL || !s->lG || !s->refw || !s->hist || !s->tb
         || !s->E || !s->X || !s->R || !s->m_prev || !s->mic_prev || !s->proc) {
         ds5aec_free(s);
         return NULL;
@@ -287,7 +293,7 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->p[P_LMAX_DB] = 0.0f;
     s->p[P_GMAX_DB] = 20.0f;
     s->p[P_BYPASS] = 0.0f;
-    s->p[P_NBIAS] = 3.0f;
+    s->p[P_NBIAS] = 2.5f;   /* min-statistics over 1.6 s: the mean noise sits ~4 dB above it */
     s->p[P_LEARN_SNR] = 2.0f;
     s->p[P_NSUB] = 1.0f;
     /* START HIGH and learn down: a bin learns only while its error is
@@ -307,6 +313,7 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->p[P_DT_FLOOR_DB] = -100.0f;
     s->dt_lo = (int)(300.0 * s->nfft / rate);
     s->dt_hi = (int)(4000.0 * s->nfft / rate);
+    if (s->dt_hi >= nb) s->dt_hi = nb - 1;
     for (i = 0; i < nb; i++) { s->lL[i] = s->p[P_L_INIT_DB]; s->lG[i] = s->p[P_G_INIT_DB]; }
     derive(s);
     return s;
@@ -315,10 +322,20 @@ API ds5aec *ds5aec_new(int frame, int rate)
 /* One tunable. Returns 0, or -1 for an unknown id. */
 API int ds5aec_param(ds5aec *s, int id, float v)
 {
-    if (!s || id < 0 || id >= P_COUNT) return -1;
+    if (!s || id < 0 || id >= P_COUNT || !(v == v) || v > 1e30f || v < -1e30f) return -1;   /* NaN / inf */
+    switch (id) {
+    case P_RELEASE: case P_DT_ADAPT: case P_DECAY: if (v < 0.0f || v > 1.0f) return -1; break;
+    case P_Q: if (v <= 0.0f || v >= 1.0f) return -1; break;
+    case P_FSM: if (v < 0.0f || v > 8.0f) return -1; break;
+    case P_HOLD: if (v < 0.0f || v > MAX_HOLD) return -1; break;
+    case P_DT_HOLD: case P_FRESH: if (v < 0.0f || v > 1e6f) return -1; break;
+    case P_BETA: case P_NFAC: case P_NBIAS: case P_STEP_DB: if (v < 0.0f) return -1; break;
+    default: break;
+    }
     s->p[id] = v;
     if (id == P_L_INIT_DB || id == P_G_INIT_DB) {
         int k;
+        s->learned = 0;
         for (k = 0; k < s->nbins; k++) {
             if (id == P_L_INIT_DB) s->lL[k] = v; else s->lG[k] = v;
         }
@@ -372,18 +389,39 @@ static int16_t sat16(float v)
     return (int16_t)v;
 }
 
-/* the room's noise floor per bin: follows a falling smoothed power at once and
- * rises slowly (min-statistics), so speech and echo do not lift it */
-static void track_noise(ds5aec *s)
+/* The room's noise floor per bin: the minimum of the smoothed power over the last NS_SUB x NS_LEN frames
+ * (minimum statistics, Martin 2001, without the bias table: nbias stands for it). A short dip -- lost
+ * Bluetooth packets are filled with exact zeros upstream -- therefore only lowers it for 1.6 s, and a
+ * frame that is digitally silent is not counted at all (MEASURED, round-10 review: the earlier tracker,
+ * instant fall and 0.2 dB/s rise, was pulled tens of dB down by 200 ms of zeros and pushed the room 17 dB
+ * under itself for half a minute). */
+static void track_noise(ds5aec *s, int silent)
 {
-    int k;
+    int k, j, nb = s->nbins;
+    float *cur;
+    if (silent) return;
     if (!s->ns_init) {
-        for (k = 0; k < s->nbins; k++) s->ns[k] = s->pe[k] + 1.0f;
+        for (j = 0; j < NS_SUB; j++)
+            for (k = 0; k < nb; k++) s->ns_sub[(size_t)j * nb + k] = s->pe[k] + 1.0f;
         s->ns_init = 1;
+        s->ns_pos = 0; s->ns_cnt = 0;
     }
-    for (k = 0; k < s->nbins; k++) {
-        float v = s->pe[k] < s->ns[k] ? s->pe[k] : s->ns[k] * s->nrise;
-        s->ns[k] = v < 1.0f ? 1.0f : v;
+    cur = s->ns_sub + (size_t)s->ns_pos * nb;
+    if (s->ns_cnt == 0)
+        for (k = 0; k < nb; k++) cur[k] = s->pe[k];
+    else
+        for (k = 0; k < nb; k++) if (s->pe[k] < cur[k]) cur[k] = s->pe[k];
+    if (++s->ns_cnt >= NS_LEN) {
+        s->ns_cnt = 0;
+        s->ns_pos = (s->ns_pos + 1) % NS_SUB;
+    }
+    for (k = 0; k < nb; k++) {
+        float m = s->ns_sub[k];
+        for (j = 1; j < NS_SUB; j++) {
+            float v = s->ns_sub[(size_t)j * nb + k];
+            if (v < m) m = v;
+        }
+        s->ns[k] = m < 1.0f ? 1.0f : m;
     }
 }
 
@@ -467,7 +505,7 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
             nn++;
             if (pe > s->p[P_DT_K] * est) nf++;
         }
-        s->dt_flag = (nn > 0 && (float)nf / (float)(s->dt_hi - s->dt_lo) > s->p[P_DT_SHARE]) ? 1.0f : 0.0f;
+        s->dt_flag = (nn > 0 && (float)nf / (float)nn > s->p[P_DT_SHARE]) ? 1.0f : 0.0f;
         if (s->fresh > 0) s->dt_flag = 0.0f;
     }
     if (near_out) *near_out = learn ? 0.0f : 1.0f;
@@ -480,6 +518,7 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
         float N = nbias * s->ns[k];
         if (learn) {
             float r0 = L * py, r1 = G * S;
+            s->learned = 1;
             /* the gate's estimate: never under gate_l x the linear estimate, so a residual that
              * grew (the volume turned up, the speaker driven into distortion) can still be learned */
             float rg = r0 > r1 ? r0 : r1, rl = gate_l * py;
@@ -533,8 +572,9 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
         if (fsm > 0) {
             int a = k - fsm, b = k + fsm, j;
             float acc = 0;
-            for (j = a; j <= b; j++) acc += (j >= 0 && j < nb) ? pr[j] : 0.0f;
-            g = acc / (float)(2 * fsm + 1);
+            int cnt = 0;
+            for (j = a; j <= b; j++) if (j >= 0 && j < nb) { acc += pr[j]; cnt++; }
+            g = acc / (float)cnt;
         }
         if (g > s->g[k]) g = s->g[k] + rel * (g - s->g[k]);
         s->g[k] = g;
@@ -559,6 +599,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
     float ecur[4096], mcur[4096], rcur[4096];
     double pmic = 0, plin = 0, pest = 0, pout = 0, gsum = 0;
     float near = 0;
+    int msilent;
     unsigned int csr;
     if (!s || !mic || !out || nstage < 0 || nstage > MAX_STAGES) return -1;
     if (nstage > 0 && (!stages || !refs)) return -1;
@@ -570,10 +611,14 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
         pmic += (double)mic[i] * mic[i];
         mcur[i] = (float)mic[i];
     }
+    msilent = pmic == 0.0;                  /* a lost packet, filled with zeros upstream */
 
     /* the processed path also runs in the frame where it is switched off, so
      * that frame can be cross-faded out of it */
-    if (active && !s->was_active) s->fresh = (int)s->p[P_FRESH];
+    /* the free-learning window: only the first time the PC plays to this canceller -- leakages still at
+     * their starting values -- not on every return from idle (a talker who speaks while the remote
+     * side pauses would be learned as echo each time) */
+    if (active && !s->was_active && !s->learned) s->fresh = (int)s->p[P_FRESH];
     if (active || s->was_active) {
         const int16_t *cur = mic;
         for (i = 0; i < n; i++) rcur[i] = 0.0f;
@@ -613,7 +658,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
             if (pe > px) { s->E[k] = s->X[k]; pe = px; }
             s->pe[k] = 0.5f * s->pe[k] + 0.5f * pe;
         }
-        track_noise(s);
+        track_noise(s, msilent);
         residual_gains(s, s->E, s->X, s->R, &near);
         if (s->p[P_BYPASS] > 0)
             for (k = 0; k < s->nbins; k++) s->g[k] = 1.0f;
@@ -642,7 +687,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
             float px = s->X[k].r * s->X[k].r + s->X[k].i * s->X[k].i;
             s->pe[k] = 0.5f * s->pe[k] + 0.5f * px;
         }
-        track_noise(s);
+        track_noise(s, msilent);
     }
     memcpy(s->m_prev, mcur, sizeof(float) * n);
     if (!active) {

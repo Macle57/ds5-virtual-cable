@@ -204,6 +204,55 @@ class CancellerTests(unittest.TestCase):
         self.assertGreater(float(np.median(lost)), -3.5, f"room noise median {np.median(lost):.1f} dB")
         self.assertGreater(min(lost), -6.0, f"room noise worst 100 ms {min(lost):.1f} dB")
 
+    def test_lost_packets_do_not_pull_the_room_noise_down(self):
+        # Round-10 review (H1): lost Bluetooth packets arrive as exact zeros, and a noise
+        # floor that follows every dip at once dragged the room 17 dB under itself for half
+        # a minute. 200 ms lost at 10 s: the room must still be kept 20 s later.
+        n = 34 * FS
+        ref = speechlike(n, 2, rate=5.1)
+        noise = np.random.default_rng(1).standard_normal(n).astype(np.float32) * np.float32(3e-3)
+        out = aligned(Sim().run(echo_of(ref, room(6, 0.6), 40) + noise, ref=ref,
+                                lose=set(range(1000, 1020))), n)
+        lost = [db(out[k:k + 4800], noise[k:k + 4800]) for k in range(28 * FS, n - FS, 4800)]
+        self.assertGreater(float(np.median(lost)), -3.5, f"room noise median {np.median(lost):.1f} dB")
+        self.assertGreater(min(lost), -6.0, f"room noise worst 100 ms {min(lost):.1f} dB")
+
+    def test_the_new_hooks_are_off_by_default(self):
+        nat = AEC.NativeCanceller()
+        for name, want in (("dt_adapt", 1.0), ("dt_beta", 1.0), ("dt_floor_db", -100.0),
+                           ("gate_l_db", -100.0), ("bypass", 0.0)):
+            self.assertEqual(nat.get(name), want, name)
+
+    def test_bad_residual_parameters_are_refused(self):
+        nat = AEC.NativeCanceller()
+        for name, v in (("release", 1.5), ("q", 1.0), ("fsm", 20), ("beta", float("nan")),
+                        ("dt_adapt", -0.1), ("hold", 99)):
+            with self.assertRaises(ValueError, msg=name):
+                nat.set(**{name: v})
+        with self.assertRaises(ValueError):
+            nat.set(nonsense=1)
+
+    def test_the_free_learning_window_is_not_rearmed_on_return_from_idle(self):
+        # Round-10 review (M2): the 1.5 s of unconditional learning restarted every time the
+        # PC resumed after 220 ms of quiet, so a local talker was learned as echo each time.
+        # A voice in the room that starts as the PC resumes must not be cut more with the
+        # window than without it.
+        def run(fresh):
+            def fac():
+                c = AEC.NativeCanceller()
+                c.set(fresh=fresh)
+                return c
+            sim = Sim(native_factory=fac)
+            n = 24 * FS
+            ref = speechlike(n, 2, rate=5.1)
+            ref[12 * FS:13 * FS] = 0                       # the remote side pauses for 1 s
+            near = speechlike(n, 9, rate=2.3, amp=0.2)
+            near[:13 * FS] = 0                             # ... and the local talker starts as it resumes
+            out = aligned(sim.run(echo_of(ref, room(6, 0.6), 40) + near, ref=ref), n)
+            talk = slice(13 * FS, 15 * FS)
+            return db(out[talk]) - db(near[talk])
+        self.assertGreater(run(150) - run(0), -1.0)
+
     def test_a_quiet_echo_of_a_loud_reference_is_found_and_cancelled(self):
         # Round 9 (user report: laptop speakers still heard in the pad mic).
         # The loopback reference is taken before the endpoint volume, so a
