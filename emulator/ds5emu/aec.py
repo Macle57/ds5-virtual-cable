@@ -311,7 +311,7 @@ NATIVE_VERSION = 4
 #: ignored).
 RESIDUAL_PARAMS = ("beta", "q", "step_db", "floor_db", "nfac", "hold", "decay", "release",
                    "nrise_db", "fsm", "ref_lo_hz", "ref_lo_db", "frz", "dtd", "lmax_db",
-                   "gmax_db", "bypass", "nbias", "learn_snr", "nsub", "l_init_db", "g_init_db", "up_slow_db", "gate_l_db", "fresh", "dt_k", "dt_share", "dt_hold", "dt_adapt", "dt_beta", "dt_floor_db")
+                   "gmax_db", "bypass", "nbias", "learn_snr", "nsub", "l_init_db", "g_init_db", "up_slow_db", "gate_l_db", "fresh", "dt_k", "dt_share", "dt_hold", "dt_adapt", "dt_beta", "dt_floor_db", "dt_force")
 
 
 def load_native():

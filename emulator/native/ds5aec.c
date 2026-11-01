@@ -174,6 +174,7 @@ enum {
     P_DT_ADAPT,      /* the linear stages' adaptation scale during double talk (1 = never slowed) */
     P_DT_BETA,       /* over-subtraction factor during double talk (x beta) */
     P_DT_FLOOR_DB,   /* the deepest gain during double talk */
+    P_DT_FORCE,      /* test aid: 1 = double talk now, -1 = not, 0 = the detector decides */
     P_COUNT
 };
 
@@ -311,6 +312,7 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->p[P_DT_ADAPT] = 1.0f;
     s->p[P_DT_BETA] = 1.0f;
     s->p[P_DT_FLOOR_DB] = -100.0f;
+    s->p[P_DT_FORCE] = 0.0f;
     s->dt_lo = (int)(300.0 * s->nfft / rate);
     s->dt_hi = (int)(4000.0 * s->nfft / rate);
     if (s->dt_hi >= nb) s->dt_hi = nb - 1;
@@ -324,6 +326,7 @@ API int ds5aec_param(ds5aec *s, int id, float v)
 {
     if (!s || id < 0 || id >= P_COUNT || !(v == v) || v > 1e30f || v < -1e30f) return -1;   /* NaN / inf */
     switch (id) {
+    case P_DT_FORCE: if (v < -1.0f || v > 1.0f) return -1; break;
     case P_RELEASE: case P_DT_ADAPT: case P_DECAY: if (v < 0.0f || v > 1.0f) return -1; break;
     case P_Q: if (v <= 0.0f || v >= 1.0f) return -1; break;
     case P_FSM: if (v < 0.0f || v > 8.0f) return -1; break;
@@ -664,6 +667,8 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
             for (k = 0; k < s->nbins; k++) s->g[k] = 1.0f;
         if (s->dt_flag > 0) s->dt_hold = (int)s->p[P_DT_HOLD];
         else if (s->dt_hold > 0) s->dt_hold--;
+        if (s->p[P_DT_FORCE] > 0) s->dt_hold = 1;
+        else if (s->p[P_DT_FORCE] < 0) s->dt_hold = 0;
         for (k = 0; k < s->nbins; k++) {
             float g = s->g[k];
             s->E[k].r *= g; s->E[k].i *= g;
