@@ -175,10 +175,17 @@ enum {
     P_DT_BETA,       /* over-subtraction factor during double talk (x beta) */
     P_DT_FLOOR_DB,   /* the deepest gain during double talk */
     P_DT_FORCE,      /* test aid: 1 = double talk now, -1 = not, 0 = the detector decides */
+    P_NER_GATE,      /* near-end mode: the residual estimate x this while NER fires (1 = no near-end mode) */
+    P_NER_THR,       /* NER threshold */
+    P_NER_HOLD,      /* frames near-end mode stays on after NER last fired */
+    P_NER_Q,         /* quantile of the per-band codec ratio tracker c_b */
+    P_NER_LEARN,     /* 1: NER (not the old share test) decides when leakages learn */
+    P_NER_NOISE,     /* NER's room level, x the residual stage's (biased-low) noise floor */
     P_COUNT
 };
 
 #define MAX_HOLD 8
+#define NER_BANDS 3
 /* the room's noise floor: minimum statistics over NS_SUB sub-windows of NS_LEN frames (8 x 20 = 1.6 s) */
 #define NS_SUB 8
 #define NS_LEN 20
@@ -198,6 +205,10 @@ typedef struct {
     float *refw;                  /* per-bin weight of the reference-based estimate */
     int hpos, ns_init, fresh, dt_hold, dt_lo, dt_hi, learned;
     float dt_flag;
+    float ner_c[NER_BANDS];        /* learned codec/residual ratio per band, dB */
+    int ner_k[NER_BANDS + 1];      /* band edges in bins: 300 / 1200 / 2400 / 4000 Hz */
+    float ner_s;                   /* smoothed NER */
+    int ner_hold, ner_on;          /* ner_on: frames NER has fired in a row */
     kiss_fft_scalar *tb;
     kiss_fft_cpx *E, *X, *R;
     float *m_prev;                /* previous mic frame, float */
@@ -313,6 +324,21 @@ API ds5aec *ds5aec_new(int frame, int rate)
     s->p[P_DT_BETA] = 1.0f;
     s->p[P_DT_FLOOR_DB] = -100.0f;
     s->p[P_DT_FORCE] = 0.0f;
+    s->p[P_NER_GATE] = 0.25f;   /* oracle (round 10): Mac -0.8 -> -0.2 dB at 0 dB, echo-only unchanged */
+    s->p[P_NER_THR] = 0.3f;
+    s->p[P_NER_HOLD] = 10.0f;
+    s->p[P_NER_Q] = 0.5f;
+    s->p[P_NER_LEARN] = 1.0f;
+    /* the residual stage's noise floor sits ~6 dB under the room's mean (round-10 DSP review, Q3);
+     * NER wants the room's real level, with margin: 1.5 x ~3.8 */
+    s->p[P_NER_NOISE] = 6.0f;
+    /* start HIGH (0 dB: NER fires on nothing) and learn down; starting low, NER fired on the echo
+     * itself and, learning only in frames it calls echo-only, never learned (round 10: 70 % false
+     * alarms on echo only) */
+    for (i = 0; i < NER_BANDS; i++) s->ner_c[i] = 0.0f;
+    s->ner_k[0] = (int)(300.0 * s->nfft / rate); s->ner_k[1] = (int)(1200.0 * s->nfft / rate);
+    s->ner_k[2] = (int)(2400.0 * s->nfft / rate); s->ner_k[3] = (int)(4000.0 * s->nfft / rate);
+    if (s->ner_k[3] >= nb) s->ner_k[3] = nb - 1;
     s->dt_lo = (int)(300.0 * s->nfft / rate);
     s->dt_hi = (int)(4000.0 * s->nfft / rate);
     if (s->dt_hi >= nb) s->dt_hi = nb - 1;
@@ -327,6 +353,9 @@ API int ds5aec_param(ds5aec *s, int id, float v)
     if (!s || id < 0 || id >= P_COUNT || !(v == v) || v > 1e30f || v < -1e30f) return -1;   /* NaN / inf */
     switch (id) {
     case P_DT_FORCE: if (v < -1.0f || v > 1.0f) return -1; break;
+    case P_NER_GATE: case P_NER_LEARN: if (v < 0.0f || v > 1.0f) return -1; break;
+    case P_NER_Q: if (v <= 0.0f || v >= 1.0f) return -1; break;
+    case P_NER_THR: case P_NER_HOLD: case P_NER_NOISE: if (v < 0.0f || v > 1e6f) return -1; break;
     case P_RELEASE: case P_DT_ADAPT: case P_DECAY: if (v < 0.0f || v > 1.0f) return -1; break;
     case P_Q: if (v <= 0.0f || v >= 1.0f) return -1; break;
     case P_FSM: if (v < 0.0f || v > 8.0f) return -1; break;
@@ -372,6 +401,8 @@ API void ds5aec_reset(ds5aec *s)
     s->was_active = 0;
     s->dt_hold = 0;
     s->dt_flag = 0.0f;
+    s->ner_s = 0.0f;
+    s->ner_hold = 0;
 }
 
 static void stft(ds5aec *s, const float *prev, const float *cur, kiss_fft_cpx *X)
@@ -484,6 +515,7 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
             float r0 = UNDB10(s->lL[k]) * py, r1 = s->refw[k] * UNDB10(s->lG[k]) * pr[k];
             if (r1 > r0) r0 = r1;
             if (gate_l * py > r0) r0 = gate_l * py;
+            if (r0 <= nbias * s->ns[k]) continue;    /* no echo expected above the room here: no evidence */
             nband++;
             if (pe < frz * r0) nfar++;
         }
@@ -511,7 +543,58 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
         s->dt_flag = (nn > 0 && (float)nf / (float)nn > s->p[P_DT_SHARE]) ? 1.0f : 0.0f;
         if (s->fresh > 0) s->dt_flag = 0.0f;
     }
-    if (near_out) *near_out = learn ? 0.0f : 1.0f;
+    /* Near end, from the linear stage's echo estimate Y and error E (round-10 DSP review, Q4): the
+     * near-end-to-echo ratio NER = sum over 300-1200 / 1200-2400 / 2400-4000 Hz of what the error holds
+     * beyond the room and beyond c_b x the estimate, over the estimate plus the room. c_b, what the linear
+     * stage leaves of its estimate on this path (on Bluetooth: mostly the mic codec's coding error), is
+     * learned per band in the frames NER calls echo only. */
+    {
+        int b;
+        float num = 0, den = 0, ner;
+        float eb[NER_BANDS], yb[NER_BANDS], nb_[NER_BANDS];
+        for (b = 0; b < NER_BANDS; b++) {
+            eb[b] = yb[b] = nb_[b] = 0;
+            for (k = s->ner_k[b]; k < s->ner_k[b + 1]; k++) {
+                float ex = X[k].r - E[k].r, ey = X[k].i - E[k].i;
+                float pe = E[k].r * E[k].r + E[k].i * E[k].i, N = s->p[P_NER_NOISE] * nbias * s->ns[k];
+                eb[b] += pe > N ? pe - N : 0.0f;
+                yb[b] += ex * ex + ey * ey;
+                nb_[b] += N;
+            }
+            {
+                float x = eb[b] - UNDB10(s->ner_c[b]) * yb[b] - 0.5f * nb_[b];
+                num += x > 0 ? x : 0.0f;
+            }
+            den += yb[b] + nb_[b];
+        }
+        ner = den > 0 ? num / den : 0.0f;
+        s->ner_s = 0.5f * s->ner_s + 0.5f * ner;
+        if (s->ner_s > s->p[P_NER_THR]) { s->ner_hold = (int)s->p[P_NER_HOLD]; s->ner_on++; }
+        else { if (s->ner_hold > 0) s->ner_hold--; s->ner_on = 0; }
+        /* firing for more than 5 s on end: more likely c_b too low (the path changed, the volume went up)
+         * than one continuous talker; let the trackers move up (only up) until it stops */
+        if (s->ner_on > 500 && s->fresh == 0)
+            for (b = 0; b < NER_BANDS; b++)
+                if (yb[b] > nb_[b]) {
+                    s->ner_c[b] += step * s->p[P_NER_Q] * 0.25f;
+                    if (s->ner_c[b] > 0.0f) s->ner_c[b] = 0.0f;
+                }
+        if (s->ner_hold == 0 && s->fresh == 0) {
+            float qn = s->p[P_NER_Q];
+            for (b = 0; b < NER_BANDS; b++) {
+                if (yb[b] <= nb_[b]) continue;          /* the estimate is not above the room here */
+                {
+                    float r = DB10(eb[b] / yb[b] + 1e-9f);
+                    s->ner_c[b] += r > s->ner_c[b] ? step * qn : -step * (1.0f - qn);
+                    if (s->ner_c[b] < -35.0f) s->ner_c[b] = -35.0f;
+                    if (s->ner_c[b] > 0.0f) s->ner_c[b] = 0.0f;
+                }
+            }
+        }
+        if (s->p[P_NER_LEARN] > 0) learn = s->fresh > 0 ? 2 : (s->ner_hold > 0 ? 0 : 1);
+    }
+    if (near_out) *near_out = s->p[P_NER_LEARN] > 0 || s->p[P_NER_GATE] < 1.0f ? (s->ner_hold > 0 ? 1.0f : 0.0f)
+                                                                         : (learn ? 0.0f : 1.0f);
     for (k = 0; k < nb; k++) {
         float ex = X[k].r - E[k].r, ey = X[k].i - E[k].i;
         float py = ex * ex + ey * ey;
@@ -560,6 +643,7 @@ static void residual_gains(ds5aec *s, const kiss_fft_cpx *E, const kiss_fft_cpx 
         if (G * S > res) res = G * S;
         /* an estimate at the room's level cannot be told from the room: only
          * what it predicts ABOVE the room is taken out */
+        if (s->ner_hold > 0) res *= s->p[P_NER_GATE];      /* near-end mode (NER) */
         res -= nsub * N;
         if (res < 0) res = 0;
         g2 = 1.0f - beta * res / (s->pe[k] + 1e-9f);

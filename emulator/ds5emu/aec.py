@@ -116,6 +116,8 @@ REF_BASE_MS = 10
 EARLY_MS = 8
 #: Worker backlog beyond which `push_mic` refuses (the bridge writes directly).
 QUEUE_MAX_MS = 150
+#: The analysis thread's period (delay probe, fine alignment; see `EchoCanceller._analyse`).
+ANALYSE_EVERY_S = 0.02
 #: Lost mic packets up to this many are filled with silence; more is a gap.
 SEQ_MAX_FILL = 25
 #: A reference frame quieter than this (-60 dBFS RMS) is silence.
@@ -311,7 +313,7 @@ NATIVE_VERSION = 4
 #: ignored).
 RESIDUAL_PARAMS = ("beta", "q", "step_db", "floor_db", "nfac", "hold", "decay", "release",
                    "nrise_db", "fsm", "ref_lo_hz", "ref_lo_db", "frz", "dtd", "lmax_db",
-                   "gmax_db", "bypass", "nbias", "learn_snr", "nsub", "l_init_db", "g_init_db", "up_slow_db", "gate_l_db", "fresh", "dt_k", "dt_share", "dt_hold", "dt_adapt", "dt_beta", "dt_floor_db", "dt_force")
+                   "gmax_db", "bypass", "nbias", "learn_snr", "nsub", "l_init_db", "g_init_db", "up_slow_db", "gate_l_db", "fresh", "dt_k", "dt_share", "dt_hold", "dt_adapt", "dt_beta", "dt_floor_db", "dt_force", "ner_gate", "ner_thr", "ner_hold", "ner_q", "ner_learn", "ner_noise")
 
 
 def load_native():
@@ -989,6 +991,11 @@ class EchoCanceller:
         #: Slotted references, in chain order.
         self._slots: list[Ref] = []
         self._lock = threading.Lock()
+        #: Guards the endpoints' state (slots, delays, filters, alignment) between the frame worker and
+        #: the analysis thread (`_analyse`): the delay probe and the fine alignment do their heavy maths
+        #: outside it, so a frame never waits behind them for more than a short apply step.
+        self._state = threading.RLock()
+        self._analysis = None
         #: Held while the worker writes a frame and while the reader switches
         #: to direct writes, so no worker frame can land after a direct one.
         self._out_lock = threading.Lock()
@@ -1045,6 +1052,10 @@ class EchoCanceller:
         if t is not None and t is not threading.current_thread():
             t.join(timeout=timeout)
         self._thread = None
+        a = self._analysis
+        if a is not None and a is not threading.current_thread():
+            a.join(timeout=timeout)
+        self._analysis = None
         self._stop_loopback()
 
     def pause(self) -> None:
@@ -1157,13 +1168,32 @@ class EchoCanceller:
                         continue                # queued before a pause
                     self._cur_gen = gen
                     self.feed_mic(mono, seq, t)
-                self.tick()
+                if self._analysis is None:
+                    self._analysis = threading.Thread(target=self._analyse, name="ds5-aec-analysis",
+                                                      daemon=True)
+                    self._analysis.start()
         except Exception as e:  # noqa: BLE001
             self.mode = "passthrough"
             self.reason = f"canceller thread died: {e!r}"
             log.exception("echo canceller failed -- the microphone is passed through")
         finally:
             self._stop_loopback()
+
+    def _analyse(self) -> None:
+        """The analysis thread: `tick()` every ANALYSE_EVERY_S while the canceller runs. Its maths (the
+        delay probe's GCC-PHAT, the fine alignment) used to run between frames on the worker and held
+        them back by up to tens of ms: enough to drain the bridge's mic ring (a dropout) or, beyond
+        QUEUE_MAX_MS, to hand unprocessed frames -- raw echo -- to the mic."""
+        try:
+            while not self._stop.is_set():
+                if self._stop.wait(ANALYSE_EVERY_S):
+                    break
+                if self._active.is_set() and self.mode == "aec" and self.native is not None:
+                    self.tick()
+        except Exception as e:  # noqa: BLE001
+            self.mode = "passthrough"
+            self.reason = f"canceller analysis died: {e!r}"
+            log.exception("echo canceller analysis failed -- the microphone is passed through")
 
     def prepare(self) -> None:
         try:
@@ -1177,6 +1207,10 @@ class EchoCanceller:
                             "passed through", self.reason)
 
     def _new_session(self) -> None:
+        with self._state:
+            self._new_session_locked()
+
+    def _new_session_locked(self) -> None:
         """A new capture session (after a pause, or after an overrun threw the
         queue away): the mic timeline starts over. Every endpoint keeps its
         delay and its filter; the filters' reference history is flushed, so
@@ -1250,6 +1284,14 @@ class EchoCanceller:
             self._frame(frame, k)
 
     def _frame(self, frame: np.ndarray, k: int) -> None:
+        with self._state:
+            out = self._frame_locked(frame, k)
+        if out is not None and self._active.is_set():
+            with self._out_lock:
+                if not self._overrun and self._cur_gen == self._gen:
+                    self.write_out(np.repeat(out, 2).tobytes())
+
+    def _frame_locked(self, frame: np.ndarray, k: int):
         pos = k + self.mic.off_f
         self.mic_hist.put(int(round(pos)), frame)
         base = REF_BASE_MS * FS // 1000
@@ -1304,10 +1346,7 @@ class EchoCanceller:
                     ss = self.native.stage_stats
                     self._watch(ref, float(st[0]), float(ss[3 * j]), float(ss[3 * j + 1]),
                                 float(ss[3 * j + 2]))
-        if self._active.is_set():
-            with self._out_lock:
-                if not self._overrun and self._cur_gen == self._gen:
-                    self.write_out(np.repeat(out, 2).tobytes())
+        return out
 
     def _watch(self, ref: Ref, mic_pow: float, in_pow: float, out_pow: float,
                est_pow: float) -> None:
@@ -1459,22 +1498,28 @@ class EchoCanceller:
     # -- the probe ---------------------------------------------------------------
 
     def tick(self) -> None:
+        """The analysis: remembered delays, fine alignment, the delay probe. Run by the analysis
+        thread while the canceller runs (and directly by the offline tests); the heavy maths runs
+        outside `_state`, the decisions inside it."""
         now = self._clock()
-        if self.mic_hist.wpos is None:
-            return
-        if self._store is not None:
-            self._slot_remembered(now)
-        for ref in list(self._slots):
+        with self._state:
+            if self.mic_hist.wpos is None:
+                return
+            if self._store is not None:
+                self._slot_remembered(now)
+            slots = list(self._slots)
+        for ref in slots:
             self._fine(ref)
-        if now < self._probe_at:
-            return
-        self._probe_at = now + PROBE_EVERY_S
-        refs = [r for r in list(self._refs.values())
-                if now - r.timeline.last_loud < 1.0 and now >= r.unheard_until]
-        if not refs:
-            return
-        ref = refs[self._probe_rr % len(refs)]
-        self._probe_rr += 1
+        with self._state:
+            if now < self._probe_at:
+                return
+            self._probe_at = now + PROBE_EVERY_S
+            refs = [r for r in list(self._refs.values())
+                    if now - r.timeline.last_loud < 1.0 and now >= r.unheard_until]
+            if not refs:
+                return
+            ref = refs[self._probe_rr % len(refs)]
+            self._probe_rr += 1
         self._probe(ref, now)
 
     def _slot_remembered(self, now: float) -> None:
@@ -1502,6 +1547,21 @@ class EchoCanceller:
                 ref.delay = None
 
     def _probe(self, ref: Ref, now: float) -> None:
+        with self._state:
+            job = self._probe_gather(ref)
+        if job is None:
+            return
+        mic, views, M, A, near = job
+        if near is not None:
+            res = [estimate_lag(mic, v, M, A, near=near) for v in views]
+        else:
+            res = [estimate_lag(mic, v, M, A, second=True) for v in views]
+        with self._state:
+            if ref.slotted != (near is not None):
+                return                          # slotted or dropped meanwhile: decide next time
+            self._probe_apply(ref, now, res, near is not None)
+
+    def _probe_gather(self, ref: Ref):
         W = int(PROBE_WINDOW_S * FS)
         P = self.mic_hist.wpos
         # non-overlapping windows: a proven slotted reference is re-checked
@@ -1519,16 +1579,20 @@ class EchoCanceller:
             return
         ref.last_probe_pos = P
         self.stats["probes"] += 1
-        agree = PROBE_AGREE_MS * FS // 1000
-        # Whether and where the echo is: the best peak of the views. Which view
-        # the endpoint is aligned on: by margin (see PROBE_VIEW_MARGIN).
+        near = None
         if ref.slotted:
             # is the echo still where the filter has it? A peak inside the
             # filter's window is far less likely by chance than the highest
             # peak over the whole search range, so a lower bar confirms it
             exp = ref.delay + ref.adj + EARLY_MS * FS // 1000
             near = (exp - TRACK_EARLY_MS * FS // 1000, exp + TRACK_LATE_MS * FS // 1000)
-            res = [estimate_lag(mic, v, M, A, near=near) for v in views]
+        return mic, views, M, A, near
+
+    def _probe_apply(self, ref: Ref, now: float, res: list, slotted: bool) -> None:
+        agree = PROBE_AGREE_MS * FS // 1000
+        # Whether and where the echo is: the best peak of the views. Which view
+        # the endpoint is aligned on: by margin (see PROBE_VIEW_MARGIN).
+        if slotted:
             lag, conf, _ = max(res, key=lambda r: r[1])
             local = [r[2] for r in res]
             if max(local) >= PROBE_CONFIRM_PEAK:
@@ -1536,7 +1600,6 @@ class EchoCanceller:
                 ref.probe_ok_at = now
                 self._rechoose_view(ref, local)
         else:
-            res = [estimate_lag(mic, v, M, A, second=True) for v in views]
             lag, conf = max(res, key=lambda r: r[1])[:2]
             # each view's peak where it agrees with the best one: a view
             # whose highest peak is elsewhere did not find this echo
@@ -1615,6 +1678,20 @@ class EchoCanceller:
     def _fine(self, ref: Ref) -> None:
         """Re-locate a slotted endpoint's echo to a fraction of a sample and
         keep it where its filter learned it (see FINE_*)."""
+        with self._state:
+            job = self._fine_gather(ref)
+        if job is None:
+            return
+        P, mic, x, S, cand, known = job
+        pat = fine_pattern(mic, x, S)
+        other = known if known is not None else cand
+        ds = pattern_shift(pat, other, FINE_SHIFT_MS * FS // 1000) if other is not None else None
+        with self._state:
+            if ref.fine_pat is not known or (known is None and ref.fine_cand is not cand):
+                return                          # changed meanwhile (a new session, a re-pattern)
+            self._fine_apply(ref, P, pat, ds)
+
+    def _fine_gather(self, ref: Ref):
         W = int(FINE_WINDOW_S * FS)
         # the window must lie after this session's mic anchor was frozen
         if self._acc_start < STARTUP_S * FS + W or ref.delay is None:
@@ -1636,8 +1713,10 @@ class EchoCanceller:
                 or float(np.sqrt(np.mean(mic ** 2))) < MIC_MIN_RMS):
             return
         ref.fine_last = P
-        pat = fine_pattern(mic, x, S)
-        shift_max = FINE_SHIFT_MS * FS // 1000
+        return P, mic, x, S, ref.fine_cand, ref.fine_pat
+
+    def _fine_apply(self, ref: Ref, P: int, pat, ds) -> None:
+        W = int(FINE_WINDOW_S * FS)
         if ref.fine_pat is None:
             # the pattern the filter learns at: taken once two windows in a
             # row agree on it (not from a window the near end dominated).
@@ -1646,7 +1725,7 @@ class EchoCanceller:
             # (They may differ by a shift: a drifting clock moves the echo
             # by up to DRIFT_MAX_PPM between windows -- 38 samples at 2 s.)
             if ref.fine_cand is not None:
-                d, corr = pattern_shift(pat, ref.fine_cand, shift_max)
+                d, corr = ds
                 gap = (P - (ref.fine_cand_pos or P)) or FINE_EVERY_S * FS
                 if corr >= FINE_MIN_CORR and abs(d) <= 2.0 + DRIFT_MAX_PPM * 1e-6 * gap:
                     ref.fine_pat = pat
@@ -1655,7 +1734,7 @@ class EchoCanceller:
             ref.fine_cand_pos = P
             ref.fine_due = False
             return
-        d, corr = pattern_shift(pat, ref.fine_pat, shift_max)
+        d, corr = ds
         if corr >= FINE_HEARD_CORR:
             ref.heard = True                    # the room's arrival pattern is there
         if corr < FINE_MIN_CORR:
