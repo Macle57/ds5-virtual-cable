@@ -984,6 +984,18 @@ class ClockSeamTests(unittest.TestCase):
             for _ in range(20):
                 self.assertEqual(len(be.read_audio_in(192)), 192)
 
+    def test_the_cancellers_mic_path_is_primed_deeper(self):
+        # Round 10: the canceller's worker delivers in bursts; the shallow prime drained.
+        one, zero = bytes([1]), bytes([0])
+        self.be._mic_via_aec = True
+        self.be._mic_ring.write(one * (B.MIC_PRIME_BYTES + 192))
+        self.assertEqual(self.be.read_audio_in(192), zero * 192)       # not yet primed
+        self.be._mic_ring.write(one * (B.MIC_PRIME_AEC_BYTES - B.MIC_PRIME_BYTES))
+        self.assertNotEqual(self.be.read_audio_in(192), zero * 192)
+        # and a burst above the plain HIGH mark is not trimmed
+        self.assertEqual(self.be._mic_depth_correction(B.MIC_HIGH_BYTES + 400), 0)
+        self.assertEqual(self.be.stats["mic_skew_drop_frames"], 0)
+
     def test_mic_underrun_forces_a_reprime_rather_than_a_dribble(self):
         self.be._mic_ring.write(b"\x01" * (B.MIC_PRIME_BYTES + 192))
         self.be.read_audio_in(192)

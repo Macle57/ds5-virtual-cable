@@ -205,6 +205,20 @@ MIC_HIGH_MS = 90
 MIC_LOW_BYTES = int(MIC_LOW_MS * USB_RATE / 1000) * USB_IN_FRAME_BYTES
 MIC_HIGH_BYTES = int(MIC_HIGH_MS * USB_RATE / 1000) * USB_IN_FRAME_BYTES
 assert MIC_LOW_BYTES < MIC_PRIME_BYTES < MIC_HIGH_BYTES < MIC_RING_BYTES
+#: While the software echo canceller writes the mic, the frames reach the ring from
+#: its worker thread, which also runs the delay probes between frames: they arrive
+#: in bursts, late by up to the length of a probe. With the 25 ms prime that drained
+#: the ring and re-primed it (a dropout every time) and the bursts then crossed
+#: MIC_HIGH, so the governor trimmed samples for minutes. MEASURED (round 10, blue,
+#: canceller on, 11 min): 11 underruns / re-primes and 5744 trimmed samples, against
+#: 1 and 20 with the canceller off; offline the probe takes up to 23 ms and the fine
+#: alignment up to 15 ms per call. So the canceller's path primes deeper and allows
+#: more depth before trimming: +35 ms of mic latency while it runs.
+MIC_PRIME_AEC_MS = 60
+MIC_HIGH_AEC_MS = 160
+MIC_PRIME_AEC_BYTES = int(MIC_PRIME_AEC_MS * USB_RATE / 1000) * USB_IN_FRAME_BYTES
+MIC_HIGH_AEC_BYTES = int(MIC_HIGH_AEC_MS * USB_RATE / 1000) * USB_IN_FRAME_BYTES
+assert MIC_LOW_BYTES < MIC_PRIME_AEC_BYTES < MIC_HIGH_AEC_BYTES < MIC_RING_BYTES
 
 #: Stop transmitting 0x39 after this long with no host audio: it saves
 #: Bluetooth airtime and, on a 10 %-battery controller, real power.
@@ -871,6 +885,8 @@ class BridgeBackend(Backend):
         self._out_ring = _ByteRing(AUDIO_OUT_RING_BYTES)
         self._mic_ring = _ByteRing(MIC_RING_BYTES)
         self._mic_primed = False
+        #: The last mic frame went through the software canceller (see MIC_PRIME_AEC_MS).
+        self._mic_via_aec = False
         self._last_audio_out = 0.0
         #: Encoded-frame queue depth, published by the pump for the stats snapshot.
         self.audio_q_depth = 0
@@ -1588,7 +1604,9 @@ class BridgeBackend(Backend):
         # slips against its reference. False = not taken: write directly.
         aec = self._aec
         if aec is not None and aec.push_mic(mono, payload[1] if len(payload) > 1 else None):
+            self._mic_via_aec = True
             return
+        self._mic_via_aec = False
         # mono -> the 2-channel USB IN stream: the real wired controller
         # duplicates the single capsule to L and R (FINDINGS: "USB mic IN: 2ch
         # descriptor, mono duplicated to L/R").
@@ -2151,7 +2169,7 @@ class BridgeBackend(Backend):
         self._mic_depth_max = max(self._mic_depth_max, depth)
 
         if not self._mic_primed:
-            if depth < MIC_PRIME_BYTES:
+            if depth < (MIC_PRIME_AEC_BYTES if self._mic_via_aec else MIC_PRIME_BYTES):
                 return b"\0" * nbytes
             self._mic_primed = True
 
@@ -2178,7 +2196,7 @@ class BridgeBackend(Backend):
         order 0.01 %. Inside [MIC_LOW, MIC_HIGH] nothing happens at all.
         """
         frame = USB_IN_FRAME_BYTES
-        if depth > MIC_HIGH_BYTES:
+        if depth > (MIC_HIGH_AEC_BYTES if self._mic_via_aec else MIC_HIGH_BYTES):
             if self._mic_ring.drop_oldest(frame):
                 self.stats["mic_skew_drop_frames"] += 1
             return 0
