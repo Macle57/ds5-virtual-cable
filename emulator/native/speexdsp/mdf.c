@@ -1274,6 +1274,9 @@ EXPORT int speex_echo_ctl(SpeexEchoState *st, int request, void *ptr)
          }
       }
          break;
+      case SPEEX_ECHO_SET_NOTCH_RADIUS:   /* ds5-virtual-usb patch: the mic's DC notch (upstream: .992 at 48 kHz) */
+         st->notch_radius = *(float*)ptr;   /* ds5-virtual-usb patch */
+         break;   /* ds5-virtual-usb patch */
       case SPEEX_ECHO_SET_ADAPT_SCALE:   /* ds5-virtual-usb patch: scale the adaptation step (0 = frozen) */
          st->adapt_scale = *(float*)ptr;   /* ds5-virtual-usb patch */
          break;   /* ds5-virtual-usb patch */

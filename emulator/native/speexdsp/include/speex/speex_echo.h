@@ -61,6 +61,8 @@ extern "C" {
 
 /** ds5-virtual-usb patch: scale the filter's adaptation step by a float (0 = frozen, 1 = upstream). */
 #define SPEEX_ECHO_SET_ADAPT_SCALE 100   /* ds5-virtual-usb patch */
+/** ds5-virtual-usb patch: set the mic-side DC notch radius (float, 0..1). */   /* ds5-virtual-usb patch */
+#define SPEEX_ECHO_SET_NOTCH_RADIUS 101   /* ds5-virtual-usb patch */
 
 /** Internal echo canceller state. Should never be accessed directly. */
 struct SpeexEchoState_;

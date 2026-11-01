@@ -117,6 +117,14 @@ API void ds5mdf_set_adapt(ds5mdf *m, float scale)
     if (m && m->mdf) speex_echo_ctl(m->mdf, SPEEX_ECHO_SET_ADAPT_SCALE, &scale);
 }
 
+/* The mic-side DC notch of the stage's MDF (vendored speexdsp patch). Upstream's .992 at 48 kHz takes
+ * 3.7 dB off a voice at 80 Hz and 2.1 at 100 Hz (round 10); the pad's mic carries no DC. */
+API void ds5mdf_set_notch(ds5mdf *m, float radius)
+{
+    if (m && m->mdf && radius > 0.0f && radius < 1.0f)
+        speex_echo_ctl(m->mdf, SPEEX_ECHO_SET_NOTCH_RADIUS, &radius);
+}
+
 API void ds5mdf_reset(ds5mdf *m)
 {
     if (m && m->mdf) speex_echo_state_reset(m->mdf);

@@ -103,6 +103,12 @@ log = logging.getLogger("ds5emu.aec")
 FS = 48000
 FRAME = 480                     # 10 ms: one pad mic packet, one native call
 TAIL_MS = 128
+#: The linear stages' mic-side DC notch (speexdsp's; set through a vendored patch). Upstream's .992 at
+#: 48 kHz takes 3.7 dB off the near end at 80 Hz and 2.1 at 100 Hz, and the pad's mic carries no DC.
+#: MEASURED (round 10 oracle: block F's short + the Mac's own recording, 0 dB): the Mac's 60-250 Hz
+#: distortion went -3.5 -> -8.4 dB (radius .998) / -8.7 (.9995) relative to it, 200-1000 Hz -7.6 -> -9.0,
+#: full band -9.7 -> -11.4 per 10 s; .998 still removes everything under ~15 Hz.
+MDF_NOTCH_RADIUS = 0.998
 #: Endpoints that can be cancelled at once, and the reference channels they
 #: may have between them (a stereo endpoint is two): the CPU budget, about
 #: 0.1-0.15 ms per channel per 10 ms frame.
@@ -342,6 +348,7 @@ def load_native():
         d.ds5mdf_free.argtypes = [vp]
         d.ds5mdf_reset.argtypes = [vp]
         d.ds5mdf_flush.argtypes = [vp, ci]
+        d.ds5mdf_set_notch.argtypes = [vp, ctypes.c_float]
         d.ds5rs_new.restype = vp
         d.ds5rs_new.argtypes = [ci, ci, ci, ci]
         d.ds5rs_free.argtypes = [vp]
@@ -362,6 +369,7 @@ class NativeStage:
         self._h = self._d.ds5mdf_new(FRAME, int(tail_ms * FS / 1000), nch, FS)
         if not self._h:
             raise OSError("ds5mdf_new failed")
+        self._d.ds5mdf_set_notch(self._h, MDF_NOTCH_RADIUS)
 
     @property
     def handle(self) -> int:
