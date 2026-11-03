@@ -67,7 +67,7 @@
 #define API __attribute__((visibility("default")))
 #endif
 
-#define DS5AEC_VERSION 4
+#define DS5AEC_VERSION 5
 #define MAX_STAGES 8
 #define MAX_CH 2
 
@@ -84,6 +84,7 @@ typedef struct {
     int frame, nch;
     int16_t *out;
     int16_t *zeros;               /* frame * nch zeros, for ds5mdf_flush */
+    float adapt_base;             /* ds5mdf_set_base_adapt: 0 = frozen (a kept filter not yet re-aligned) */
 } ds5mdf;
 
 API void ds5mdf_free(ds5mdf *m)
@@ -102,6 +103,7 @@ API ds5mdf *ds5mdf_new(int frame, int tail, int nch, int rate)
     m = (ds5mdf *)zalloc(sizeof(*m));
     if (!m) return NULL;
     m->frame = frame; m->nch = nch;
+    m->adapt_base = 1.0f;
     m->mdf = speex_echo_state_init_mc(frame, tail, 1, nch);
     m->out = (int16_t *)zalloc(sizeof(int16_t) * frame);
     m->zeros = (int16_t *)zalloc(sizeof(int16_t) * frame * nch);
@@ -123,6 +125,12 @@ API void ds5mdf_set_notch(ds5mdf *m, float radius)
 {
     if (m && m->mdf && radius > 0.0f && radius < 1.0f)
         speex_echo_ctl(m->mdf, SPEEX_ECHO_SET_NOTCH_RADIUS, &radius);
+}
+
+/* The stage's own adaptation scale (the chain multiplies the double-talk scale onto it each frame). */
+API void ds5mdf_set_base_adapt(ds5mdf *m, float scale)
+{
+    if (m) m->adapt_base = scale < 0.0f ? 0.0f : (scale > 1.0f ? 1.0f : scale);
 }
 
 API void ds5mdf_reset(ds5mdf *m)
@@ -720,7 +728,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
         for (j = 0; j < nstage; j++) {
             ds5mdf *m = stages[j];
             double pe = 0, pin = 0, pou = 0;
-            ds5mdf_set_adapt(m, s->dt_hold > 0 ? s->p[P_DT_ADAPT] : 1.0f);
+            ds5mdf_set_adapt(m, m->adapt_base * (s->dt_hold > 0 ? s->p[P_DT_ADAPT] : 1.0f));
             speex_echo_cancellation(m->mdf, cur, refs[j], m->out);
             for (i = 0; i < n; i++) {
                 float d = (float)cur[i] - (float)m->out[i];

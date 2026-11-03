@@ -217,6 +217,16 @@ PROBE_PAIR_SPAN_MS = 60
 PROBE_PAIR_VOTES = 3
 PROBE_AGREE_MS = 2
 PROBE_EVERY_S = 0.25
+#: A slotted endpoint whose loopback stream re-anchored (a new playback: Realtek's stamps then jump by tens
+#: of ms against the mic, MEASURED round 10: -70.6 / +59.2 / +60.7 ms between takes) or whose mic session
+#: is new is "unsettled": it is probed every window instead of every TRACK_EVERY_S, one probe at
+#: PROBE_SURE_PEAK moves it, the move keeps the filter's weights (the read point moves with the echo), and
+#: its filter runs without adapting until a probe or the fine alignment finds the echo where the filter has
+#: it -- or UNSETTLED_MAX_S of its audio pass. MEASURED (round-10 replay, block H warm yt_lap): the first 3 s
+#: went from 0.3 dB of cancellation (filter reset ~6 s in) to the steady value.
+UNSETTLED_MAX_S = 4.0
+#: Whether an unsettled filter runs frozen (see above).
+UNSETTLED_FREEZE = True
 # --- fine alignment ------------------------------------------------------------
 #: Each slotted endpoint's echo is re-located to a fraction of a sample (full
 #: rate GCC-PHAT, 100 Hz - 7 kHz, +-FINE_SPAN_MS around where the filter
@@ -311,7 +321,7 @@ def _dll_path() -> str:
 _DLL = None
 
 
-NATIVE_VERSION = 4
+NATIVE_VERSION = 5
 
 #: The residual stage's tunables (ds5aec.c, `ds5aec_param` ids). The defaults
 #: live in the DLL; `DS5_AEC_RESIDUAL="beta=2,floor_db=-20"` overrides some for
@@ -348,6 +358,7 @@ def load_native():
         d.ds5mdf_free.argtypes = [vp]
         d.ds5mdf_reset.argtypes = [vp]
         d.ds5mdf_flush.argtypes = [vp, ci]
+        d.ds5mdf_set_base_adapt.argtypes = [vp, ctypes.c_float]
         d.ds5mdf_set_notch.argtypes = [vp, ctypes.c_float]
         d.ds5rs_new.restype = vp
         d.ds5rs_new.argtypes = [ci, ci, ci, ci]
@@ -378,6 +389,11 @@ class NativeStage:
     def reset(self) -> None:
         if self._h:
             self._d.ds5mdf_reset(self._h)
+
+    def freeze(self, frozen: bool) -> None:
+        """Run without adapting (a kept filter whose echo is not re-located yet)."""
+        if self._h:
+            self._d.ds5mdf_set_base_adapt(self._h, 0.0 if frozen else 1.0)
 
     def flush(self, frames: int = TAIL_MS // 10 + 1) -> None:
         """Make the filter's reference history silence (weights untouched)."""
@@ -862,6 +878,10 @@ class Ref:
         #: mix; see PROBE_VIEW_MARGIN). Chosen when slotted, kept in the delay
         #: store, and re-chosen by the probes while slotted.
         self.view = 0
+        #: The loopback anchor count last seen, and whether the echo must be re-located (PROBE_*).
+        self.anchors_seen = 0
+        self.unsettled = False
+        self.unsettled_frames = 0
         self._clear_fine()
         self._clear_windows()
 
@@ -1234,6 +1254,7 @@ class EchoCanceller:
             ref.fine_hist = []
             if ref.stage is not None:
                 ref.stage.flush()
+            self._unsettle(ref)
         if self.native is not None:
             self.native.reset()
 
@@ -1308,6 +1329,9 @@ class EchoCanceller:
             if self._refs.get(ref.id) is not ref:
                 self._unslot(ref)               # the endpoint went away / changed
                 continue
+            if ref.timeline.anchors != ref.anchors_seen:
+                ref.anchors_seen = ref.timeline.anchors
+                self._unsettle(ref)
             if ref.rate:
                 ref.adj += ref.rate * FRAME         # follow the endpoint's clock
             r = ref.timeline.read(pos - base - ref.delay - ref.adj, FRAME)
@@ -1315,13 +1339,12 @@ class EchoCanceller:
             ref.quiet_frames = 0 if is_loud else ref.quiet_frames + 1
             if ref.quiet_frames >= ACTIVE_HOLD_FRAMES:
                 continue                        # silent: its filter is not run
-            if (ref.fine_due and ref.fine_pat is not None
-                    and self._acc_start < FINE_HOLD_S * FS):
-                # A new session, and this endpoint's echo has not been
-                # re-located yet: its converged filter would subtract a
-                # misaligned estimate AND adapt away from what it learned.
-                # Leave the mic to it untouched for these few hundred ms.
-                continue
+            if ref.unsettled:
+                # its echo may have moved (a new session, a new playback): the filter runs, but without
+                # adapting away from what it learned, until the echo is re-located (UNSETTLED_MAX_S)
+                ref.unsettled_frames += 1
+                if is_loud and ref.unsettled_frames > UNSETTLED_MAX_S * 100:
+                    self._settle(ref)
             if ref.nch == 2:
                 # mid and side rather than left and right: with mono content
                 # (side silent) the mid filter learns the true sum of the two
@@ -1355,6 +1378,21 @@ class EchoCanceller:
                     self._watch(ref, float(st[0]), float(ss[3 * j]), float(ss[3 * j + 1]),
                                 float(ss[3 * j + 2]))
         return out
+
+    def _unsettle(self, ref: Ref) -> None:
+        if not ref.slotted:
+            return
+        ref.unsettled = True
+        ref.unsettled_frames = 0
+        ref.last_probe_pos = None
+        ref.track_votes = []
+        if ref.stage is not None and UNSETTLED_FREEZE:
+            ref.stage.freeze(True)
+
+    def _settle(self, ref: Ref) -> None:
+        ref.unsettled = False
+        if ref.stage is not None:
+            ref.stage.freeze(False)
 
     def _watch(self, ref: Ref, mic_pow: float, in_pow: float, out_pow: float,
                est_pow: float) -> None:
@@ -1478,6 +1516,8 @@ class EchoCanceller:
             return False
         self._slots.append(ref)
         ref.slotted = True
+        ref.anchors_seen = ref.timeline.anchors      # found on this stream: settled
+        ref.unsettled = False
         ref.provisional = provisional
         ref.prov_moved = False
         ref.quiet_frames = 0
@@ -1574,7 +1614,7 @@ class EchoCanceller:
         P = self.mic_hist.wpos
         # non-overlapping windows: a proven slotted reference is re-checked
         # every TRACK_EVERY_S, anything else at most once per window
-        gap = TRACK_EVERY_S * FS if ref.slotted and not ref.provisional else W
+        gap = TRACK_EVERY_S * FS if ref.slotted and not ref.provisional and not ref.unsettled else W
         if ref.last_probe_pos is not None and 0 <= P - ref.last_probe_pos < gap:
             return
         M = int(PROBE_MAX_LAG_S * FS)
@@ -1644,9 +1684,11 @@ class EchoCanceller:
         if -TRACK_EARLY_MS * ms <= shift <= TRACK_LATE_MS * ms:
             ref.heard = True                    # the echo is where the filter is
             ref.track_votes = []
+            if ref.unsettled and abs(shift) <= 2 * agree:
+                self._settle(ref)
             return
         ref.track_votes = [v for v in ref.track_votes[-1:] if abs(v - shift) <= agree] + [shift]
-        if len(ref.track_votes) >= 2:
+        if len(ref.track_votes) >= 2 or (ref.unsettled and conf >= PROBE_SURE_PEAK):
             ref.delay += ref.adj + float(np.median(ref.track_votes))
             ref.adj = 0.0
             if ref.provisional:
@@ -1655,7 +1697,11 @@ class EchoCanceller:
             ref.heard = True
             ref._clear_fine()
             if ref.stage is not None:
-                ref.stage.reset()               # its taps belonged to the old delay
+                # the read point moves with the echo, so the taps still fit it: keep them, only the
+                # reference history they hold is from before the move
+                ref.stage.flush()
+            if ref.unsettled:
+                self._settle(ref)
             self.stats["delay_moves"] += 1
             log.info("echo of %s moved by %+.1f ms -- following it", ref.name,
                      shift * 1000 / FS)
@@ -1765,6 +1811,8 @@ class EchoCanceller:
                 self._realign(ref, d if corr >= FINE_SURE_CORR else 0.5 * (d + pend), corr)
                 ref.fine_due = False
                 ref.fine_hist = []
+                if ref.unsettled:
+                    self._settle(ref)
             else:
                 ref.fine_pend = d
             return

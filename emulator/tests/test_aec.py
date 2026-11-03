@@ -433,6 +433,27 @@ class CancellerTests(unittest.TestCase):
             eng.stop()
         self.assertIsNone(getattr(eng, "_analysis", None))
 
+    def test_a_playback_whose_stamps_jumped_is_cancelled_within_seconds(self):
+        # Round 10, live: between two playbacks the Realtek loopback's stamps moved by
+        # -70.6 / +59.2 / +60.7 ms against the mic. An echo that moved EARLIER than the
+        # filter's window cannot be re-adapted to: the tracker wanted two probes 5 s apart
+        # and then reset the filter, so the first 5-8 s of a new playback leaked. Now a
+        # re-anchored stream is probed every window, its kept filter runs frozen meanwhile,
+        # and the move keeps the weights.
+        sim = Sim()
+        n = 14 * FS
+        ref = speechlike(n, 2, rate=5.1)
+        h = room(6, 0.6)
+        sim.run(echo_of(ref, h, 100), ref=ref)              # learn the path
+        self.assertEqual(sim.eng.status()["slots"], ["Speakers (Test)"])
+        ref2 = speechlike(n, 4, rate=5.1)
+        mic2 = echo_of(ref2, h, 40)                          # the same path, 60 ms earlier vs the stamps
+        out = aligned(sim.run(mic2, ref=ref2), n)
+        span = slice(2 * FS, 10 * FS)
+        red = db(out[span], mic2[span])
+        # MEASURED: -20 dB; the old tracker -2 (nothing cancelled until 6.5 s, then a reset)
+        self.assertLess(red, -8.0, f"2-10 s into the new playback: {red:.1f} dB")
+
     def test_a_stalled_worker_hands_the_mic_back(self):
         block = threading.Event()
 
