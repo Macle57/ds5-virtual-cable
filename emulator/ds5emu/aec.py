@@ -74,8 +74,11 @@ What makes it safe to leave on:
     unprocessed mic, and `status()["health"]` says so (the dashboard shows it).
 
 Reference timing: loopback packets carry QPC presentation stamps and are
-laid on a 48 kHz `time.perf_counter()` timeline (`RefTimeline`), following
-the stamps with a fractional offset. Microphone samples are mapped onto the
+laid on a 48 kHz `time.perf_counter()` timeline (`RefTimeline`) at a
+fractional offset that the stamps fix once per stream start (averaged over
+its first packets) and then only steer slowly (`REF_STAMP_ALPHA`, ~10 s), so
+the stamps' own jitter never reaches the read point -- a cast endpoint's
+stamps wobble by 0.3 ms while its audio does not. Microphone samples are mapped onto the
 same timeline by their least late arrival (`MicClock`), anchored briefly at
 each session start and then held, and references are read at
 fractional positions (cubic interpolation). Each endpoint's bulk delay is
@@ -165,6 +168,19 @@ GAP_S = 0.25
 STARTUP_S = 0.05
 #: A loopback stamp this far from where the stream says it is re-anchors.
 STAMP_JUMP = 96
+#: How fast a reference's timeline follows its packets' presentation stamps, per packet (`RefTimeline.push`):
+#: after an anchor the stamps are AVERAGED (weight 1/n) until 1/n reaches this, then followed exponentially
+#: (time constant ~1/REF_STAMP_ALPHA packets, 10 s). The stamps only have to fix the stream's position once
+#: per anchor and follow its clock; the echo's own motion is followed by the fine alignment and the drift fit.
+#: Following them fast (0.05, until round 10) injects their jitter into the read point: MEASURED (round 10,
+#: block K, spacedesk virtual speaker = audio cast over WiFi to an iPad): its stamps wobble 0.31 ms std,
+#: correlated over ~50-100 ms, while the audio itself is steady to ~16 us; at 0.05 the read point moved
+#: 5 samples std within each second (Realtek: 0.4), speexdsp's leak estimate sat at 1.0 and the linear stage
+#: removed 1.8 dB of the iPad's echo (live config 2.5 dB). At 0.001 with the average: 9.8 dB linear, 16.5 dB
+#: with the residual stage; laptop Realtek and the pad PCM twin unchanged (+-0.1 dB, block J and K replays).
+#: A stream clock that drifts against QPC is trailed by a constant drift / alpha (0.48 samples per ppm), so
+#: beyond ~180 ppm it would re-anchor at STAMP_JUMP; the endpoints measured run within 1 ppm of QPC.
+REF_STAMP_ALPHA = 0.001
 
 # --- bulk delay probe ---------------------------------------------------------
 PROBE_WINDOW_S = 1.0
@@ -543,9 +559,14 @@ class RefTimeline:
     timeline.
 
     Samples live in a ring indexed by how many were ever written; a timeline
-    position is that index plus `off`, a float that follows the packets'
-    presentation stamps (they are exact once a stream runs). A stamp that
-    disagrees by more than `STAMP_JUMP` re-anchors; silence fills a gap.
+    position is that index plus `off`, a float set from the packets'
+    presentation stamps: averaged over the packets since the last anchor,
+    then followed with `REF_STAMP_ALPHA` per packet. The samples are contiguous;
+    the stamps only fix where they sit and follow the stream's clock (measured
+    within 1 ppm of QPC on Realtek, the pads' USB speakers and spacedesk), so a
+    jittery stamp moves the read point by a fraction of a sample, not by the
+    jitter. A stamp that disagrees by more than `STAMP_JUMP` re-anchors;
+    silence fills a gap.
     `read` interpolates at fractional positions (cubic), so following a
     drifting clock is a smooth resampling rather than a sample slip.
     """
@@ -558,6 +579,7 @@ class RefTimeline:
         self._w = 0
         self._lo = 0
         self.off: float | None = None
+        self._n = 0                     # packets since the last anchor
         self._last_t = -math.inf
         self.anchors = 0
         self.last_push = -math.inf
@@ -585,8 +607,10 @@ class RefTimeline:
                     self._lo = self._w
                 self.off = start - self._w
                 self.anchors += 1
+                self._n = 0
             self._append(x)
-            self.off += 0.05 * ((epos - self._w) - self.off)
+            self._n += 1
+            self.off += max(REF_STAMP_ALPHA, 1.0 / self._n) * ((epos - self._w) - self.off)
             self._last_t = t_end
             self.last_push = t_end
             if float(np.vdot(x, x)) > LOUD_RMS * LOUD_RMS * n:

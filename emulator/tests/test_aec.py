@@ -1094,6 +1094,61 @@ class TimingTests(unittest.TestCase):
         want = np.sin(2 * np.pi * 440 * (np.arange(1000) + 100.5) / FS)
         np.testing.assert_allclose(y, want, atol=2e-3)
 
+    def _wobbly_stamps(self, n, seed=7, std_ms=0.31, rho=0.9):
+        """Presentation stamps of a steady 10 ms stream that wobble like spacedesk's (round 10, block K):
+        0.31 ms std, correlated over a few packets, never near STAMP_JUMP."""
+        r = np.random.default_rng(seed)
+        j = np.zeros(n)
+        for i in range(1, n):
+            j[i] = rho * j[i - 1] + np.sqrt(1 - rho * rho) * r.normal(0.0, std_ms * 1e-3)
+        return (np.arange(n) + 1) * 0.01 + np.clip(j, -1.5e-3, 1.5e-3)
+
+    def test_jittering_stamps_leave_the_read_point_steady(self):
+        # the audio is contiguous; only its stamps wobble. Following them packet by packet moved the read
+        # point 5 samples std within each second and cost the linear stage its whole cancellation (block K)
+        tl = AEC.RefTimeline()
+        st = self._wobbly_stamps(3000)
+        x = np.zeros(F, np.float32)
+        offs = []
+        for t in st:
+            tl.push(x, t, 0.0)
+            offs.append(tl.off)
+        offs = np.array(offs[1000:])
+        self.assertEqual(tl.anchors, 1)
+        self.assertLess(float(np.std(offs)), 2.0)                  # samples; 15 in the stamps (0.05 per packet: ~5)
+        self.assertLess(float(np.max(np.abs(np.diff(offs)))), 0.1)
+        self.assertLess(abs(float(np.mean(offs))), 4.0)            # and in the right place
+
+    def test_a_real_offset_step_still_re_anchors(self):
+        tl = AEC.RefTimeline()
+        x = np.arange(1, 4801, dtype=np.float32)
+        for i in range(200):
+            tl.push(x[:F], (i + 1) * 0.01, 0.0)
+        self.assertEqual(tl.anchors, 1)
+        # the stream jumps 5 ms (240 samples > STAMP_JUMP): the new packets sit where their stamps say at once
+        step = 0.005
+        for i in range(200, 210):
+            k = i - 200
+            tl.push(x[k * F:(k + 1) * F], (i + 1) * 0.01 + step, 0.0)
+        self.assertEqual(tl.anchors, 2)
+        start = (200 * 0.01 + step) * FS
+        np.testing.assert_allclose(tl.read(start, 10 * F)[:, 0], x[:10 * F], atol=1e-3)
+
+    def test_a_drifting_stream_clock_is_still_followed(self):
+        # 100 ppm against QPC for 90 s (432 samples in all): followed without a re-anchor. The slow follower
+        # settles to trailing the ramp by a CONSTANT slope / REF_STAMP_ALPHA (0.048 / 0.001 = 48 samples
+        # here), which the fine alignment absorbs like any delay; it must not keep growing.
+        tl = AEC.RefTimeline()
+        x = np.zeros(F, np.float32)
+        lag = {}
+        for i in range(9000):
+            tl.push(x, (i + 1) * 0.01 * (1 + 100e-6), 0.0)
+            if i + 1 in (6000, 9000):
+                lag[i + 1] = (i + 1) * 0.01 * 100e-6 * FS - tl.off
+        self.assertEqual(tl.anchors, 1)
+        self.assertLess(abs(lag[9000] - lag[6000]), 1.0)
+        self.assertLess(abs(lag[9000]), 0.048 / AEC.REF_STAMP_ALPHA + 5)
+
     def test_the_mic_clock_takes_the_least_late_packet(self):
         mc = AEC.MicClock()
         r = np.random.default_rng(2)
