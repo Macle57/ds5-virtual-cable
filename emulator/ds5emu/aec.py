@@ -391,6 +391,14 @@ PROVISIONAL_Q = 0.65
 #: endpoint whose reference has been silent this long gives up its slot
 #: (its delay stays remembered, so it comes back quickly).
 EVICT_SILENT_S = 10.0
+#: When no slotted endpoint is silent, an endpoint the PROBE has just found (a heard newcomer: never a remembered
+#: delay, which is only provisional) takes the slot of one that still plays but whose echo has not been found in
+#: this many watch windows in a row (`_watch`; a masked mirrored slot does not count them, so a louder mirror never
+#: takes its slot). Below UNHEARD_WINDOWS, so the heard newcomer does not wait for the drop. MEASURED (round 10):
+#: the laptop's echo stops (speakers unplugged, Realtek still renders) while a heard cast plays the same stream and
+#: the budget is full: the cast waited 37 s for the drop (4 windows of 5 s of audio, 8 s each with the gaps); 2
+#: windows halve that. 1 window is too few: block L2's masked Realtek slot failed the masked bound in one window.
+EVICT_UNHEARD_WINDOWS = 2
 #: An endpoint silent this long may try its remembered delay again.
 STORE_RETRY_SILENT_S = 5.0
 #: The delay store is written at most this often per endpoint for small
@@ -1248,7 +1256,7 @@ class EchoCanceller:
         self._slot_gen = 0                      # bumped whenever the set of slots changes (ghost ranges)
         self.stats = {"frames": 0, "frames_active": 0, "lost_packets": 0,
                       "refused": 0, "overruns": 0, "native_errors": 0, "slotted": 0,
-                      "slotted_from_store": 0, "store_rejected": 0, "evicted": 0, "pair_slotted": 0, "run_slotted": 0, "yield_asks": 0, "yield_moves": 0,
+                      "slotted_from_store": 0, "store_rejected": 0, "evicted": 0, "evicted_unheard": 0, "pair_slotted": 0, "run_slotted": 0, "yield_asks": 0, "yield_moves": 0,
                       "unslotted": 0, "delay_moves": 0, "fine_moves": 0, "drift_fits": 0, "fine_repatterns": 0,
                       "view_changes": 0, "probes": 0, "sessions": 0,
                       "native_us": 0.0}
@@ -1720,28 +1728,53 @@ class EchoCanceller:
         if key:
             self._store.forget(key)
 
-    def _fits(self, ref: Ref) -> bool:
-        return (len(self._slots) < MAX_REFS
-                and sum(r.nch for r in self._slots) + ref.nch <= MAX_CHANNELS)
+    def _fits(self, ref: Ref, without: list = ()) -> bool:
+        left = [r for r in self._slots if r not in without]
+        return len(left) < MAX_REFS and sum(r.nch for r in left) + ref.nch <= MAX_CHANNELS
+
+    def _victims(self, ref: Ref, now: float, provisional: bool) -> list | None:
+        """The slots that give way so `ref` fits, or None if it cannot fit (then nothing is evicted). Silent
+        endpoints first (longest silent first, `EVICT_SILENT_S`); then, for a newcomer the probe found (not a
+        `provisional` remembered delay), endpoints that play but whose echo has not been found in
+        `EVICT_UNHEARD_WINDOWS` windows (longest unheard first)."""
+        silent = sorted((r for r in self._slots if now - r.timeline.last_loud >= EVICT_SILENT_S),
+                        key=lambda r: r.timeline.last_loud)
+        unheard = [] if provisional else sorted(
+            (r for r in self._slots if now - r.timeline.last_loud < EVICT_SILENT_S
+             and not r.provisional and r.bad_windows >= EVICT_UNHEARD_WINDOWS),
+            key=lambda r: -r.bad_windows)
+        out: list = []
+        for r in silent + unheard:
+            if self._fits(ref, out):
+                break
+            out.append(r)
+        return out if self._fits(ref, out) else None
 
     def _slot(self, ref: Ref, provisional: bool = False) -> bool:
         if ref.slotted:
             return True
         now = self._clock()
-        while not self._fits(ref):
-            # The budget is full. An endpoint nobody has played for a while
-            # gives way (longest silent first); its delay stays remembered
-            # and it is slotted again on its next sound.
-            idle = [r for r in self._slots if now - r.timeline.last_loud >= EVICT_SILENT_S]
-            if not idle:
+        if not self._fits(ref):
+            victims = self._victims(ref, now, provisional)
+            if victims is None:
                 return False
-            victim = min(idle, key=lambda r: r.timeline.last_loud)
-            log.info("echo of %s: silent for %.0f s, giving its filter slot to %s",
-                     victim.name, now - victim.timeline.last_loud, ref.name)
-            self._remember(victim)
-            self._unslot(victim)
-            victim.store_tried = False
-            self.stats["evicted"] += 1
+            for victim in victims:
+                if now - victim.timeline.last_loud >= EVICT_SILENT_S:
+                    # nobody has played it for a while: its delay stays remembered
+                    # and it is slotted again on its next sound
+                    log.info("echo of %s: silent for %.0f s, giving its filter slot to %s",
+                             victim.name, now - victim.timeline.last_loud, ref.name)
+                    self._remember(victim)
+                    self._unslot(victim)
+                    victim.store_tried = False
+                else:
+                    # it plays, but its echo is not in the mic: dropped early, as `_watch` would drop it
+                    log.info("echo of %s not found in %d windows while it plays -- giving its filter slot to %s",
+                             victim.name, victim.bad_windows, ref.name)
+                    self._unslot(victim)
+                    victim.unheard_until = now + UNHEARD_RETRY_S
+                    self.stats["evicted_unheard"] += 1
+                self.stats["evicted"] += 1
         try:
             if ref.stage is None or ref.stage.nch != ref.nch:
                 ref.stage = self._stage_factory(ref.nch)

@@ -1242,6 +1242,48 @@ class CancellerTests(unittest.TestCase):
         self.assertFalse(sim.eng._refs["Laptop"].slotted)
         self.assertTrue(sim.eng._refs["Cast"].slotted)
 
+
+    def test_a_heard_mirror_takes_the_only_slot_from_a_dead_echo(self):
+        # one slot: the laptop holds it (on its own echo, after a yield); its echo stops at 30 s while the heard
+        # cast plays on. The cast takes the slot after EVICT_UNHEARD_WINDOWS windows, not after the drop
+        n = 75 * FS
+        a = speechlike(n, 2, rate=5.1)
+        sh = int(0.150 * FS)
+        cast = np.concatenate([np.zeros(sh, np.float32), a[:-sh]])
+        lap = echo_of(a, room(6, 0.5), 20)
+        lap[30 * FS:] = 0
+        mic = echo_of(cast, room(8, 0.6), 300) + lap + np.float32(1e-4) *             np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        old = AEC.MAX_REFS
+        AEC.MAX_REFS = 1
+        try:
+            sim = Sim()
+            out = aligned(sim.run(mic, ref={"Cast": cast, "Laptop": a}), n)
+        finally:
+            AEC.MAX_REFS = old
+        self.assertEqual(sim.eng.stats["evicted_unheard"], 1)
+        self.assertEqual(sim.eng.status()["slots"], ["Cast"])
+        self.assertLess(db(out[60 * FS:74 * FS], mic[60 * FS:74 * FS]), -40.0)
+
+    def test_with_the_channels_full_a_heard_newcomer_takes_an_unheard_stereo_slot(self):
+        # the production budget: laptop + USB speaker (stereo, both heard) fill the four channels; a cast (stereo,
+        # unrelated audio) starts at 15 s; the laptop's speakers go dead at 30 s while Realtek still renders
+        n = 70 * FS
+        st = lambda x, y: np.stack([x, 0.7 * x + 0.3 * y], 1).astype(np.float32)  # noqa: E731
+        ech = lambda x, seed, d: echo_of(x[:, 0], room(seed, 0.5), d) + echo_of(x[:, 1], room(seed + 1, 0.5), d + 3)  # noqa: E731,E501
+        lap = st(speechlike(n, 2, rate=5.1), speechlike(n, 3, rate=4.9))
+        usb = st(speechlike(n, 12, rate=4.3), speechlike(n, 13, rate=3.9))
+        c = speechlike(n, 31, rate=4.7)
+        c[:15 * FS] = 0
+        cast = st(c, c)
+        e_lap = ech(lap, 6, 20)
+        e_lap[30 * FS:] = 0
+        mic = e_lap + ech(usb, 12, 60) + ech(cast, 8, 300) + np.float32(1e-4) *             np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        sim = Sim()
+        out = aligned(sim.run(mic, ref={"Laptop": lap, "USB": usb, "Cast": cast}), n)
+        self.assertEqual(sim.eng.stats["evicted_unheard"], 1)
+        self.assertEqual(sorted(sim.eng.status()["slots"]), ["Cast", "USB"])
+        self.assertLess(db(out[60 * FS:69 * FS], mic[60 * FS:69 * FS]), -20.0)
+
     def test_an_unheard_mirror_does_not_keep_the_heard_endpoint_yielding(self):
         # headphones (or a muted cast) playing the same stream 150 ms AHEAD of the laptop: the laptop's echo shows
         # in their probe as another endpoint's ghost, forever. They may ask once; then they back off
@@ -1619,6 +1661,57 @@ class TimingTests(unittest.TestCase):
         self.assertTrue(eng._slot(ref))
         self._watch_windows(eng, ref, AEC.UNHEARD_WINDOWS, [(10000, 11000, other)], est=1e1)
         self.assertFalse(ref.slotted)
+
+
+    def _full(self, eng, *spec):
+        refs = []
+        for name, nch, loud in spec:
+            r = AEC.Ref(name, name, nch)
+            r.delay = 1000.0
+            r.timeline.last_loud = loud
+            self.assertTrue(eng._slot(r))
+            refs.append(r)
+        return refs
+
+    def test_a_heard_newcomer_takes_the_slot_of_an_unheard_endpoint_that_still_plays(self):
+        eng, _ = self._decider()                                   # the clock stands at 100 s
+        lap, usb = self._full(eng, ("Laptop", 2, 100.0), ("USB", 2, 100.0))      # four channels, both playing
+        cast = AEC.Ref("Cast", "Cast", 2)
+        cast.delay = 3000.0
+        cast.timeline.last_loud = 100.0
+        # the laptop masked by the cast (its mirror: the cast's echo in its probe, its own filter still removing
+        # an echo): heard by proxy, its slot is not taken
+        self._watch_windows(eng, lap, AEC.UNHEARD_WINDOWS - 1, [(10000, 11000, cast)])
+        self.assertFalse(eng._slot(cast))
+        # unheard for one window: not yet
+        self._watch_windows(eng, lap, AEC.EVICT_UNHEARD_WINDOWS - 1, [(10000, 11000, cast)], est=1e1)
+        self.assertFalse(eng._slot(cast))
+        self._watch_windows(eng, lap, 1, [(10000, 11000, cast)], est=1e1)
+        self.assertEqual(lap.bad_windows, AEC.EVICT_UNHEARD_WINDOWS)
+        # a remembered delay (provisional) is not a heard newcomer
+        self.assertFalse(eng._slot(cast, provisional=True))
+        self.assertTrue(lap.slotted and usb.slotted)
+        # found by the probe: the laptop gives way, the heard USB speaker keeps its slot
+        self.assertTrue(eng._slot(cast))
+        self.assertFalse(lap.slotted)
+        self.assertTrue(usb.slotted)
+        self.assertEqual((eng.stats["evicted"], eng.stats["evicted_unheard"]), (1, 1))
+        self.assertGreater(lap.unheard_until, 100.0)
+
+    def test_nothing_is_evicted_unless_the_newcomer_then_fits(self):
+        eng, _ = self._decider()
+        quiet, _, small = self._full(eng, ("Quiet", 1, 50.0), ("B", 2, 100.0), ("C", 1, 100.0))  # 3 slots, 4 ch
+        d = AEC.Ref("D", "D", 2)
+        d.delay = 3000.0
+        # the silent slot alone does not make room for two channels: it is not evicted for nothing
+        self.assertFalse(eng._slot(d))
+        self.assertTrue(quiet.slotted)
+        self.assertEqual(eng.stats["evicted"], 0)
+        # with C unheard while it plays, the silent one and C together do
+        small.bad_windows = AEC.EVICT_UNHEARD_WINDOWS
+        self.assertTrue(eng._slot(d))
+        self.assertFalse(quiet.slotted or small.slotted)
+        self.assertEqual((eng.stats["evicted"], eng.stats["evicted_unheard"]), (2, 1))
 
     def test_a_slot_whose_echo_is_still_there_is_not_moved(self):
         eng, ref = self._decider()
