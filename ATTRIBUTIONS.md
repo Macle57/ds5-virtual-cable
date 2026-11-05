@@ -115,8 +115,9 @@ without ceremony and would be far harder without.
 
 [SpeexDSP](https://github.com/xiph/speexdsp) (Jean-Marc Valin and the Xiph.org
 contributors, BSD-3-Clause) is the microphone echo canceller's linear stage and
-resampler. It is vendored with one small patch to `mdf.c`: an adaptation-step control
-and a DC-notch control (`SPEEX_ECHO_SET_ADAPT_SCALE`, `SPEEX_ECHO_SET_NOTCH_RADIUS`); `NOTICE` has the details.
+resampler. It is vendored with one small patch to `mdf.c`: an adaptation-step control,
+a DC-notch control and a reference-rescale control (`SPEEX_ECHO_SET_ADAPT_SCALE`, `SPEEX_ECHO_SET_NOTCH_RADIUS`,
+`SPEEX_ECHO_SCALE_REFERENCE`); `NOTICE` has the details.
 
 ---
 

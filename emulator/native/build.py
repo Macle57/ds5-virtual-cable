@@ -13,10 +13,12 @@ SpeexDSP-1.2.1.tar.gz, sha256 d17ca363654556a4ff1d02cc13d9eb1fc5a8642c90b40bd54c
 The files are byte-identical to the release except speexdsp_config_types.h,
 which upstream generates at configure time and is written out here, and a
 patch to mdf.c / include/speex/speex_echo.h (every changed line is marked
-"ds5-virtual-usb patch") adding two ctls: SPEEX_ECHO_SET_ADAPT_SCALE scales the
+"ds5-virtual-usb patch") adding three ctls: SPEEX_ECHO_SET_ADAPT_SCALE scales the
 filter's adaptation step (0 = frozen; 1, the default, is upstream behaviour),
-and SPEEX_ECHO_SET_NOTCH_RADIUS sets the mic-side DC notch (aec.py uses .998;
-upstream .992 cut the near end below ~150 Hz).
+SPEEX_ECHO_SET_NOTCH_RADIUS sets the mic-side DC notch (aec.py uses .998;
+upstream .992 cut the near end below ~150 Hz), and SPEEX_ECHO_SCALE_REFERENCE
+rescales the state when the reference is fed at a new gain (aec.py boosts a
+quiet endpoint's reference; the filter it learned stays valid).
 
 The compiler is found the way setuptools finds it for C extensions (vswhere ->
 MSVC), so neither a developer prompt nor any download is needed: a Visual

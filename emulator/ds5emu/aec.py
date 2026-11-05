@@ -53,7 +53,8 @@ What makes it safe to leave on:
   * nothing happens until a reference is proven to reach this mic: an
     endpoint gets a filter only after two non-overlapping 1 s probes find
     its echo at the same delay with a peak above anything unrelated audio
-    produced in calibration, or one probe at twice that -- or, after a
+    produced in calibration, or one probe at twice that, or four in a row at
+    a lower peak (PROBE_RUN_VOTES) -- or, after a
     restart, on the delay it had last time, provisionally: unless a probe or
     the filter confirms it within `PROVISIONAL_S` it is forgotten.
     Headphones never qualify, so they never change the mic;
@@ -129,11 +130,45 @@ QUEUE_MAX_MS = 150
 ANALYSE_EVERY_S = 0.02
 #: Lost mic packets up to this many are filled with silence; more is a gap.
 SEQ_MAX_FILL = 25
-#: A reference frame quieter than this (-60 dBFS RMS) is silence.
+#: A reference frame quieter than this (-60 dBFS RMS) is silence -- for an endpoint playing at full scale.
+#: The gate follows each endpoint's own audio (`RefTimeline.loud_thr`): a frame is silence LOUD_REL_DB under
+#: its playing level or less than LOUD_OVER_FLOOR_DB over its noise floor (the quietest packets over the last
+#: LOUD_FLOOR_WINDOW_S), never above LOUD_RMS and never below LOUD_FLOOR_DB. Some endpoints apply their volume
+#: in software BEFORE the loopback tap (spacedesk: at volume 0.1 its reference sat at -63 dBFS median, 63 % of
+#: its packets under -60, while the iPad still played 23 dB under full level and the room heard it; MEASURED
+#: round 10, block K calibrated). Digital silence and faint hiss stay under LOUD_FLOOR_DB, and a steady signal
+#: over it (keep-alive noise players, comfort noise) sets its own floor, so the idle path is reached for them. The
+#: margin over the floor is small on purpose: a 10 ms packet of steady noise varies by ~0.3 dB (+-0.9 dB over
+#: 1000 packets), while quiet music without pauses only dips 3-7 dB under its median (with a 10 dB margin, music
+#: at -63 dBFS counted as playing 6 % of the time; with 3 dB, 84 %; review of round 10).
 LOUD_RMS = 1e-3
+LOUD_REL_DB = 40.0
+LOUD_FLOOR_DB = -70.0
+LOUD_OVER_FLOOR_DB = 3.0
+LOUD_FLOOR_WINDOW_S = 10
+#: speexdsp's MDF is not level-invariant (absolute regularisation terms in its step size): fed a reference at
+#: -58 dBFS its leak estimate sat at 1.0 and it did not adapt (MEASURED round 10, block K calibrated, spacedesk at
+#: volume 0.1: 0.2 dB of its echo removed; the same replay with the reference 20 dB up: 9.1 dB). A quiet endpoint's
+#: reference is therefore fed to its stage boosted (`EchoCanceller._normalise`): toward REF_NORM_DB from its slow
+#: playing level (`RefTimeline.level_slow_db`: the un-boosted reference's loud passages, packets over
+#: LOUD_FLOOR_DB only, so hiss never counts), in REF_NORM_STEP_DB steps, at most REF_NORM_MAX_DB, never so far
+#: that the recent peak (`RefTimeline.peak_db`) would come within REF_NORM_HEADROOM_DB of clipping, never
+#: attenuated, and only once the level has REF_NORM_MATURE_S of audio behind it (a fade-in or a quiet intro is
+#: not a playing level). A lower gain -- 0 dB, or what the headroom allows -- is taken at once; a higher one only
+#: when it is REF_NORM_MOVE_DB higher, not within REF_NORM_HOLD_S of the last change (or at the first mature
+#: choice). Each change rescales the stage's state with it (`NativeStage.scale_ref`, SPEEX_ECHO_SCALE_REFERENCE)
+#: so the learned filter stays right. Full-scale endpoints (Realtek's loopback is taken before its volume, the
+#: pads' USB speakers) are never boosted.
+REF_NORM_DB = -30.0
+REF_NORM_STEP_DB = 6.0
+REF_NORM_MAX_DB = 40.0
+REF_NORM_MOVE_DB = 12.0
+REF_NORM_HOLD_S = 30.0
+REF_NORM_MATURE_S = 10.0
+REF_NORM_HEADROOM_DB = 6.0
 #: A microphone window quieter than this (-90 dBFS RMS, about one LSB of the
 #: pad's 16-bit mic) carries nothing to look for an echo in: the probe and
-#: the fine alignment skip it. It is NOT the reference's -60 dBFS: the echo of
+#: the fine alignment skip it. It is NOT the reference's gate (LOUD_RMS, -60 dBFS at full scale): the echo of
 #: a PC speaker in the pad's mic is routinely far quieter than the audio
 #: Windows sends that speaker. The loopback reference is taken BEFORE the
 #: endpoint volume (MEASURED round 9, laptop Realtek speakers: a -20 dBFS tone
@@ -231,6 +266,36 @@ PROBE_VOTES = 2
 PROBE_PAIR_PEAK = 7.0
 PROBE_PAIR_SPAN_MS = 60
 PROBE_PAIR_VOTES = 3
+#: A run of weaker peaks (see `_run_vote`): this many probe windows IN A ROW whose best peak is at least
+#: PROBE_CONFIRM_PEAK, all at the same lag (+-PROBE_AGREE_MS), are as good as two votes. Unrelated audio puts its
+#: best peak somewhere new every window. MEASURED round 10 (block K multi: a USB pad speaker under the laptop's
+#: louder echo and a voice): the echo was at the right lag in 15 windows in a row with peaks 7.6-12.1 and was
+#: slotted only after ~22 s (two agreeing peaks >= 12 needed); with this rule ~5 s. Against unrelated audio
+#: (that reference moved under two other takes, 308 windows): max peak 8.3, never two in a row >= 8.
+PROBE_RUN_VOTES = 4
+#: Mirrored audio -- the same stream on two endpoints (laptop speakers + a cast display): each endpoint's probe
+#: also sees the OTHER endpoint's echo, at that echo's lag plus the offset between the two references. A slotted
+#: endpoint's echo is not another endpoint's: where another slotted endpoint's reference matches this one's
+#: (ref-to-ref GCC-PHAT peak >= PROBE_GHOST_PEAK), the lag its echo would show up at here (+-PROBE_GHOST_MS) is
+#: left out of this endpoint's peak search (`_ghosts`). MEASURED round 10 (block K, Realtek + spacedesk playing
+#: the same short): the Realtek slot moved between its own echo (~17 ms) and the iPad's (~287 ms) every few
+#: windows (7 moves in a take) because the iPad's echo, seen through Realtek's reference, peaked higher.
+PROBE_GHOST_PEAK = 12.0
+PROBE_GHOST_MS = 10
+#: Which endpoint takes a mirrored echo must not depend on which slotted first. An unslotted endpoint whose only
+#: echo is another slotted endpoint's ghost (best peak inside a ghost range at >= PROBE_MIN_PEAK, nothing else
+#: >= PROBE_CONFIRM_PEAK) asks that endpoint to YIELD for PROBE_YIELD_S: its probe then looks outside its own
+#: window too, and if it finds another echo of its own there (PROBE_RUN_VOTES agreeing windows at peaks >=
+#: PROBE_CONFIRM_PEAK during the yield, not a ghost) it moves to it with a fresh filter, leaving the asker its echo.
+PROBE_YIELD_S = 12.0
+#: An endpoint that asked another to yield and did not get its echo asks that endpoint again only after
+#: PROBE_YIELD_BACKOFF_S, doubling each time (at most PROBE_YIELD_BACKOFF_MAX_S): a mirror the room never hears
+#: (headphones, a muted cast display, a virtual sink) sees the other's echo in its probe for as long as both play,
+#: and must not keep that endpoint yielding. While yielding, an endpoint still follows its own echo the normal
+#: way (two agreeing windows, a move that keeps the taps) for a shift within its filter's tail; only a jump
+#: further than that is the yield move.
+PROBE_YIELD_BACKOFF_S = 120.0
+PROBE_YIELD_BACKOFF_MAX_S = 1800.0
 PROBE_AGREE_MS = 2
 PROBE_EVERY_S = 0.25
 #: A slotted endpoint whose loopback stream re-anchored (a new playback: Realtek's stamps then jump by tens
@@ -337,7 +402,7 @@ def _dll_path() -> str:
 _DLL = None
 
 
-NATIVE_VERSION = 5
+NATIVE_VERSION = 6
 
 #: The residual stage's tunables (ds5aec.c, `ds5aec_param` ids). The defaults
 #: live in the DLL; `DS5_AEC_RESIDUAL="beta=2,floor_db=-20"` overrides some for
@@ -376,6 +441,8 @@ def load_native():
         d.ds5mdf_flush.argtypes = [vp, ci]
         d.ds5mdf_set_base_adapt.argtypes = [vp, ctypes.c_float]
         d.ds5mdf_set_notch.argtypes = [vp, ctypes.c_float]
+        d.ds5mdf_scale_ref.argtypes = [vp, ctypes.c_float]
+        d.ds5mdf_scale_ref.restype = ci
         d.ds5rs_new.restype = vp
         d.ds5rs_new.argtypes = [ci, ci, ci, ci]
         d.ds5rs_free.argtypes = [vp]
@@ -410,6 +477,12 @@ class NativeStage:
         """Run without adapting (a kept filter whose echo is not re-located yet)."""
         if self._h:
             self._d.ds5mdf_set_base_adapt(self._h, 0.0 if frozen else 1.0)
+
+    def scale_ref(self, g: float) -> bool:
+        """The reference will be fed `g` times larger from now on: rescale the
+        filter's state so what it learned stays right (REF_NORM_*). False if the
+        native core refused (then the caller resets the filter)."""
+        return bool(self._h) and self._d.ds5mdf_scale_ref(self._h, float(g)) == 0
 
     def flush(self, frames: int = TAIL_MS // 10 + 1) -> None:
         """Make the filter's reference history silence (weights untouched)."""
@@ -584,6 +657,19 @@ class RefTimeline:
         self.anchors = 0
         self.last_push = -math.inf
         self.last_loud = -math.inf
+        #: The endpoint's levels, dB of per-channel packet power over packets above LOUD_FLOOR_DB: playing level
+        #: (up within ~50 ms, down over ~5 s), slow playing level (up ~0.5 s, down ~20 s; REF_NORM_DB), recent
+        #: peak sample (dBFS, down ~20 s), seconds of such audio so far; the noise floor (minimum packet power over
+        #: the last LOUD_FLOOR_WINDOW_S); and the RMS under which a frame counts as silence (see LOUD_REL_DB).
+        self.level_db: float | None = None
+        self.level_slow_db: float | None = None
+        self.peak_db = -math.inf
+        self.level_secs = 0.0
+        self.floor_db = -math.inf
+        self._mins: deque = deque(maxlen=LOUD_FLOOR_WINDOW_S)
+        self._min_cur = math.inf
+        self._min_n = 0
+        self.loud_thr = LOUD_RMS
 
     @property
     def wpos(self) -> float | None:
@@ -613,8 +699,41 @@ class RefTimeline:
             self.off += max(REF_STAMP_ALPHA, 1.0 / self._n) * ((epos - self._w) - self.off)
             self._last_t = t_end
             self.last_push = t_end
-            if float(np.vdot(x, x)) > LOUD_RMS * LOUD_RMS * n:
+            p = float(np.vdot(x, x)) / n               # summed over the channels: the frame gate, as before
+            self._levels(x, n, p)
+            if p > self.loud_thr * self.loud_thr:
                 self.last_loud = t_end
+
+    def _levels(self, x: np.ndarray, n: int, p: float) -> None:
+        """Update the level trackers and the silence gate from one packet (under the lock)."""
+        k = n / FRAME                                  # the rates below are per 10 ms of audio
+
+        def follow(cur, new, up, down):
+            a = up if new > cur else down
+            return cur + (1.0 - (1.0 - a) ** k) * (new - cur)
+
+        pm_db = 10.0 * math.log10(p / self.nch + 1e-30)
+        # noise floor: minimum statistics over LOUD_FLOOR_WINDOW_S one-second blocks
+        self._min_cur = min(self._min_cur, max(pm_db, -120.0))
+        self._min_n += n
+        if self._min_n >= FS:
+            self._mins.append(self._min_cur)
+            self._min_cur, self._min_n = math.inf, 0
+        if len(self._mins) == self._mins.maxlen:
+            self.floor_db = min(self._mins)
+        if pm_db > LOUD_FLOOR_DB:
+            pk_db = 20.0 * math.log10(float(np.max(np.abs(x))) + 1e-30)
+            if self.level_db is None:
+                self.level_db = self.level_slow_db = pm_db
+                self.peak_db = pk_db
+            else:
+                self.level_db = follow(self.level_db, pm_db, 0.2, 0.002)
+                self.level_slow_db = follow(self.level_slow_db, pm_db, 0.02, 0.0005)
+                self.peak_db = pk_db if pk_db > self.peak_db else follow(self.peak_db, pk_db, 1.0, 0.0005)
+            self.level_secs += n / FS                # audio over LOUD_FLOOR_DB behind the level estimate
+        if self.level_db is not None:
+            thr_db = max(self.level_db - LOUD_REL_DB, self.floor_db + LOUD_OVER_FLOOR_DB, LOUD_FLOOR_DB)
+            self.loud_thr = 10.0 ** (min(thr_db, 20.0 * math.log10(LOUD_RMS)) / 20.0)
 
     def _append(self, x: np.ndarray) -> None:
         n = int(x.shape[0])
@@ -734,14 +853,16 @@ def _decimate(x: np.ndarray, k: int = PROBE_DECIM) -> np.ndarray:
 
 
 def estimate_lag(mic: np.ndarray, ref: np.ndarray, max_lag: int, lead: int = 0,
-                 near: tuple | None = None, second: bool = False):
+                 near: tuple | None = None, second: bool = False, exclude: tuple = ()):
     """GCC-PHAT. `mic` is W samples; `ref` covers [max_lag before mic, lead after
     it]. Returns (lag in 48 kHz samples, peak-to-RMS confidence); lag in
     [-lead, max_lag], positive = the echo is later than the reference. With
     `near=(lo, hi)` (lags, 48 kHz samples) a third value is returned: the
     confidence of the highest peak inside that range. With `second`, two more
     values instead: the lag and confidence of the highest peak at least
-    PROBE_AGREE_MS away from the first."""
+    PROBE_AGREE_MS away from the first. `exclude`: (lo, hi) lag ranges (48 kHz
+    samples) the best peaks are not looked for in (another endpoint's echo,
+    `EchoCanceller._ghosts`); the `near` confidence and the RMS ignore them."""
     m = _decimate(mic)
     r = _decimate(ref)
     L = max_lag // PROBE_DECIM
@@ -751,9 +872,17 @@ def estimate_lag(mic: np.ndarray, ref: np.ndarray, max_lag: int, lead: int = 0,
     nfft = 1 << int(math.ceil(math.log2(m.size + r.size)))
     G = np.fft.rfft(r, nfft) * np.conj(np.fft.rfft(m, nfft))
     G /= np.abs(G) + 1e-12
-    cc = np.fft.irfft(G, nfft)[: L + A + 1]
+    cc_all = np.fft.irfft(G, nfft)[: L + A + 1]
+    rms = float(np.sqrt(np.mean(cc_all * cc_all))) + 1e-12
+    cc = cc_all
+    if exclude:
+        cc = cc_all.copy()
+        for lo, hi in exclude:
+            a = max(0, int(math.floor(L - hi / PROBE_DECIM)))
+            b = min(cc.size - 1, int(math.ceil(L - lo / PROBE_DECIM)))
+            if b >= a:
+                cc[a:b + 1] = -np.inf
     k = int(np.argmax(cc))
-    rms = float(np.sqrt(np.mean(cc * cc))) + 1e-12
     if second:
         g = PROBE_AGREE_MS * FS // 1000 // PROBE_DECIM + 1
         c2 = cc.copy()
@@ -766,7 +895,7 @@ def estimate_lag(mic: np.ndarray, ref: np.ndarray, max_lag: int, lead: int = 0,
     # lag (L - k) * DECIM in [lo, hi]  <=>  k in [L - hi/DECIM, L - lo/DECIM]
     k0 = max(0, int(math.floor(L - near[1] / PROBE_DECIM)))
     k1 = min(cc.size - 1, int(math.ceil(L - near[0] / PROBE_DECIM)))
-    local = float(np.max(cc[k0:k1 + 1])) / rms if k1 >= k0 else 0.0
+    local = float(np.max(cc_all[k0:k1 + 1])) / rms if k1 >= k0 else 0.0
     return (L - k) * PROBE_DECIM, float(cc[k]) / rms, local
 
 
@@ -808,6 +937,11 @@ def pattern_shift(now: np.ndarray, then: np.ndarray, max_shift: int, up: int = 1
 # ---------------------------------------------------------------------------
 # references
 # ---------------------------------------------------------------------------
+
+
+def W_PROBE() -> int:
+    """The probe window in samples."""
+    return int(PROBE_WINDOW_S * FS)
 
 
 def _probe_mix(ref: np.ndarray) -> np.ndarray:
@@ -881,6 +1015,22 @@ class Ref:
         self.prov_moved = False
         #: Agreeing two-arrival probe results (see PROBE_PAIR_*).
         self.pair_votes: list = []
+        #: Agreeing weaker single peaks in a row (see PROBE_RUN_VOTES).
+        self.run_votes: list = []
+        #: Lag ranges (lo, hi, endpoint) other endpoints' echoes explain in this one's last probe (see
+        #: PROBE_GHOST_*), the slot generation they were taken at, and until when this endpoint has been asked
+        #: to yield the echo it holds (PROBE_YIELD_S).
+        self.ghosts: list = []
+        self.ghost_gen = -1
+        self.yield_until = -math.inf
+        #: When this endpoint may next ask each other endpoint (by id) to yield, and the back-off it is at.
+        self.ask_next: dict = {}
+        #: Gain (dB) this endpoint's reference is fed to its stage with (see REF_NORM_*), when it was last
+        #: changed (clock), and whether the first choice from a mature level has been made for this filter.
+        self.norm_db = 0.0
+        self.norm_at = -math.inf
+        self.norm_decided = False
+        self.norm_off = False                   # the native core refused a rescale: no boost for this filter
         self.store_tried = False
         self.votes: list = []
         self.last_probe_pos: int | None = None
@@ -938,7 +1088,8 @@ class Ref:
                 "slotted": self.slotted, "provisional": self.provisional,
                 "view": VIEW_NAMES[self.view],
                 "delay_ms": None if self.delay is None else round((self.delay + self.adj) * 1000 / FS, 2),
-                "conf": round(self.lag_conf, 1), "anchors": self.timeline.anchors,
+                "conf": round(self.lag_conf, 1), "anchors": self.timeline.anchors, "ref_gain_db": self.norm_db,
+                "ghosts_ms": [round((g[0] + g[1]) * 500 / FS, 1) for g in self.ghosts],
                 "echo_share_db": None if self.est_share_db is None else round(self.est_share_db, 1),
                 "removal_ratio": None if self.removal_ratio is None else round(self.removal_ratio, 2),
                 "drift_ppm": round(self.rate * 1e6, 2)}
@@ -1074,9 +1225,10 @@ class EchoCanceller:
         self._probe_rr = 0
         self.mode = "starting"
         self.reason = ""
+        self._slot_gen = 0                      # bumped whenever the set of slots changes (ghost ranges)
         self.stats = {"frames": 0, "frames_active": 0, "lost_packets": 0,
                       "refused": 0, "overruns": 0, "native_errors": 0, "slotted": 0,
-                      "slotted_from_store": 0, "store_rejected": 0, "evicted": 0, "pair_slotted": 0,
+                      "slotted_from_store": 0, "store_rejected": 0, "evicted": 0, "pair_slotted": 0, "run_slotted": 0, "yield_asks": 0, "yield_moves": 0,
                       "unslotted": 0, "delay_moves": 0, "fine_moves": 0, "drift_fits": 0, "fine_repatterns": 0,
                       "view_changes": 0, "probes": 0, "sessions": 0,
                       "native_us": 0.0}
@@ -1359,7 +1511,8 @@ class EchoCanceller:
             if ref.rate:
                 ref.adj += ref.rate * FRAME         # follow the endpoint's clock
             r = ref.timeline.read(pos - base - ref.delay - ref.adj, FRAME)
-            is_loud = float(np.vdot(r, r)) > LOUD_RMS * LOUD_RMS * FRAME
+            thr = ref.timeline.loud_thr
+            is_loud = float(np.vdot(r, r)) > thr * thr * FRAME
             ref.quiet_frames = 0 if is_loud else ref.quiet_frames + 1
             if ref.quiet_frames >= ACTIVE_HOLD_FRAMES:
                 continue                        # silent: its filter is not run
@@ -1374,6 +1527,9 @@ class EchoCanceller:
                 # (side silent) the mid filter learns the true sum of the two
                 # paths and nothing is split arbitrarily between channels
                 r = np.stack([r[:, 0] + r[:, 1], r[:, 0] - r[:, 1]], 1) * 0.5
+            self._normalise(ref)
+            if ref.norm_db:
+                r = r * np.float32(10.0 ** (ref.norm_db / 20.0))
             refs.append(np.ascontiguousarray((np.clip(r, -1.0, 1.0) * 32767.0).astype("<i2")))
             stages.append(ref.stage)
             run.append(ref)
@@ -1402,6 +1558,39 @@ class EchoCanceller:
                     self._watch(ref, float(st[0]), float(ss[3 * j]), float(ss[3 * j + 1]),
                                 float(ss[3 * j + 2]))
         return out
+
+    def _normalise(self, ref: Ref) -> None:
+        """Choose the gain this endpoint's reference is fed to its stage with
+        (see REF_NORM_DB). Called per frame while it runs."""
+        if ref.norm_off:
+            return
+        tl = ref.timeline
+        lvl = tl.level_slow_db
+        want = 0.0
+        if lvl is not None and tl.level_secs >= REF_NORM_MATURE_S:
+            step = REF_NORM_STEP_DB
+            want = min(step * math.floor(max(REF_NORM_DB - lvl, 0.0) / step + 0.5), REF_NORM_MAX_DB)
+            want = max(0.0, min(want, step * math.floor((-REF_NORM_HEADROOM_DB - tl.peak_db) / step)))
+        cur = ref.norm_db
+        if want == cur:
+            if lvl is not None and tl.level_secs >= REF_NORM_MATURE_S:
+                ref.norm_decided = True
+            return
+        now = self._clock()
+        if want > cur and ref.norm_decided and (want - cur < REF_NORM_MOVE_DB or now - ref.norm_at < REF_NORM_HOLD_S):
+            return                              # a higher gain: rare (see REF_NORM_MOVE_DB)
+        ref.norm_decided = True
+        if ref.stage is not None and hasattr(ref.stage, "scale_ref") and \
+                not ref.stage.scale_ref(10.0 ** ((want - cur) / 20.0)):
+            log.warning("echo filter of %s could not be rescaled -- starting it over, without a boost", ref.name)
+            ref.stage.reset()                   # a reset filter is fed at 0 dB again (native gain 1)
+            ref.norm_db = 0.0
+            ref.norm_off = True
+            return
+        log.info("echo of %s: its reference plays at %.0f dB (peak %.0f dBFS) -- feeding it to the filter %+.0f dB",
+                 ref.name, -999.0 if lvl is None else lvl, tl.peak_db, want)
+        ref.norm_db = want
+        ref.norm_at = now
 
     def _unsettle(self, ref: Ref) -> None:
         if not ref.slotted:
@@ -1545,9 +1734,16 @@ class EchoCanceller:
         ref.provisional = provisional
         ref.prov_moved = False
         ref.quiet_frames = 0
+        ref.norm_db = 0.0                       # a new or reset filter: fed un-boosted until _normalise decides
+        ref.norm_decided = False
+        ref.norm_off = False
+        ref.run_votes = []
+        ref.yield_until = -math.inf
+        ref.ask_next = {}
         ref._clear_windows()
         ref._clear_fine()
         self.stats["slotted"] += 1
+        self._slot_gen += 1
         return True
 
     def _unslot(self, ref: Ref) -> None:
@@ -1564,8 +1760,13 @@ class EchoCanceller:
         ref.view = 0
         ref.votes = []
         ref.track_votes = []
+        ref.run_votes = []
+        ref.norm_db = 0.0
+        ref.norm_decided = False
+        ref.yield_until = -math.inf
         ref._clear_windows()
         ref._clear_fine()
+        self._slot_gen += 1
 
     # -- the probe ---------------------------------------------------------------
 
@@ -1623,22 +1824,32 @@ class EchoCanceller:
             job = self._probe_gather(ref)
         if job is None:
             return
-        mic, views, M, A, near = job
+        mic, views, M, A, near, others, gen, yielding = job
+        ghosts = self._ghosts(views[0][M:M + W_PROBE()], views[0], others, M, A)
+        ex = tuple((lo, hi) for lo, hi, _ in ghosts)
+        if yielding and near is not None:
+            ex = ex + (near,)                   # asked to yield: look for an echo of its own outside its window
         if near is not None:
-            res = [estimate_lag(mic, v, M, A, near=near) for v in views]
+            res = [estimate_lag(mic, v, M, A, near=near, exclude=ex) for v in views]
         else:
-            res = [estimate_lag(mic, v, M, A, second=True) for v in views]
+            res = [estimate_lag(mic, v, M, A, second=True, exclude=ex) for v in views]
+        unmasked = estimate_lag(mic, views[0], M, A) if ghosts and near is None else None
         with self._state:
             if ref.slotted != (near is not None):
                 return                          # slotted or dropped meanwhile: decide next time
-            self._probe_apply(ref, now, res, near is not None)
+            if gen != self._slot_gen:
+                return                          # another endpoint slotted or left meanwhile: its echo may be here
+            ref.ghosts = ghosts
+            self._probe_apply(ref, now, res, near is not None, unmasked=unmasked)
 
     def _probe_gather(self, ref: Ref):
         W = int(PROBE_WINDOW_S * FS)
         P = self.mic_hist.wpos
         # non-overlapping windows: a proven slotted reference is re-checked
         # every TRACK_EVERY_S, anything else at most once per window
-        gap = TRACK_EVERY_S * FS if ref.slotted and not ref.provisional and not ref.unsettled else W
+        yielding = ref.slotted and self._clock() < ref.yield_until
+        gap = TRACK_EVERY_S * FS if (ref.slotted and not ref.provisional and not ref.unsettled
+                                     and not yielding) else W
         if ref.last_probe_pos is not None and 0 <= P - ref.last_probe_pos < gap:
             return
         M = int(PROBE_MAX_LAG_S * FS)
@@ -1646,9 +1857,12 @@ class EchoCanceller:
         base = REF_BASE_MS * FS // 1000
         mic = self.mic_hist.read(P - W, W)
         views = _probe_views(ref.timeline.read(P - W - base - M, W + M + A))
-        if (float(np.sqrt(np.mean(views[0][M:M + W] ** 2))) < LOUD_RMS
+        if (float(np.sqrt(np.mean(views[0][M:M + W] ** 2))) < ref.timeline.loud_thr
                 or float(np.sqrt(np.mean(mic ** 2))) < MIC_MIN_RMS):
+            ref.run_votes = []                  # a skipped window breaks a run
             return
+        if ref.last_probe_pos is not None and P - ref.last_probe_pos > 2 * W:
+            ref.run_votes = []                  # ... and so does a gap
         ref.last_probe_pos = P
         self.stats["probes"] += 1
         near = None
@@ -1658,9 +1872,40 @@ class EchoCanceller:
             # peak over the whole search range, so a lower bar confirms it
             exp = ref.delay + ref.adj + EARLY_MS * FS // 1000
             near = (exp - TRACK_EARLY_MS * FS // 1000, exp + TRACK_LATE_MS * FS // 1000)
-        return mic, views, M, A, near
+        # the other slotted endpoints, for the ghost ranges (`_ghosts`): which, and where their echo is, noted
+        # here; their references are read and correlated outside the lock (a timeline has its own lock).
+        # Unsettled or provisional ones are left out: their delay is not confirmed.
+        others = [(other, other.delay + other.adj + EARLY_MS * FS // 1000) for other in self._slots
+                  if other is not ref and other.stage is not None and other.delay is not None
+                  and not other.unsettled and not other.provisional]
+        return mic, views, M, A, near, (others, P - W - base - M), self._slot_gen, yielding
 
-    def _probe_apply(self, ref: Ref, now: float, res: list, slotted: bool) -> None:
+    @staticmethod
+    def _ghosts(seg_w: np.ndarray, seg: np.ndarray, others: tuple, M: int, A: int) -> list:
+        """The lag ranges where OTHER slotted endpoints' echoes show up in this
+        endpoint's probe window: for each other slotted endpoint whose reference
+        over the window matches this one's (ref-to-ref GCC-PHAT, either way round,
+        peak >= PROBE_GHOST_PEAK), its echo lag minus the offset between the two
+        references, +-PROBE_GHOST_MS. Mirrored audio only; unrelated references
+        give nothing. `seg`: this endpoint's mix over the probe span, `seg_w` its
+        window part; `others`: ([(endpoint, its echo lag)], the span's start).
+        Runs outside `_state`."""
+        out = []
+        tol = PROBE_GHOST_MS * FS // 1000
+        lst, pos = others
+        for other, e_o in lst:
+            oseg = _probe_mix(other.timeline.read(pos, seg.size))
+            if float(np.sqrt(np.mean(oseg[M:M + seg_w.size] ** 2))) < other.timeline.loud_thr:
+                continue
+            lag, pk = estimate_lag(seg_w, oseg, M, A)              # this reference later than the other
+            lag2, pk2 = estimate_lag(oseg[M:M + seg_w.size], seg, M, A)   # the other later than this one
+            if pk2 > pk:
+                lag, pk = -lag2, pk2
+            if pk >= PROBE_GHOST_PEAK:
+                out.append((e_o - lag - tol, e_o - lag + tol, other))
+        return out
+
+    def _probe_apply(self, ref: Ref, now: float, res: list, slotted: bool, unmasked=None) -> None:
         agree = PROBE_AGREE_MS * FS // 1000
         # Whether and where the echo is: the best peak of the views. Which view
         # the endpoint is aligned on: by margin (see PROBE_VIEW_MARGIN).
@@ -1677,11 +1922,31 @@ class EchoCanceller:
             # whose highest peak is elsewhere did not find this echo
             scores = [r[1] if abs(r[0] - lag) <= agree else 0.0 for r in res]
         ref.lag_conf = conf
-        if conf < PROBE_MIN_PEAK:
+        if not ref.slotted and unmasked is not None and conf < PROBE_CONFIRM_PEAK \
+                and unmasked[1] >= PROBE_MIN_PEAK:
+            # its only echo is another endpoint's ghost: if that endpoint holds an echo that is ours (it slotted
+            # first, on what both see), ask it to look for one of its own (PROBE_YIELD_S)
+            for lo, hi, owner in ref.ghosts:
+                nxt, back = ref.ask_next.get(owner.id, (-math.inf, PROBE_YIELD_BACKOFF_S))
+                if lo <= unmasked[0] <= hi and owner.slotted and now >= owner.yield_until and now >= nxt:
+                    owner.yield_until = now + PROBE_YIELD_S
+                    owner.track_votes = []
+                    ref.ask_next[owner.id] = (now + back, min(2 * back, PROBE_YIELD_BACKOFF_MAX_S))
+                    self.stats["yield_asks"] += 1
+                    log.info("echo of %s is where %s's filter is -- asking it to look for its own", ref.name,
+                             owner.name)
+        if not ref.slotted and self._run_vote(ref, lag, conf, scores, agree):
+            return
+        yielding = ref.slotted and now < ref.yield_until
+        # while yielding, a jump beyond the filter's tail is looked for at a lower bar (the asker's need
+        # corroborates it); anything closer is the endpoint's own echo moving, followed the normal way
+        far = yielding and abs(lag - EARLY_MS * FS // 1000 - ref.delay - ref.adj) > TAIL_MS * FS // 1000
+        if conf < (PROBE_CONFIRM_PEAK if far else PROBE_MIN_PEAK):
             if not ref.slotted:
                 ref.votes = []
                 self._pair_vote(ref, res, agree)
-            ref.track_votes = []
+            if not yielding:
+                ref.track_votes = []            # (a yielding endpoint keeps its votes over a weak window)
             return
         delay = lag - EARLY_MS * FS // 1000
         if not ref.slotted:
@@ -1711,8 +1976,42 @@ class EchoCanceller:
             if ref.unsettled and abs(shift) <= 2 * agree:
                 self._settle(ref)
             return
-        ref.track_votes = [v for v in ref.track_votes[-1:] if abs(v - shift) <= agree] + [shift]
-        if len(ref.track_votes) >= 2 or (ref.unsettled and conf >= PROBE_SURE_PEAK):
+        if shift > TRACK_LATE_MS * ms and not yielding and max(r[2] for r in res) >= PROBE_CONFIRM_PEAK:
+            # the echo is still where the filter is: a stronger peak further LATE (another endpoint's echo that
+            # the ghost ranges did not catch) is no reason to move. Early moves are not held back: after an early
+            # step the old window still holds the echo's own later reflections.
+            ref.heard = True
+            ref.track_votes = []
+            return
+        if far:
+            # an echo of its own beyond its filter's tail, PROBE_RUN_VOTES windows in a row (peaks >= CONFIRM:
+            # the other endpoint's need corroborates it)
+            ref.track_votes = [v for v in ref.track_votes[-(PROBE_RUN_VOTES - 1):] if abs(v - shift) <= agree] + [shift]
+        else:
+            ref.track_votes = [v for v in ref.track_votes[-1:] if abs(v - shift) <= agree] + [shift]
+        if far and len(ref.track_votes) >= PROBE_RUN_VOTES:
+            # it held an echo another endpoint needs and has found one of its own: a different echo, so a fresh
+            # filter rather than the moved taps
+            ref.delay += ref.adj + float(np.median(ref.track_votes))
+            ref.adj = 0.0
+            ref.track_votes = []
+            ref.yield_until = -math.inf
+            ref._clear_fine()
+            if ref.stage is not None:
+                ref.stage.reset()
+            ref.norm_db = 0.0
+            ref.norm_decided = False
+            ref.norm_off = False
+            if ref.unsettled:
+                self._settle(ref)               # a fresh filter on a located echo: let it adapt
+            self._slot_gen += 1
+            self.stats["delay_moves"] += 1
+            self.stats["yield_moves"] += 1
+            log.info("echo of %s: moved to its own echo %.1f ms behind its reference", ref.name,
+                     (ref.delay + EARLY_MS * FS // 1000) * 1000 / FS)
+            self._remember(ref)
+            return
+        if not far and (len(ref.track_votes) >= 2 or (ref.unsettled and conf >= PROBE_SURE_PEAK)):
             ref.delay += ref.adj + float(np.median(ref.track_votes))
             ref.adj = 0.0
             if ref.provisional:
@@ -1787,7 +2086,7 @@ class EchoCanceller:
         phi = self.mic.off_f - round(self.mic.off_f)
         q = (P - W) + phi - base - ref.delay - ref.adj
         x = _probe_view(ref.timeline.read(q - E - S, W + 2 * S), ref.view)
-        if (float(np.sqrt(np.mean(x[S:S + W] ** 2))) < LOUD_RMS
+        if (float(np.sqrt(np.mean(x[S:S + W] ** 2))) < ref.timeline.loud_thr
                 or float(np.sqrt(np.mean(mic ** 2))) < MIC_MIN_RMS):
             return
         ref.fine_last = P
@@ -1900,6 +2199,29 @@ class EchoCanceller:
         self.stats["fine_moves"] += 1
         log.debug("echo of %s re-aligned by %+.2f samples (corr %.2f)", ref.name, d, corr)
         self._remember(ref, force=False)
+
+    def _run_vote(self, ref: Ref, lag: float, conf: float, scores: list, agree) -> bool:
+        """PROBE_RUN_VOTES windows in a row whose best peak (outside the ghost
+        ranges) is >= PROBE_CONFIRM_PEAK at the same lag slot the endpoint. True
+        if it was slotted here."""
+        if conf < PROBE_CONFIRM_PEAK:
+            ref.run_votes = []
+            return False
+        ref.run_votes = [v for v in ref.run_votes[-(PROBE_RUN_VOTES - 1):]
+                         if abs(v[0] - lag) <= agree] + [(lag, scores)]
+        if len(ref.run_votes) < PROBE_RUN_VOTES:
+            return False
+        votes, ref.run_votes = ref.run_votes, []
+        ref.delay = float(np.median([v[0] for v in votes])) - EARLY_MS * FS // 1000
+        if not self._slot(ref):
+            ref.delay = None
+            return False
+        ref.view = _choose_view(np.sum([v[1] for v in votes], axis=0))
+        self.stats["run_slotted"] += 1
+        log.info("echo of %s found %.1f ms behind its reference in %d windows in a row (peak %.1f) "
+                 "-- cancelling it", ref.name, lag * 1000 / FS, len(votes), conf)
+        self._remember(ref)
+        return True
 
     def _pair_vote(self, ref: Ref, res: list, agree) -> bool:
         """A room with two near-equal arrivals splits the GCC peak between

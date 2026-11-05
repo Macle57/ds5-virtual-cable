@@ -114,8 +114,9 @@ ds5aec.dll and shipped in every build) compiles SpeexDSP's MDF echo canceller,
 its resampler and the KISS FFT it uses, vendored in emulator/native/speexdsp/
 from the release tag SpeexDSP-1.2.1 (archive SHA-256
 d17ca363654556a4ff1d02cc13d9eb1fc5a8642c90b40bd54ce266c3807b91a7). Modified:
-mdf.c and include/speex/speex_echo.h carry two small controls
-(SPEEX_ECHO_SET_ADAPT_SCALE for the adaptation step, SPEEX_ECHO_SET_NOTCH_RADIUS for the mic's DC notch; every changed line is marked
+mdf.c and include/speex/speex_echo.h carry three small controls
+(SPEEX_ECHO_SET_ADAPT_SCALE for the adaptation step, SPEEX_ECHO_SET_NOTCH_RADIUS for the mic's DC notch,
+SPEEX_ECHO_SCALE_REFERENCE to rescale the state when the reference's gain changes; every changed line is marked
 "ds5-virtual-usb patch"); the other files are unmodified. Their
 notices follow, as the BSD licences require; the installer also places them
 in THIRD-PARTY-NOTICES.txt next to the application.

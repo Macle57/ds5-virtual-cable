@@ -63,6 +63,8 @@ extern "C" {
 #define SPEEX_ECHO_SET_ADAPT_SCALE 100   /* ds5-virtual-usb patch */
 /** ds5-virtual-usb patch: set the mic-side DC notch radius (float, 0..1). */   /* ds5-virtual-usb patch */
 #define SPEEX_ECHO_SET_NOTCH_RADIUS 101   /* ds5-virtual-usb patch */
+/** ds5-virtual-usb patch: the reference will be fed scaled by a float from now on: rescale the state to match. */   /* ds5-virtual-usb patch */
+#define SPEEX_ECHO_SCALE_REFERENCE 102   /* ds5-virtual-usb patch */
 
 /** Internal echo canceller state. Should never be accessed directly. */
 struct SpeexEchoState_;

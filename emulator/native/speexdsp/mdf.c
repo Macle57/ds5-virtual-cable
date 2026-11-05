@@ -1280,6 +1280,26 @@ EXPORT int speex_echo_ctl(SpeexEchoState *st, int request, void *ptr)
       case SPEEX_ECHO_SET_ADAPT_SCALE:   /* ds5-virtual-usb patch: scale the adaptation step (0 = frozen) */
          st->adapt_scale = *(float*)ptr;   /* ds5-virtual-usb patch */
          break;   /* ds5-virtual-usb patch */
+#ifndef FIXED_POINT   /* ds5-virtual-usb patch */
+      case SPEEX_ECHO_SCALE_REFERENCE:   /* ds5-virtual-usb patch: the far end is fed g times larger from now on */
+      {   /* ds5-virtual-usb patch */
+         /* ds5-virtual-usb patch: the state becomes what it would be had the far end always been g times larger:
+          * its history (time and frequency domain, pre-emphasis memory) and power estimate scale with it, the
+          * filters (background and foreground) by 1/g, so the echo estimate is unchanged. */
+         float g = *(float*)ptr;   /* ds5-virtual-usb patch */
+         int i, N = st->window_size, M = st->M, C = st->C, K = st->K;   /* ds5-virtual-usb patch */
+         if (!(g > 0.0f)) return -1;   /* ds5-virtual-usb patch */
+         for (i = 0; i < K * N; i++) st->x[i] *= g;   /* ds5-virtual-usb patch */
+         for (i = 0; i < K * (M + 1) * N; i++) st->X[i] *= g;   /* ds5-virtual-usb patch */
+         for (i = 0; i < K; i++) st->memX[i] *= g;   /* ds5-virtual-usb patch */
+         for (i = 0; i <= st->frame_size; i++) { st->power[i] *= g * g; st->power_1[i] /= g * g; }   /* ds5-virtual-usb patch */
+         for (i = 0; i < C * K * M * N; i++) st->W[i] /= g;   /* ds5-virtual-usb patch */
+#ifdef TWO_PATH   /* ds5-virtual-usb patch */
+         for (i = 0; i < C * K * M * N; i++) st->foreground[i] /= g;   /* ds5-virtual-usb patch */
+#endif   /* ds5-virtual-usb patch */
+      }   /* ds5-virtual-usb patch */
+         break;   /* ds5-virtual-usb patch */
+#endif   /* ds5-virtual-usb patch */
       default:
          speex_warning_int("Unknown speex_echo_ctl request: ", request);
          return -1;

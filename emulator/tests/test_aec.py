@@ -13,6 +13,7 @@ Skipped when numpy is missing or the DLL has not been built
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 import threading
@@ -994,6 +995,206 @@ class CancellerTests(unittest.TestCase):
             self.assertNotIn(a, eng._slots)
             self.assertEqual(AEC.DelayStore(path).get("pad1|A"), 50.0)
 
+    def test_mirrored_audio_keeps_each_echo_on_its_own_endpoint(self):
+        # the same stream on two endpoints (laptop speakers + a cast display 150 ms behind): each endpoint's
+        # probe also sees the other's echo, and the cast's (louder) echo peaks higher in the laptop's probe
+        # than the laptop's own. Without the ghost ranges both slots sat on the cast's echo (7.7 dB). Which
+        # endpoint is probed first must not matter: with the cast first the laptop slots on the cast's echo,
+        # and gives it up when the cast asks (PROBE_YIELD_S).
+        n = 50 * FS
+        a = speechlike(n, 2, rate=5.1)
+        sh = int(0.150 * FS)
+        b = np.concatenate([np.zeros(sh, np.float32), a[:-sh]])
+        mic = echo_of(a, room(6, 0.35), 20) + echo_of(b, room(8, 0.6), 300) + np.float32(1e-4) * \
+            np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        for order in (("Laptop", "Cast"), ("Cast", "Laptop")):
+            with self.subTest(first=order[0]):
+                sim = Sim()
+                refs = {"Laptop": a, "Cast": b}
+                out = aligned(sim.run(mic, ref={k: refs[k] for k in order}), n)
+                self.assertEqual(sorted(sim.eng.status()["slots"]), ["Cast", "Laptop"])
+                laptop = sim.eng._refs["Laptop"]
+                self.assertLess((laptop.delay + laptop.adj) * 1000 / FS, 100.0)    # its own echo, not the cast's
+                self.assertLessEqual(sim.eng.stats["delay_moves"], 1)
+                self.assertLess(db(out[35 * FS:49 * FS], mic[35 * FS:49 * FS]), -20.0)
+
+    def test_an_early_delay_step_beyond_the_fine_range_is_followed(self):
+        # the echo arrives 30 ms earlier from 20 s on (an AV receiver's latency change) and the room has a
+        # reflection 30 ms after the direct sound, so the old window still holds an echo: the move is taken
+        def h_with_reflection():
+            h = room(6, 0.3).copy()
+            h[0] += 0.6
+            h[int(0.030 * FS)] += 0.3
+            return h
+        sim = Sim()
+        n = 40 * FS
+        x = speechlike(n, 2, rate=5.1)
+        e = np.convolve(x, h_with_reflection())[:n]
+        k0, k1, ts = int(0.040 * FS), int(0.010 * FS), 20 * FS
+        mic = np.zeros(n, np.float32)
+        mic[k0:ts] = e[:ts - k0]
+        mic[ts:] = e[ts - k1:n - k1]
+        mic += np.float32(1e-4) * np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        out = aligned(sim.run(mic, ref=x), n)
+        self.assertGreaterEqual(sim.eng.stats["delay_moves"], 1)
+        self.assertLess(db(out[25 * FS:39 * FS], mic[25 * FS:39 * FS]), -10.0)
+
+    def test_a_software_volume_endpoint_turned_down_is_cancelled(self):
+        # the endpoint applies its volume before the loopback tap: a reference at -67 dBFS RMS whose echo the
+        # room still hears (spacedesk at volume 0.1). The gate follows the endpoint's level and the stage is
+        # fed the reference boosted (speexdsp's MDF does not adapt at that level).
+        sim = Sim()
+        n = 40 * FS
+        x = speechlike(n, 2, rate=5.1)
+        ref = x * np.float32(0.01)
+        mic = echo_of(x * np.float32(0.1), room(6, 0.6), 40) + np.float32(1e-4) * \
+            np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        out = aligned(sim.run(mic, ref=ref), n)
+        self.assertEqual(sim.eng.status()["slots"], ["Speakers (Test)"])
+        self.assertGreater(sim.eng._refs["Speakers (Test)"].norm_db, 20.0)
+        # (the boost waits for REF_NORM_MATURE_S of audio over the -70 dB floor: ~17 s of this speech)
+        self.assertLess(db(out[30 * FS:39 * FS], mic[30 * FS:39 * FS]), -20.0)
+
+    def test_hiss_with_blips_on_an_endpoint_leaves_the_mic_bit_exact(self):
+        # -75 dBFS hiss with an occasional -60 dBFS blip, on an endpoint the mic does not hear
+        sim = Sim()
+        n = 12 * FS
+        mic = speechlike(n, 7)
+        ref = (np.random.default_rng(5).standard_normal(n) * 10 ** (-75 / 20)).astype(np.float32)
+        for s in range(FS, n - FS, 2 * FS):
+            ref[s:s + F] *= np.float32(10 ** (15 / 20))
+        out = sim.run(mic, ref=ref)
+        self.assertEqual(sim.eng.status()["slots"], [])
+        want = to16(mic)
+        np.testing.assert_array_equal(out[F:F + want.size - F], want[:want.size - F])
+
+    def test_a_cancelled_endpoint_that_falls_to_hiss_goes_idle_again(self):
+        sim = Sim()
+        n = 24 * FS
+        ref = speechlike(n, 2, rate=5.1)
+        ref[14 * FS:] = (np.random.default_rng(6).standard_normal(n - 14 * FS) * 10 ** (-75 / 20)).astype(np.float32)
+        mic = echo_of(ref, room(6, 0.6), 40) + speechlike(n, 7, amp=0.05)
+        out = sim.run(mic, ref=ref)
+        self.assertEqual(sim.eng.status()["slots"], ["Speakers (Test)"])
+        want = to16(mic)
+        tail = slice(18 * FS, n - FS)                      # the hold and the tail are over: bit for bit again
+        np.testing.assert_array_equal(out[tail.start + F:tail.stop + F], want[tail])
+        self.assertEqual(sim.eng._refs["Speakers (Test)"].norm_db, 0.0)    # a full-scale endpoint: no boost
+
+    def test_rescaling_a_stage_keeps_what_it_learned(self):
+        # the reference fed at a new gain from one frame on (REF_NORM_*): with the state rescaled the converged
+        # filter stays right; a blind gain step makes it 4x wrong and it takes seconds to re-learn
+        n = 9 * FS
+        x = (speechlike(n, 2, rate=5.1) * 32767 * 0.3).astype(np.float64)
+        y = np.convolve(x, room(6, 0.6))[:n]
+        noise = np.random.default_rng(8).standard_normal(n)
+        k0 = 6 * FS // F
+
+        def erle_after_step(g, rescale):
+            st, can = AEC.NativeStage(1), AEC.NativeCanceller()
+            can.set(bypass=1)
+            o = []
+            for j in range(n // F):
+                if j == k0 and rescale:
+                    st.scale_ref(g)
+                xf = x[j * F:(j + 1) * F] * (g if j >= k0 else 1.0)
+                mic = np.clip(np.round(y[j * F:(j + 1) * F] + noise[j * F:(j + 1) * F]), -32768, 32767)
+                o.append(can.process(mic.astype("<i2"), [st],
+                                     [np.ascontiguousarray(np.clip(np.round(xf), -32768, 32767).astype("<i2")[:, None])], True))
+            st.close()
+            can.close()
+            out = np.concatenate(o).astype(np.float64)[F:]
+            s = slice(6 * FS, 7 * FS)                     # the first second after the step
+            return -db(out[s], y[s])
+
+        steady = erle_after_step(1.0, False)
+        for g in (4.0, 0.25):
+            self.assertGreater(erle_after_step(g, True), steady - 3.0)
+            self.assertLess(erle_after_step(g, False), steady - 15.0)
+
+    def test_a_remembered_delay_with_a_fade_in_is_not_boosted(self):
+        # a full-scale endpoint, its delay remembered: playback starts with a 2 s fade-in from -60 dB. A boost
+        # chosen from the fade-in's level would clip the reference for the hold (review B1: 14-16 dB for 30 s)
+        n = 30 * FS
+        x = speechlike(n, 2, rate=5.1, amp=0.9)
+        h = room(6, 0.6)
+        noise = lambda s: np.float32(1e-4) * np.random.default_rng(s).standard_normal(n).astype(np.float32)  # noqa: E731
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "delays.json")
+            Sim(delay_store=AEC.DelayStore(path), pad_id="pad1").run(echo_of(x * np.float32(0.5), h, 40) + noise(1),
+                                                                      ref=x)
+            fade = np.ones(n, np.float32)
+            fade[:2 * FS] = 10 ** (np.linspace(-60, 0, 2 * FS) / 20)
+            y = speechlike(n, 4, rate=4.3, amp=0.9) * fade
+            mic = echo_of(y * np.float32(0.5), h, 40) + noise(2)
+            sim = Sim(delay_store=AEC.DelayStore(path), pad_id="pad1")
+            out = aligned(sim.run(mic, ref=y), n)
+        self.assertEqual(sim.eng.stats["slotted_from_store"], 1)
+        self.assertEqual(sim.eng._refs["Speakers (Test)"].norm_db, 0.0)
+        for s0 in range(4, 28, 4):
+            self.assertLess(db(out[s0 * FS:(s0 + 4) * FS], mic[s0 * FS:(s0 + 4) * FS]), -40.0)
+
+    def test_a_quiet_intro_on_a_full_scale_endpoint_never_clips_the_fed_reference(self):
+        n = 40 * FS
+        x = speechlike(n, 2, rate=5.1, amp=0.9)
+        vol = np.ones(n, np.float32)
+        vol[:12 * FS] = 10 ** (-30 / 20)                    # a quiet intro (-48 dBFS), then -18 dBFS
+        ref = x * vol
+        mic = echo_of(ref * np.float32(0.5), room(6, 0.6), 40) + np.float32(1e-4) * \
+            np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        peak = [0]
+        orig = AEC.NativeCanceller.process
+
+        def process(nc, mic16, stages, refs, active):
+            for r in refs:
+                peak[0] = max(peak[0], int(np.max(np.abs(r.astype(np.int32)))))
+            return orig(nc, mic16, stages, refs, active)
+
+        AEC.NativeCanceller.process = process
+        try:
+            sim = Sim()
+            out = aligned(sim.run(mic, ref=ref), n)
+        finally:
+            AEC.NativeCanceller.process = orig
+        self.assertLess(peak[0], 32767)
+        self.assertEqual(sim.eng._refs["Speakers (Test)"].norm_db, 0.0)
+        self.assertLess(db(out[16 * FS:39 * FS], mic[16 * FS:39 * FS]), -40.0)
+
+    def test_steady_keep_alive_noise_lets_the_canceller_go_idle(self):
+        # -65 dBFS steady noise after the content stops (a keep-alive noise player): over the old -70 floor,
+        # but it is the endpoint's own noise floor, so the bit-exact idle path comes back -- heard or not
+        n = 34 * FS
+        content = speechlike(n, 2, rate=5.1)
+        content[10 * FS:] = (np.random.default_rng(6).standard_normal(n - 10 * FS) * 10 ** (-65 / 20)).astype(np.float32)
+        for heard in (False, True):
+            with self.subTest(heard=heard):
+                sim = Sim()
+                mic = speechlike(n, 7, amp=0.05) + (echo_of(content, room(6, 0.6), 40) if heard else 0)
+                out = sim.run(mic.astype(np.float32), ref=content)
+                want = to16(mic.astype(np.float32))
+                tail = slice(28 * FS, n - FS)
+                np.testing.assert_array_equal(out[tail.start + F:tail.stop + F], want[tail])
+
+    def test_an_unheard_mirror_does_not_keep_the_heard_endpoint_yielding(self):
+        # headphones (or a muted cast) playing the same stream 150 ms AHEAD of the laptop: the laptop's echo shows
+        # in their probe as another endpoint's ghost, forever. They may ask once; then they back off
+        n = 60 * FS
+        a = speechlike(n, 2, rate=5.1)
+        sh = int(0.150 * FS)
+        phones = np.concatenate([a[sh:], np.zeros(sh, np.float32)])
+        mic = echo_of(a, room(6, 0.6), 20) + np.float32(1e-4) * \
+            np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        for order in (("Laptop", "Phones"), ("Phones", "Laptop")):
+            with self.subTest(first=order[0]):
+                sim = Sim()
+                refs = {"Laptop": a, "Phones": phones}
+                out = aligned(sim.run(mic, ref={k: refs[k] for k in order}), n)
+                self.assertLessEqual(sim.eng.stats["yield_asks"], 1)
+                laptop = sim.eng._refs["Laptop"]
+                self.assertTrue(laptop.slotted)
+                self.assertLess((laptop.delay + laptop.adj) * 1000 / FS, 100.0)
+                self.assertLess(db(out[30 * FS:59 * FS], mic[30 * FS:59 * FS]), -40.0)
+
     def test_two_near_equal_arrivals_are_found(self):
         # two reflections of the same strength 25 ms apart split the probe's
         # peak; each alone stays under PROBE_MIN_PEAK
@@ -1148,6 +1349,199 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(tl.anchors, 1)
         self.assertLess(abs(lag[9000] - lag[6000]), 1.0)
         self.assertLess(abs(lag[9000]), 0.048 / AEC.REF_STAMP_ALPHA + 5)
+
+    def test_excluded_lags_are_not_the_best_peak(self):
+        r = np.random.default_rng(4)
+        src = r.standard_normal(3 * FS).astype(np.float32)
+        M, A = int(0.6 * FS), int(0.05 * FS)
+        d1, d2 = int(0.100 * FS), int(0.300 * FS)
+        x = np.concatenate([np.zeros(M, np.float32), src])
+        mic = 0.5 * np.roll(x, d1)[M:M + FS] + 1.0 * np.roll(x, d2)[M:M + FS]
+        ref = x[M - M:M + FS + A]
+        self.assertAlmostEqual(AEC.estimate_lag(mic, ref, M, A)[0], d2, delta=12)
+        lag, conf = AEC.estimate_lag(mic, ref, M, A, exclude=((d2 - 480, d2 + 480),))
+        self.assertAlmostEqual(lag, d1, delta=12)
+        self.assertGreater(conf, AEC.PROBE_SURE_PEAK)
+        # whether an echo is inside a filter's window is not affected by the exclusion
+        near = (d2 - 240, d2 + 240)
+        self.assertAlmostEqual(AEC.estimate_lag(mic, ref, M, A, near=near, exclude=(near,))[2],
+                               AEC.estimate_lag(mic, ref, M, A, near=near)[2], places=6)
+
+    def _decider(self):
+        class Stage:
+            def __init__(self, nch):
+                self.nch = nch
+
+            def reset(self): pass
+            def freeze(self, frozen): pass
+            def flush(self, frames=0): pass
+            def close(self): pass
+
+        eng = AEC.EchoCanceller(lambda b: None, loopback=False, clock=lambda: 100.0,
+                                stage_factory=Stage)
+        ref = AEC.Ref("ep", "Speakers (Test)", 1)
+        eng._refs[ref.id] = ref
+        return eng, ref
+
+    def test_a_run_of_weaker_peaks_at_one_lag_slots_the_endpoint(self):
+        eng, ref = self._decider()
+        lag = 2000
+        res = [(lag, 9.5, lag + 900, 4.0)] * 3                # each window under PROBE_MIN_PEAK
+        for _ in range(3):                                     # literal counts: the rule is four in a row
+            eng._probe_apply(ref, 100.0, res, False)
+            self.assertFalse(ref.slotted)
+        eng._probe_apply(ref, 100.0, res, False)
+        self.assertTrue(ref.slotted)
+        self.assertEqual(eng.stats["run_slotted"], 1)
+        self.assertAlmostEqual(ref.delay, lag - AEC.EARLY_MS * FS // 1000, delta=1)
+
+    def test_weaker_peaks_that_wander_never_slot(self):
+        eng, ref = self._decider()
+        for k in range(40):
+            lag = 2000 + (k % 5) * 1500                        # unrelated audio: somewhere new every window
+            eng._probe_apply(ref, 100.0, [(lag, 10.0, lag + 700, 4.0)] * 3, False)
+        self.assertFalse(ref.slotted)
+        eng2, ref2 = self._decider()
+        for k in range(40):                                    # the same lag, but a weak window between
+            eng2._probe_apply(ref2, 100.0, [(2000, 9.0 if k % 3 else 6.0, 2900, 4.0)] * 3, False)
+        self.assertFalse(ref2.slotted)
+
+    def test_the_reference_boost_rises_rarely_and_falls_at_once(self):
+        now = [100.0]
+        calls = []
+
+        class Stage:
+            nch = 1
+            ok = True
+
+            def scale_ref(self, g):
+                calls.append(round(20 * math.log10(g), 1))
+                return self.ok
+
+            def reset(self):
+                calls.append("reset")
+
+        eng = AEC.EchoCanceller(lambda b: None, loopback=False, clock=lambda: now[0], stage_factory=lambda n: Stage())
+        ref = AEC.Ref("ep", "Speakers (Test)", 1)
+        ref.stage = Stage()
+        tl = ref.timeline
+        tl.level_slow_db, tl.peak_db, tl.level_secs = -54.0, -40.0, 5.0
+        eng._normalise(ref)
+        self.assertEqual((ref.norm_db, calls), (0.0, []))            # not 10 s of audio yet: no boost
+        tl.level_secs = 12.0
+        eng._normalise(ref)
+        self.assertEqual((ref.norm_db, calls), (24.0, [24.0]))        # the first mature choice
+        tl.level_slow_db = -40.0
+        eng._normalise(ref)
+        self.assertEqual((ref.norm_db, calls[-1]), (12.0, -12.0))     # lower: at once
+        tl.level_slow_db = -48.0
+        now[0] += 60
+        eng._normalise(ref)
+        self.assertEqual(ref.norm_db, 12.0)                           # +6 only: not worth a change
+        tl.level_slow_db = -60.0
+        eng._normalise(ref)
+        self.assertEqual((ref.norm_db, calls[-1]), (30.0, 18.0))      # +18, the hold long over
+        tl.level_slow_db = -72.0
+        eng._normalise(ref)
+        self.assertEqual(ref.norm_db, 30.0)                           # +12 more, but within the hold
+        tl.peak_db = -20.0
+        eng._normalise(ref)
+        self.assertEqual((ref.norm_db, calls[-1]), (12.0, -18.0))     # the headroom: peak + gain <= -6 dBFS, at once
+        tl.level_slow_db, tl.peak_db = -10.0, -1.0
+        eng._normalise(ref)
+        self.assertEqual(ref.norm_db, 0.0)                            # a want of 0 always wins
+        ref.stage.ok = False
+        tl.level_slow_db, tl.peak_db = -50.0, -30.0
+        now[0] += 60
+        eng._normalise(ref)
+        self.assertEqual(calls[-1], "reset")                          # the native rescale refused: start over
+
+    def test_a_probe_is_not_decided_when_the_slots_changed_meanwhile(self):
+        eng, ref = self._decider()
+        decided = []
+        eng._probe_apply = lambda *a, **k: decided.append(a)
+        rng = np.random.default_rng(1)
+        W, M, A = int(AEC.PROBE_WINDOW_S * FS), int(AEC.PROBE_MAX_LAG_S * FS), AEC.PROBE_LEAD_MS * FS // 1000
+        mic = rng.standard_normal(W).astype(np.float32)
+        views = [rng.standard_normal(W + M + A).astype(np.float32)] * 3
+        gen = eng._slot_gen
+        eng._probe_gather = lambda r: (mic, views, M, A, None, ([], 0), gen, False)
+        eng._probe(ref, 100.0)
+        self.assertEqual(len(decided), 1)
+        eng._slot_gen += 1                                           # an endpoint slotted between gather and apply
+        eng._probe(ref, 100.0)
+        self.assertEqual(len(decided), 1)
+
+    def test_a_yielding_endpoint_still_follows_its_own_echo(self):
+        eng, ref = self._decider()
+        flushed, reset = [], []
+        ref.delay = 2000.0
+        self.assertTrue(eng._slot(ref))
+        ref.stage.flush = lambda frames=0: flushed.append(1)
+        ref.stage.reset = lambda: reset.append(1)
+        ref.yield_until = 100.0 + AEC.PROBE_YIELD_S
+        E = AEC.EARLY_MS * FS // 1000
+        early = 2000 + E - int(0.030 * FS)                    # its echo 30 ms earlier: a normal move, taps kept
+        for _ in range(2):
+            eng._probe_apply(ref, 100.0, [(early, 15.0, 2.0)] * 3, True)
+        self.assertAlmostEqual(ref.delay, early - E, delta=1)
+        self.assertEqual((len(flushed), len(reset), eng.stats["yield_moves"]), (1, 0, 0))
+        far = int(ref.delay) + E + int(0.300 * FS)            # beyond the tail: the yield move, at a lower bar
+        ref.unsettled = True
+        ref.stage.freeze = lambda frozen: None
+        for k in range(5):                                     # four agreeing windows; a weak one between
+            eng._probe_apply(ref, 100.0, [(far, 9.0 if k != 2 else 5.0, 2.0)] * 3, True)
+        self.assertAlmostEqual(ref.delay, far - E, delta=1)
+        self.assertEqual((len(reset), eng.stats["yield_moves"]), (1, 1))
+        self.assertFalse(ref.unsettled)                        # the fresh filter adapts at once
+
+    def test_quiet_continuous_music_counts_as_playing(self):
+        # gapless content only dips a few dB under its median: it must not be taken for the endpoint's noise floor
+        rng = np.random.default_rng(5)
+        n = 40 * FS
+        t = np.arange(n) / FS
+        music = np.convolve(rng.standard_normal(n), np.exp(-np.arange(30) / 8.0), "same") * \
+            (1 + 0.4 * np.sin(2 * np.pi * 0.5 * t))
+        music = (music / np.sqrt(np.mean(music ** 2)) * 10 ** (-63 / 20)).astype(np.float32)
+        tl = AEC.RefTimeline()
+        loud = []
+        for i in range(n // F):
+            before = tl.last_loud
+            tl.push(music[i * F:(i + 1) * F], (i + 1) * 0.01, 0.0)
+            loud.append(tl.last_loud != before)
+        self.assertGreater(np.mean(loud[1500:]), 0.5)
+
+    def test_a_slot_whose_echo_is_still_there_is_not_moved(self):
+        eng, ref = self._decider()
+        ref.delay = 600.0
+        self.assertTrue(eng._slot(ref))
+        far = 600 + AEC.EARLY_MS * FS // 1000 + 13000         # a stronger peak 270 ms away
+        for _ in range(4):
+            eng._probe_apply(ref, 100.0, [(far, 25.0, 15.0)] * 3, True)    # own echo still at 15 in the window
+        self.assertEqual(ref.delay, 600.0)
+        self.assertEqual(eng.stats["delay_moves"], 0)
+        for _ in range(2):
+            eng._probe_apply(ref, 100.0, [(far, 25.0, 2.0)] * 3, True)     # the echo left the window
+        self.assertEqual(eng.stats["delay_moves"], 1)
+        self.assertAlmostEqual(ref.delay, far - AEC.EARLY_MS * FS // 1000, delta=1)
+
+    def test_the_activity_gate_follows_the_endpoint_level_but_not_into_silence(self):
+        tl = AEC.RefTimeline()
+        quiet = (np.random.default_rng(2).standard_normal(F) * 10 ** (-65 / 20)).astype(np.float32)
+        for i in range(300):
+            tl.push(quiet, (i + 1) * 0.01, 0.0)
+        self.assertLess(tl.loud_thr, 10 ** (-66 / 20))                        # well under -60 dBFS now
+        self.assertGreater(tl.last_loud, 2.9)                               # and the quiet stream is "playing"
+        t_loud = tl.last_loud
+        for i in range(300, 400):
+            tl.push(np.zeros(F, np.float32), (i + 1) * 0.01, 0.0)          # digital silence
+        self.assertEqual(tl.last_loud, t_loud)
+        hiss = (np.random.default_rng(3).standard_normal(F) * 10 ** (-90 / 20)).astype(np.float32)
+        tl2 = AEC.RefTimeline()
+        for i in range(300):
+            tl2.push(hiss, (i + 1) * 0.01, 0.0)
+        self.assertEqual(tl2.last_loud, -math.inf)                          # faint hiss never counts
+        self.assertEqual(tl2.loud_thr, AEC.LOUD_RMS)
 
     def test_the_mic_clock_takes_the_least_late_packet(self):
         mc = AEC.MicClock()

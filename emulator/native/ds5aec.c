@@ -67,7 +67,7 @@
 #define API __attribute__((visibility("default")))
 #endif
 
-#define DS5AEC_VERSION 5
+#define DS5AEC_VERSION 6
 #define MAX_STAGES 8
 #define MAX_CH 2
 
@@ -85,6 +85,8 @@ typedef struct {
     int16_t *out;
     int16_t *zeros;               /* frame * nch zeros, for ds5mdf_flush */
     float adapt_base;             /* ds5mdf_set_base_adapt: 0 = frozen (a kept filter not yet re-aligned) */
+    float ref_gain;               /* the gain the reference is fed at (ds5mdf_scale_ref); the residual stage sums
+                                   * the references without it */
 } ds5mdf;
 
 API void ds5mdf_free(ds5mdf *m)
@@ -104,6 +106,7 @@ API ds5mdf *ds5mdf_new(int frame, int tail, int nch, int rate)
     if (!m) return NULL;
     m->frame = frame; m->nch = nch;
     m->adapt_base = 1.0f;
+    m->ref_gain = 1.0f;
     m->mdf = speex_echo_state_init_mc(frame, tail, 1, nch);
     m->out = (int16_t *)zalloc(sizeof(int16_t) * frame);
     m->zeros = (int16_t *)zalloc(sizeof(int16_t) * frame * nch);
@@ -127,6 +130,16 @@ API void ds5mdf_set_notch(ds5mdf *m, float radius)
         speex_echo_ctl(m->mdf, SPEEX_ECHO_SET_NOTCH_RADIUS, &radius);
 }
 
+/* The stage's reference will be fed `g` times larger from now on (vendored speexdsp patch,
+ * SPEEX_ECHO_SCALE_REFERENCE): the learned filter is rescaled so the echo estimate does not change. */
+API int ds5mdf_scale_ref(ds5mdf *m, float g)
+{
+    if (!m || !m->mdf || !(g > 0.0f)) return -1;
+    if (speex_echo_ctl(m->mdf, SPEEX_ECHO_SCALE_REFERENCE, &g) != 0) return -1;
+    m->ref_gain *= g;
+    return 0;
+}
+
 /* The stage's own adaptation scale (the chain multiplies the double-talk scale onto it each frame). */
 API void ds5mdf_set_base_adapt(ds5mdf *m, float scale)
 {
@@ -136,6 +149,7 @@ API void ds5mdf_set_base_adapt(ds5mdf *m, float scale)
 API void ds5mdf_reset(ds5mdf *m)
 {
     if (m && m->mdf) speex_echo_state_reset(m->mdf);
+    if (m) m->ref_gain = 1.0f;
 }
 
 /* Run `frames` frames of silence (reference and microphone) through the
@@ -735,7 +749,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
                 pe += (double)d * d;
                 pin += (double)cur[i] * cur[i];
                 pou += (double)m->out[i] * m->out[i];
-                rcur[i] += (float)refs[j][i * m->nch];
+                rcur[i] += (float)refs[j][i * m->nch] / m->ref_gain;   /* un-boosted (ds5mdf_scale_ref) */
             }
             if (stage_stats) {
                 stage_stats[3 * j] = (float)(pin / n);
