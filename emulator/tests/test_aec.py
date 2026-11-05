@@ -349,6 +349,88 @@ class CancellerTests(unittest.TestCase):
         after = slice(13 * FS, 15 * FS)
         self.assertLess(db(y[after], mic[after]), -20.0)
 
+
+    def _zero_runs(self, out16):
+        z = np.concatenate([[0], (out16 == 0).astype(np.int8), [0]])
+        d = np.diff(z)
+        return int(np.sum(np.flatnonzero(d == -1) - np.flatnonzero(d == 1) >= 240))
+
+    def test_a_lost_packet_is_concealed_not_left_as_digital_zeros(self):
+        # block L: Bluetooth drops a few mic packets a minute (seq gaps of 1-2); each was a 10-20 ms hole of exact
+        # zeros in the delivered mic. Nothing plays here, so every arrived frame is the input one frame late
+        n = 14 * FS
+        mic = (np.random.default_rng(1).standard_normal(n).astype(np.float32) * np.float32(3e-3)
+               + speechlike(n, 7, rate=2.3, amp=0.08))
+        gaps = {300: 1, 500: 2, 700: 5, 1000: 12}
+        lose = {k + d for k, ln in gaps.items() for d in range(ln)}
+        sim = Sim()
+        out = sim.run(mic, lose=lose)
+        self.assertEqual(out.size, (n // F) * F)
+        self.assertEqual(sim.eng.stats["lost_packets"], len(lose))
+        self.assertEqual(sim.eng.stats["concealed_frames"], len(lose))
+        self.assertEqual(self._zero_runs(out[F:]), 0)
+        got = out[F:].reshape(-1, F)
+        want = (np.clip(mic[:got.size], -1.0, 1.0) * 32767.0).astype("<i2").reshape(-1, F)
+        for k in range(len(got) - 1):
+            if k not in lose:                       # arrived frames, also the ones right next to a gap
+                self.assertTrue(np.array_equal(got[k], want[k]), k)
+        y = aligned(out, n)
+        for k, ln in gaps.items():
+            a, b = k * F, (k + ln) * F
+            typical = float(np.median(np.abs(np.diff(y[a - 2 * F:b + 2 * F]))))
+            for edge in (a, b):                     # no click where the fill meets the audio
+                self.assertLess(abs(y[edge] - y[edge - 1]), 6 * typical + 1e-4, (k, edge))
+            self.assertLess(db(y[a:b], mic[a:b]), 3.0, k)
+            if ln <= 2:
+                self.assertGreater(db(y[a:b], mic[a:b]), -6.0, k)
+            else:                                   # a long gap dips 20 ms in from its edges, so it does not buzz
+                r = int(AEC.CONCEAL_RAMP_MS * FS / 1000)
+                self.assertLess(db(y[a + r:b - r], mic[a + r:b - r]), -6.0, k)
+
+    def test_a_lost_packet_right_after_a_new_session_is_concealed(self):
+        n = 3 * FS
+        mic = np.random.default_rng(2).standard_normal(n).astype(np.float32) * np.float32(3e-3)
+        sim = Sim()
+        sim.run(mic)
+        sim.eng.pause()
+        sim.eng._new_session()
+        sim.eng.resume()
+        before = sim.eng.stats["lost_packets"]
+        out = sim.run(mic, lose={1, 2})             # the session's first packet arrives, the next two do not
+        self.assertEqual(sim.eng.stats["lost_packets"], before + 2)
+        self.assertEqual(out.size, (n // F) * F)
+        frames = out.reshape(-1, F)
+        self.assertFalse(np.any(np.all(frames[2:4] == 0, 1)))    # the two lost frames (one frame late)
+
+    def test_a_lost_packet_does_not_leak_echo_while_cancelling(self):
+        # review of v7: concealing the canceller's INPUT put a time-reversed copy of the echo in front of the
+        # filter (-37 dBFS in the lost frames against -42 around them). The output is concealed instead
+        n = 30 * FS
+        ref = speechlike(n, 2, rate=5.1)
+        mic = echo_of(ref, room(6, 0.6), 40) + np.float32(1e-3) * np.random.default_rng(1).standard_normal(
+            n).astype(np.float32)
+        gaps = [1200 + 60 * g for g in range(20)]
+        lose = {k + d for g, k in enumerate(gaps) for d in range(1 + g % 3)}
+        out = aligned(Sim().run(mic, ref=ref, lose=lose), n)
+        lost = np.array(sorted(lose))
+        near = sorted({k + d for k in gaps for d in range(-8, 12)} - lose)
+        def lv(fr):
+            return 10 * np.log10(np.mean(np.concatenate([out[f * F:(f + 1) * F] for f in fr]) ** 2) + 1e-12)
+        self.assertLess(lv(lost), lv(near) + 2.0)
+        self.assertGreater(lv(lost), lv(near) - 6.0)          # and no hole either
+
+    def test_the_concealment_joins_both_sides(self):
+        rng = np.random.default_rng(2)
+        before = rng.standard_normal(AEC.FRAME).astype(np.float32)
+        after = rng.standard_normal(AEC.FRAME).astype(np.float32)
+        for lost in (1, 2, 5, 12):
+            c = AEC._conceal(before, after, lost)
+            self.assertEqual(c.size, lost * AEC.FRAME)
+            self.assertAlmostEqual(float(c[0]), float(before[-1]), delta=1e-2)
+            self.assertAlmostEqual(float(c[-1]), float(after[0]), delta=1e-2)
+            self.assertTrue(np.all(np.isfinite(c)))
+        self.assertEqual(AEC._conceal(np.zeros(0, np.float32), after, 1).size, AEC.FRAME)   # nothing before it yet
+
     def test_a_new_capture_session_keeps_the_delay_and_the_filter(self):
         sim = Sim()
         n = 10 * FS

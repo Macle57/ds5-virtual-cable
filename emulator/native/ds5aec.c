@@ -742,7 +742,10 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
         for (j = 0; j < nstage; j++) {
             ds5mdf *m = stages[j];
             double pe = 0, pin = 0, pou = 0;
-            ds5mdf_set_adapt(m, m->adapt_base * (s->dt_hold > 0 ? s->p[P_DT_ADAPT] : 1.0f));
+            /* a lost packet (zeros upstream): the stage runs so its reference history stays in step, but
+             * frozen -- with no mic its error is minus its own echo estimate, nothing to learn from */
+            ds5mdf_set_adapt(m, msilent ? 0.0f
+                             : m->adapt_base * (s->dt_hold > 0 ? s->p[P_DT_ADAPT] : 1.0f));
             speex_echo_cancellation(m->mdf, cur, refs[j], m->out);
             for (i = 0; i < n; i++) {
                 float d = (float)cur[i] - (float)m->out[i];
@@ -751,6 +754,7 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
                 pou += (double)m->out[i] * m->out[i];
                 rcur[i] += (float)refs[j][i * m->nch] / m->ref_gain;   /* un-boosted (ds5mdf_scale_ref) */
             }
+            if (msilent) pe = pin = pou = 0;   /* no evidence about the echo either way */
             if (stage_stats) {
                 stage_stats[3 * j] = (float)(pin / n);
                 stage_stats[3 * j + 1] = (float)(pou / n);
@@ -759,8 +763,11 @@ API int ds5aec_process(ds5aec *s, const int16_t *mic, int nstage, ds5mdf *const 
             cur = m->out;
         }
         for (i = 0; i < n; i++) {
-            float y = (float)mic[i] - (float)cur[i];
-            ecur[i] = (float)cur[i];
+            /* a lost packet: the chain's output is the mic's, silence, not minus the echo estimate (that
+             * would reach the neighbouring frames through the STFT); the host conceals the frame */
+            float c = msilent ? 0.0f : (float)cur[i];
+            float y = (float)mic[i] - c;
+            ecur[i] = c;
             plin += (double)ecur[i] * ecur[i];
             pest += (double)y * y;
         }

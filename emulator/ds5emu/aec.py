@@ -65,8 +65,10 @@ What makes it safe to leave on:
     unplugged, the user put headphones on) loses its slot again, decided
     per endpoint;
   * the microphone timeline is exact: the pad numbers its mic packets (BT
-    payload byte 1) and every lost packet is replaced by 10 ms of silence,
-    so a loss never shifts the echo against its reference;
+    payload byte 1) and every lost packet is replaced by 10 ms of silence
+    on the canceller's input, so a loss never shifts the echo against its
+    reference; on its output those 10 ms are concealed from the output
+    either side (`_conceal`), so no hole of digital zeros reaches the host;
   * the producers never wait: `push_mic` (BT reader thread) refuses when the
     worker is behind by more than `QUEUE_MAX_MS` and the bridge then writes
     the frame directly -- a stall costs the cancellation, never the mic, and
@@ -130,6 +132,10 @@ QUEUE_MAX_MS = 150
 ANALYSE_EVERY_S = 0.02
 #: Lost mic packets up to this many are filled with silence; more is a gap.
 SEQ_MAX_FILL = 25
+#: The output of lost frames (`_conceal`) dips to CONCEAL_MIN of its level CONCEAL_RAMP_MS in from each edge of
+#: the gap, so a long gap does not buzz (the mirrored packet repeats every 20 ms).
+CONCEAL_MIN = 0.1
+CONCEAL_RAMP_MS = 20
 #: A reference frame quieter than this (-60 dBFS RMS) is silence -- for an endpoint playing at full scale.
 #: The gate follows each endpoint's own audio (`RefTimeline.loud_thr`): a frame is silence LOUD_REL_DB under
 #: its playing level or less than LOUD_OVER_FLOOR_DB over its noise floor (the quietest packets over the last
@@ -965,6 +971,41 @@ def pattern_shift(now: np.ndarray, then: np.ndarray, max_shift: int, up: int = 1
 # ---------------------------------------------------------------------------
 
 
+def _extend(x: np.ndarray, n: int) -> np.ndarray:
+    """`x` continued past its end for n samples by mirroring it (x reversed, x, x reversed, ...): continuous at
+    every junction, the same spectrum and level as x."""
+    if x.size == 0:
+        return np.zeros(n, np.float32)
+    reps = -(-n // x.size)
+    return np.concatenate([x[::-1] if k % 2 == 0 else x for k in range(reps)])[:n]
+
+
+def _conceal(before: np.ndarray, after: np.ndarray, lost: int) -> np.ndarray:
+    """lost * FRAME samples for a gap between `before` (the audio up to it) and `after` (the audio from its
+    end): `before` continued forward and `after` continued backward (`_extend`), cross-faded, dipping to
+    CONCEAL_MIN CONCEAL_RAMP_MS in from each edge. MEASURED (round 10, block L): Bluetooth drops 3-8 mic
+    packets a minute (sequence gaps of 1-2) while the bridge's link counters stay at zero; delivered as exact
+    zeros, each one was a 10-20 ms hole in the mic (the P5 gate)."""
+    n = lost * FRAME
+    a = _extend(np.asarray(before, np.float32), n)
+    b = _extend(np.asarray(after, np.float32)[::-1], n)[::-1]
+    t = np.arange(n, dtype=np.float32) + 0.5
+    w = 0.5 - 0.5 * np.cos(np.pi * t / n)
+    # the middle of the gap is never louder than the quieter side (the canceller's first frame after a gap carries
+    # a little of the gap's disturbance; a speech onset or offset just after or before it is not stretched over it)
+    def rms(x):
+        return float(np.sqrt(np.mean(np.square(x)))) if np.size(x) else 0.0
+    la, lb = rms(before), rms(after)
+    bump = np.sin(np.pi * t / n)
+    if la > lb > 0.0:
+        a = a * (1.0 - (1.0 - lb / la) * bump)
+    elif lb > la > 0.0:
+        b = b * (1.0 - (1.0 - la / lb) * bump)
+    edge = np.minimum(t, n - t) / (CONCEAL_RAMP_MS * FS / 1000)
+    env = 1.0 - (1.0 - CONCEAL_MIN) * (0.5 - 0.5 * np.cos(np.pi * np.minimum(edge, 1.0)))
+    return (((1.0 - w) * a + w * b) * env).astype(np.float32)
+
+
 def W_PROBE() -> int:
     """The probe window in samples."""
     return int(PROBE_WINDOW_S * FS)
@@ -1249,12 +1290,14 @@ class EchoCanceller:
         self.native: NativeCanceller | None = None
         self.mic_hist = MicHistory()
         self._reset_session()
+        self._held_out = 0                     # output frames of lost packets waiting for their concealment
+        self._out_tail = np.zeros(0, np.float32)   # the last output frame written (`_conceal`)
         self._probe_at = 0.0
         self._probe_rr = 0
         self.mode = "starting"
         self.reason = ""
         self._slot_gen = 0                      # bumped whenever the set of slots changes (ghost ranges)
-        self.stats = {"frames": 0, "frames_active": 0, "lost_packets": 0,
+        self.stats = {"frames": 0, "frames_active": 0, "lost_packets": 0, "concealed_frames": 0,
                       "refused": 0, "overruns": 0, "native_errors": 0, "slotted": 0,
                       "slotted_from_store": 0, "store_rejected": 0, "evicted": 0, "evicted_unheard": 0, "pair_slotted": 0, "run_slotted": 0, "yield_asks": 0, "yield_moves": 0,
                       "unslotted": 0, "delay_moves": 0, "fine_moves": 0, "drift_fits": 0, "fine_repatterns": 0,
@@ -1266,6 +1309,8 @@ class EchoCanceller:
         self._seq: int | None = None
         self._acc = np.zeros(0, np.float32)
         self._acc_start = 0
+        self._lost_spans: list = []            # filled sample ranges of the input, in _acc_start positions
+        self._prev_lost = False                # the frame just processed was a fill: its output comes next
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -1503,6 +1548,8 @@ class EchoCanceller:
                 lost = (seq - self._seq - 1) % 256
                 if 0 < lost <= SEQ_MAX_FILL:
                     self.stats["lost_packets"] += lost
+                    at = self._acc_start + self._acc.size
+                    self._lost_spans.append((at, at + lost * FRAME))
                     mono = np.concatenate([np.zeros(lost * FRAME, np.float32), mono])
                 elif lost > SEQ_MAX_FILL:
                     anchor = True
@@ -1514,15 +1561,35 @@ class EchoCanceller:
             self._acc = self._acc[FRAME:]
             k = self._acc_start
             self._acc_start += FRAME
-            self._frame(frame, k)
+            while self._lost_spans and self._lost_spans[0][1] <= k:
+                self._lost_spans.pop(0)
+            lost = bool(self._lost_spans) and self._lost_spans[0][0] <= k + FRAME // 2 < self._lost_spans[0][1]
+            self._frame(frame, k, lost)
 
-    def _frame(self, frame: np.ndarray, k: int) -> None:
+    def _frame(self, frame: np.ndarray, k: int, lost: bool = False) -> None:
         with self._state:
             out = self._frame_locked(frame, k)
-        if out is not None and self._active.is_set():
+        if out is None:
+            return
+        # A lost packet reaches the canceller as zeros (the timeline stays exact); its OUTPUT comes one call later
+        # (the residual stage's frame of latency) and is held until the next real output frame, then replaced by
+        # one concealed from the output either side. Arrived frames are never touched.
+        held, self._prev_lost = self._prev_lost, lost
+        if held:
+            self._held_out += 1
+            return
+        frames = [out]
+        if self._held_out:
+            fill = _conceal(self._out_tail, out.astype(np.float32), self._held_out)
+            frames = list(np.clip(np.round(fill), -32768, 32767).astype("<i2").reshape(-1, FRAME)) + frames
+            self.stats["concealed_frames"] += self._held_out
+            self._held_out = 0
+        self._out_tail = out.astype(np.float32)
+        if self._active.is_set():
             with self._out_lock:
                 if not self._overrun and self._cur_gen == self._gen:
-                    self.write_out(np.repeat(out, 2).tobytes())
+                    for f in frames:
+                        self.write_out(np.repeat(f, 2).tobytes())
 
     def _frame_locked(self, frame: np.ndarray, k: int):
         pos = k + self.mic.off_f
