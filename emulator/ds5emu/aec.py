@@ -296,6 +296,24 @@ PROBE_YIELD_S = 12.0
 #: further than that is the yield move.
 PROBE_YIELD_BACKOFF_S = 120.0
 PROBE_YIELD_BACKOFF_MAX_S = 1800.0
+#: Ghost ranges also come from a matched endpoint that plays but is NOT slotted yet: its own best probe peak (>=
+#: PROBE_MIN_PEAK, at most PROBE_CAND_S old) is where its echo is, and a SLOTTED endpoint does not take that echo.
+#: MEASURED round 10, block L2 (laptop + iPad playing the same short, the iPad 15-20 dB louder): at the start of
+#: the take Realtek's own echo was weak in its probe (peaks 3-7) and it moved +206 ms onto the iPad's echo while
+#: spacedesk, not slotted yet, already saw that echo as its own (peak 19-26); Realtek then held it for the whole
+#: take (its own echo never reached 8, so it could not yield) and spacedesk only got a slot when Realtek's ghost
+#: lapsed four minutes later. Only slotted endpoints use these ranges, and only LATER than their filter's window
+#: (that bad move was +206 ms): a mirror the room never hears publishes the slotted endpoint's own echo seen
+#: through its reference, and an EARLY step of that echo must still be followed. Two unslotted endpoints that both
+#: see one echo are resolved as before (first to slot; PROBE_YIELD_S).
+PROBE_CAND_S = 3.0
+#: A slotted endpoint unheard while a matched endpoint's echo is in its probe (masked by the louder mirror) is kept
+#: only while its own filter still shows an echo: an estimate >= MASKED_EST_DB of the mic AND removing >= MASKED_Q
+#: of it, over the window. MEASURED: block L2, Realtek masked by the iPad: -11..-19 dB, 0.46-1.0 (one window under
+#: 0.5); the review's dead laptop echo under a heard mirror: -48..-61 dB, -0.7..-1.0. A dead echo with a voice in
+#: the room gave -9 dB and 0.4 (round 5), so both are required.
+MASKED_EST_DB = -25.0
+MASKED_Q = 0.5
 PROBE_AGREE_MS = 2
 PROBE_EVERY_S = 0.25
 #: A slotted endpoint whose loopback stream re-anchored (a new playback: Realtek's stamps then jump by tens
@@ -1025,6 +1043,8 @@ class Ref:
         self.yield_until = -math.inf
         #: When this endpoint may next ask each other endpoint (by id) to yield, and the back-off it is at.
         self.ask_next: dict = {}
+        #: While not slotted: its last strong probe peak (lag, clock), for the other endpoints' ghost ranges.
+        self.cand: tuple | None = None
         #: Gain (dB) this endpoint's reference is fed to its stage with (see REF_NORM_*), when it was last
         #: changed (clock), and whether the first choice from a mature level has been made for this filter.
         self.norm_db = 0.0
@@ -1659,7 +1679,10 @@ class EchoCanceller:
                     self._forget(ref)
                 self._unslot(ref)
             return
-        ref.bad_windows = 0 if heard else ref.bad_windows + 1
+        # a matched endpoint playing the same audio louder (its echo in this probe, `ghosts`) masks this one's
+        # echo the way a louder room does; the slot is kept while that lasts (block L2: Realtek under the iPad)
+        masked = bool(ref.ghosts) and share >= MASKED_EST_DB and q >= MASKED_Q
+        ref.bad_windows = 0 if (heard or masked) else ref.bad_windows + 1
         if ref.bad_windows >= UNHEARD_WINDOWS:
             log.info("echo of %s no longer found in the microphone -- "
                      "reference dropped", ref.name)
@@ -1740,6 +1763,7 @@ class EchoCanceller:
         ref.run_votes = []
         ref.yield_until = -math.inf
         ref.ask_next = {}
+        ref.cand = None
         ref._clear_windows()
         ref._clear_fine()
         self.stats["slotted"] += 1
@@ -1825,7 +1849,8 @@ class EchoCanceller:
         if job is None:
             return
         mic, views, M, A, near, others, gen, yielding = job
-        ghosts = self._ghosts(views[0][M:M + W_PROBE()], views[0], others, M, A)
+        ghosts = self._ghosts(views[0][M:M + W_PROBE()], views[0], others, M, A,
+                              late_from=None if near is None else near[1])
         ex = tuple((lo, hi) for lo, hi, _ in ghosts)
         if yielding and near is not None:
             ex = ex + (near,)                   # asked to yield: look for an echo of its own outside its window
@@ -1875,25 +1900,37 @@ class EchoCanceller:
         # the other slotted endpoints, for the ghost ranges (`_ghosts`): which, and where their echo is, noted
         # here; their references are read and correlated outside the lock (a timeline has its own lock).
         # Unsettled or provisional ones are left out: their delay is not confirmed.
-        others = [(other, other.delay + other.adj + EARLY_MS * FS // 1000) for other in self._slots
+        others = [(other, other.delay + other.adj + EARLY_MS * FS // 1000, False) for other in self._slots
                   if other is not ref and other.stage is not None and other.delay is not None
                   and not other.unsettled and not other.provisional]
+        if ref.slotted:
+            others += self._candidates(ref, self._clock())
         return mic, views, M, A, near, (others, P - W - base - M), self._slot_gen, yielding
 
+    def _candidates(self, ref: Ref, now: float) -> list:
+        """For a slotted endpoint's ghost ranges: (endpoint, its echo lag, True) of every other endpoint that plays,
+        is not slotted, and found a strong peak of its own within PROBE_CAND_S (see PROBE_CAND_S). Whether it
+        plays the same audio is checked with the ref-to-ref correlation in `_ghosts`."""
+        return [(other, other.cand[0], True) for other in list(self._refs.values())
+                if other is not ref and not other.slotted and other.cand is not None
+                and now - other.cand[1] <= PROBE_CAND_S and now - other.timeline.last_loud < 1.0]
+
     @staticmethod
-    def _ghosts(seg_w: np.ndarray, seg: np.ndarray, others: tuple, M: int, A: int) -> list:
+    def _ghosts(seg_w: np.ndarray, seg: np.ndarray, others: tuple, M: int, A: int, late_from=None) -> list:
         """The lag ranges where OTHER slotted endpoints' echoes show up in this
         endpoint's probe window: for each other slotted endpoint whose reference
         over the window matches this one's (ref-to-ref GCC-PHAT, either way round,
         peak >= PROBE_GHOST_PEAK), its echo lag minus the offset between the two
         references, +-PROBE_GHOST_MS. Mirrored audio only; unrelated references
         give nothing. `seg`: this endpoint's mix over the probe span, `seg_w` its
-        window part; `others`: ([(endpoint, its echo lag)], the span's start).
-        Runs outside `_state`."""
+        window part; `others`: ([(endpoint, its echo lag, published)], the span's
+        start); a published (not slotted) endpoint's range counts only if it lies
+        after `late_from` (the end of this endpoint's filter window, see
+        PROBE_CAND_S). Runs outside `_state`."""
         out = []
         tol = PROBE_GHOST_MS * FS // 1000
         lst, pos = others
-        for other, e_o in lst:
+        for other, e_o, published in lst:
             oseg = _probe_mix(other.timeline.read(pos, seg.size))
             if float(np.sqrt(np.mean(oseg[M:M + seg_w.size] ** 2))) < other.timeline.loud_thr:
                 continue
@@ -1901,7 +1938,7 @@ class EchoCanceller:
             lag2, pk2 = estimate_lag(oseg[M:M + seg_w.size], seg, M, A)   # the other later than this one
             if pk2 > pk:
                 lag, pk = -lag2, pk2
-            if pk >= PROBE_GHOST_PEAK:
+            if pk >= PROBE_GHOST_PEAK and not (published and (late_from is None or e_o - lag - tol <= late_from)):
                 out.append((e_o - lag - tol, e_o - lag + tol, other))
         return out
 
@@ -1922,6 +1959,11 @@ class EchoCanceller:
             # whose highest peak is elsewhere did not find this echo
             scores = [r[1] if abs(r[0] - lag) <= agree else 0.0 for r in res]
         ref.lag_conf = conf
+        if not ref.slotted:
+            # where it finds its echo, for the slotted endpoints' ghost ranges (PROBE_CAND_S): its best peak
+            # before the ranges were taken out, since that is the echo a slotted endpoint must not take
+            c_lag, c_conf = (unmasked[0], unmasked[1]) if unmasked is not None else (lag, conf)
+            ref.cand = (c_lag, now) if c_conf >= PROBE_MIN_PEAK else None
         if not ref.slotted and unmasked is not None and conf < PROBE_CONFIRM_PEAK \
                 and unmasked[1] >= PROBE_MIN_PEAK:
             # its only echo is another endpoint's ghost: if that endpoint holds an echo that is ours (it slotted

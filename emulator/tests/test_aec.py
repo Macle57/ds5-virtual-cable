@@ -1175,6 +1175,73 @@ class CancellerTests(unittest.TestCase):
                 tail = slice(28 * FS, n - FS)
                 np.testing.assert_array_equal(out[tail.start + F:tail.stop + F], want[tail])
 
+    def test_a_slotted_endpoint_does_not_take_the_echo_a_new_mirror_finds(self):
+        # block L2: the laptop plays alone and is slotted. The next playback (a new session: it re-anchors and is
+        # unsettled) plays the same stream on the laptop and on a cast display ~18 dB louder: the laptop's own
+        # echo is weak in its probe and the cast's echo, seen through the laptop's reference, strong. 713d4bc
+        # moved the laptop onto the cast's echo for good and the cast never slotted (17.8 dB); the laptop must
+        # stay while the cast, not slotted yet, already finds that echo as its own (25.7 dB)
+        n1, n2 = 15 * FS, 40 * FS
+        a1 = speechlike(n1, 3, rate=4.7)
+        a = speechlike(n2, 2, rate=5.1)
+        sh = int(0.150 * FS)
+        b = np.concatenate([np.zeros(sh, np.float32), a[:-sh]])
+        noise = lambda n, s: np.float32(1e-4) * np.random.default_rng(s).standard_normal(n).astype(np.float32)  # noqa: E731
+        mic = echo_of(a, room(6, 0.08), 20) + echo_of(b, room(8, 0.6), 300) + noise(n2, 2)
+        for order in (("Laptop", "Cast"), ("Cast", "Laptop")):
+            with self.subTest(first=order[0]):
+                sim = Sim()
+                sim.run(echo_of(a1, room(6, 0.5), 20) + noise(n1, 1), ref={"Laptop": a1})
+                refs = {"Laptop": a, "Cast": b}
+                out = aligned(sim.run(mic, ref={k: refs[k] for k in order}), n2)
+                laptop, cast = sim.eng._refs["Laptop"], sim.eng._refs["Cast"]
+                self.assertTrue(cast.slotted)
+                self.assertTrue(laptop.slotted)
+                self.assertLess((laptop.delay + laptop.adj) * 1000 / FS, 100.0)    # still on its own echo
+                self.assertGreater((cast.delay + cast.adj) * 1000 / FS, 250.0)     # the cast on its own
+                self.assertLess(db(out[20 * FS:39 * FS], mic[20 * FS:39 * FS]), -22.0)
+
+    def test_an_early_step_is_followed_under_an_unheard_mirror_with_no_slot_free(self):
+        # headphones play the same stream 150 ms ahead and see the laptop's echo through their reference (and
+        # publish it); there is no slot for them. The laptop's echo steps 30 ms earlier: it must still be followed
+        n = 70 * FS
+        a = speechlike(n, 2, rate=5.1)
+        sh = int(0.150 * FS)
+        phones = np.concatenate([a[sh:], np.zeros(sh, np.float32)])
+        e1, e2 = echo_of(a, room(6, 0.6), 50), echo_of(a, room(6, 0.6), 20)
+        mic = np.concatenate([e1[:35 * FS], e2[35 * FS:]]) + np.float32(1e-4) * \
+            np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        old = AEC.MAX_REFS
+        AEC.MAX_REFS = 1
+        try:
+            for order in (("Laptop", "Phones"), ("Phones", "Laptop")):
+                with self.subTest(first=order[0]):
+                    sim = Sim()
+                    refs = {"Laptop": a, "Phones": phones}
+                    out = aligned(sim.run(mic, ref={k: refs[k] for k in order}), n)
+                    laptop = sim.eng._refs["Laptop"]
+                    self.assertTrue(laptop.slotted)
+                    self.assertGreaterEqual(sim.eng.stats["delay_moves"], 1)
+                    self.assertLess(db(out[45 * FS:69 * FS], mic[45 * FS:69 * FS]), -5.0)
+        finally:
+            AEC.MAX_REFS = old
+
+    def test_a_dead_slot_under_a_heard_mirror_is_dropped(self):
+        # the laptop's own echo stops at 30 s (speakers unplugged; Realtek still renders) while a heard cast keeps
+        # playing the same stream: the masked rule must not keep the dead slot
+        n = 100 * FS
+        a = speechlike(n, 2, rate=5.1)
+        sh = int(0.150 * FS)
+        cast = np.concatenate([np.zeros(sh, np.float32), a[:-sh]])
+        lap = echo_of(a, room(6, 0.5), 20)
+        lap[30 * FS:] = 0
+        mic = echo_of(cast, room(8, 0.6), 300) + lap + np.float32(1e-4) * \
+            np.random.default_rng(1).standard_normal(n).astype(np.float32)
+        sim = Sim()
+        sim.run(mic, ref={"Laptop": a, "Cast": cast})
+        self.assertFalse(sim.eng._refs["Laptop"].slotted)
+        self.assertTrue(sim.eng._refs["Cast"].slotted)
+
     def test_an_unheard_mirror_does_not_keep_the_heard_endpoint_yielding(self):
         # headphones (or a muted cast) playing the same stream 150 ms AHEAD of the laptop: the laptop's echo shows
         # in their probe as another endpoint's ghost, forever. They may ask once; then they back off
@@ -1510,6 +1577,48 @@ class TimingTests(unittest.TestCase):
             tl.push(music[i * F:(i + 1) * F], (i + 1) * 0.01, 0.0)
             loud.append(tl.last_loud != before)
         self.assertGreater(np.mean(loud[1500:]), 0.5)
+
+    def test_an_unslotted_endpoints_published_peak_expires(self):
+        now = [100.0]
+        eng = AEC.EchoCanceller(lambda b: None, loopback=False, clock=lambda: now[0],
+                                stage_factory=lambda n: type("S", (), {"nch": n})())
+        a, b = AEC.Ref("a", "Laptop", 1), AEC.Ref("b", "Cast", 1)
+        eng._refs = {"a": a, "b": b}
+        a.slotted = True
+        b.timeline.last_loud = 100.0
+        b.cand = (15000.0, 100.0)
+        self.assertEqual([(o.name, lag, pub) for o, lag, pub in eng._candidates(a, 100.0)], [("Cast", 15000.0, True)])
+        self.assertEqual(eng._candidates(a, 100.0 + AEC.PROBE_CAND_S + 0.1), [])     # too old
+        b.slotted = True
+        self.assertEqual(eng._candidates(a, 100.0), [])                               # slotted: a real ghost now
+        b.slotted = False
+        b.timeline.last_loud = 90.0
+        self.assertEqual(eng._candidates(a, 100.0), [])                               # not playing
+
+    def _watch_windows(self, eng, ref, windows, ghosts, est=1e4):
+        need = int(AEC.UNHEARD_WINDOW_S * 100)
+        for _ in range(windows):
+            for _ in range(need):
+                ref.ghosts = ghosts
+                eng._watch(ref, 1e6, 1e6, 1e6 - 0.9 * est, est)
+
+    def test_a_masked_mirrored_slot_is_kept_and_an_unheard_one_is_dropped(self):
+        eng, ref = self._decider()
+        ref.delay = 2000.0
+        self.assertTrue(eng._slot(ref))
+        other = AEC.Ref("o", "Cast", 1)
+        # a matched endpoint's echo is in this endpoint's probe (it plays the same stream, louder) and its own
+        # filter still estimates and removes an echo (-20 dB of the mic, 0.9 of it): kept
+        self._watch_windows(eng, ref, AEC.UNHEARD_WINDOWS + 2, [(10000, 11000, other)])
+        self.assertTrue(ref.slotted)
+        # nothing else plays and nothing hears it: the ordinary rule drops it
+        self._watch_windows(eng, ref, AEC.UNHEARD_WINDOWS, [])
+        self.assertFalse(ref.slotted)
+        # masked, but its filter shows no echo of its own (a dead echo under a heard mirror): dropped too
+        ref.delay = 2000.0
+        self.assertTrue(eng._slot(ref))
+        self._watch_windows(eng, ref, AEC.UNHEARD_WINDOWS, [(10000, 11000, other)], est=1e1)
+        self.assertFalse(ref.slotted)
 
     def test_a_slot_whose_echo_is_still_there_is_not_moved(self):
         eng, ref = self._decider()
